@@ -1,0 +1,226 @@
+# New Proxy/Upgrade Bug Patterns
+# Derived from solodit_by_category/proxy_upgrade.json (38 findings)
+# Patterns proxy-009 through proxy-014
+# Complements existing patterns proxy-001 to proxy-008 in proxy-upgrade.md
+
+- id: proxy-009
+  pattern: notDelegated-kills-upgradeability
+  name: "UUPS functions marked notDelegated make contract non-upgradeable"
+  causa_raiz: "UUPS upgradeable contracts use the notDelegated modifier on initialize() or _authorizeUpgrade(). This modifier requires msg.sender == address(this), which is false when called through a proxy via delegatecall. The contract compiles and deploys, but can never actually be upgraded because upgradeToAndCall() internally calls _authorizeUpgrade() which reverts."
+  como_funciona: |
+    1. Protocol deploys AssetFactory behind a UUPS proxy.
+    2. AssetFactory.initialize() has the notDelegated modifier.
+    3. Proxy calls initialize() via delegatecall -- notDelegated checks address(this) != deploymentAddress, reverts.
+    4. Even if initialize succeeds via workaround, _authorizeUpgrade() also has notDelegated.
+    5. Admin calls upgradeToAndCall() on proxy -- internally calls _authorizeUpgrade() via delegatecall -- reverts.
+    6. Contract is permanently non-upgradeable. If a critical bug is found, no fix is possible.
+    7. Ownership may also be stuck in a contract (e.g., ModuleCore) that cannot call upgradeToAndCall().
+  invariante: "UUPS initialize() and _authorizeUpgrade() must never use the notDelegated modifier. upgradeToAndCall() must be callable through the proxy by the authorized upgrader."
+  que_mirar:
+    - "grep -rn 'notDelegated' --include='*.sol' -- look for it on initialize or _authorizeUpgrade"
+    - "UUPS contracts where ownership is set to a contract that lacks upgradeToAndCall() capability"
+    - "Contracts inheriting UUPSUpgradeable but deployed without a proxy (notDelegated is a hint)"
+    - "Check deploy scripts: is the contract actually deployed behind a proxy or standalone?"
+  como_se_arregla: "Remove notDelegated from initialize() and _authorizeUpgrade(). Ensure the owner contract can call upgradeToAndCall(). If standalone deployment is intended, do not inherit UUPSUpgradeable."
+  trampas:
+    - "notDelegated is legitimate for functions that should ONLY run on the implementation directly (rare)"
+    - "The contract compiles fine -- this only manifests at runtime when upgrade is attempted"
+    - "If the owner is set to a contract (e.g., ModuleCore), verify that contract exposes upgrade functionality"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "solodit #41488 (Cork Protocol, Sherlock), #41486 (Cork Protocol, Sherlock)"
+  tags: [UUPS, notDelegated, upgrade, broken-upgradeability]
+  relacionado_con: [proxy-003]
+  incidentes_verificados:
+    - nombre: "Cork Protocol"
+      fecha: "Aug 2024"
+      perdida: "N/A (broken functionality)"
+      tipo: "AssetFactory and FlashSwapRouter marked notDelegated on initialize and _authorizeUpgrade -- permanently non-upgradeable"
+      verificado: true
+      fuente: "Sherlock audit 2024-08-cork-protocol, issues #185 and #47"
+
+- id: proxy-010
+  pattern: constructor-config-behind-proxy
+  name: "Constructor-only configuration does not apply to proxy"
+  causa_raiz: "Developer places chain-specific or protocol configuration logic in the constructor of an upgradeable implementation contract. Constructors run during deployment and affect the implementation contract's own storage/state. But the proxy -- which holds all user funds and real state -- never executes the constructor. The configuration is applied to the wrong contract."
+  como_funciona: |
+    1. ParticlePositionManager has constructor that calls Blast.configure() to set yield mode to claimable.
+    2. Contract is deployed behind a UUPS proxy. Constructor runs on the implementation address.
+    3. Blast yield/gas configuration is set on the implementation contract, not the proxy.
+    4. The proxy contract (where all ETH, WETHB, USDB balances live) has default void/disabled yield mode.
+    5. All yield and gas refunds that should accrue to the protocol are permanently lost.
+    6. No setter function exists to change the mode after deployment.
+  invariante: "Any configuration that affects contract state (yield modes, gas modes, rebasing token config, chain-specific setup) must be in initialize(), not the constructor. Constructor should only contain _disableInitializers() and immutable assignments."
+  que_mirar:
+    - "Constructors in upgradeable contracts that do more than _disableInitializers() and set immutables"
+    - "Blast-specific: grep for 'configureClaimableYield|configureClaimableGas|configure(' in constructors"
+    - "Any external call in a constructor of a proxied contract"
+    - "Chain-specific config (Blast yield, Optimism gas, etc.) that must apply to the proxy address"
+  como_se_arregla: "Move all configuration logic from constructor to initialize(). Constructor should only set immutables and call _disableInitializers(). For Blast: call Blast.configure() inside initialize()."
+  trampas:
+    - "immutable variables ARE set correctly in constructors (they live in bytecode, not storage) -- do not flag these"
+    - "_disableInitializers() in constructor is correct and expected"
+    - "This is Blast/L2-specific in many cases but the general pattern applies to any chain-specific setup"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "solodit #40716 (Particle, Cantina)"
+  tags: [proxy, constructor, blast, yield, configuration, initialize]
+  relacionado_con: [proxy-002]
+  incidentes_verificados:
+    - nombre: "Particle Protocol"
+      fecha: "2024"
+      perdida: "Permanent yield loss (all Blast yield/gas on proxy)"
+      tipo: "Blast.configure() in constructor only affected implementation, not proxy -- zero yield accrual"
+      verificado: true
+      fuente: "Cantina audit of Particle"
+
+- id: proxy-011
+  pattern: upgrade-drops-interface
+  name: "V2 implementation is not a strict superset of V1 interface"
+  causa_raiz: "When upgrading a UUPS proxy, the new implementation must contain ALL functions from V1 plus any new ones. If V2 is written as a standalone contract that only adds new features without inheriting V1, all V1 function selectors disappear. Calls to those functions (from scripts, other contracts, or users) silently succeed with empty return data or revert."
+  como_funciona: |
+    1. RewardsEngineV1 has distribute(), epoch config, claim functions.
+    2. RewardsEngineV1_1 is written as a new standalone contract inheriting only OZ base contracts.
+    3. V1_1 only adds claimFor() and batchClaimFor() -- does NOT inherit V1.
+    4. After proxy upgrade to V1_1, calls to distribute() revert (selector not found).
+    5. Migration runbook calls distribute() after upgrade -- entire migration breaks.
+    6. Protocol is stuck: cannot distribute rewards, must deploy another upgrade to fix.
+  invariante: "After upgrade, every function selector present in V(N) must also be present in V(N+1). V(N+1) implementation must be a strict superset of V(N) interface."
+  que_mirar:
+    - "V2 contracts that do NOT inherit from V1 -- instead written from scratch"
+    - "Compare function selectors: forge inspect V1 abi vs forge inspect V2 abi"
+    - "Upgrade runbooks/scripts that call functions -- verify those functions exist in new impl"
+    - "Contracts that remove or rename public/external functions between versions"
+    - "New implementation inheriting different base contracts than V1"
+  como_se_arregla: "V2 should inherit V1 and add new functionality. If rewrite is necessary, ensure all V1 external function selectors are preserved. Run fork test: upgrade proxy, then execute full V1 interface + migration script."
+  trampas:
+    - "Some functions are intentionally removed (deprecated) -- but callers must be updated first"
+    - "Even if the function body changes, the selector must remain callable"
+    - "Internal functions don't matter -- only public/external selectors"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "solodit #64790 (Buck Labs, Spearbit)"
+  tags: [proxy, upgrade, interface, ABI, migration, UUPS]
+  relacionado_con: [proxy-003, proxy-006]
+  incidentes_verificados:
+    - nombre: "Buck Labs RewardsEngine"
+      fecha: "2025"
+      perdida: "N/A (caught in audit)"
+      tipo: "RewardsEngineV1_1 did not inherit V1 -- distribute() missing after upgrade, blocking migration"
+      verificado: true
+      fuente: "Spearbit audit of Buck Labs"
+
+- id: proxy-012
+  pattern: initializer-vs-onlyInitializing-misuse
+  name: "Base contract uses initializer modifier instead of onlyInitializing"
+  causa_raiz: "In OpenZeppelin's upgradeable pattern, base/parent contracts must use onlyInitializing on their __init functions (called during child initialization). If a base contract uses the initializer modifier instead, calling it from a child's initialize() (which also has initializer) causes a revert due to reentrancy protection in the Initializable contract -- the initializer modifier does not allow nested calls."
+  como_funciona: |
+    1. EIP712MetaTransaction has initializeEIP712() with the initializer modifier.
+    2. QuantProtocol has initialize() with the initializer modifier.
+    3. initialize() calls initializeEIP712() internally.
+    4. OpenZeppelin's initializer modifier sets _initializing = true on first call.
+    5. Second nested initializer call checks _initializing -- in Solidity >= 0.8 with OZ v4.x, this reverts.
+    6. Contract cannot be initialized through the proxy. Deployment fails silently or requires workaround.
+    7. Exception: if called inside a constructor context (e.g., via deployProxy), nested initializer may succeed due to special constructor handling -- but this is fragile.
+  invariante: "Base/parent upgradeable contracts must use onlyInitializing modifier on their internal init functions. Only the top-level child contract's initialize() should use initializer."
+  que_mirar:
+    - "grep -rn 'initializer' --include='*.sol' -- look for base contracts using initializer instead of onlyInitializing"
+    - "Internal init functions (__ContractName_init) with public visibility and initializer modifier"
+    - "Inheritance chains where multiple contracts each have initializer-modified functions"
+    - "Contracts marked public instead of internal on their init helpers"
+  como_se_arregla: "Change base contract init functions to use onlyInitializing modifier and internal visibility. Only the final child contract's initialize() should use initializer. Follow OZ pattern: __Base_init() is internal onlyInitializing."
+  trampas:
+    - "In constructor context (deployProxy), nested initializer calls may succeed -- bug only appears on redeployment or upgrade"
+    - "OZ v5 changed some behavior around reentrancy in initializers -- check the specific version"
+    - "reinitializer(N) has different nesting rules than initializer"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "solodit #1684 (Rolla, Code4rena)"
+  tags: [proxy, initializer, onlyInitializing, OpenZeppelin, upgradeable]
+  relacionado_con: [proxy-002, proxy-004]
+  incidentes_verificados:
+    - nombre: "Rolla / Quant Protocol"
+      fecha: "Mar 2022"
+      perdida: "N/A (broken initialization)"
+      tipo: "EIP712MetaTransaction used initializer instead of onlyInitializing -- nested init reverts"
+      verificado: true
+      fuente: "Code4rena 2022-03-rolla contest"
+
+- id: proxy-013
+  pattern: missing-state-migration-on-upgrade
+  name: "V2 replaces storage variables without migration function"
+  causa_raiz: "When upgrading, V2 replaces V1's global state variables with a new structure (e.g., single variable to per-vault mapping). The old storage slot values are not migrated to the new structure. After upgrade, the new mapping/struct reads default zero values instead of the intended V1 values. Critical protocol parameters silently become zero."
+  como_funciona: |
+    1. LiquidationManagerV1 has global liquidatorRewardBps = 25% and bufferRewardsBps = 25%.
+    2. V2 replaces these with mapping(uint8 => LiquidationConfiguration) per vault.
+    3. Upgrade to V2 occurs. No reinitializer or migration function is called.
+    4. liquidationConfiguration[vaultId] returns zero for all vaults (mapping default).
+    5. Liquidation reward calculations use zero values -- liquidators get zero reward.
+    6. Nobody liquidates because there is no incentive. Protocol accumulates bad debt.
+  invariante: "After upgrade, all V1 state must be accessible through V2's interface with correct values. Any structural change to storage variables requires a reinitializer that migrates V1 values to V2 format."
+  que_mirar:
+    - "V2 contracts that replace variables with mappings or structs but have no reinitializer(N)"
+    - "reinitializer functions that set new variables but don't copy from old ones"
+    - "Upgrade scripts that don't call any migration function after upgradeToAndCall"
+    - "Default-zero values in new mappings/structs that replace non-zero V1 globals"
+    - "Compare V1 storage layout to V2 -- any renamed or restructured slots need migration"
+  como_se_arregla: "Implement reinitializer(N) that reads old values and writes them into new structure. Test on fork: upgrade, then verify all V1 parameter values are accessible through V2 interface. Include migration in upgradeToAndCall data parameter."
+  trampas:
+    - "If V2 storage is append-only (new slots after V1 slots), old values survive -- only structural changes need migration"
+    - "reinitializer version must be incremented correctly (2 for first upgrade, 3 for second, etc.)"
+    - "TimelockUpgradeableProxy patterns may not clear upgrade state after execution (solodit #63531) -- separate issue but related"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "solodit #63444 (Hyperstable, Pashov Audit Group)"
+  tags: [proxy, upgrade, migration, reinitializer, state, storage]
+  relacionado_con: [proxy-001, proxy-006]
+  incidentes_verificados:
+    - nombre: "Hyperstable LiquidationManager"
+      fecha: "Jun 2025"
+      perdida: "N/A (caught in audit)"
+      tipo: "V2 replaced global reward params with per-vault mapping -- zero rewards for all vaults post-upgrade"
+      verificado: true
+      fuente: "Pashov Audit Group audit of Hyperstable_2025-06-03"
+
+- id: proxy-014
+  pattern: unsafe-downgrade-storage-reorder
+  name: "Rollback to V1 after V2 corrupts storage due to slot reordering"
+  causa_raiz: "V2 implementation reorders storage slots compared to V1. After the proxy runs V2, those slots hold V2 values. If the proxy is downgraded back to V1 (emergency rollback), V1 interprets the same slots as different fields. Addresses, amounts, and access control state get cross-contaminated."
+  como_funciona: |
+    1. V1 storage: slot0=buck, slot1=liquidityReserve, slot2=policyManager, slot3=usdc.
+    2. V2 storage: slot0=buck, slot1=policyManager, slot2=oracleAdapter, slot3=liquidityReserve.
+    3. Proxy upgraded to V2. V2 writes policyManager address to slot1, oracleAdapter to slot2.
+    4. Emergency: proxy rolled back to V1.
+    5. V1 reads slot1 as liquidityReserve -- but it contains policyManager address from V2.
+    6. Funds sent to liquidityReserve go to policyManager contract instead.
+    7. Access checks using wrong addresses may grant unauthorized access or lock out admins.
+  invariante: "Storage slot assignments must be identical between V1 and V2 for all shared variables. If V2 reorders slots, rollback to V1 must be explicitly forbidden or a migration contract must be used."
+  que_mirar:
+    - "Upgrade runbooks with 'rollback' or 'downgrade' steps"
+    - "V2 contracts that reorder existing V1 storage variables (not just append)"
+    - "forge inspect V1 storage-layout vs forge inspect V2 storage-layout -- any reordered slots"
+    - "Emergency procedures that point proxy back to old implementation"
+    - "Proxy admin timelocks with rollback capabilities"
+  como_se_arregla: "Never reorder existing storage slots between versions (append-only). Remove rollback-to-V1 from runbooks if V2 reorders storage. If rollback is required, deploy fresh proxy with clean V1 state. Alternatively, create a dedicated rollback implementation that migrates V2 layout back to V1."
+  trampas:
+    - "Append-only storage changes ARE safe to rollback (V1 simply ignores new trailing slots)"
+    - "ERC-7201 namespaced storage makes reordering within a namespace safe but cross-namespace changes still matter"
+    - "This is an operational/runbook issue as much as a code issue -- auditors should review upgrade procedures"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "solodit #64799 (Buck Labs, Spearbit)"
+  tags: [proxy, upgrade, rollback, storage, downgrade, migration]
+  relacionado_con: [proxy-001, proxy-006, proxy-013]
+  incidentes_verificados:
+    - nombre: "Buck Labs LiquidityWindow"
+      fecha: "2025"
+      perdida: "N/A (caught in audit)"
+      tipo: "V2 reordered storage slots -- runbook suggested rollback to V1 which would corrupt addresses and misroute funds"
+      verificado: true
+      fuente: "Spearbit audit of Buck Labs"

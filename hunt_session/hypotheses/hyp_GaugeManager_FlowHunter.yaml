@@ -1,0 +1,417 @@
+component: GaugeManager
+hunter: FlowHunter
+analysis_date: "2026-03-21"
+
+hypotheses:
+
+  - id: GM-F-01
+    tier: 1
+    type: property
+    title: "Protocol reward dust swept to wrong recipient via _sendDepositDeltas"
+    description: >
+      _sendLeftoversAndRewards() retains rewardAmount0/rewardAmount1 in GaugeManager
+      as protocol fees intended to be drained only via withdrawBalances(). However,
+      _sendDepositDeltas() computes token deltas as (balanceAfter - balanceBefore) for
+      the current operation. If residual protocol reward tokens from a previous
+      compoundRewards() call share the same token0/token1 as a subsequent stakePosition()
+      or compoundRewards() call, those residual tokens inflate the delta and are forwarded
+      to the next position owner instead of accruing to the protocol withdrawer.
+      Attack: compound position A (USDC/ETH) leaves 50 USDC as protocol reward in
+      GaugeManager. Owner of position B (same pool) calls stakePosition. The
+      token0Before snapshot captures 50 USDC already in contract. deposit() does not
+      add more USDC. But if ANY other mechanism increases balance (e.g., airdrop or
+      partial fee from gauge), then the 50 USDC was already "baked in" to token0Before,
+      so no extra sweep. Actually the contamination risk is the OPPOSITE direction:
+      if token0Before is captured when residual tokens are present, then those tokens
+      are NOT swept (since delta = 0). The real scenario is a race: if two stakePositions
+      are called in the same block for different tokenIds with the same token pair, and
+      the first deposit triggers a fee collection that arrives BEFORE the second
+      token0Before snapshot, the second caller's delta would be zero — underpaying them.
+      The cleaner invariant: GaugeManager should hold zero token0/token1 for any pair
+      after any complete operation (stakePosition, compoundRewards, unstakePosition).
+      Residual protocol rewards violate this invariant and can corrupt future delta
+      calculations.
+    attack_scenario: >
+      1. compoundRewards(tokenId_A) completes, leaving X USDC as protocol reward in GaugeManager.
+      2. Owner calls stakePosition(tokenId_B) on a USDC/ETH position.
+      3. token0Before = X (existing residual USDC), deposit() calls NPM.collect sending Y USDC.
+      4. token0After = X + Y. Delta = Y — correct, user gets Y.
+      5. BUT if X was already a delta from a gauge collect inside the deposit, the user gets
+         X + Y instead of just Y. Net effect: protocol rewards stolen from withdrawer.
+      6. The direction of loss depends on ordering of events during deposit's internal collect.
+    solidity: |
+      // After any complete stakePosition() or compoundRewards() call,
+      // GaugeManager should hold zero or only pre-existing balances for token0/token1.
+      // Protocol rewards (rewardAmount0/rewardAmount1) must be tracked separately,
+      // not left as raw balances co-mingled with fee deltas.
+      //
+      // Invariant: for each token pair processed, the protocol reward dust
+      // accumulated across N compound calls must equal what withdrawBalances() sees.
+      //
+      // Ghost tracking version:
+      uint256 protocolReward0Accumulated; // incremented in _sendLeftoversAndRewards
+      uint256 protocolReward1Accumulated;
+
+      function invariant_protocolRewardNotSweptToUser() public {
+          // After compoundRewards, residual protocol rewards must still be in contract
+          // (not sent to user via _sendDepositDeltas in a subsequent operation).
+          // This is verified by checking that withdrawBalances-accessible balance
+          // is >= sum of all accumulated protocol rewards.
+          uint256 contractToken0 = IERC20(token0).balanceOf(address(gaugeManager));
+          t(contractToken0 >= protocolReward0Accumulated,
+            "protocol reward swept to wrong recipient");
+      }
+    validated: false
+    priority: high
+    confidence: 65
+    notes: >
+      The contamination direction is subtle. Requires careful trace through deposit timing.
+      Token0Before is captured BEFORE deposit(), so residual rewards are in the baseline.
+      If gauge.deposit() collects exactly Y fees, user gets Y — correct. Protocol rewards
+      remain undisturbed. The BUG scenario requires: tokens arrive at GaugeManager BETWEEN
+      token0Before snapshot and the delta check via some external trigger. Low likelihood
+      in normal operation but worth a fork test. Mark as medium confidence until fork-tested.
+
+  - id: GM-F-02
+    tier: 1
+    type: property
+    title: "NFT and gauge state permanently desynchronized if compoundRewards reverts mid-flight"
+    description: >
+      In compoundRewards(), IGauge.withdraw(tokenId) is called first (line 276), which
+      moves the NFT from the gauge to GaugeManager. Then _swapAeroForPosition() and
+      _addLiquidity() are called. If either of these reverts (TWAP check fails, slippage,
+      deadline exceeded, NPM revert), the ENTIRE transaction reverts — including the
+      withdraw. This is fine for atomicity. HOWEVER: if the revert happens between
+      IGauge.withdraw() and IGauge.deposit(), and if for some reason the revert is NOT
+      full (e.g., the gauge's withdraw uses a try/catch internally or has side effects
+      outside the EVM call stack), the NFT ends up in GaugeManager but tokenIdToGauge
+      still points to the gauge. Subsequent calls to unstakePosition() will call
+      IGauge.withdraw() on a gauge that no longer holds the NFT, causing a revert and
+      permanently bricking the position. In practice, Solidity reverts are atomic, so
+      this scenario requires a non-reverting mid-function failure path.
+      More concrete: what if IGauge.withdraw() SUCCEEDS but the NPM.safeTransferFrom
+      during unstake triggers a callback that causes only a partial state reset?
+      This is guarded by nonReentrant. Confidence reduced accordingly.
+    attack_scenario: >
+      1. User calls compoundRewards(tokenId) when AERO rewards are sufficient.
+      2. _claimRewardsToSelf succeeds, gauge.withdraw(tokenId) moves NFT to GaugeManager.
+      3. _swapAeroForPosition reverts (e.g., TWAP deviation exceeds threshold).
+      4. Full EVM revert → gauge.withdraw side effects rolled back → NFT returns to gauge.
+      5. In standard EVM this is safe. Risk materializes if gauge has commit-then-revert
+         pattern where withdrawal fee is taken before the revert propagates.
+      6. If a non-standard gauge implementation burns a fee on withdraw regardless of
+         revert, the position could become undercollectable. Owner loses staking rewards.
+    solidity: |
+      // After compoundRewards() completes successfully:
+      // tokenIdToGauge[tokenId] must still point to a gauge != address(0)
+      // AND the NFT must be held by that gauge (or an intermediary wrapper).
+      function invariant_stakeIntegrityAfterCompound(uint256 tokenId) public {
+          address gauge = gaugeManager.tokenIdToGauge(tokenId);
+          if (gauge != address(0)) {
+              // position should be back in gauge after successful compound
+              // (not held by GaugeManager itself)
+              address nftOwner = npm.ownerOf(tokenId);
+              t(nftOwner != address(gaugeManager),
+                "NFT stranded in GaugeManager after compound");
+          }
+      }
+    validated: false
+    priority: high
+    confidence: 55
+    notes: >
+      Standard EVM atomicity makes the full-revert-mid-flight scenario safe. The real
+      concern is non-standard gauge behavior. Confidence 55% because it requires
+      a non-standard (but owner-configurable) gauge. Worth a targeted fork test
+      checking the exact custody state after a compoundRewards() that reverts on swap.
+
+  - id: GM-F-03
+    tier: 1
+    type: property
+    title: "CEI violation: tokenIdToGauge written after external calls in stakePosition"
+    description: >
+      In stakePosition() (line 159-199), the state mapping tokenIdToGauge[tokenId] = gauge
+      is written at line 198, AFTER three external calls:
+        1. nonfungiblePositionManager.safeTransferFrom() (line 185) — triggers onERC721Received
+        2. nonfungiblePositionManager.approve() (line 186)
+        3. IGauge(gauge).deposit() (line 187) — external call to gauge
+      The nonReentrant modifier guards against same-function reentry. However, cross-function
+      reentry is possible if the gauge (during deposit) calls a GaugeManager function that
+      does NOT have nonReentrant. Specifically, withdrawBalances() (line 127) has no
+      nonReentrant guard. During IGauge.deposit(), if the gauge calls back into
+      GaugeManager.withdrawBalances(), the attacker can drain any tokens in GaugeManager
+      at the moment of deposit (e.g., fee tokens from the NPM.collect triggered inside deposit).
+      The gauge is owner-configured (trusted), but misconfiguration or a compromised gauge
+      creates this window. Additionally, tokenIdToGauge[tokenId] is not yet set when deposit
+      is executing, so any gauge logic checking "is this tokenId registered" would see false.
+    attack_scenario: >
+      Requires malicious/compromised gauge (owner-configured, so trust-gated).
+      1. Owner misconfigures a gauge with a malicious deposit() implementation.
+      2. Victim calls vault.stakePosition(tokenId).
+      3. GaugeManager.stakePosition executes. gauge.deposit(tokenId) is called.
+      4. Malicious gauge's deposit() calls back to GaugeManager.withdrawBalances([token0], attacker).
+      5. withdrawBalances() has no nonReentrant — executes successfully.
+      6. Any token0/token1 fees collected by NPM.collect during deposit are drained to attacker.
+      7. tokenIdToGauge is not yet set, so _requireStakedGauge would revert (not useful here).
+      8. Net: fee tokens that should go to position owner are drained to attacker.
+    solidity: |
+      // Invariant: withdrawBalances should not succeed during an active stakePosition
+      // or compoundRewards execution. Since nonReentrant blocks the stakePosition
+      // re-entry but NOT withdrawBalances, we check that no cross-function reentry occurs.
+      //
+      // Property: token0/token1 balance delta attributed to owner must equal
+      // the actual increase observed, i.e., no "mid-flight drain" is possible.
+      //
+      // Test: set up a gauge mock that calls withdrawBalances during deposit().
+      // Verify withdrawBalances reverts (it should if nonReentrant covers it).
+      // CURRENT STATE: withdrawBalances is NOT protected by nonReentrant.
+      // This is the finding: withdrawBalances() should have nonReentrant.
+      function invariant_withdrawBalancesNotCallableDuringStake() public {
+          // Ghost: track if withdrawBalances was called during an active stakePosition
+          // If ghost_inStakePosition == true and withdrawBalances was called => VIOLATION
+          t(!ghost_withdrawBalancesCalledDuringStake,
+            "withdrawBalances called reentrantly during stakePosition");
+      }
+    validated: false
+    priority: high
+    confidence: 70
+    notes: >
+      Key finding: withdrawBalances() lacks nonReentrant. The cross-function reentry
+      window exists during any of the three external calls in stakePosition() and during
+      compoundRewards() swaps. The guard on stakePosition (nonReentrant) does NOT protect
+      withdrawBalances. Requires a malicious gauge or swap pool (both owner-configured).
+      Confidence 70% on the mechanism, lower on exploitability given owner trust model.
+
+  - id: GM-F-04
+    tier: 2
+    type: property
+    title: "Inconsistent staking state observable between gauge.withdraw and gauge.deposit in compoundRewards"
+    description: >
+      In compoundRewards(), tokenIdToGauge[tokenId] is never cleared between the
+      IGauge.withdraw(tokenId) call (line 276) and the IGauge.deposit(tokenId) call
+      (line 282). During this window, the mapping says "staked at gauge X" but the NFT
+      is held by GaugeManager. This creates a phantom staking state. Any external observer
+      calling vault._isStaked() or tokenIdToGauge() during this window sees "staked" when
+      the actual custody is at GaugeManager. More critically: claimRewards() is also
+      nonReentrant — so an attacker cannot exploit this window directly. But if any
+      off-chain or cross-contract logic reads tokenIdToGauge to decide whether to perform
+      operations (e.g., a keeper bot that calls claimRewards when staked), the inconsistent
+      state could cause double-processing or missed operations. Not a direct fund loss path
+      in the current architecture, but a logical invariant violation.
+    attack_scenario: >
+      No direct fund loss path identified within current architecture due to nonReentrant
+      coverage on all state-changing functions. The inconsistency is observable off-chain.
+      Theoretical: if a future function is added without nonReentrant that reads
+      tokenIdToGauge to make custody decisions, the phantom state would be exploitable.
+      Current risk: keeper bots may attempt getReward during compound window and fail.
+    solidity: |
+      // Invariant: if tokenIdToGauge[tokenId] != address(0), the NFT must NOT be
+      // held by GaugeManager itself. GaugeManager should only hold NFTs transiently
+      // during safe transfer hops, not after mapping is set.
+      function invariant_noNFTStrandedInGaugeManagerWhileMappingSet(uint256 tokenId) public {
+          address gauge = gaugeManager.tokenIdToGauge(tokenId);
+          if (gauge != address(0)) {
+              address nftOwner = npm.ownerOf(tokenId);
+              t(nftOwner != address(gaugeManager),
+                "tokenId marked staked but NFT held by GaugeManager");
+          }
+      }
+    validated: false
+    priority: medium
+    confidence: 80
+    notes: >
+      This invariant WILL break during compoundRewards fuzzing because the window
+      exists by design. Tag as Tier 2 / expected-transient. The relevant test is
+      "does the invariant hold at the END of compoundRewards" — yes it does.
+      Only useful for detecting incomplete transactions or future architecture drift.
+
+  - id: GM-F-05
+    tier: 2
+    type: property
+    title: "onERC721Received accepts transfers from any tokenIdToGauge address without depth check"
+    description: >
+      GaugeManager.onERC721Received() (line 526) accepts NFT transfers if:
+        (a) msg.sender == nonfungiblePositionManager, AND
+        (b) from == vault OR from == tokenIdToGauge[tokenId]
+      Condition (b) allows the mapped gauge to transfer the NFT back to GaugeManager
+      at ANY time — not just during an authorized unstake or compound flow. If a gauge
+      is compromised or misbehaving, it can push the NFT back to GaugeManager outside
+      of any GaugeManager-initiated flow. Once the NFT arrives at GaugeManager with no
+      active nonReentrant lock, there is no pending operation to process it. The NFT
+      sits in GaugeManager with tokenIdToGauge still pointing to the old gauge.
+      Subsequent vault operations (unstakeIfStaked, liquidation) will call
+      IGauge.withdraw() on the gauge — but the gauge no longer has the NFT and will
+      revert. The position becomes permanently unwithdrawable.
+    attack_scenario: >
+      Requires compromised/malicious gauge (owner-configured).
+      1. Gauge is legitimately configured for pool P.
+      2. Gauge spontaneously calls npm.safeTransferFrom(gauge, gaugeManager, tokenId).
+      3. GaugeManager.onERC721Received: from == tokenIdToGauge[tokenId] → PASSES.
+      4. NFT is now in GaugeManager. tokenIdToGauge[tokenId] still == gauge.
+      5. Any call to unstakePosition or unstakeIfStaked calls IGauge.withdraw(tokenId).
+      6. Gauge no longer has the NFT → withdraw reverts.
+      7. Vault cannot liquidate or remove the position. Borrower defaults without recourse.
+    solidity: |
+      // Invariant: after any onERC721Received triggered by a gauge (not vault),
+      // there must be an active GaugeManager operation in progress (nonReentrant locked).
+      // Since onERC721Received is view, we can't check _status directly,
+      // but we can verify the post-condition: gauge-originated transfers must leave
+      // the NFT back in the gauge before the transaction completes.
+      //
+      // Weaker testable invariant:
+      function invariant_nftNotStrandedInGaugeManagerFromGaugeTransfer(uint256 tokenId) public {
+          // If tokenIdToGauge is set and NFT is in GaugeManager, it must be a transient state
+          // inside an active operation. Since this is a property check (not mid-transaction),
+          // the invariant should always hold at rest.
+          address gauge = gaugeManager.tokenIdToGauge(tokenId);
+          if (gauge != address(0)) {
+              address nftOwner = npm.ownerOf(tokenId);
+              t(nftOwner != address(gaugeManager),
+                "NFT stranded in GaugeManager by unauthorized gauge transfer");
+          }
+      }
+    validated: false
+    priority: high
+    confidence: 60
+    notes: >
+      This is the same end-state as GM-F-02 but with a different attack path (gauge pushes
+      rather than compound fails). The onERC721Received check is the entry point. The
+      acceptance condition (from == tokenIdToGauge) is intentionally broad to support
+      wrapper gauges, but creates this griefing surface. Confidence 60%: requires
+      compromised gauge. Worth documenting as a design assumption that must hold.
+
+  - id: GM-F-06
+    tier: 1
+    type: property
+    title: "Delta calculation in _sendDepositDeltas does not account for pre-existing GaugeManager balances of same token pair"
+    description: >
+      _sendDepositDeltas() measures balance increase as (balanceAfter - balanceBefore).
+      If GaugeManager holds a pre-existing balance of token0 from a previous operation
+      (e.g., protocol rewards retained from _sendLeftoversAndRewards), the snapshot
+      token0Before = IERC20(token0).balanceOf(address(this)) already includes those
+      residual tokens. When gauge.deposit() triggers NPM.collect and sends Y token0 to
+      GaugeManager, token0After = preExisting + Y. Delta = Y → correct, user gets Y.
+      Protocol rewards (preExisting) are NOT swept. This is the NORMAL path.
+      HOWEVER: if token0Before is captured BEFORE any residual tokens arrive (race
+      condition in the same block from a different tx), then token0Before < preExisting,
+      and user's delta includes protocol reward tokens. The exploitable scenario is:
+      1. Token0Before = 0 (contract was empty for this token)
+      2. A concurrent tx (same block) sends 50 token0 to GaugeManager (e.g., direct token
+         transfer, airdrop, or front-run)
+      3. gauge.deposit() sends additional 10 token0 via NPM.collect
+      4. token0After = 60. Delta = 60. User gets 60 instead of 10.
+      This is a donation/contamination attack where an attacker donates tokens to
+      GaugeManager to inflate the next user's delta at the cost of the donation itself.
+      Economic loss: attacker loses 50 tokens, user gains 50 extra — no net theft but
+      griefing of protocol reserves possible by inflating user deltas to zero out
+      any protocol rewards accumulated in the contract.
+    attack_scenario: >
+      Marginal economic attack. Attacker front-runs a stakePosition() call:
+      1. Sees pending stakePosition(tokenId) for a USDC/ETH position in mempool.
+      2. token0Before will be captured as current_balance (includes 50 USDC protocol fee).
+      3. Attacker sends 0 USDC (no-op). OR attacker sends 50 USDC to GaugeManager BEFORE
+         the snapshot is taken, then user's delta calculation inflates... wait.
+      Actually the reverse: attacker must REDUCE the balance before snapshot OR increase
+      it between snapshot and measurement. Since attacker can only ADD tokens (can't
+      withdraw without being withdrawer), the attack inflates the delta, giving the user
+      MORE than expected. Attacker loses the donated amount. This is a griefing vector
+      against protocol fee accumulation, not against users.
+    solidity: |
+      // Invariant: the sum of all tokens sent to position owners via _sendDepositDeltas
+      // must equal exactly the sum of all tokens received by GaugeManager via gauge.deposit()
+      // NPM.collect callbacks. Protocol reserves must not be redistributed.
+      //
+      // Ghost tracking invariant:
+      // ghost_totalSentViaDepositDeltas[token] should equal
+      // ghost_totalReceivedFromGaugeDeposits[token]
+      function invariant_depositDeltasMatchGaugeCollects(address token) public {
+          t(ghost_totalSentViaDepositDeltas[token] <= ghost_totalReceivedFromGaugeDeposits[token],
+            "more tokens sent as deposit deltas than received from gauge deposits");
+      }
+    validated: false
+    priority: medium
+    confidence: 50
+    notes: >
+      This is the donation attack variant specific to _sendDepositDeltas. Economic impact
+      is limited: attacker loses funds to inflate user's delta. Real risk is protocol
+      fee reserves being incorrectly counted as user fees. Confidence 50%: requires
+      specific timing and is not directly profitable for attacker. Tier 1 property test
+      worth running to confirm the isolation works correctly.
+
+  - id: GM-F-07
+    tier: 1
+    type: property
+    title: "withdrawBalances missing nonReentrant allows cross-function reentry during swap callback"
+    description: >
+      During compoundRewards(), _swapThroughPool() calls pool.swap() which triggers
+      uniswapV3SwapCallback() on GaugeManager. This callback is not guarded by
+      nonReentrant (it's in Swapper base contract). During the swap, the pool calls
+      back GaugeManager.uniswapV3SwapCallback(). The callback itself transfers tokenIn
+      to the pool. However, a malicious pool (misconfigured via rewardBasePools by owner)
+      could instead call GaugeManager.withdrawBalances() during the callback, since
+      withdrawBalances() has no nonReentrant guard. At this point in compoundRewards(),
+      GaugeManager holds: AERO (rewards), token0Out, token1Out from swap output. A
+      malicious pool could drain all of these via withdrawBalances() during the callback.
+      The attacker must control a pool listed in rewardBasePools — owner-gated, but this
+      represents a significant misconfiguration risk surface.
+    attack_scenario: >
+      1. Owner (compromised or malicious) sets rewardBasePools[USDC] = maliciousPool.
+      2. User calls compoundRewards(tokenId). AERO rewards are claimed to GaugeManager.
+      3. _swapAeroToTarget → _swapThroughPool(maliciousPool, AERO, USDC, amount).
+      4. maliciousPool.swap() is called. Pool calls back GaugeManager.uniswapV3SwapCallback.
+      5. During callback setup, pool FIRST calls GaugeManager.withdrawBalances([AERO, USDC], attacker).
+      6. withdrawBalances has no nonReentrant — executes, drains all AERO + any received tokens.
+      7. Callback then fails or pool extracts all value.
+      8. User's compound call reverts or completes with zero effect but AERO is gone.
+    solidity: |
+      // Invariant: during any active compoundRewards execution (tracked via ghost),
+      // withdrawBalances must not be callable by any address including withdrawer.
+      // Since withdrawBalances lacks nonReentrant, this must be verified via ghost.
+      //
+      // Simpler invariant: AERO balance should not decrease during compoundRewards
+      // except via the explicit swap path (measurable via ghost_aeroSentToSwap).
+      function invariant_aeroBalanceDecreasesOnlyViaSwap() public {
+          uint256 currentAero = aeroToken.balanceOf(address(gaugeManager));
+          // aero can only leave via: _sendAeroIfAny (to owner/recipient) or _swapThroughPool
+          // If ghost_withdrawBalancesDrainedAero is true during compound → VIOLATION
+          t(!ghost_withdrawBalancesDrainedAeroDuringCompound,
+            "AERO drained via withdrawBalances during compoundRewards");
+      }
+    validated: false
+    priority: high
+    confidence: 70
+    notes: >
+      This is the cleaner formulation of GM-F-03 applied to the swap path specifically.
+      withdrawBalances() missing nonReentrant is the root cause for both GM-F-03 and
+      GM-F-07. The recommendation is a single fix: add nonReentrant to withdrawBalances().
+      Priority: HIGH. These two hypotheses (GM-F-03, GM-F-07) should be treated as one
+      finding with two attack paths. Root cause is identical.
+
+false_positives:
+  - id: FP-01
+    description: >
+      "delete tokenIdToGauge[tokenId] after safeTransferFrom in _unstakePosition
+      triggers vault.onERC721Received which could re-enter GaugeManager"
+    reason: >
+      Vault.onERC721Received() does NOT call back into GaugeManager. It only performs
+      _addTokenToOwner and accounting updates. The callers of _unstakePosition
+      (unstakePosition, unstakeIfStaked) both have nonReentrant, blocking any reentry
+      before the delete. Non-finding.
+
+  - id: FP-02
+    description: >
+      "stakePosition CEI: external calls before tokenIdToGauge set allows reentrancy
+      via onERC721Received to fake-stake another NFT"
+    reason: >
+      onERC721Received is marked `view` — it cannot modify state. It only validates
+      the incoming NFT and returns the selector. No state changes possible during
+      this callback. The CEI violation is real (mapping written last) but onERC721Received
+      being view eliminates the reentry-via-callback vector. Non-finding for this specific path.
+
+  - id: FP-03
+    description: >
+      "compoundRewards leaves tokenIdToGauge set during withdraw-to-deposit window,
+      allowing a concurrent claimRewards to double-claim rewards"
+    reason: >
+      claimRewards() is nonReentrant. During an active compoundRewards() (also
+      nonReentrant), claimRewards cannot execute in the same call stack. Cross-block
+      ordering is fine since each tx is atomic. Non-finding.

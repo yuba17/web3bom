@@ -1,0 +1,488 @@
+protocol: revert-lend
+component: GaugeManager
+file: src/GaugeManager.sol
+domain: staking
+hunter: OracleHunter
+generated_at: "2026-03-21T00:00:00Z"
+
+# ─── ANÁLISIS PREVIO ───────────────────────────────────────────────────────────
+#
+# TWAP window: 60 segundos, maxTickDifference = 200 ticks (~2%), maxPriceDiff = 2%.
+#
+# _validateSwap usa:
+#   1. _hasMaxTWAPTickDifference: rechaza el swap si currentTick se desvía > 200 ticks del TWAP(60s)
+#   2. amountOutMin derivado de sqrtPriceX96 del SLOT0 (precio ACTUAL, no TWAP) con 2% haircut.
+#
+# VULNERABILIDAD CRÍTICA IDENTIFICADA (GM-O-01):
+#   amountOutMin se calcula a partir de sqrtPriceX96 obtenido del SLOT0 (precio en tiempo real),
+#   NO del TWAP. Si un atacante manipula el precio SPOT justo antes del bloque donde se ejecuta
+#   compoundRewards (e.g., via sandwich), puede hacer que sqrtPriceX96 sea desfavorable para el
+#   compounding, resultando en un amountOutMin efectivamente MÁS BAJO (en la dirección correcta).
+#   El check TWAP solo valida que el tick actual no se aleje > 200 ticks del TWAP — pero si el
+#   atacante mueve el precio exactamente 199 ticks (dentro del límite), el amountOutMin calculado
+#   desde ese precio manipulado aplicará el 2% haircut sobre un precio ya 199 ticks peor.
+#   Resultado: el swap acepta menos tokens del esperado → los owners reciben menos compounding.
+#   Fondos en riesgo: la diferencia entre precio TWAP justo y precio-manipulado-199-ticks.
+#   ~2% por swap sobre el total de AERO rewards. No es fund loss directo pero sí value extraction.
+#
+# TWO-HOP PATH sin validación compuesta (GM-O-02):
+#   En el path AERO → otherToken → targetToken:
+#     hop1: _swapThroughPool(intermediatePool, AERO, otherToken, amountIn)  ← validado vs TWAP de intermediatePool
+#     hop2: _swapThroughPool(positionPool, otherToken, targetToken, intermediateAmount) ← validado vs TWAP de positionPool
+#   Cada hop se valida independientemente. Un atacante que puede mover ambos pools (o solo uno)
+#   puede superar el slippage total. El amountOutMin del hop2 se calcula con el precio SPOT del
+#   positionPool — si ese pool fue manipulado 199 ticks en la dirección desfavorable, el amountOutMin
+#   será ~4% peor que el precio correcto (199 ticks en hop1 + 199 ticks en hop2).
+#   No hay invariante que garantice: finalAmount >= TWAP_PRICE_AERO_TO_TARGET * amountIn * (1 - tolerance).
+#
+# TWO-HOP ASYMMETRY (GM-O-03):
+#   _swapAeroForPosition llama a _swapAeroToTarget dos veces: una para token0 y otra para token1.
+#   En el path two-hop para token0: AERO → token1 (via intermediatePool) → token0 (via positionPool).
+#   En el path two-hop para token1: AERO → token0 (via intermediatePool) → token1 (via positionPool).
+#   El positionPool se usa en AMBAS llamadas — en sentidos opuestos. El precio del positionPool es
+#   leído dos veces del slot0, potencialmente en el MISMO bloque. Si el pool fue manipulado, ambos
+#   swaps se ejecutan con el precio corrompido. Pero más importante: si solo hay directPool para uno
+#   de los tokens, se mezclan paths directos y two-hop — sin documentación ni validación de si el
+#   escenario mixto fue considerado.
+#
+# aeroSplitBps = 0 o 10000 edge case (GM-O-04):
+#   Si aeroSplitBps = 0, todo el AERO se intenta convertir en token1 (requestedAero0 = 0).
+#   _swapAeroToTarget con amountIn = 0 retorna (0, 0) → amount0Out = 0.
+#   _addLiquidity con maxAddAmount0 = 0 y maxAddAmount1 > 0 → solo se añade token1.
+#   Para una posición Uniswap V3 con un rango específico, añadir solo un token puede resultar en
+#   0 liquidez añadida si el precio actual está fuera del rango de ese token. El usuario recibe
+#   token1 como leftover pero el AERO se gastó completamente. No hay pérdida de fondos pero hay
+#   degradación de la función principal (compounding) que no está documentada.
+#   Severidad real: LOW. By design per aeroSplitBps param, pero edge case no testeado.
+#
+# AERO LEFTOVER ACCOUNTING (GM-O-05):
+#   state.spentAero = spentAero0 + spentAero1.
+#   En ambos paths (direct y two-hop), spentAero = amountIn (completo), no importa cuánto
+#   token realmente se obtuvo. Incluso si amountOut = 0 (improbable pero pool casi vacío),
+#   spentAero se marca como gastado y no hay leftover para el owner.
+#   MÁS RELEVANTE: si targetToken == aeroToken (shortcut), spentAero = amountIn y amountOut = amountIn
+#   — se "gasta" sin swap. El owner no pierde, pero el accounting no refleja que no se hizo swap.
+#   El invariante que falla aquí es: spentAero <= aeroAmount siempre (ya verificado en código).
+#   El invariante que NO está verificado: amountOut > 0 cuando amountIn > 0 y el swap fue ejecutado.
+#
+# rewardBasePools CON POOL DE BAJA LIQUIDEZ (GM-O-06):
+#   setRewardBasePool verifica que el pool tenga los tokens correctos y sea el pool canónico de la
+#   factory (via IAerodromeSlipstreamFactory.getPool). Pero NO verifica liquidez mínima.
+#   Un owner malicioso o comprometido puede configurar un pool AERO/TOKEN con 1 wei de liquidez.
+#   Cualquier compoundRewards con ese token causaría: swap ejecutado, enorme slippage, amountOut ≈ 0,
+#   amountOutMin pasaría (porque se calcula desde el precio SPOT manipulado).
+#   El TWAP del pool de 1 wei puede ser manipulado al valor que el atacante quiera.
+#   Categoría: TRUSTED OWNER. Por las reglas del bounty, si owner está en trusted roles → OUT OF SCOPE.
+#   Lo incluyo como LOW porque documentar el vector es útil y algunos bounties pagan por configs inseguras.
+#
+# SLOT0 REENTRANCY en multi-hop (GM-O-07):
+#   _getPoolSlot0 usa staticcall. No hay reentrancy posible vía este vector.
+#   Los swaps usan _poolSwap que llama pool.swap y luego recibe el callback uniswapV3SwapCallback.
+#   El callback solo transfiere tokenIn al pool. No hay forma de reentrar compoundRewards desde ahí
+#   porque nonReentrant está activo. DESCARTADO como vector.
+#
+# ─── CONCLUSIÓN DE SEVERIDAD ───────────────────────────────────────────────────
+# GM-O-01: MEDIUM (valor extraíble ~2-4% de rewards, requiere MEV/sandwich, no fund loss total)
+# GM-O-02: MEDIUM (dos-hop amplifica el vector de GM-O-01)
+# GM-O-03: LOW-MEDIUM (edge case mixto, difícil de explotar, más diseño que bug)
+# GM-O-04: LOW (by design, baja severidad)
+# GM-O-05: LOW/INFO (accounting correcto, pero amountOut = 0 sin revert es silencioso)
+# GM-O-06: LOW (trusted owner, out of scope para la mayoría de bounties)
+
+hypotheses:
+
+  - id: GM-O-01
+    tier: 1
+    type: property
+    description: >
+      amountOutMin en _validateSwap se calcula desde sqrtPriceX96 del SLOT0 (precio spot actual),
+      NO desde el TWAP. Un atacante puede manipular el precio spot hasta 199 ticks dentro del límite
+      de 200 ticks, haciendo que amountOutMin refleje un precio ya desplazado ~2%. El check TWAP
+      solo verifica la distancia, no protege el amountOutMin de ser calculado desde un precio manipulado.
+      Resultado: compoundRewards ejecuta swaps aceptando hasta ~4% menos tokens que el precio justo.
+    attack_scenario: >
+      Atacante (MEV/sandwich) en el mismo bloque:
+      1. Abre una posición grande en el pool AERO/token, desplaza el precio 199 ticks en dirección desfavorable.
+      2. Víctima llama compoundRewards → _swapThroughPool lee slot0 (precio ya manipulado).
+      3. amountOutMin = precio_manipulado * amountIn * 0.98 → acepta hasta ~4% menos (199 ticks ≈ 2% + 2% haircut).
+      4. Swap ejecuta a precio real → diferencia ~2% capturada como slippage por el atacante.
+      5. Atacante cierra posición en el pool. Net profit: ~2% del valor de AERO compoundeado.
+      Sin pérdida de fondos del vault, pero los owners reciben menos liquidity de la que deberían.
+    solidity: |
+      // Invariante: el amountOut real del swap debe ser >= TWAP price * amountIn * (1 - maxAllowedSlippage)
+      // donde TWAP se calcula sobre REWARD_TWAP_SECONDS (60s).
+      // Este invariante NO puede expresarse directamente como assertion en Properties.sol sin un helper
+      // que calcule el precio TWAP — requiere fork. Se expresa como una CHECK post-swap:
+      //
+      // Para testear: capturar amountOutMin calculado desde TWAP (no desde slot0),
+      // y verificar que el amountOut real >= twapBasedMin.
+      //
+      // Pseudo-invariant (requiere ghost vars y fork):
+      //   (int24 twapTick, bool ok) = _getTWAPTick(pool, 60);
+      //   uint256 twapSqrtPrice = TickMath.getSqrtRatioAtTick(twapTick);
+      //   uint256 twapPrice = FullMath.mulDiv(twapSqrtPrice, twapSqrtPrice, Q96);
+      //   uint256 twapBasedMin;
+      //   if (swap0For1) {
+      //       twapBasedMin = FullMath.mulDiv(amountIn * (Q64 - MAX_PRICE_DIFF_X64), twapPrice, Q160);
+      //   } else {
+      //       twapBasedMin = FullMath.mulDiv(amountIn * (Q64 - MAX_PRICE_DIFF_X64), Q32, twapPrice);
+      //   }
+      //   // If this fails: amountOutMin was calculated from a manipulated spot price
+      //   gte(amountOutActual, twapBasedMin, "GM-O-01: swap accepted price worse than TWAP-derived minimum");
+    ghost_vars:
+      - "uint256 internal ghost_lastAeroSwapAmountIn;"
+      - "uint256 internal ghost_lastAeroSwapAmountOut;"
+    validated: false
+    priority: high
+    confidence: 55
+    notes: >
+      Confidence 55: El vector existe en teoría y es bien conocido en Uniswap V3 con TWAP cortos.
+      En la práctica, los keepers/operadores de compoundRewards son entidades conocidas (no cualquiera puede llamar),
+      lo que reduce el impacto económico. La pérdida es de valor, no de principal. En Aerodrome Slipstream
+      en Base, los bloques son de 2 segundos → manipular un TWAP de 60 segundos requiere controlar 30 bloques
+      consecutivos, lo cual es costoso. El riesgo real es un sandwich de 1 bloque (1 tick),
+      no 199 ticks sostenidos. Reducir confidence a 55 por la dificultad práctica de la manipulación.
+
+  - id: GM-O-02
+    tier: 1
+    type: property
+    description: >
+      En el path two-hop (AERO → otherToken → targetToken), cada hop valida su slippage
+      independientemente contra su propio pool. No existe validación del slippage compuesto end-to-end.
+      Si ambos pools se desplazan 199 ticks cada uno (ambos dentro del límite individual),
+      el output final puede ser ~4% peor que el precio compuesto correcto AERO→targetToken.
+      Adicionalmente, el intermediateAmount (output del hop1) se usa como amountIn del hop2 sin
+      floor: si hop1 produce intermediateAmount = 0 (pool casi vacío o extremo), hop2 aún se llama
+      pero con amountIn = 0, devolviendo amountOut = 0 silenciosamente.
+    attack_scenario: >
+      Contexto: targetToken = WETH, rewardBasePools[WETH] = address(0), rewardBasePools[USDC] = aeroUsdcPool.
+      Path: AERO → USDC (via aeroUsdcPool) → WETH (via positionPool USDC/WETH).
+      1. Atacante manipula aeroUsdcPool 199 ticks: AERO vale ~2% menos en USDC.
+      2. Atacante manipula positionPool 199 ticks: USDC vale ~2% menos en WETH.
+      3. compoundRewards ejecuta two-hop: cada hop pasa TWAP check (199 < 200 ticks).
+      4. amountOutMin hop1 = spotPrice_manipulado * 0.98 → acepta más slippage.
+      5. amountOutMin hop2 = spotPrice_manipulado * 0.98 → acepta más slippage.
+      6. Usuario recibe ~4% menos WETH del que debería a precio justo.
+      Profit del atacante: ~4% del AERO compoundeado en WETH value.
+    solidity: |
+      // Invariante: en el path two-hop, el amountOut final debe satisfacer
+      // amountOut >= compositePrice(AERO → targetToken) * amountIn * (1 - 2 * maxPriceDiff)
+      // donde compositePrice es el precio TWAP de AERO→otherToken × TWAP de otherToken→targetToken.
+      //
+      // No se puede implementar directamente en Properties.sol sin acceso a los pools.
+      // Expresamos como tracking de ghost vars en handlers de compoundRewards:
+      //
+      //   ghost_aeroIn = state.aeroAmount  (antes del swap)
+      //   ghost_token0Out = state.amount0Out (después del swap)
+      //   ghost_token1Out = state.amount1Out (después del swap)
+      //
+      // El invariante testeable en fork: capturar precios TWAP antes de llamar compoundRewards,
+      // calcular expected output, verificar que actual output >= expected * 0.94 (6% tolerance: 4% slippage + 2% fees).
+      //
+      // Assertion proxy (usable en fuzzer con mock que simula slippage perfecto):
+      //   if (ghost_aeroIn > 0 && ghost_token0Out == 0 && ghost_token1Out == 0) {
+      //       t(false, "GM-O-02: two-hop produced zero output for non-zero aero input");
+      //   }
+      if (ghost_aeroCompoundedIn > 0) {
+          // At minimum: if AERO was spent, some token must have been produced
+          // (unless targetToken == aeroToken shortcut)
+          t(
+              ghost_amount0OutAfterSwap > 0 || ghost_amount1OutAfterSwap > 0,
+              "GM-O-02: AERO spent but zero tokens produced in both directions"
+          );
+      }
+    ghost_vars:
+      - "uint256 internal ghost_aeroCompoundedIn;"
+      - "uint256 internal ghost_amount0OutAfterSwap;"
+      - "uint256 internal ghost_amount1OutAfterSwap;"
+    validated: false
+    priority: high
+    confidence: 60
+    notes: >
+      El zero-output assertion es testeable directamente (confidence 60 para ese caso específico).
+      El caso de slippage compuesto acumulado es más difícil de formalizar como invariante binario
+      sin un oracle de referencia. En fork: verificar con precios reales de Base mainnet.
+      Prioridad alta porque el two-hop es el path default cuando no hay directPool configurado.
+
+  - id: GM-O-03
+    tier: 2
+    type: property
+    description: >
+      En _swapAeroForPosition, el positionPool es usado en ambas llamadas a _swapAeroToTarget:
+      una vez en sentido otherToken→targetToken (para token0) y otra en sentido opuesto (para token1).
+      Cada llamada lee el slot0 del positionPool por separado. Si en el path two-hop para token0
+      se usa el directPool para token1 (o viceversa), se mezclan paths que usan distintos pools,
+      y el precio del positionPool se lee en un estado que puede haber cambiado entre los dos swaps
+      (si los swaps modifican el positionPool en el mismo bloque — lo cual ocurre en el two-hop de token1).
+      Específicamente: si el two-hop de token0 hace swap en positionPool (USDC→WETH),
+      el precio del positionPool cambia. Luego el two-hop de token1 valida su slippage contra
+      el precio YA MODIFICADO del positionPool (desde el primer swap). El TWAP check del segundo
+      hop usa el precio post-primer-swap como referencia.
+    attack_scenario: >
+      Escenario: positionPool = USDC/WETH. aeroSplitBps = 5000.
+      1. compoundRewards llama _swapAeroForPosition.
+      2. _swapAeroToTarget(positionPool, WETH, USDC, requestedAero0):
+         - two-hop: AERO→USDC (aeroUsdcPool) → USDC→WETH (positionPool). Lee slot0 de positionPool.
+         - Ejecuta el swap en positionPool, moviendo el precio.
+      3. _swapAeroToTarget(positionPool, USDC, WETH, requestedAero1):
+         - two-hop: AERO→WETH (aeroWethPool) → WETH→USDC (positionPool). Lee slot0 del positionPool MODIFICADO.
+         - amountOutMin calculado del precio post-primer-swap. Puede ser más favorable o desfavorable.
+      El efecto neto no es una pérdida directa de fondos (los swaps son en sentidos opuestos),
+      pero la validación del slippage del segundo swap se hace contra un precio que el propio
+      contrato acaba de cambiar — haciendo el check TWAP menos preciso.
+      Impacto: LOW. Este comportamiento es implícito en el diseño, pero no está documentado.
+    solidity: |
+      // Property: después de ambos swaps, el total gastado en AERO no debe exceder aeroAmount
+      // (ya garantizado por el código, pero verificar que spentAero = spentAero0 + spentAero1 <= aeroAmount)
+      //
+      // Y verificar que amountAdded0 + rewardAmount0 <= amount0Out (no se añade más de lo disponible)
+      // (ya verificado implícitamente en _sendLeftoversAndRewards via el cálculo de leftover)
+      //
+      // Assertion testeable:
+      if (ghost_aeroAmount > 0) {
+          lte(ghost_spentAero, ghost_aeroAmount, "GM-O-03: spentAero > aeroAmount (accounting error)");
+          lte(ghost_amountAdded0 + ghost_rewardAmount0, ghost_amount0Out + 1, "GM-O-03: added0 > amount0Out");
+          lte(ghost_amountAdded1 + ghost_rewardAmount1, ghost_amount1Out + 1, "GM-O-03: added1 > amount1Out");
+      }
+    ghost_vars:
+      - "uint256 internal ghost_aeroAmount;"
+      - "uint256 internal ghost_spentAero;"
+      - "uint256 internal ghost_amount0Out;"
+      - "uint256 internal ghost_amount1Out;"
+      - "uint256 internal ghost_amountAdded0;"
+      - "uint256 internal ghost_amountAdded1;"
+      - "uint256 internal ghost_rewardAmount0;"
+      - "uint256 internal ghost_rewardAmount1;"
+    validated: false
+    priority: medium
+    confidence: 70
+    notes: >
+      Confidence 70 en el assertion de accounting (spentAero y leftover math).
+      El issue de "segundo swap valida contra precio modificado por el primero" es conceptualmente
+      correcto pero de baja severidad — el impacto neto de swaps en sentidos opuestos en el mismo
+      pool tiende a cancelarse. No perseguir como critical.
+
+  - id: GM-O-04
+    tier: 2
+    type: property
+    description: >
+      El cálculo de leftoverAero en _sendLeftoversAndRewards asume
+      state.spentAero <= state.aeroAmount. Si por cualquier razón spentAero > aeroAmount,
+      la substracción `state.aeroAmount - state.spentAero` wrappea (underflow en unchecked o revert).
+      En el código actual esto parece imposible porque spentAero = spentAero0 + spentAero1,
+      y cada uno es exactamente amountIn (o 0 si amountIn = 0). Pero si el shortcut
+      `targetToken == address(aeroToken)` se activa para AMBOS tokens (token0 == aeroToken y
+      token1 == aeroToken), spentAero = requestedAero0 + requestedAero1 = aeroAmount — correcto.
+      Sin embargo, si aeroToken es token0 Y hay two-hop para token1 que falla silenciosamente,
+      spentAero podría ser != amountIn esperado. No es un bug activo pero es un invariante
+      que vale fuzzear para confirmar que el accounting de AERO nunca se corrompe.
+    attack_scenario: >
+      Si spentAero > aeroAmount: la línea `leftoverAero = state.aeroAmount - state.spentAero`
+      causaría underflow (panic en Solidity 0.8+), haciendo revert de compoundRewards.
+      Esto sería un DoS de compounding para ese tokenId si el estado se corrompe.
+      Impacto real: LOW/INFO si es solo underflow-revert (no fund loss). Pero DoS de compounding
+      significa que los rewards se acumulan sin poder ser reinvertidos → pérdida de yield para el owner.
+    solidity: |
+      // Invariant: spentAero siempre <= aeroAmount
+      // Activar en el handler de compoundRewards capturando el estado antes/después
+      if (ghost_compoundCalled) {
+          lte(
+              ghost_spentAero,
+              ghost_aeroAmount,
+              "GM-O-04: spentAero > aeroAmount (would underflow in _sendLeftoversAndRewards)"
+          );
+          // También: leftover + spent == total
+          eq(
+              ghost_spentAero + ghost_leftoverAero,
+              ghost_aeroAmount,
+              "GM-O-04: AERO conservation broken (spentAero + leftover != aeroAmount)"
+          );
+      }
+    ghost_vars:
+      - "bool internal ghost_compoundCalled;"
+      - "uint256 internal ghost_leftoverAero;"
+    validated: false
+    priority: medium
+    confidence: 80
+    notes: >
+      Confidence 80: el invariante de conservación de AERO (spentAero + leftover == aeroAmount)
+      es simple y testeable directamente en mock setup. Alta probabilidad de encontrar regressions
+      si se cambia la lógica de routing. El bug activo es bajo pero el invariante es bueno como regresión.
+
+  - id: GM-O-05
+    tier: 1
+    type: property
+    description: >
+      En el two-hop path, si _swapThroughPool del hop1 retorna intermediateAmount = 0
+      (por ejemplo, pool con toda la liquidez en el rango contrario, o outputBps = 0 en mock),
+      el hop2 se llama con amountIn = intermediateAmount = 0. _swapThroughPool retorna 0 para
+      amountIn = 0 (check al inicio). Resultado: amountOut = 0 silenciosamente, sin revert.
+      El AERO fue marcado como spentAero = amountIn (completo), el owner recibe 0 tokens del
+      targetToken. Los AERO se "gastan" pero no se convierten en liquidez útil.
+      Diferente de GM-O-02: este caso específico es sobre el output = 0 silencioso en two-hop
+      cuando el pool intermedio está completamente exhausto.
+    attack_scenario: >
+      Escenario teórico en mainnet si el pool AERO/USDC tiene liquidez concentrada y el precio
+      se mueve fuera de rango: _swapThroughPool retorna amountOut = 0 aunque amountIn > 0.
+      (Uniswap V3 puede devolver amountOut = 0 si no hay liquidez en el tick actual).
+      spentAero = amountIn (completo). El owner recibe:
+        - leftoverAero = 0 (spentAero = aeroAmount)
+        - amount0Out = 0 (no se añade liquidez)
+        - Los AERO rewards se pierden efectivamente (no se reinvierten ni se devuelven).
+      Pérdida: 100% de los AERO rewards compoundeados en esa llamada.
+      Este escenario requiere que el pool ESTÉ out-of-range Y que pase el TWAP check
+      (posible si el precio se movió gradualmente). En la práctica, el TWAP check de 200 ticks
+      probablemente protege contra esto en pools con actividad real. Pero en pools de baja
+      liquidez, el precio puede moverse mucho más que 200 ticks.
+    solidity: |
+      // Invariante: si AERO fue gastado en un swap (spentAero > 0 para una dirección),
+      // entonces o bien (a) targetToken == aeroToken (shortcut, amountOut == amountIn),
+      // o bien (b) amountOut > 0.
+      // Si amountOut == 0 y spentAero > 0 y targetToken != aeroToken → los AERO se perdieron.
+      //
+      // Checker post-compoundRewards (via ghost vars en handler):
+      if (ghost_spentAero0 > 0 && !ghost_token0IsAero) {
+          t(ghost_amount0Out > 0, "GM-O-05: spentAero0 > 0 but amount0Out = 0 (AERO lost silently in swap)");
+      }
+      if (ghost_spentAero1 > 0 && !ghost_token1IsAero) {
+          t(ghost_amount1Out > 0, "GM-O-05: spentAero1 > 0 but amount1Out = 0 (AERO lost silently in swap)");
+      }
+    ghost_vars:
+      - "uint256 internal ghost_spentAero0;"
+      - "uint256 internal ghost_spentAero1;"
+      - "bool internal ghost_token0IsAero;"
+      - "bool internal ghost_token1IsAero;"
+    validated: false
+    priority: high
+    confidence: 65
+    notes: >
+      Confidence 65: el escenario de pool out-of-range no es trivial en mainnet con pools activos
+      (el TWAP check actuaría antes). Pero en periodos de alta volatilidad o pools de baja liquidez,
+      es posible. En fuzzer mock donde outputBps puede ser 0: este invariante ROMPE TRIVIALMENTE
+      (proof que el código no revierte en ese caso). Si el fuzzer confirma el zero-output silencioso,
+      escalar a Tier 1 confirmado.
+
+  - id: GM-O-06
+    tier: 2
+    type: property
+    description: >
+      _validateSwap con REWARD_TWAP_SECONDS = 60 en Aerodrome Slipstream (Base, bloques 2s):
+      el TWAP cubre exactamente 30 bloques. En Uniswap V3 clásico esto sería muy manipulable,
+      pero Aerodrome Slipstream tiene una cardinality mínima efectiva por su diseño. Sin embargo,
+      si el pool acaba de ser creado o reiniciado y tiene < 30 observaciones, la llamada a
+      pool.observe(secondsAgos) puede revertir con OLD, haciendo que _getTWAPTick devuelva
+      twapOk = false. En ese caso, _hasMaxTWAPTickDifference retorna false y _validateSwap
+      lanza TWAPCheckFailed(). Esto bloquearía todos los compoundRewards para posiciones en ese pool.
+      No es un bug de seguridad sino un DoS de disponibilidad, pero merece documentación.
+      Si un nuevo pool se añade a rewardBasePools y tiene < 60s de historia TWAP,
+      compoundRewards falla silenciosamente (o revierte) para todos los tokens que usen ese pool.
+    attack_scenario: >
+      Si un keeper intenta compoundRewards justo después de que se haya configurado un nuevo
+      rewardBasePool con un pool recién creado (< 60s de historia), la operación revierte con
+      TWAPCheckFailed. Los rewards no se compoundan hasta que el pool tenga suficiente historia.
+      Esto no es un ataque activo (el pool necesita tiempo para acumular TWAP), pero en el
+      escenario de un pool recién creado configurado por error, TODOS los compoundRewards
+      para ese token fallarán hasta que el pool tenga 60+ segundos de historia.
+      Severidad: LOW/DoS. No hay fund loss. Se mitiga esperando 60s después de crear el pool.
+    solidity: |
+      // Invariante: si rewardBasePools[token] está configurado (≠ address(0)),
+      // entonces el pool debe tener suficiente historia TWAP para pasar el check.
+      // No es un invariante binario fuzzeable directamente — es una propiedad temporal.
+      //
+      // Lo que SÍ se puede verificar: que si _validateSwap revirtió con TWAPCheckFailed,
+      // fue porque el TWAP no estaba disponible (twapOk = false), no porque el precio
+      // estuviera fuera del rango. Esta distinción es importante para el debug.
+      //
+      // Ghost var tracking: si compoundRewards revirtió, ¿fue por TWAP o por slippage?
+      // (En la práctica, solo monitoreable via event logs, no via invariante Solidity.)
+      //
+      // Assertion de configuración (testeable en setup):
+      // Para cada rewardBasePool configurado, verificar que pool.observe([0, 60]) no revierte.
+      // Esto es un check de pre-condición, no un invariante de runtime.
+      t(true, "GM-O-06: informational — TWAP cardinality check, not a runtime invariant");
+    ghost_vars: []
+    validated: false
+    priority: low
+    confidence: 85
+    notes: >
+      Confidence 85 en que el comportamiento descrito es correcto (TWAP puede no estar disponible
+      para pools nuevos). Severidad LOW: es un edge case de configuración, no un bug explotable.
+      Incluido principalmente para documentación y para que el auditor manual verifique que
+      los rewardBasePools configurados en producción tienen historia TWAP suficiente.
+
+  - id: GM-O-07
+    tier: 2
+    type: optimize
+    description: >
+      Maximizar extracción de valor de un compoundRewards vía manipulación de precio spot
+      dentro del límite TWAP. Mide cuánto AERO (en términos de token0/token1 valor)
+      puede extraerse de una operación de compounding legítima usando la ventana de 199 ticks.
+    attack_scenario: >
+      Atacante mide: ¿cuánto profit puede generar manipulando el precio spot exactamente
+      REWARD_MAX_TWAP_TICK_DIFFERENCE - 1 ticks antes de compoundRewards?
+      Si la función de optimización retorna positivo, existe un vector económico real.
+      La ganancia del atacante viene del slippage adicional que el contrato acepta vs precio justo.
+    solidity: |
+      // Función optimize: retorna ganancia neta del atacante tras manipular y sandwiching compoundRewards
+      // Parámetros de fuzzing: tickManipulation (0 a 199), aeroRewardAmount, pool seleccionado
+      //
+      // Proxy measurable:
+      // ghost_ownerToken0Received + ghost_ownerToken1Received (en términos de USDC value) vs
+      // ghost_expectedOutputAtTwapPrice (calculado a precio TWAP justo)
+      //
+      // Si ghost_expectedOutputAtTwapPrice - ghost_actualOutputValue > umbral → hay extracción
+      int256 attackerProfit = int256(ghost_aeroValueAtManipulatedPrice) - int256(ghost_aeroValueAtTwapPrice);
+      return attackerProfit; // > 0 si hay extracción de valor
+    ghost_vars:
+      - "int256 internal ghost_aeroValueAtManipulatedPrice;"
+      - "int256 internal ghost_aeroValueAtTwapPrice;"
+    validated: false
+    priority: medium
+    confidence: 50
+    notes: >
+      Confidence 50: la función optimize requiere acceso a precios TWAP y spot, lo cual
+      necesita fork setup completo. En mock, la función es trivialmente explotable (outputBps < 100%).
+      En fork real: la dificultad de mover 199 ticks en Aerodrome Base en 60s es alta
+      dado el MEV y la liquidez concentrada. Útil como Echidna optimization target en fork.
+      Si el fuzzer reporta profit > 0 en fork → escalar a Tier 1.
+
+false_positives:
+  - hunter: OracleHunter
+    id: GM-O-FP-01
+    reason: >
+      La validación TWAP de 60 segundos es suficiente para Aerodrome Base (bloques 2s = 30 bloques).
+      Manipular 200 ticks en 30 bloques consecutivos en un pool activo de Aerodrome con liquidez
+      concentrada requeriría capital enorme y sería capturable por MEV bots competidores.
+      El riesgo residual es muy bajo en condiciones normales de mercado.
+      NO es un finding de severidad alta — máximo MEDIUM si se documentan condiciones específicas.
+    investigated_at: "2026-03-21T00:00:00Z"
+    pending_briefing_update:
+      action: add_to_trampas
+      briefing: staking.md
+      content: >
+        TWAP 60s en Aerodrome Base (2s bloques): 30 bloques para manipular.
+        El check es TWAP distance, no TWAP price — amountOutMin viene del spot.
+        Esta distinción es la vulnerabilidad real (spot puede estar manipulado dentro del TWAP window).
+
+  - hunter: OracleHunter
+    id: GM-O-FP-02
+    reason: >
+      setRewardBasePool requiere owner y verifica via factory.getPool que sea el pool canónico.
+      No es posible configurar un pool falso. La baja liquidez del pool es riesgo de configuración
+      del owner, no un bug del contrato. En el contexto de Immunefi, trusted roles = excluded.
+    investigated_at: "2026-03-21T00:00:00Z"
+    pending_briefing_update:
+      action: add_to_trampas
+      briefing: staking.md
+      content: >
+        setRewardBasePool verifica canonicidad del pool via factory.getPool.
+        La restricción de owner y la verificación de tokens hacen que sea trusted role,
+        no un vector explotable sin acceso privilegiado.
+
+  - hunter: OracleHunter
+    id: GM-O-FP-03
+    reason: >
+      Reentrancy via uniswapV3SwapCallback: el callback solo transfiere tokenIn al pool.
+      nonReentrant protege compoundRewards. No hay vector de reentrancy por esta vía.
+    investigated_at: "2026-03-21T00:00:00Z"
+    pending_briefing_update: null

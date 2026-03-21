@@ -1,0 +1,681 @@
+component: GaugeManager
+hunter: WildcardHunter
+timestamp: "2026-03-21"
+focus: "Edge cases, composability, economic attacks, non-obvious interactions"
+
+# ─── WILDCARD ANALYSIS NOTES ────────────────────────────────────────────────
+# Deep read confirmed:
+# - spentAero is always == aeroAmount by construction (sum of two requested splits)
+# - leftover underflow is prevented by integer arithmetic bounds (MathHunter confirmed)
+# - onERC721Received zero-address bypass is unreachable (AccessHunter confirmed)
+# - Mid-compound state visibility to other txs is impossible (EVM atomicity)
+#
+# NOVEL ANGLES NOT COVERED BY OTHER HUNTERS:
+# 1. Same base pool used twice in one compound call → stale TWAP for second leg
+# 2. Two-hop route uses positionPool to move price of the position being compounded
+# 3. Deposit delta snapshot timing interacts with allowance reset timing
+# 4. compoundRewards can silently skip addLiquidity (both maxAdd0 and maxAdd1 == 0)
+#    leaving AERO fully as leftovers with zero position improvement, bypassing the
+#    minAeroReward intent
+# 5. _swapAeroToTarget two-hop: if rewardBasePools[otherToken] is a pool for AERO/otherToken
+#    and the compound tries AERO→otherToken then otherToken→targetToken, the second hop
+#    through positionPool can extract from the LP position's own liquidity pool
+# 6. aeroSplitBps = 0 with token1 having no base pool and token0 having one:
+#    requestedAero0 = 0 → skip token0 leg. requestedAero1 = aeroAmount, uses token0's
+#    base pool as INTERMEDIATE → AERO→token0→token1. Correct. But then amount0Out = 0,
+#    amount1Out = result. maxAddAmount0 = 0. If position is out-of-range on token1 side
+#    only, addLiquidity may add only token1 (nonzero). If position is fully out of range
+#    on both sides, BOTH maxAdd amounts are 0 but code checks maxAddAmount0 != 0 ||
+#    maxAddAmount1 != 0 — so if BOTH zero, increaseLiquidity is skipped entirely.
+#    Compound "succeeds" but adds nothing to the position. This wastes gas and the protocol
+#    fee is 0 (no addLiquidity). Owner gets all tokens as leftover. Not a direct fund loss
+#    but the compound operation produces no position improvement.
+# ────────────────────────────────────────────────────────────────────────────
+
+hypotheses:
+  - id: GM-W-01
+    tier: 1
+    type: property
+    description: >
+      When only rewardBasePools[token1] is configured (no direct pool for token0),
+      both swap legs in _swapAeroForPosition use the SAME base pool (rewardBasePools[token1])
+      within a single compoundRewards call. The token0 leg takes the two-hop path:
+      AERO→token1 via rewardBasePools[token1], then token1→token0 via positionPool.
+      The token1 leg takes the direct path: AERO→token1 via rewardBasePools[token1].
+      Both legs call _swapThroughPool on the same pool in the same transaction.
+      The TWAP validation for the SECOND call to this pool uses slot0 and observe()
+      captured AFTER the first swap already moved the pool price. However,
+      _validateSwap reads currentTick and sqrtPriceX96 at call time (inside _swapThroughPool),
+      so the second call actually gets the POST-first-swap price for validation.
+      The TWAP (60s) is still the pre-manipulation value. If an attacker manipulates
+      the base pool price before the compound call, the first swap validates against
+      a (slightly) stale TWAP and the second swap validates against a FURTHER-stale TWAP
+      (because the first swap moved the price). Combined, the two swaps can each be
+      individually within the 2% tolerance but the aggregate slippage exceeds 2%.
+    attack_scenario: >
+      1. Position is tokenA/tokenB. Only rewardBasePools[tokenB] = AERO/tokenB pool is set.
+      2. Attacker front-runs by manipulating AERO/tokenB pool price by ~1.9% (within 2% TWAP tolerance).
+      3. compoundRewards is called with aeroSplitBps causing both legs to use the AERO/tokenB pool.
+      4. First leg (tokenB direct): swaps AERO at 1.9% bad price.
+      5. First swap moves pool price further. Now price has moved ~3.8% total from TWAP.
+      6. Second leg (tokenA two-hop): TWAP is still original (60s window), currentTick is now
+         post-first-swap. The TWAP check compares currentTick to twapTick. After the first swap
+         moved currentTick by ~95 ticks (1.9%), the TWAP check for the second hop sees
+         currentTick even further from the TWAP — which could FAIL the TWAP check for the second leg,
+         causing the entire compound to revert. OR: if attacker moves price in the favorable direction
+         for the second leg while being bad for the first, combined extraction can exceed 2%.
+      Net result: attacker can grief the compound (forced revert) or extract value above the
+      per-hop slippage tolerance by exploiting the sequential price impact on a shared pool.
+    solidity: |
+      // Invariant: when both swap legs route through the same base pool,
+      // the combined slippage must not exceed REWARD_MAX_PRICE_DIFFERENCE_X64.
+      // Cannot express as a single Solidity assertion without custom oracle.
+      // Fuzzing target: configure only rewardBasePools[token1], call compoundRewards
+      // with large aeroAmount and measure effective AERO-in vs token0+token1-out ratio.
+      //
+      // Observable via ghost tracking:
+      // ghost_aeroSpent (= aeroAmount, always)
+      // ghost_amount0Out + ghost_amount1Out (in aero-equivalent terms at TWAP price)
+      // Assert: combined_output_aero_value >= aeroSpent * (Q64 - 2*REWARD_MAX_PRICE_DIFFERENCE_X64) / Q64
+      function invariant_combined_swap_slippage_within_tolerance() public view returns (bool) {
+          // Placeholder — requires oracle integration for end-to-end check
+          // Key: test with _only_ rewardBasePools[token1] set to force both legs through same pool
+          return ghost_combined_output_in_aero_value >=
+              ghost_aero_spent * (type(uint64).max - 2 * REWARD_MAX_PRICE_DIFFERENCE_X64) / type(uint64).max;
+      }
+    validated: false
+    priority: high
+    confidence: 65
+    notes: >
+      This is the stale-TWAP-on-shared-pool composability issue. Not covered by MathHunter or AccessHunter.
+      The 60-second TWAP window provides partial protection but a flash-loan-funded price movement
+      sustained for 60s (or within a large block) could pass the per-hop check while failing end-to-end.
+      Needs fork testing with real AERO/USDC pool to measure actual price impact.
+      The grief-vector (forced revert on second hop due to accumulated tick deviation) is HIGH confidence.
+
+  - id: GM-W-02
+    tier: 1
+    type: property
+    description: >
+      The two-hop swap path in _swapAeroToTarget(positionPool, targetToken=token0, otherToken=token1)
+      uses the position's own pool as the SECOND hop: otherToken→targetToken via positionPool.
+      At this point in the compoundRewards flow, the position NFT has been withdrawn from the gauge
+      (IGauge.withdraw at line 276) but not yet re-deposited. The position's liquidity is still
+      in the pool — it was just uncustodied from the gauge, NOT removed from the AMM.
+      The swap through positionPool moves the price, which:
+      (a) The position earns fees on this swap (since liquidity is still in the pool range)
+      (b) The price shift changes the optimal token0/token1 ratio for the subsequent addLiquidity
+      (c) If the swap is large enough, it can push the price out of the position's tick range,
+          causing addLiquidity to add only one token (the other maxAdd is constrained to 0 by NPM),
+          leaving the other token as "leftover" sent to the owner instead of compounded.
+      This means: large compounds that use the two-hop route can partially undo themselves by
+      moving the position's pool price against the add-liquidity direction.
+    attack_scenario: >
+      1. Position is token0/token1, currently in range.
+      2. compoundRewards is called with large aeroSplitBps (routing most AERO to token0).
+      3. Two-hop path: AERO → token1 → token0 via positionPool (large amount0 swap direction).
+      4. The position pool price shifts significantly (pushing toward more token0).
+      5. When _addLiquidity runs, the NPM uses the new price to determine the ratio.
+         If price crossed the position's upper tick, only token0 can be added, not token1.
+      6. Result: token1 swapped by the first intermediate hop is wasted (leftover sent to owner),
+         and the protocol fee is only on the smaller effective add. No direct fund loss,
+         but the compound is less efficient than intended — the owner loses to slippage on
+         their own position's pool. This is a form of economic inefficiency exploitable via
+         MEV: attacker observes the compound and sandwiches the positionPool swap.
+    solidity: |
+      // Property: after compoundRewards, if aeroSplitBps directs both token legs through
+      // the position pool, the position must still be in-range or the compound is neutral.
+      // Observable: amountAdded0 > 0 AND amountAdded1 > 0 implies position was in range.
+      // If amountAdded0 == 0 XOR amountAdded1 == 0 after a two-hop compound, price moved.
+      //
+      // Ghost invariant: track whether positionPool tick changed during compound
+      // If tick changed significantly (>= tickSpacing), emit warning
+      //
+      // Simplified testable form:
+      function invariant_compound_does_not_strand_tokens_outside_range(
+          uint256 amountAdded0,
+          uint256 amountAdded1,
+          uint256 amount0Out,
+          uint256 amount1Out
+      ) public pure returns (bool) {
+          // If both swap outputs are nonzero but addLiquidity only consumed one side,
+          // the other became leftover — compound was partially self-defeating.
+          // Warn if: (amount0Out > 0 && amountAdded0 == 0) || (amount1Out > 0 && amountAdded1 == 0)
+          bool wasted0 = amount0Out > 0 && amountAdded0 == 0;
+          bool wasted1 = amount1Out > 0 && amountAdded1 == 0;
+          // Not a hard failure, but high economic loss indicator
+          return !wasted0 && !wasted1;
+      }
+    validated: false
+    priority: medium
+    confidence: 60
+    notes: >
+      This is a compound self-interference bug. Not a fund loss (owner gets leftovers back),
+      but the compound is economically inefficient and potentially exploitable via sandwich.
+      The position pool is also the swap venue — this creates a feedback loop.
+      AccessHunter GM-A-03 noted the 0 slippage on addLiquidity; this is the complementary
+      finding: the SWAP before addLiquidity can cause the range-exit that makes addLiquidity add nothing.
+
+  - id: GM-W-03
+    tier: 1
+    type: property
+    description: >
+      compoundRewards has this sequence:
+        1. _claimRewardsToSelf → AERO lands in GaugeManager
+        2. IGauge.withdraw(tokenId)
+        3. _swapAeroForPosition → AERO spent, token0/token1 land in GaugeManager
+        4. _addLiquidity → token0/token1 approved to NPM, NPM pulls amountAdded0/1
+        5. [ALLOWANCE RESET] safeApprove(NPM, 0) called if maxAddAmount != 0
+        6. token0BeforeDeposit = balanceOf(token0) ← snapshot AFTER NPM pulled tokens
+        7. IGauge.deposit(tokenId) → triggers NPM.collect, fees land in GaugeManager
+        8. _sendDepositDeltas(token0Before=step6) → sends delta to owner
+        9. _sendLeftoversAndRewards → sends (amount0Out - amountAdded0 - rewardAmount0) to owner
+
+      PROBLEM: In step 6, token0BeforeDeposit = balanceOf(token0) includes any protocol fees
+      (rewardAmount0) from THIS compound call that are NOT yet sent anywhere (they stay in GM
+      as protocol fee). The snapshot at step 6 is AFTER addLiquidity removed amountAdded0 from GM.
+      At this point, GM holds: (amount0Out - amountAdded0) = rewardAmount0 + leftover0.
+
+      When gauge.deposit fires NPM.collect and sends fees to GM (step 7), the delta =
+      token0After - token0Before = depositFees0 (correct, fees attributed to owner).
+
+      THEN in step 9: leftover0 = amount0Out - amountAdded0 - rewardAmount0 is ALSO sent to owner.
+
+      BOTH depositFees0 (via sendDepositDeltas) AND leftover0 (via sendLeftoversAndRewards)
+      are sent to owner. BUT rewardAmount0 stays in GM. If depositFees0 + leftover0 + rewardAmount0
+      > token0 balance in GM before step 9, the transfer in step 9 (leftover0) REVERTS.
+
+      For this to happen: the gauge deposit must return FEWER tokens than the balance snapshot
+      would imply. Specifically: if gauge.deposit() calls NPM.collect() which returns LESS than
+      what the snapshot expected (e.g., another concurrent call already collected those fees),
+      the balance at step 7 could be lower than step 6, making delta NEGATIVE (underflow in
+      _sendDepositDeltas since it only transfers when token0After > token0Before — no negative).
+      So sendDepositDeltas is safe. But the OVERALL balance after sendDepositDeltas might be
+      less than rewardAmount0 + leftover0 needed by sendLeftoversAndRewards.
+    attack_scenario: >
+      Scenario: Protocol fees (rewardAmount0) from a PREVIOUS compound are sitting in GaugeManager.
+      A new compound for a DIFFERENT position (same token0) is initiated.
+
+      Assume (simplified):
+      - Prior protocol fees in GM: 1000 token0
+      - Current compound: amount0Out = 500, amountAdded0 = 400, rewardAmount0 = 8, leftover0 = 92
+
+      Step 6 snapshot: token0Before = 1000 (prior fees) + (500 - 400) = 1000 + 100 = 1100
+      (GM holds: prior_fees(1000) + post-add-leftover(100) = 1100)
+
+      Step 7: gauge.deposit triggers collect, adds depositFees0 = 50 token0 to GM
+      token0After = 1150. delta = 50 → sent to owner. GM now holds 1100.
+
+      Step 9: _sendLeftoversAndRewards sends leftover0 = 92 to owner. GM goes from 1100 to 1008.
+      rewardAmount0 = 8 stays in GM as protocol fee. Final GM balance = 1008.
+      Total expected protocol fee accumulation = prior_fees(1000) + new_fee(8) = 1008. Correct.
+
+      This seems fine. But what if step 7 (gauge deposit) CONSUMES from GM instead of sending?
+      For example, if the Slipstream gauge.deposit does NOT call collect for this specific position
+      (e.g., position has 0 accumulated fees), token0After = token0Before, delta = 0.
+      Then step 9: GM holds 1100 - 0 = 1100. leftover0 = 92 sent → GM = 1008. Correct.
+
+      The actual exploit requires a gauge implementation where deposit TAKES tokens FROM GM
+      rather than sending to it. With the standard Aerodrome CLGauge, this cannot happen.
+      However: if a gauge implementation pulls extra tokens from msg.sender during deposit
+      (e.g., some fee-on-deposit gauge), the balance would DROP at step 7, potentially making
+      the total tokens in GM insufficient for the leftover0 transfer in step 9.
+
+      This is a TRUST ASSUMPTION on gauge behavior: gauge.deposit() must not pull tokens from
+      GaugeManager beyond approving the NFT. If a malicious/buggy gauge pulls token0/token1
+      during deposit, _sendLeftoversAndRewards will revert, permanently locking the compound.
+    solidity: |
+      // Invariant: after gauge.deposit() in compoundRewards, GaugeManager's token0 balance
+      // must be sufficient to cover (leftover0 + rewardAmount0).
+      // This is equivalent to: (amount0Out - amountAdded0) <= GM.token0Balance after deposit.
+      //
+      // Since _sendDepositDeltas sends depositFees and sendLeftoversAndRewards sends leftover:
+      // GM balance post-compound = prior_fees + rewardAmount0 (only retained amount)
+      //
+      // Ghost tracking:
+      uint256 ghost_prior_fees_token0; // accumulated from previous compounds
+      // After compound, GM must hold >= ghost_prior_fees_token0 + rewardAmount0
+      function invariant_gm_balance_covers_rewards_after_compound() public view returns (bool) {
+          // After compoundRewards returns:
+          return IERC20(token0).balanceOf(address(gaugeManager)) >=
+              ghost_prior_fees_token0 + ghost_rewardAmount0_this_compound;
+      }
+    validated: false
+    priority: medium
+    confidence: 50
+    notes: >
+      This is a gauge trust assumption vulnerability. With standard Aerodrome CLGauge, safe.
+      With a non-standard gauge that calls safeTransferFrom(GaugeManager, ...) during deposit,
+      the compound would revert after the NFT is already withdrawn, leaving the position
+      temporarily unstaked (NFT in GaugeManager, not in gauge). The position can be recovered
+      by calling unstakePosition (which will find tokenIdToGauge still set and succeed),
+      but the compound state is inconsistent. Medium confidence because it requires a
+      non-standard gauge to trigger.
+
+  - id: GM-W-04
+    tier: 1
+    type: property
+    description: >
+      _addLiquidity skips increaseLiquidity entirely when BOTH maxAddAmount0 == 0 AND
+      maxAddAmount1 == 0. This happens when amount0Out == 0 AND amount1Out == 0, which
+      occurs when aeroSplitBps == 0 AND token1 == aeroToken (the passthrough returns
+      (amountIn, amountIn) = (aeroAmount, aeroAmount) for amount0Out=0 because requestedAero0=0,
+      and amount1Out = aeroAmount as passthrough), OR when all swaps produced zero output.
+
+      ACTUALLY: Let's trace aeroSplitBps=0 precisely:
+      - requestedAero0 = 0, requestedAero1 = aeroAmount
+      - _swapAeroToTarget(positionPool, token0, token1, 0) → returns (0, 0) [amountIn=0 early return]
+      - _swapAeroToTarget(positionPool, token1, token0, aeroAmount) → swaps aeroAmount for amount1Out
+      - state.amount0Out = 0, state.amount1Out = amount1Out
+      - maxAddAmount0 = 0 * Q64 / ... = 0
+      - maxAddAmount1 = amount1Out * Q64 / (reward + Q64) > 0
+      - Condition: maxAddAmount0 != 0 || maxAddAmount1 != 0 → TRUE (maxAddAmount1 > 0)
+      - So addLiquidity IS called with amount0Desired=0, amount1Desired=maxAddAmount1
+      - NPM handles this correctly (adds only token1 liquidity if position favors it)
+
+      The TRUE skip case is when amount0Out=0 AND amount1Out=0, which requires:
+      aeroSplitBps=0 AND token1 has a configured base pool BUT the swap produced zero output
+      (e.g., price is at a limit and amountOutMin > 0 causes SlippageError before reaching zero).
+      Actually if swap reverts, compoundRewards reverts — the skip case is unreachable normally.
+
+      REAL EDGE CASE: position is fully out of range on BOTH sides. increaseLiquidity is called
+      with amount0Desired > 0 and amount1Desired > 0 but the NPM returns amountAdded0=0 and
+      amountAdded1=0 (position at a tick boundary where both are zero). Then:
+      rewardAmount0 = 0, rewardAmount1 = 0.
+      leftover0 = amount0Out - 0 - 0 = amount0Out (ALL sent to owner as leftover).
+      leftover1 = amount1Out - 0 - 0 = amount1Out (ALL sent to owner as leftover).
+      Protocol earns ZERO fee. Position gets ZERO added liquidity.
+      The compound "succeeds" but adds nothing. Owner gets everything back as leftovers.
+      minAeroReward only protects the AERO claim threshold, not the position outcome.
+    attack_scenario: >
+      An out-of-range position staked in GaugeManager can be compounded indefinitely.
+      Each compound: claims AERO rewards, swaps to token0/token1, adds 0 liquidity
+      (position out of range), returns all tokens to owner as leftover.
+      Protocol fee = 0 (rewardAmount = 0 when amountAdded = 0).
+      The compound function works correctly (no fund loss) but the protocol earns nothing.
+
+      More interestingly: if a BORROWER has an out-of-range staked position, they can call
+      compoundRewards (as owner, directly on GaugeManager) to continuously extract AERO rewards
+      as token0/token1 leftovers WITHOUT the vault's health check. The compound converts AERO
+      to token0/token1 and sends them directly to the owner. For a leveraged borrower, this
+      extracts value from the position (reduces future yield) without the vault detecting it.
+
+      HOWEVER: the position's liquidity value does NOT decrease (NPM added nothing, so nothing
+      was removed). The tokens sent to owner were AERO rewards converted to other tokens.
+      The vault's collateral value (based on LP position NFT) is unchanged.
+      So health is maintained. This is by design — AERO is not part of the collateral anyway.
+    solidity: |
+      // Property: if compound call adds zero liquidity (amountAdded0=0 AND amountAdded1=0),
+      // the position must be out of range (this is the only legitimate reason).
+      // If in-range position has both amountAdded = 0, there's an accounting bug.
+      //
+      // Note: this requires position tick data from NPM.
+      // Simplified: after compound, if both amountAdded are 0, position should be confirmed OOR.
+      function invariant_zero_liquidity_add_implies_out_of_range(
+          uint256 tokenId,
+          uint256 amountAdded0,
+          uint256 amountAdded1
+      ) public view returns (bool) {
+          if (amountAdded0 == 0 && amountAdded1 == 0) {
+              // Verify position is out of range
+              (,, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper,,,,,) =
+                  npm.positions(tokenId);
+              IUniswapV3Pool pool = IUniswapV3Pool(factory.getPool(token0, token1, fee));
+              (, int24 currentTick,,,,) = pool.slot0();
+              return currentTick < tickLower || currentTick >= tickUpper;
+          }
+          return true;
+      }
+    validated: true
+    priority: medium
+    confidence: 75
+    notes: >
+      The zero-add case is a real edge case that produces correct behavior (no fund loss) but
+      zero protocol fee and no position improvement. Worth testing to confirm behavior matches
+      expectation. The owner-direct compound path extracting AERO as leftovers without vault
+      health check is by design and not exploitable since AERO rewards don't affect LP collateral value.
+
+  - id: GM-W-05
+    tier: 1
+    type: property
+    description: >
+      _swapAeroToTarget intermediate routing asymmetry: when called for the token0 leg,
+      the "other token" is token1. When called for the token1 leg, the "other token" is token0.
+      If NEITHER rewardBasePools[token0] NOR rewardBasePools[token1] is set, both legs revert.
+      If ONLY rewardBasePools[token0] is set:
+      - token0 leg: direct AERO→token0 via rewardBasePools[token0]. OK.
+      - token1 leg: no direct pool, uses intermediate = rewardBasePools[token0] (otherToken=token0).
+        Does AERO→token0 via rewardBasePools[token0], then token0→token1 via positionPool.
+
+      This means for the token1 leg using the two-hop path, the positionPool is used for
+      token0→token1 swap. SIMULTANEOUSLY, for the token0 leg (if it uses direct route),
+      no positionPool usage. So only the token1 leg uses the positionPool.
+
+      BUT: if the pool between AERO and token0 (rewardBasePools[token0]) has low liquidity,
+      both legs hammering it in the same transaction create high slippage:
+      - token0 leg: buys token0 with X aero → moves price
+      - token1 leg: buys token0 with Y aero (for intermediate) → moves price MORE
+
+      The token1 leg's TWAP check (for the AERO→token0 pool) is done at call time for
+      that specific _swapThroughPool invocation, but the TWAP (60-second time-weighted average)
+      doesn't change within the same block. Both calls use the same TWAP but different
+      current prices (second call is post-first-swap). The 200-tick tolerance means a
+      ~2% move doesn't fail the check, but both calls hitting the same low-liquidity pool
+      can cause the second call to exceed the tolerance if the first already moved it significantly.
+    attack_scenario: >
+      Attack vector: Depleted base pool griefing.
+      1. Pool AERO/token0 has low liquidity (recently initialized or drained).
+      2. Large compound call routes both legs through it:
+         - Direct token0 leg buys token0 (moves pool price).
+         - Two-hop token1 leg tries to buy token0 via same pool.
+      3. If the first swap moved the price by > 200 ticks (REWARD_MAX_TWAP_TICK_DIFFERENCE),
+         the second call fails the TWAP check → compoundRewards reverts.
+      4. Position is temporarily unstaked (gauge.withdraw already called at line 276).
+         tokenIdToGauge[tokenId] is still set.
+      5. The compound reverts. But wait: the revert bubbles up from _swapAeroForPosition.
+         This is BEFORE _addLiquidity and gauge.deposit. The gauge.withdraw at line 276
+         already happened (NFT left gauge). The revert at line 277 (_swapAeroForPosition)
+         propagates to compoundRewards() which reverts the entire transaction.
+         Since EVM reverts undo all state changes, gauge.withdraw is also reverted.
+         NFT is back in gauge. tokenIdToGauge is unchanged. State is clean.
+
+      CONCLUSION: The revert in the swap step is actually safe due to EVM atomicity.
+      The compound fails but leaves no permanent state damage. This is a DoS/liveness
+      concern when the base pool has insufficient depth, not a fund-loss scenario.
+
+      THE REAL ISSUE: An attacker can deliberately drain the base pool before a large compound
+      call to grief the compound and force it to fail repeatedly. This is economically
+      rational for a competitor who wants the position to NOT earn compound rewards.
+    solidity: |
+      // Property: if rewardBasePools[token0] is set but rewardBasePools[token1] is not,
+      // a large compound call must not revert due to accumulated price impact on shared pool.
+      // Observable via: both legs must succeed independently AND in sequence.
+      //
+      // Test: configure only rewardBasePools[token0], run compoundRewards with large aeroAmount.
+      // If the second leg (two-hop via rewardBasePools[token0]) fails TWAP check after first leg
+      // already moved the price, the compound reverts. Measure at what aeroAmount threshold this occurs.
+      //
+      // Invariant to fuzz:
+      function invariant_compound_not_blocked_by_shared_pool_price_impact(
+          uint256 aeroAmount
+      ) public view returns (bool) {
+          // After a compound with a given aeroAmount, if only one base pool is configured,
+          // the compound must succeed OR explicitly report NotEnoughReward/SlippageError
+          // rather than TWAPCheckFailed (the latter indicates the shared pool was moved too much).
+          // Cannot express statically — requires call interception.
+          // Fuzz target: track whether TWAPCheckFailed occurs specifically on the second
+          // _swapThroughPool call when both legs share a base pool.
+          return true; // placeholder
+      }
+    validated: false
+    priority: high
+    confidence: 70
+    notes: >
+      This is the shared-base-pool compound griefing attack. Novel angle: the SAME pool is
+      used sequentially by both swap legs when only one base pool is configured. The first
+      swap's price impact can cause the second swap's TWAP check to fail if the pool is
+      thin. An attacker can drain the base pool to make large compounds revert (DoS).
+      Since rewards continue accruing but cannot be claimed via compound, the owner is forced
+      to use claimRewards instead (losing compounding benefits). Not a permanent lock
+      (plain unstake + claim works), but a griefing attack on compounding efficiency.
+
+  - id: GM-W-06
+    tier: 1
+    type: property
+    description: >
+      _claimRewardsToSelf uses balance delta measurement: aeroBefore = balanceOf(GM),
+      IGauge.getReward(tokenId), aeroAmount = balanceAfter - aeroBefore.
+      This correctly isolates ONLY the newly received AERO from this specific claim.
+
+      However, _claimRewardsToSelfBestEffort (used in unstake) has an extra check:
+        try IGauge(gauge).getReward(tokenId) {
+            uint256 aeroAfter = aeroToken.balanceOf(address(this));
+            if (aeroAfter > aeroBefore) { aeroAmount = aeroAfter - aeroBefore; }
+        } catch {}
+
+      The `if (aeroAfter > aeroBefore)` guard means: if aeroAfter == aeroBefore (the gauge
+      returned 0 rewards), aeroAmount = 0. Correct.
+
+      BUT: the guard also means: if a malicious gauge or reentrancy during getReward() causes
+      GaugeManager's AERO balance to DECREASE (by transferring AERO out of GM via some external
+      mechanism during the try block), then aeroAfter < aeroBefore. The guard catches this
+      (returns 0 instead of underflowing). This is a defense. Good.
+
+      The ACTUAL edge case: what if getReward() succeeds but transfers LESS AERO than expected
+      (e.g., gauge has a reserve that reduces payouts)? aeroAfter > aeroBefore is true,
+      aeroAmount = actual received amount. This is handled correctly.
+
+      REAL ISSUE: If the gauge's getReward emits AERO to an intermediate contract first,
+      and THAT contract then transfers to GaugeManager, the balance delta is still correct
+      (it measures what landed in GM, not what the gauge emitted). If the intermediate
+      contract skims some AERO before forwarding, the owner loses rewards. This is a
+      gauge trust assumption, not a GaugeManager bug.
+
+      THE NOVEL ANGLE: During compoundRewards, _claimRewardsToSelf is called FIRST. If this
+      claim returns aeroAmount > 0, then later when the same tokenId is part of an unstake
+      (e.g., vault.liquidate during the same block as a failed compound from a prior attempt),
+      _claimRewardsToSelfBestEffort will find 0 rewards (already claimed). This is correct
+      and by design. BUT: if the VAULT's compoundRewardsFirst path (transformWithRewardCompound)
+      is called, it calls gaugeManager.compoundRewards() which claims ALL rewards. Then later
+      in the SAME transaction, _unstakeIfNeeded → _claimAndSendRewardsBestEffort claims 0.
+      The rewards were already distributed in the compound step. No bug.
+
+      ACTUAL NOVEL FINDING: In _requireVaultOrOwner, the function calls vault.ownerOf(tokenId)
+      which reads tokenOwner[tokenId] from vault storage. This is a state read. If the vault's
+      tokenOwner is 0 (position was removed), ownerOf returns 0. Then:
+        if (msg.sender != address(vault) && msg.sender != owner(=0)) revert Unauthorized
+      If msg.sender is NOT the vault, and owner is 0, then msg.sender != 0 (callers are real addresses)
+      → check fails → revert. Safe.
+      BUT: can owner be address(0)? Only if tokenOwner[tokenId] == 0, meaning the position was
+      removed from the vault. But if position is removed, tokenIdToGauge[tokenId] should also
+      be 0 (unstaked during remove). So _requireStakedGauge would revert before _requireVaultOrOwner.
+      Actually: claimRewards calls _requireVaultOrOwner THEN _requireStakedGauge. Order matters.
+      If tokenOwner = 0 (position removed from vault but somehow still staked), _requireVaultOrOwner
+      allows the vault to call but NOT the zero owner. The vault calling claimRewards for a
+      position it no longer owns... the vault.remove() calls _unstakeIfNeeded first, so by the
+      time tokenOwner = 0, the position should be unstaked. Race condition? No — remove() is atomic.
+    attack_scenario: >
+      Low-probability edge case: if vault.remove() fails AFTER _unstakeIfNeeded but before
+      clearing tokenOwner (this cannot happen in the current code since they're in the same tx),
+      a stale tokenIdToGauge entry could exist for a position no longer in the vault.
+      But since all operations are atomic, this state is unreachable. Marking as false positive
+      of the deeper analysis — included to document the reasoning.
+    solidity: |
+      // Property: if tokenIdToGauge[tokenId] != address(0), then vault.ownerOf(tokenId) != address(0).
+      // An orphaned staked position (staked but no vault owner) is impossible.
+      function invariant_staked_position_has_vault_owner(uint256 tokenId) public view returns (bool) {
+          address gauge = gaugeManager.tokenIdToGauge(tokenId);
+          if (gauge == address(0)) return true; // not staked, skip
+          address owner = vault.ownerOf(tokenId);
+          return owner != address(0);
+      }
+    validated: true
+    priority: medium
+    confidence: 80
+    notes: >
+      This is actually a STRONG invariant to fuzz because violation means a position is
+      permanently locked in the gauge with no owner to unstake it. The vault's atomic
+      unstake-before-remove makes this unreachable in current code, but worth testing
+      to confirm no edge case (e.g., vault liquidation race) breaks it.
+
+  - id: GM-W-07
+    tier: 1
+    type: property
+    description: >
+      CRITICAL COMPOSABILITY ISSUE: compoundRewards is callable by the position owner
+      (not just vault) via _requireVaultOrOwner. When the vault calls
+      _transform() → compoundRewards() → the vault has already set transformedTokenId = tokenId.
+      During this vault-initiated compound, the vault calls gaugeManager.compoundRewards()
+      as msg.sender = vault. Inside that call, the compound does gauge.withdraw(tokenId) then
+      gauge.deposit(tokenId). After gauge.deposit, the gauge calls NPM.collect() which triggers
+      NPM callbacks. At this point, the gauge-NFT is being deposited and the vault's
+      transformedTokenId is set.
+
+      NOW: what if the vault's onERC721Received is triggered during this flow?
+      - gauge.deposit calls NPM.safeTransferFrom(msg.sender=GaugeManager, gauge, tokenId)
+      - NPM records the new owner as gauge
+      - No onERC721Received called on vault (NFT is going TO the gauge, not the vault)
+
+      The vault's onERC721Received is only triggered when an NFT is transferred TO the vault.
+      During compound, the NFT goes GaugeManager→gauge, not to vault.
+
+      HOWEVER: in _transform, AFTER the compound (line 536) and AFTER _unstakeIfNeeded (line 539),
+      the vault does nonfungiblePositionManager.approve(transformer, tokenId) (line 542).
+      But wait — if compoundRewardsFirst ran and the position was re-staked during compound
+      (compound leaves it in gauge), then _unstakeIfNeeded (line 539) calls unstakeIfStaked
+      which calls _unstakePosition → gauge.withdraw → NFT comes back to GaugeManager →
+      GaugeManager.safeTransferFrom(GM, vault, tokenId) → vault.onERC721Received is triggered
+      with transformedTokenId already set to tokenId.
+
+      In vault.onERC721Received with oldTokenId == tokenId (same token being returned):
+        `if (tokenId != oldTokenId)` → FALSE → the if block is skipped.
+
+      WAIT — the code checks `uint256 oldTokenId = transformedTokenId`. If transformedTokenId == tokenId,
+      then oldTokenId == tokenId, so `tokenId != oldTokenId` is FALSE, and the replacement
+      migration block is skipped. The function just returns the selector. But this means:
+      when the staked NFT returns to the vault during _unstakeIfNeeded within a _transform call,
+      the vault's onERC721Received does NOTHING (just returns selector). The position IS in the
+      vault now (NFT received), but onERC721Received didn't re-initialize any state. This is fine
+      because the position was already tracked in tokenOwner[tokenId] from its original deposit.
+
+      THE ACTUAL ISSUE: if compoundRewards produces a NEW tokenId (it doesn't — it uses the same
+      tokenId throughout), but what if a future integration uses range-and-compound that mints a
+      new position? AutoRangeAndCompound is a separate transformer, not part of GaugeManager.compound.
+      In GaugeManager.compoundRewards, the tokenId never changes. No issue.
+    attack_scenario: >
+      This analysis confirms the vault + gaugeManager interaction is safe for same-tokenId operations.
+      The novel angle was: could onERC721Received with transformedTokenId set cause unexpected behavior?
+      Answer: No, because the vault's onERC721Received correctly handles the case where the returned
+      NFT has tokenId == oldTokenId (it's the same position, just returning from gauge custody).
+      Marking this as a false positive of the composability analysis — included to document
+      the deep reasoning about vault-gauge-NFT transfer flows.
+    solidity: |
+      // Property: vault.onERC721Received with tokenId == transformedTokenId must always succeed
+      // (return the selector, not revert) when called during _transform's _unstakeIfNeeded flow.
+      // This confirms the NFT return path during transform is handled.
+      function invariant_nft_return_during_transform_is_safe(uint256 tokenId) public view returns (bool) {
+          // If transformedTokenId == tokenId (we're in transform mode for this position),
+          // and the NFT arrives at the vault (e.g., during unstake),
+          // the vault must accept it without reverting.
+          // In current code, tokenId == oldTokenId case skips the if block → always returns selector.
+          return true; // by code inspection
+      }
+    validated: false
+    priority: low
+    confidence: 30
+    notes: >
+      After deep analysis, this is a FALSE POSITIVE. The vault correctly handles NFT return
+      during transform for same-tokenId. Included to document the analysis path.
+      The real gem from this analysis is confirming that GaugeManager.compoundRewards within
+      vault._transform creates NO unexpected state in vault.onERC721Received.
+
+  - id: GM-W-08
+    tier: 1
+    type: property
+    description: >
+      NOVEL HIGH-VALUE FINDING: compoundRewards adds liquidity with amount0Min=0 and amount1Min=0
+      in the increaseLiquidity call (line 491). This means the position owner accepts ANY outcome
+      from addLiquidity, including being given zero liquidity even when tokens are provided.
+
+      The attack scenario from AccessHunter GM-A-03 identified the 0 slippage issue.
+      This hypothesis extends it: specifically, the SEQUENCE of operations creates a sandwich window.
+
+      Timeline of compoundRewards:
+      1. gauge.withdraw(tokenId) — NFT leaves gauge, goes to GM
+      2. _swapAeroForPosition — N swaps happen with TWAP protection (good)
+      3. _addLiquidity:
+         a. safeIncreaseAllowance(NPM, maxAdd0/1) — GM approves NPM
+         b. NPM.increaseLiquidity(tokenId, maxAdd0, maxAdd1, 0, 0, deadline) — adds at current price
+         c. safeApprove(NPM, 0) — allowance reset
+      4. gauge.deposit(tokenId) — NFT back to gauge
+
+      The sandwich window is step 3b: after the swap protections in step 2, but before the
+      liquidity add. An MEV bot can:
+      a. Let step 2 (swap) complete — can't front-run the whole tx atomically in Solidity
+      b. Observe the pending tx, front-run step 3b specifically by executing between blocks
+      — but this is impossible since steps 2 and 3 are in the same transaction.
+
+      HOWEVER: the positionPool used in two-hop routing IS the same pool that addLiquidity
+      uses. The two-hop swap at step 2 MOVES the positionPool price. Then addLiquidity at step 3
+      uses the NEW (post-swap) price. If the two-hop swap moved the price out of the position's
+      tick range, addLiquidity adds 0 of one token (as noted in GM-W-02). No sandwich needed.
+      The position pool self-interference creates the slippage without any external attacker.
+
+      THE REAL NOVEL FINDING: The `deadline` parameter in compoundRewards controls ONLY the
+      increaseLiquidity deadline, NOT the swaps. The swaps in _swapThroughPool use
+      sqrtPriceLimitX96 = MIN/MAX_SQRT_RATIO ± 1 (no price limit on the swap itself).
+      The TWAP check happens BEFORE the swap in _validateSwap. But if the block timestamp
+      advances past the deadline BETWEEN the TWAP check and the increaseLiquidity call,
+      the liquidity add reverts but the swaps have already executed — AERO was already spent
+      on token0/token1, the NFT is withdrawn from gauge but not re-deposited.
+
+      Wait — the revert propagates and undoes everything (EVM atomicity). So deadline expiry
+      still reverts the whole transaction. The deadline only affects the final state of
+      increaseLiquidity, and since it all reverts, the position is safe.
+
+      BUT: if deadline == block.timestamp and a slow block includes the tx AFTER the deadline,
+      the whole compound reverts with expired deadline. The position remains staked (all reverted),
+      but the user passed a deadline they thought was valid. This is standard deadline behavior.
+    attack_scenario: >
+      The deadline parameter only checks at increaseLiquidity time. If set to block.timestamp,
+      a block producer could deliberately include the tx late (after deadline) to make it fail,
+      preventing compounding of a competitor's position. With deadline = block.timestamp + N,
+      the N-second window protects against this. This is standard MEV and not a GaugeManager bug.
+      The more interesting case: the deadline passed by compoundRewards to increaseLiquidity
+      is a USER-PROVIDED value. If the user passes deadline = 0 (or type(uint256).max),
+      the liquidity add is deadline-unlimited. This is valid for owner-initiated compounds.
+      No protocol enforcement of minimum deadline.
+    solidity: |
+      // Property: deadline passed to compoundRewards must be > block.timestamp
+      // Otherwise the increaseLiquidity call will revert with "Transaction too old"
+      // For fuzzing: ensure deadline is always > block.timestamp when testing compound.
+      //
+      // Observed gap: no minimum deadline enforcement in compoundRewards parameter.
+      // A user can pass deadline = 0, which will always fail increaseLiquidity.
+      // This creates a "compound that always reverts" state if the owner is confused.
+      //
+      // But since EVM reverts everything atomically, this is just user error, not a bug.
+      function invariant_deadline_gt_timestamp(uint256 deadline) public view returns (bool) {
+          return deadline > block.timestamp;
+      }
+    validated: true
+    priority: low
+    confidence: 40
+    notes: >
+      The deadline issue is standard and well-known. The novel angle (self-interference of
+      positionPool two-hop swap with addLiquidity price) is covered better in GM-W-02.
+      This hypothesis confirms no additional deadline-specific vulnerability beyond user error.
+      The key finding from this analysis: the swaps use NO deadline (only sqrtPriceLimit),
+      so a tx that is delayed in the mempool executes the swaps at whatever current price
+      the TWAP allows, but the addLiquidity is time-bounded. The combination means:
+      swaps execute but liquidity add fails if too delayed → entire tx reverts. Safe.
+
+false_positives:
+  - id: FP-W-01
+    description: >
+      AERO double-counting when token0=AERO. Initial concern: spentAero includes AERO not
+      physically transferred, and leftover0 sends AERO as token0 leftovers. Full trace:
+      spentAero = requestedAero0 + requestedAero1 = aeroAmount (always by construction).
+      leftoverAero = 0. leftover0 = amount0Out - amountAdded0 - rewardAmount0 is sent
+      as token0 (= AERO). rewardAmount0 stays in GM as protocol fee (also AERO).
+      Total AERO dispensed: amountAdded0 (into position) + rewardAmount0 (protocol fee) +
+      leftover0 (owner leftover) = amount0Out = requestedAero0. Plus requestedAero1 went
+      to the AERO→token1 swap. Grand total = requestedAero0 + requestedAero1 = aeroAmount.
+      BALANCED. No double-counting.
+    maps_to: "Initial concern in GM-W-04 analysis"
+
+  - id: FP-W-02
+    description: >
+      compoundRewards NFT temporarily out of gauge visible to concurrent liquidation.
+      EVM atomicity: all state changes in compoundRewards are atomic within one transaction.
+      The mid-compound state where NFT is in GaugeManager (between gauge.withdraw and gauge.deposit)
+      is never visible to any other transaction. AccessHunter GM-A-06 confirmed this.
+    maps_to: "GM-A-06 (already marked false positive by AccessHunter)"
+
+  - id: FP-W-03
+    description: >
+      vault.onERC721Received behavior when transformedTokenId == tokenId (same token returns
+      during _transform's unstake step). Analysis in GM-W-07 confirmed this is safe: the
+      `if (tokenId != oldTokenId)` block is skipped, selector is returned, position state
+      was already tracked from original deposit.
+    maps_to: "GM-W-07 analysis"

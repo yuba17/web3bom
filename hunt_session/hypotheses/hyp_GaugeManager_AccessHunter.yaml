@@ -1,0 +1,410 @@
+component: GaugeManager
+hunter: AccessHunter
+hypotheses:
+
+  - id: GM-A-01
+    tier: 1
+    type: property
+    description: >
+      withdrawBalances() allows the withdrawer to drain ANY ERC20 token balance held by GaugeManager,
+      including aeroToken. During compoundRewards(), the protocol fee portion (rewardAmount0/rewardAmount1)
+      is intentionally retained in the contract for later withdrawal. However, withdrawBalances() also
+      accepts aeroToken as input — any AERO that accrued as an intermediate balance during a compound
+      cycle that was NOT yet distributed (e.g., if leftoverAero > 0 due to spentAero < aeroAmount) can
+      also be swept. More critically: if a claimRewards call is followed immediately by a withdrawBalances
+      call in the same block (frontrunning by the withdrawer or reorg), the aeroToken balance that was
+      supposed to go to the position owner but is still in transit could be drained. The invariant is:
+      immediately after any compoundRewards() call, the GaugeManager should hold no more aeroToken than
+      the accumulated protocol fee dust from all prior cycles.
+    attack_scenario: >
+      The withdrawer (or an attacker who compromises the withdrawer key) calls withdrawBalances([aeroToken], attacker)
+      in the same block as a compoundRewards() call. If there is any aeroToken that was claimed but not
+      yet distributed to the owner (race in same tx is impossible due to nonReentrant, but across-tx dust
+      from rounding, or mid-sequence state if code is modified), it gets swept. For the current code,
+      the real risk is: rewardAmount0/rewardAmount1 stay in contract intentionally, but aeroToken for
+      owner (leftoverAero) is ALSO supposed to be sent out in _sendLeftoversAndRewards. If the withdrawer
+      is separate from the owner, a malicious withdrawer calling withdrawBalances([aeroToken]) after staking
+      a position would grab any claimed AERO that the compound left behind as owner share.
+    solidity: |
+      // After any compoundRewards() call completes, leftoverAero must be zero in GaugeManager.
+      // If aeroToken balance of GaugeManager is nonzero, it MUST equal accumulated rewardAmount0/rewardAmount1
+      // from token0/token1 that remain as protocol fees — NOT any user-owned aero balance.
+      // This is not directly checkable as a stateless invariant without ghost vars, but:
+      function invariant_aeroBalanceOnlyProtocolFees() public view returns (bool) {
+          // After compound, leftoverAero is sent to owner in _sendLeftoversAndRewards.
+          // So any residual aeroToken balance must be 0 if the last call was compoundRewards with full aero spending.
+          // Ghost var: track sum of rewardAmount0, rewardAmount1 translated into expected aero residue.
+          // For fuzzing: assert that GaugeManager.aeroToken.balanceOf(address(gaugeManager))
+          //              <= ghost_accumulated_protocol_reward_aero
+          return aeroToken.balanceOf(address(gaugeManager)) <= ghost_accumulated_protocol_aero;
+      }
+    validated: false
+    priority: medium
+    confidence: 40
+    notes: >
+      The code does correctly call _sendLeftoversAndRewards which transfers leftoverAero to the owner before
+      returning. So under normal single-transaction flow, there is NO race. The real question is whether
+      aeroToken can accumulate as dust between calls. Current design: protocol fees in token0/token1 stay,
+      not AERO. AERO leftover goes to owner. So aeroToken balance after compound should be ~0 unless there's
+      a rounding Wei. The withdrawer CAN drain it, but there's typically nothing there. Mark as LOW risk
+      under normal operation. HIGH risk only if: (a) withdrawer is compromised AND (b) someone front-runs
+      a compoundRewards to read the aero balance before it's sent out — but nonReentrant blocks this
+      within the same call. Investigate deeper with fork testing.
+
+  - id: GM-A-02
+    tier: 1
+    type: property
+    description: >
+      onERC721Received() checks `from != address(vault) && from != tokenIdToGauge[tokenId]`. When a tokenId
+      has never been staked, tokenIdToGauge[tokenId] == address(0). This means the check becomes:
+      `from != address(vault) && from != address(0)`. Any address that is NOT the vault can send an NFT
+      to GaugeManager as long as the `from` field equals address(0) — which is impossible for real ERC721
+      transfers since the zero address cannot own tokens. However: the `from` argument in onERC721Received
+      is the PREVIOUS OWNER passed by the NFT contract, and in Solidity ERC721 safeTransferFrom, `from` is
+      whatever is passed in, NOT necessarily validated by the NPM. The NPM will set `from` to the actual
+      previous owner. But here's the real bug: ANY address can call NPM.safeTransferFrom(gaugeManager, ..., tokenId)
+      if they own that NFT — the `msg.sender` check `if (msg.sender != address(nonfungiblePositionManager))`
+      is correct and blocks direct calls. The `from` parameter is msg.sender in the NPM transfer, so it will
+      be the actual token owner. There is no bypass here. HOWEVER: if tokenIdToGauge[tokenId] is address(0)
+      for a NEW tokenId (never staked), and someone sends a DIFFERENT (unrelated) NFT tokenId where
+      tokenIdToGauge[that_tokenId] == address(0), the condition `from == address(vault)` must be true.
+      So unrelated NFTs can only come in via the vault. This seems safe.
+    attack_scenario: >
+      An attacker sends a random Uniswap V3 NFT (not from vault, not from a gauge) to GaugeManager.
+      The NPM calls onERC721Received with from=attacker. The check fires:
+        from != address(vault) → true
+        from != tokenIdToGauge[tokenId] → tokenIdToGauge[randomTokenId] == address(0), so from != address(0) → true
+      Therefore the check PASSES for from == address(0) only, which cannot happen for a real sender.
+      For any real attacker address, both conditions are true → revert Unauthorized.
+      CONCLUSION: The zero address edge case is unreachable in practice. This is safe as designed.
+      BUT: If a gauge implementation sends the NFT back to GaugeManager during an external call in the
+      unstake flow and the tokenIdToGauge mapping was already deleted (delete tokenIdToGauge[tokenId]
+      happens AFTER the safeTransferFrom in _unstakePosition), the order matters.
+      In _unstakePosition: IGauge.withdraw(tokenId) → NPM.safeTransferFrom(this, vault, tokenId) → delete tokenIdToGauge.
+      The gauge.withdraw() should send the NFT BACK to GaugeManager which triggers onERC721Received
+      with from=gauge. At this point tokenIdToGauge[tokenId] == gauge (not yet deleted). So this works.
+      No issue found here.
+    solidity: |
+      // Verify that no address other than vault or configured gauge can deposit an NFT into GaugeManager.
+      // This is only testable by calling NPM.safeTransferFrom from an attacker address.
+      function invariant_onlyVaultOrGaugeCanDepositNFT() public {
+          // If an NFT is in GaugeManager custody, its tokenIdToGauge must be set (staked)
+          // OR the NFT must have just arrived from vault (mid-stake, before tokenIdToGauge is set).
+          // There is no state where GaugeManager holds an NFT with tokenIdToGauge[id] == 0
+          // unless it's currently inside the stakePosition call flow.
+          // Stateless invariant: not easily expressible without call-depth tracking.
+          // Use handler-based: any attempt to safeTransferFrom an arbitrary NFT to GaugeManager
+          // from a non-vault, non-gauge address must revert.
+      }
+    validated: true
+    priority: low
+    confidence: 20
+    notes: >
+      After full analysis, this is NOT a vulnerability. The zero address case is unreachable.
+      The gauge withdrawal flow correctly reads tokenIdToGauge BEFORE delete. Marking as false positive.
+
+  - id: GM-A-03
+    tier: 1
+    type: property
+    description: >
+      compoundRewards() is callable DIRECTLY by the position owner (not just by the vault). When the owner
+      calls it directly, the function performs: claimRewards → withdraw from gauge → swap AERO → addLiquidity
+      → re-deposit to gauge. The position NFT is inside the gauge during the entire call. The vault's
+      health check for the loan only runs when the vault calls _requireLoanIsHealthy (after transform).
+      If the owner calls compoundRewards() directly on GaugeManager (bypassing vault.transform()), the
+      vault does NOT re-check health. The compound operation increases liquidity, which should IMPROVE health.
+      BUT: during the compound, the NFT is briefly withdrawn from the gauge and re-deposited. The vault
+      tracks whether a position is staked via its own stakeStatus mapping. If vault.stakePosition was used
+      to send the NFT to GaugeManager, and GaugeManager internally calls gauge.withdraw/deposit during
+      compound, the vault is UNAWARE. The vault only knows the NFT left its custody (it's in GaugeManager
+      or gauge), not the sub-steps. The health check bypass is the key concern.
+    attack_scenario: >
+      1. User has a position with loan near liquidation threshold (collateral barely above debt).
+      2. User calls GaugeManager.compoundRewards() directly (owner path, no vault health check).
+      3. During _swapAeroForPosition, the compounding could in theory produce less liquidity than expected
+         if slippage is bad (minAmount0/minAmount1 are 0 in _addLiquidity call!).
+      4. After compound, position liquidity is slightly less than before if swap was very lossy.
+      5. Vault never re-checked health, so a borderline position could become undercollateralized
+         without triggering the health check.
+      KEY: The `_addLiquidity` call uses `amount0Min: 0, amount1Min: 0` — there is no slippage protection
+      on the liquidity add. An attacker could sandwich the compoundRewards call to manipulate the pool
+      price, causing the liquidity add to return almost nothing, resulting in position value loss without
+      a health check.
+    solidity: |
+      // Invariant: after any compoundRewards() call, if the position has a loan,
+      // the vault health check must still pass.
+      // This is a stateful invariant requiring vault integration.
+      function invariant_compoundDoesNotDestroyHealth(uint256 tokenId) public view returns (bool) {
+          if (vault.loans(tokenId) == 0) return true; // no debt, skip
+          (bool isHealthy,,,) = vault.loanInfo(tokenId);
+          // After compound, position must still be healthy OR must have been healthy before compound.
+          // If isHealthy is false after a direct owner compound call, this is a bug.
+          (, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+          uint256 debt = vault.loans(tokenId); // debtShares, need exchange rate
+          return collateralValue >= debt; // simplified
+      }
+    validated: true
+    priority: high
+    confidence: 65
+    notes: >
+      The real issue is: (1) no slippage protection on addLiquidity (amount0Min=0, amount1Min=0),
+      (2) direct owner call bypasses vault health check, (3) sandwich attack during compound could
+      reduce position value below debt threshold. This is a genuine finding candidate. The vault path
+      (transformWithRewardCompound) calls _requireLoanIsHealthy AFTER compound, but the direct
+      owner path does NOT go through the vault. This asymmetry is the vulnerability.
+      Confidence 65% — need to confirm that the vault actually enforces health on its compound path
+      and that the direct path truly bypasses it. The vault's _transform() calls _requireLoanIsHealthy
+      at line 579 AFTER the compound, but direct GaugeManager.compoundRewards() has NO such check.
+
+  - id: GM-A-04
+    tier: 1
+    type: property
+    description: >
+      claimRewards() accepts an arbitrary `recipient` address when called by the vault. The function
+      _requireVaultOrOwner() returns the owner of the tokenId from vault.ownerOf(). If msg.sender == vault,
+      the check passes. Then `recipient` is used as-is if non-zero. The vault can therefore redirect ALL
+      AERO rewards for any position to any address — including address(0xdead), the vault contract itself,
+      or any attacker-controlled address. Under the current vault code (transformWithRewardCompound and
+      _unstakePosition in vault), the vault always passes the actual owner as recipient. But if a malicious
+      vault-registered transformer calls vault.transform() and inside the transform callback somehow
+      causes the vault to call claimRewards with a different recipient, rewards could be stolen.
+      More directly: in _unstakePosition (vault-internal), the vault calls gaugeManager.unstakeIfStaked()
+      which calls _claimAndSendRewardsBestEffort internally — it always sends to vault.ownerOf(tokenId).
+      So rewards during unstake go to the correct owner. But claimRewards() is a SEPARATE external function
+      that CAN be called by msg.sender == vault with arbitrary recipient. The vault calls claimRewards
+      only through transformWithRewardCompound indirectly via compoundRewards, not claimRewards directly.
+      The direct attack vector is: can a transformer call vault -> then invoke something that triggers
+      claimRewards with a bad recipient? Not in current code, but the function signature allows it.
+    attack_scenario: >
+      If a future vault upgrade or a currently-allowed transformer can call IGaugeManager.claimRewards(tokenId, attacker),
+      then ALL pending AERO rewards for that tokenId are sent to `attacker`. The vault's access to
+      claimRewards with arbitrary recipient is an unrestricted privilege that depends entirely on the
+      vault implementation being correct. In the current code this is "by design" and the vault is
+      trusted, but it's a fragile trust assumption.
+    solidity: |
+      // Invariant: claimRewards() with vault as caller should only send to vault.ownerOf(tokenId)
+      // or an address explicitly approved by the owner. Currently there is no such approval mechanism.
+      function invariant_claimRewardsRecipientMustBeOwnerOrApproved(uint256 tokenId, address recipient) public view {
+          address owner = vault.ownerOf(tokenId);
+          // If vault called claimRewards(tokenId, recipient) where recipient != owner,
+          // this should revert. Currently it does NOT revert.
+          // The invariant is: aeroToken balance of recipient should only increase if recipient == owner
+          //                   or recipient was pre-approved by owner.
+          // Cannot express this as a pure view invariant without event/trace tracking.
+      }
+    validated: true
+    priority: medium
+    confidence: 50
+    notes: >
+      This is a DESIGN CONCERN rather than a direct exploit in the current codebase. The vault is
+      trusted and currently never calls claimRewards with wrong recipient. However the function
+      interface has no enforcement that recipient must be owner — it's fully open for vault to
+      redirect. If vault contract has any other bug that lets a third party trigger claimRewards
+      via the vault, rewards get stolen. This is a composability risk / future-upgrade risk.
+      In current code: LOW severity. In upgraded/extended code: potential HIGH.
+
+  - id: GM-A-05
+    tier: 1
+    type: property
+    description: >
+      setCompoundReward() enforces that `_totalRewardX64 <= totalRewardX64` (can only DECREASE the fee).
+      This is a one-way ratchet — once lowered, the owner can never raise it back (MAX_REWARD_X64 = 2%).
+      This is almost certainly intentional (anti-rug protection). However: setWithdrawer() allows the owner
+      to change the withdrawer to any non-zero address, including the owner themselves. If the owner sets
+      withdrawer = owner, then the owner can call withdrawBalances() for all protocol fees. This is
+      expected behavior, but it means if the owner key is compromised, the attacker can both:
+      (a) change the withdrawer to themselves (via setWithdrawer) and
+      (b) drain all token balances in the contract (rewardAmount0, rewardAmount1 accumulated).
+      The owner cannot raise the reward fee, but they CAN drain all accumulated fees instantly by
+      updating the withdrawer. This is a privilege escalation path via key compromise, not an on-chain bug.
+    attack_scenario: >
+      1. Owner key compromised.
+      2. Attacker calls setWithdrawer(attacker).
+      3. Attacker calls withdrawBalances([token0, token1, aeroToken], attacker).
+      4. All protocol fee reserves swept instantly.
+      No on-chain protection prevents this from happening in a single transaction.
+      This is standard smart contract risk but worth noting in the audit.
+    solidity: |
+      // Invariant: withdrawer cannot call withdrawBalances() on accumulated protocol fees
+      // within the same tx as setWithdrawer() was changed.
+      // This is a timelock/governance issue, not an invariant.
+      // For fuzzing: track that accumulated protocol reward (rewardAmount0 + rewardAmount1 across
+      // all compound calls) is only ever claimable by the originally configured withdrawer.
+      function invariant_protocolFeesIntact() public view returns (bool) {
+          // Ghost var: ghost_accumulated_protocol_token0_fees, ghost_accumulated_protocol_token1_fees
+          // After all compound calls, GaugeManager must hold AT LEAST these amounts.
+          // If balance drops below accumulated fees without a withdrawBalances call, it's a bug.
+          return (
+              IERC20(trackedToken0).balanceOf(address(gaugeManager)) >= ghost_protocol_fees_token0 &&
+              IERC20(trackedToken1).balanceOf(address(gaugeManager)) >= ghost_protocol_fees_token1
+          );
+      }
+    validated: true
+    priority: low
+    confidence: 30
+    notes: >
+      The setWithdrawer + withdrawBalances combination giving owner full drain capability is by design
+      and expected in protocol fee controllers. Not a vulnerability in the current trust model.
+      Only notable if the bounty scope covers admin key compromise scenarios. Mark as informational.
+
+  - id: GM-A-06
+    tier: 1
+    type: property
+    description: >
+      compoundRewards() called directly by the position owner (not via vault.transformWithRewardCompound)
+      causes the NFT to briefly leave the gauge: IGauge.withdraw(tokenId) is called at line 276,
+      then IGauge.deposit(tokenId) at line 282. During this window, the vault's internal state believes
+      the position is still staked. The vault checks staked status via GaugeManager.tokenIdToGauge[tokenId],
+      which is NOT cleared during compound — it remains set to gauge throughout. So from the vault's
+      perspective, the position never left gauge custody. But from the NPM's perspective, between
+      lines 276 and 282, the NFT is owned by GaugeManager directly (not the gauge). At this point,
+      if someone could call vault.liquidate() for this tokenId, the vault would try to unstake
+      (call unstakeIfStaked → _unstakePosition) which tries gauge.withdraw() on an already-withdrawn NFT.
+      This could fail or produce unexpected state. The nonReentrant guard prevents re-entry into
+      compoundRewards, but vault.liquidate() does NOT call compoundRewards — it's a different path.
+    attack_scenario: >
+      1. Owner of tokenId calls GaugeManager.compoundRewards() directly.
+      2. Execution is at line 276: IGauge(gauge).withdraw(tokenId). NFT is now in GaugeManager.
+      3. tokenIdToGauge[tokenId] is still set (not cleared until... it's never cleared in compound!).
+      4. Simultaneously (different EOA) someone calls vault.liquidate(tokenId).
+         - Vault calls _unstakeIfNeeded(tokenId).
+         - _unstakeIfNeeded calls gaugeManager.unstakeIfStaked(tokenId).
+         - GaugeManager._unstakePosition: gauge = tokenIdToGauge[tokenId] (still set to gauge).
+         - Calls IGauge(gauge).withdraw(tokenId) — but NFT is NOT in gauge, it's in GaugeManager!
+         - This REVERTS the IGauge.withdraw call.
+         - If revert propagates up, liquidation fails.
+         - But _claimAndSendRewardsBestEffort uses try/catch, then the withdraw DOES revert.
+         - This blocks liquidation of an undercollateralized position.
+      This is the real attack: owner directly calls compoundRewards to griefing liquidators.
+    solidity: |
+      // Invariant: vault.liquidate() must ALWAYS succeed for an undercollateralized position,
+      // regardless of whether compoundRewards() is being called concurrently.
+      // In single-threaded EVM: compoundRewards mid-execution state is only visible within same tx.
+      // ACTUALLY: in EVM, each external call is atomic per transaction. Two separate transactions
+      // cannot interleave at the instruction level. So this concern is only valid within a single tx
+      // (reentrancy), which nonReentrant prevents. CONCLUSION: this is NOT exploitable in practice.
+      // The EVM executes one tx at a time. The mid-compound state (NFT in GaugeManager) is
+      // never visible to a concurrent liquidation tx. This is safe.
+      function invariant_liquidationNotBlockedByCompound() public view returns (bool) {
+          return true; // Not a real invariant — EVM atomicity makes this a non-issue.
+      }
+    validated: false
+    priority: low
+    confidence: 5
+    notes: >
+      FALSE POSITIVE. EVM transactions are atomic and sequential. The mid-compound state where NFT
+      is temporarily in GaugeManager (between gauge.withdraw and gauge.deposit) is never visible to
+      another transaction. nonReentrant also blocks same-tx reentrancy. Marking as false positive.
+
+  - id: GM-A-07
+    tier: 1
+    type: property
+    description: >
+      _requireVaultOrOwner() calls vault.ownerOf(tokenId) which returns tokenOwner[tokenId] from the
+      vault's storage. During vault.transform() execution, transformedTokenId is set to the tokenId
+      being transformed, but the ownership record (tokenOwner[tokenId]) is NOT changed — the original
+      owner is still the owner. So during a transform, _requireVaultOrOwner returns the original owner.
+      The concern: if a malicious transformer is executing inside vault.transform(), and inside that
+      execution it calls GaugeManager.compoundRewards() or claimRewards(), the vault IS msg.sender
+      (because vault.transform calls transformer.call(), and the transformer could call gaugeManager
+      directly as msg.sender == transformer, NOT vault). So the transformer can only pass _requireVaultOrOwner
+      if the transformer IS the vault or the transformer IS vault.ownerOf(tokenId).
+      If a transformerAllowList[transformer] is true, and that transformer calls GaugeManager directly,
+      it would fail _requireVaultOrOwner unless it's the owner. This is safe.
+      BUT: what if an allowed transformer IS the same address as a position owner? Unlikely by design.
+    attack_scenario: >
+      An allowed transformer contract happens to be the same address as vault.ownerOf(tokenId).
+      Inside the transform callback, the transformer (as msg.sender) calls GaugeManager.claimRewards()
+      with an arbitrary recipient. Since msg.sender == vault.ownerOf(tokenId), the check passes.
+      The transformer can redirect the position owner's AERO rewards to any address.
+      This requires: transformer contract address == position owner address, which is a design-level
+      control issue, not a code bug.
+    solidity: |
+      // Invariant: no allowed transformer can act as msg.sender to pass _requireVaultOrOwner()
+      // for a position they do not own.
+      // In practice: transformerAllowList entries are contracts, not user EOAs. Position owners
+      // are EOAs or contract wallets. The intersection should be empty.
+      function invariant_transformerCannotImpersonateOwner(uint256 tokenId, address transformer) public view returns (bool) {
+          if (!vault.transformerAllowList(transformer)) return true;
+          // If transformer is in allowlist, it should NOT equal vault.ownerOf(tokenId)
+          // for any active position.
+          return transformer != vault.ownerOf(tokenId);
+      }
+    validated: true
+    priority: low
+    confidence: 20
+    notes: >
+      This is a theoretical composability concern. In practice, transformers are protocol-deployed
+      contracts (AutoRangeAndCompound, LeverageTransformer, etc.) and are never the same address
+      as a position owner. Marking as low priority / informational.
+
+  - id: GM-A-08
+    tier: 1
+    type: property
+    description: >
+      setGauge() validates that pool.gauge() == gauge address via a staticcall, but does NOT validate
+      that the gauge contract is a legitimate Aerodrome CLGauge. Any contract that implements a gauge()
+      function returning a specific address could be used as the `pool` argument. The real concern is
+      whether a malicious or misconfigured gauge could be registered. Once registered, that gauge receives
+      NFT custody (via IGauge.deposit) and can refuse to return it (IGauge.withdraw could revert).
+      If the gauge is malicious and IGauge.withdraw reverts, _unstakePosition reverts, which would
+      block vault liquidation and unstaking. The try/catch in _claimAndSendRewardsBestEffort does NOT
+      protect the withdraw() call — only the getReward() call is wrapped in try/catch.
+    attack_scenario: >
+      1. Owner registers a malicious gauge via setGauge(pool, maliciousGauge).
+         - The pool must return maliciousGauge when pool.gauge() is called.
+      2. A position is staked into this gauge.
+      3. When vault tries to unstakePosition (e.g., during liquidation), IGauge(maliciousGauge).withdraw(tokenId)
+         reverts (gauge refuses to return the NFT).
+      4. Liquidation is permanently blocked for that position.
+      5. The position can accumulate bad debt without being liquidatable.
+      SEVERITY: The owner (trusted admin) controls setGauge, so this requires admin compromise or malice.
+      If this is an externally-controlled protocol, admin malice is an excluded scenario. But it's worth
+      noting because the impact is severe (permanent position lock).
+    solidity: |
+      // Invariant: for all staked positions, IGauge(tokenIdToGauge[tokenId]).withdraw(tokenId) must succeed.
+      // Cannot test this without calling the gauge, but can verify the gauge is a known-good address.
+      function invariant_stakedGaugeMustBeWithdrawable(uint256 tokenId) public view returns (bool) {
+          address gauge = gaugeManager.tokenIdToGauge(tokenId);
+          if (gauge == address(0)) return true;
+          // Verify gauge is in the approved poolToGauge mapping (was set by owner via setGauge)
+          // This is already true by construction since only setGauge can add to poolToGauge.
+          // The real invariant: gauge must never revert on withdraw() for a deposited tokenId.
+          // Testable only via fork with real gauges.
+          return true; // trivially true with real gauges; depends on gauge integrity
+      }
+    validated: true
+    priority: medium
+    confidence: 45
+    notes: >
+      Admin-controlled gauge registration with admin-malice as requirement. Confidence is moderate
+      because the impact (stuck positions, blocked liquidation) is HIGH but the trigger (admin malice
+      or owner key compromise + fake gauge setup) requires elevated access. Worth noting in the report
+      as an admin trust risk. The withdraw() call has no try/catch protection unlike getReward().
+
+false_positives:
+  - id: FP-01
+    description: "onERC721Received zero-address bypass is unreachable in practice"
+    reason: >
+      When tokenIdToGauge[tokenId] == address(0), the check becomes `from != address(0)`.
+      Since the zero address cannot own or transfer ERC721 tokens, no real call can produce from == address(0).
+      The safeTransferFrom in NPM always sets from = actual previous owner. This is safe by EVM invariant.
+    maps_to: GM-A-02 (marked low confidence and validated: true for this reason)
+
+  - id: FP-02
+    description: "Mid-compound gauge.withdraw state visible to concurrent liquidation"
+    reason: >
+      EVM executes transactions sequentially and atomically. The state where the NFT is in GaugeManager
+      (between gauge.withdraw and gauge.deposit) is never visible to another pending transaction.
+      The nonReentrant guard also blocks same-tx re-entry. This is not exploitable.
+    maps_to: GM-A-06 (marked validated: false, confidence: 5)
+
+  - id: FP-03
+    description: "compoundRewards caller is owner, health check bypassed — liquidity should only increase"
+    reason: >
+      The compound operation converts AERO rewards into position liquidity, which INCREASES collateral value.
+      Under normal market conditions (no extreme sandwich), the position value after compound >= before.
+      The case where a sandwich attack forces addLiquidity to add near-zero liquidity (due to 0 min amounts)
+      IS a real concern (see GM-A-03) but requires active MEV attack against a specific position.
+      Under normal conditions this is by design — owner compounding is a positive action.
+    maps_to: GM-A-03 (kept as medium confidence 65% because sandwich + 0 slippage protection is real)

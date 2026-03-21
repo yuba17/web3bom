@@ -1,0 +1,513 @@
+component: V3Oracle
+hunter: OracleHunter
+timestamp: "2026-03-21"
+focus: "Oracle price manipulation, TWAP window attacks, Chainlink staleness edge cases, mode-switch during liquidation, maxPoolPriceDifference griefing, dual-oracle bypass, _getFeeGrowthOutside ABI length, decimal misconfiguration, cachedChainlinkReferencePriceX96 stale cache"
+
+# ─── ANALYSIS NOTES ────────────────────────────────────────────────────────────
+#
+# KEY FINDINGS SUMMARY:
+#
+# 1. TWAP MANIPULATION (twapSeconds): The oracle accepts twapSeconds as a
+#    per-token config set by the owner. If twapSeconds is set to a SHORT value
+#    (e.g. 60s or even 0), the price is trivially manipulable within one block
+#    (0 = spot price!). There is NO minimum enforcement in setTokenConfig().
+#    An owner misconfiguration or a compromised owner → TWAP is useless.
+#    Additionally, twapSeconds=0 explicitly uses the CURRENT slot0 price (line
+#    444-445), meaning it is 100% manipulable by any large swap in the same block.
+#
+# 2. CHAINLINK STALENESS BOUNDARY: Line 420:
+#      if (updatedAt + feedConfig.maxFeedAge < block.timestamp || answer <= 0)
+#    If updatedAt = type(uint256).max and maxFeedAge > 0, the addition wraps
+#    around in Solidity 0.8+ (reverts with overflow). However the real edge case
+#    is the BOUNDARY: when updatedAt + maxFeedAge == block.timestamp exactly, the
+#    condition is FALSE — the feed is accepted as fresh when it is EXACTLY at the
+#    expiry boundary. This is a ±1s off-by-one. Severity: Low.
+#    The overflow scenario (updatedAt = MAX_UINT): Solidity 0.8 will REVERT the
+#    staleness check, making Chainlink-based prices permanently inaccessible.
+#    If a malicious/buggy Chainlink feed returns updatedAt=MAX_UINT, the oracle
+#    reverts on every call — DoS on all prices using that feed.
+#
+# 3. MODE SWITCHING DURING PENDING LIQUIDATION: setOracleMode() can be called
+#    by emergencyAdmin at any time with no delay. If a position is underwater and
+#    a liquidation tx is in the mempool, emergencyAdmin (or an attacker who
+#    compromised emergencyAdmin) can front-run the liquidation by switching the
+#    oracle mode for a collateral token from CHAINLINK_TWAP_VERIFY (which is
+#    accurate) to TWAP (which uses the manipulable pool price). If the TWAP pool
+#    is then manipulated to show a higher collateral value, the position appears
+#    healthy and the liquidation reverts. This is a governance/trust boundary
+#    attack, but emergencyAdmin is NOT necessarily the same as owner.
+#
+# 4. maxPoolPriceDifference GRIEFING (CRITICAL - Tier 1):
+#    _populatePrices() at line 529 calls:
+#      _requireMaxDifference(priceX96, derivedPoolPriceX96, maxPoolPriceDifference)
+#    where priceX96 is the CURRENT pool slot0 price and derivedPoolPriceX96 is
+#    derived from oracle prices. If an attacker moves the POOL's spot price away
+#    from the oracle-derived price by more than maxPoolPriceDifference, ALL calls
+#    to getValue() revert. This blocks:
+#      - liquidation() in V3Vault (calls oracle.getValue())
+#      - borrow health checks
+#      - any collateral valuation
+#    The attacker can prevent liquidation of an underwater position by performing
+#    a large swap in the Uniswap pool (of the COLLATERAL tokens, not the lending
+#    asset pool). This is profitable if the attacker is the borrower AND their
+#    position is about to be liquidated: cost of manipulating pool < liquidation
+#    penalty saved.
+#    Note: the check uses the COLLATERAL POSITION's pool (from _loadPositionState,
+#    which calls pool.slot0 directly), not the oracle's reference pool.
+#
+# 5. DUAL-ORACLE BYPASS - TWAP_CHAINLINK_VERIFY borrower weaponization (Tier 1):
+#    In TWAP_CHAINLINK_VERIFY mode, TWAP is the primary price and Chainlink is
+#    the verify price. _requireMaxDifference() reverts if the gap > maxDifference.
+#    A borrower CAN manipulate the Uniswap TWAP pool of a collateral token OVER
+#    TIME (across multiple blocks) so that TWAP > real price. This inflates the
+#    reported collateral value. The Chainlink verify price will eventually diverge
+#    from the manipulated TWAP, causing _requireMaxDifference() to REVERT.
+#    This means: the oracle reverts when called → getValue() reverts → liquidation
+#    is blocked. Simultaneously, if the borrower can keep the TWAP-vs-Chainlink
+#    gap JUST BELOW maxDifference during the borrow phase (when borrowing against
+#    inflated collateral), then widen it after → the position is unliquidatable.
+#    This is a 2-step attack: (a) slowly pump TWAP, borrow at inflated value,
+#    (b) widen gap further to block liquidation.
+#
+# 6. _getFeeGrowthOutside UNEXPECTED ABI LENGTH (Tier 2):
+#    Line 648-666: the function staticcalls pool.ticks(tick) and expects either
+#    256 bytes (Uniswap v3) or 320 bytes (Aerodrome Slipstream). Any other length
+#    causes a revert with InvalidPool().
+#    Risk: if a future Uniswap v3 fork or Aerodrome upgrade adds/removes a field
+#    from ticks(), all positions in that pool permanently fail getValue(). This
+#    is a availability/liveness risk rather than a fund-loss risk at protocol
+#    level. However, it could block liquidation for positions using such pools.
+#    Current exploitability: LOW unless a pool is configured that returns a
+#    different ticks() ABI (e.g. a custom/malicious pool passed in via position).
+#
+# 7. DECIMAL MISCONFIGURATION — price0X96/price1X96 distortion:
+#    In _getReferenceTokenPriceX96 (lines 355-363), decimal adjustment uses
+#    feedConfig.tokenDecimals vs referenceTokenDecimals. If tokenDecimals is
+#    WRONG in the config (e.g. configured as 18 but real token is 6), the price
+#    is off by 10^12. setTokenConfig() reads decimals on-chain (line 257:
+#    IERC20Metadata(token).decimals()), so this cannot be misconfigured for
+#    standard ERC20s. However, feedDecimals is read from feed.decimals() (line
+#    256). If a Chainlink feed is configured for the wrong pair (e.g. WBTC/ETH
+#    instead of WBTC/USD), feedDecimals is correct but the price semantics are
+#    wrong. This is an admin configuration error, not a code bug.
+#    The real vulnerability: if a token has decimals() that returns a different
+#    value than the actual on-chain precision (non-standard ERC20), the math is
+#    wrong. But this is a token-level issue.
+#    MORE INTERESTING: TWAP price in _getTWAPPriceX96 (line 435):
+#      poolTWAPPriceX96 = Q96 * Q96 / priceX96
+#    If priceX96 is near 0 (extremely cheap token), this could be astronomically
+#    large, but FullMath handles 512-bit intermediate values so no overflow.
+#    If priceX96 overflows uint256... priceX96 = mulDiv(sqrtP, sqrtP, Q96).
+#    sqrtPriceX96 max is TickMath.MAX_SQRT_RATIO ≈ 2^128, so priceX96 max is
+#    2^256/Q96 ≈ 2^160. Within uint256. No overflow.
+#
+# 8. cachedChainlinkReferencePriceX96 STALE WITHIN A CALL:
+#    In _populatePrices() (lines 516-519), cachedChainlinkReferencePriceX96 is
+#    fetched once when pricing token0 and reused for token1. This is correct IF
+#    token0 uses Chainlink (so the cache is populated). BUT: if token0 is the
+#    referenceToken itself, _getReferenceTokenPriceX96 returns (Q96, 0) — the
+#    cache remains 0. Then when pricing token1, cachedChainlinkReferencePriceX96
+#    is still 0, so token1's Chainlink path fetches the referenceToken price
+#    fresh. This is CORRECT behavior but causes 2 Chainlink calls instead of 1.
+#    The stale cache scenario: in getTokenValue() (lines 152-154), if tokenIn
+#    is NOT referenceToken and does NOT use Chainlink (mode=TWAP), the cache
+#    remains 0. Then tokenOut's Chainlink path fetches referenceToken price
+#    again — two independent calls at potentially different block timestamps.
+#    In a multi-block scenario this is fine, but within a single transaction on
+#    a chain where Chainlink can return different answers per call (e.g., if a
+#    round update happens mid-execution), the two prices could differ.
+#    HOWEVER: in a single EVM transaction, block.timestamp is fixed, and
+#    Chainlink is deterministic within a block. So this is NOT exploitable in
+#    normal conditions. Only if Chainlink feed can return non-deterministic
+#    results within a block — not possible with standard Chainlink.
+#    VERDICT: Not exploitable. Document as informational.
+#
+# ─── CRITICAL PATHS ──────────────────────────────────────────────────────────
+# Most dangerous path: VO-O-04 (pool spot price manipulation → block liquidation)
+# This is the most actionable attack because:
+#   - No governance/admin cooperation needed
+#   - Attacker is the borrower, who has economic incentive
+#   - Cost is only the swap fee + slippage for moving pool price
+#   - Benefit is avoiding liquidation penalty (2-10% of position value)
+#   - The pool being manipulated is the COLLATERAL token pool (token0/token1 of
+#     the Uniswap NFT position), NOT the lending asset pool
+# ─────────────────────────────────────────────────────────────────────────────
+
+hypotheses:
+  - id: VO-O-01
+    tier: 2
+    type: property
+    description: >
+      twapSeconds=0 in TokenConfig causes _getReferencePoolPriceX96() (line 444)
+      to use the CURRENT pool slot0 price instead of a TWAP. There is NO minimum
+      twapSeconds enforcement in setTokenConfig(). If an owner (or a governance
+      attack) sets twapSeconds=0 for a token in TWAP or CHAINLINK_TWAP_VERIFY
+      mode, the TWAP price becomes the live spot price, trivially manipulable
+      within a single block via a large swap. The vulnerability is that the oracle
+      silently degrades to a spot oracle with ZERO manipulation resistance.
+    attack_scenario: >
+      Owner (malicious or compromised) calls setTokenConfig(WBTC, ..., twapSeconds=0,
+      mode=TWAP_CHAINLINK_VERIFY, ...). Attacker (who controls WBTC/USDC pool
+      liquidity) front-runs a victim's borrow: (1) flashloan large WBTC, (2) swap
+      into WBTC/USDC pool to inflate WBTC/USDC spot price, (3) victim's borrow
+      call uses inflated WBTC price as collateral value → victim can borrow more
+      than truly collateralized, (4) attacker unwinds in same block. With
+      TWAP_CHAINLINK_VERIFY, Chainlink verify could catch this IF maxDifference
+      is tight. But if twapSeconds=0 AND mode=TWAP (no verify), attack is clean.
+    solidity: |
+      // Invariant: twapSeconds must be non-zero for any mode that uses TWAP
+      // In Chimera Properties.sol:
+      function invariant_twapSeconds_nonzero_when_twap_used() public view returns (bool) {
+          // For each configured token, if mode uses TWAP, twapSeconds must be > 0
+          // (Cannot enumerate all tokens from Properties — use ghost tracking)
+          // Ghost: track all configured tokens via handler
+          for (uint256 i = 0; i < configuredTokens.length; i++) {
+              address token = configuredTokens[i];
+              (IV3Oracle.TokenConfig memory cfg) = oracle.feedConfigs(token);
+              IV3Oracle.Mode mode = cfg.mode;
+              bool usesTWAP = (mode == IV3Oracle.Mode.CHAINLINK_TWAP_VERIFY ||
+                               mode == IV3Oracle.Mode.TWAP_CHAINLINK_VERIFY ||
+                               mode == IV3Oracle.Mode.TWAP);
+              if (usesTWAP) {
+                  t(cfg.twapSeconds > 0, "twapSeconds must be > 0 when TWAP is used");
+              }
+          }
+          return true;
+      }
+
+  - id: VO-O-02
+    tier: 2
+    type: property
+    description: >
+      Chainlink staleness check at line 420:
+        if (updatedAt + feedConfig.maxFeedAge < block.timestamp || answer <= 0)
+      contains an off-by-one: when updatedAt + maxFeedAge == block.timestamp
+      exactly, the condition evaluates to FALSE and the stale feed is ACCEPTED
+      as fresh. The feed is exactly at its expiry boundary but passes the check.
+      Additionally, if a Chainlink feed returns updatedAt = type(uint256).max,
+      Solidity 0.8 checked arithmetic causes the addition to REVERT with overflow,
+      making all prices dependent on that feed permanently inaccessible (DoS).
+      The overflow DoS is more severe: it requires a malicious/buggy feed but
+      results in a permanent oracle halt for all tokens using that feed.
+    attack_scenario: >
+      Overflow DoS: A Chainlink feed (whether legitimately broken or configured
+      to a malicious aggregator) returns updatedAt = type(uint256).max. Every
+      call to _getChainlinkPriceX96() reverts. Any token configured with
+      CHAINLINK, CHAINLINK_TWAP_VERIFY, or TWAP_CHAINLINK_VERIFY mode becomes
+      unpriceable. getValue() reverts → all liquidations blocked → bad debt
+      accumulates. Off-by-one: adversary times a borrow or collateral withdrawal
+      to the exact block where updatedAt + maxFeedAge == block.timestamp, getting
+      slightly stale price data accepted.
+    solidity: |
+      // Invariant: staleness check must reject feeds at or past their age limit
+      function invariant_chainlink_staleness_strict() public view returns (bool) {
+          // After calling _getChainlinkPriceX96 succeeds, the returned price
+          // must have been from a round where updatedAt + maxFeedAge > block.timestamp
+          // Test: mock a feed with updatedAt = block.timestamp - maxFeedAge
+          // and assert oracle reverts (currently it does NOT revert — off-by-one)
+          uint256 updatedAt = block.timestamp - uint256(maxFeedAge);
+          // Expected: revert. Actual: passes (< check fails, == is not caught)
+          // The correct check should be: updatedAt + maxFeedAge <= block.timestamp
+          t(false, "staleness check accepts feed exactly at expiry boundary");
+          return true;
+      }
+
+  - id: VO-O-03
+    tier: 2
+    type: property
+    description: >
+      setOracleMode() (lines 292-303) can be called by emergencyAdmin WITHOUT
+      any timelock or delay. This function changes the pricing mode for any
+      token (e.g., from CHAINLINK_TWAP_VERIFY to TWAP). There is no event
+      listening or delay mechanism. A compromised emergencyAdmin can front-run
+      a pending liquidation transaction: (1) switch token mode to TWAP, (2)
+      manipulate the TWAP pool to inflate collateral value, (3) liquidation tx
+      reverts because position appears healthy. The attack requires emergencyAdmin
+      compromise, but emergencyAdmin is a SEPARATE address from owner (line 73),
+      with weaker security guarantees. The critical window is any time a position
+      is underwater: the oracle mode switch is atomic, reversible, and leaves no
+      on-chain trace if switched back after liquidation is blocked.
+    attack_scenario: >
+      Borrower has an underwater position using token X as collateral.
+      Liquidation tx is in the mempool. Borrower (or accomplice with emergencyAdmin
+      key) calls setOracleMode(tokenX, Mode.TWAP) to switch to unverified TWAP.
+      Borrower then swaps in the TWAP reference pool for tokenX to push TWAP price
+      up. Liquidation call checks collateral value → getValue() returns inflated
+      value → position appears healthy → liquidation reverts. Bad debt is avoided
+      by borrower. emergencyAdmin is then switched back to CHAINLINK_TWAP_VERIFY
+      by owner if needed (to obscure the manipulation).
+    solidity: |
+      // Invariant: oracle mode changes should not cause previously-unhealthy
+      // positions to appear healthy (i.e., mode switch must not rescue bad debt)
+      function invariant_mode_switch_cannot_rescue_bad_debt() public view returns (bool) {
+          // Ghost: track positions that were liquidatable before mode switch
+          for (uint256 i = 0; i < trackedTokenIds.length; i++) {
+              uint256 tokenId = trackedTokenIds[i];
+              bool wasLiquidatable = positionLiquidatableSnapshot[tokenId];
+              if (wasLiquidatable) {
+                  // After any mode switch, position must still be liquidatable
+                  // (or oracle must revert, which also blocks liquidation — also bad)
+                  try oracle.getValue(tokenId, asset, false) returns (uint256 value, ...) {
+                      // If oracle succeeds after mode switch, check if still liquidatable
+                      t(isLiquidatable(tokenId, value), "mode switch rescued bad debt position");
+                  } catch {
+                      // Oracle reverts — liquidation is blocked — also a violation
+                      t(false, "oracle revert after mode switch blocks liquidation of bad debt");
+                  }
+              }
+          }
+          return true;
+      }
+
+  - id: VO-O-04
+    tier: 1
+    type: property
+    description: >
+      CRITICAL. _populatePrices() at line 529 checks:
+        _requireMaxDifference(priceX96, derivedPoolPriceX96, maxPoolPriceDifference)
+      where priceX96 = current pool slot0 spot price of the COLLATERAL POSITION's
+      Uniswap pool (from _getPoolSlot0, line 511), and derivedPoolPriceX96 is
+      computed from the oracle prices of token0/token1. If an attacker moves the
+      pool's spot price (via a large swap) so that it deviates from the oracle-
+      derived price by more than maxPoolPriceDifference, EVERY call to getValue()
+      reverts with PriceDifferenceExceeded(). This blocks ALL liquidations that
+      involve positions in that pool. The attacker is typically the borrower
+      themselves, who has economic incentive to avoid liquidation. The attack is
+      profitable when: cost_of_swap_manipulation < liquidation_penalty_saved.
+      For a 5% liquidation penalty on a $1M position ($50K at risk), the attacker
+      can afford significant pool manipulation costs. The comment in the code
+      itself (lines 523-524) acknowledges this: "when a pool is in this state,
+      liquidations will be disabled" — but assumes arbitrageurs will restore
+      price. This assumption FAILS when: (a) the attacker can afford to maintain
+      the manipulation longer than arbitrageurs can respond, or (b) the pool has
+      low external liquidity, making manipulation cheap.
+    attack_scenario: >
+      Step 1: Attacker has a large underwater position using WBTC/USDC Uniswap
+      NFT as collateral. Position debt > collateral value, liquidation imminent.
+      Step 2: Attacker flashloans a large amount of USDC, swaps into the WBTC/USDC
+      pool (the same pool as the collateral NFT), moving the spot price of WBTC
+      by more than maxPoolPriceDifference (e.g., 2% on a 200bps threshold).
+      Step 3: Liquidator calls vault.liquidate(tokenId). Vault calls oracle.getValue().
+      oracle._populatePrices() computes derivedPoolPriceX96 from Chainlink WBTC
+      and USDC prices, then reads pool.slot0() → manipulated spot. The difference
+      exceeds maxPoolPriceDifference → revert PriceDifferenceExceeded().
+      Step 4: Liquidation fails. Attacker unwinds the swap (loses only swap fees).
+      Net result: attacker pays ~0.05-0.3% in pool fees to avoid 2-10% liquidation
+      penalty. FOR DEEP POOLS (e.g. ETH/USDC 0.05%), the cost of moving price 2%
+      may be prohibitively high. FOR THIN POOLS (long-tail assets), extremely cheap.
+    solidity: |
+      // Invariant: if a position is underwater (debt > collateral), liquidation
+      // must be callable (oracle must not revert) regardless of pool spot price
+      // This is the core invariant — its violation IS the attack.
+      function invariant_underwater_positions_are_always_liquidatable() public returns (bool) {
+          for (uint256 i = 0; i < trackedTokenIds.length; i++) {
+              uint256 tokenId = trackedTokenIds[i];
+              uint256 debtShares = vault.loans(tokenId);
+              if (debtShares == 0) continue;
+              // Check if debt exceeds collateral (using cached safe price)
+              bool isUnderwater = _isUnderwater(tokenId);
+              if (isUnderwater) {
+                  // Oracle MUST succeed for liquidation to work
+                  try oracle.getValue(tokenId, vault.asset(), false) returns (
+                      uint256 value, uint256, uint256, uint256
+                  ) {
+                      // If oracle succeeds, check that vault confirms liquidatable
+                      t(vault.isLiquidatable(tokenId), "underwater position not liquidatable despite valid oracle");
+                  } catch {
+                      // Oracle REVERTED — liquidation is blocked — CRITICAL VIOLATION
+                      t(false, "oracle reverted for underwater position — liquidation blocked by pool price manipulation");
+                  }
+              }
+          }
+          return true;
+      }
+
+  - id: VO-O-05
+    tier: 1
+    type: property
+    description: >
+      TWAP_CHAINLINK_VERIFY mode dual-oracle weaponization by borrower.
+      In TWAP_CHAINLINK_VERIFY mode, the primary price is the TWAP and Chainlink
+      is the verify price. _requireMaxDifference() reverts if
+      |TWAP - Chainlink| > maxDifference (line 382). A borrower can exploit this
+      in two phases:
+      Phase A (inflation): Slowly manipulate the TWAP reference pool across
+      multiple blocks to make TWAP > true price, keeping the divergence JUST
+      below maxDifference. During this window, borrow against the inflated
+      collateral value.
+      Phase B (liquidation block): Widen the TWAP/Chainlink gap ABOVE maxDifference.
+      Now every call to getValue() for that token reverts. The underwater position
+      becomes unliquidatable. The attacker has borrowed more than collateral is
+      worth, and the position cannot be liquidated.
+      This is distinct from VO-O-04: the manipulation is on the ORACLE reference
+      pool (the pool used for TWAP pricing), not the collateral position's pool.
+      The oracle reference pool may have different liquidity characteristics.
+    attack_scenario: >
+      Token X is priced in TWAP_CHAINLINK_VERIFY mode. Reference pool is X/USDC
+      (same as the collateral position pool or a separate pool).
+      Day 1-3: Attacker slowly buys X in the TWAP pool across many blocks,
+      pushing 1-hour TWAP from $100 to $105 (5% above Chainlink price of $100).
+      If maxDifference = 500 (5%), TWAP is just at the edge.
+      Day 3: Attacker uses inflated $105 oracle price to borrow against an NFT
+      position. Borrows 5% more than they should be able to.
+      Day 4: Attacker makes one large swap in the TWAP pool, pushing TWAP to
+      $112 (12% above Chainlink). Now |TWAP - Chainlink| = 12% > maxDifference=5%.
+      getValue() reverts for all positions containing token X → vault cannot
+      liquidate the attacker's underwater position. Attacker walks away with
+      excess borrowed funds.
+    solidity: |
+      // Invariant: in TWAP_CHAINLINK_VERIFY mode, the oracle must not be
+      // permanently blocking while a position is underwater
+      function invariant_twap_chainlink_verify_cannot_block_liquidation() public returns (bool) {
+          // If any token in TWAP_CHAINLINK_VERIFY mode has TWAP deviated from
+          // Chainlink by more than maxDifference, and there are underwater positions
+          // containing that token, this is a critical violation.
+          for (uint256 i = 0; i < configuredTokens.length; i++) {
+              address token = configuredTokens[i];
+              TokenConfig memory cfg = oracle.feedConfigs(token);
+              if (cfg.mode != IV3Oracle.Mode.TWAP_CHAINLINK_VERIFY) continue;
+              // Attempt to get price — if it reverts, check if any position is underwater
+              bool oracleReverts = false;
+              try oracle.getTokenValue(token, 1e18, referenceToken) {} catch {
+                  oracleReverts = true;
+              }
+              if (oracleReverts) {
+                  // Verify no underwater positions exist for this token
+                  t(!hasUnderwaterPositionWithToken(token),
+                    "TWAP/Chainlink divergence blocks liquidation of underwater position");
+              }
+          }
+          return true;
+      }
+
+  - id: VO-O-06
+    tier: 2
+    type: property
+    description: >
+      _getFeeGrowthOutside() (lines 642-667) uses staticcall on pool.ticks(tick)
+      and accepts ONLY two exact response lengths: 256 bytes (Uniswap v3 standard,
+      8 return values) or 320 bytes (Aerodrome Slipstream, 10 return values). Any
+      other ABI response length causes InvalidPool() revert. This creates a liveness
+      risk: any Uniswap v3 fork or future pool upgrade that adds/removes a field
+      from ticks() will cause every position in that pool to fail getValue() and
+      getLiquidityAndFees() permanently. The fee calculation path (_getFees) calls
+      this function, and when it fails, the entire getValue() reverts. This blocks
+      liquidation for ALL positions in the affected pool. For current deployments
+      on Base (Aerodrome Slipstream) and mainnet (Uniswap v3), this is fine. But
+      the protocol aims for multi-chain support, and any integration of pools with
+      non-standard ticks() ABI creates a liquidation DoS for all positions therein.
+    attack_scenario: >
+      A pool factory supported by the oracle (Aerodrome or Uniswap fork) upgrades
+      its tick structure to add a new field. All pools deployed by the new factory
+      return 352-byte responses from ticks(). Every call to getValue() for positions
+      in those pools hits the final revert InvalidPool() at line 666. Liquidations
+      for all such positions are permanently blocked until oracle is upgraded.
+      Alternatively: a malicious pool is somehow passed as a reference pool during
+      setTokenConfig() that returns unexpected ABI from ticks(). However,
+      setTokenConfig() validates that the pool has the right token pair (line 269),
+      providing some protection.
+    solidity: |
+      // Invariant: _getFeeGrowthOutside must not revert for any pool that is
+      // registered as a reference pool in TokenConfig
+      function invariant_fee_growth_outside_never_reverts_for_configured_pools() public view returns (bool) {
+          for (uint256 i = 0; i < configuredPools.length; i++) {
+              IUniswapV3Pool pool = IUniswapV3Pool(configuredPools[i]);
+              int24 testTick = 0; // initialized tick
+              // getFeeGrowthOutside should succeed for any initialized tick in configured pool
+              (bool success,) = address(oracle).staticcall(
+                  abi.encodeWithSignature("_getFeeGrowthOutside(address,int24)", address(pool), testTick)
+              );
+              // Note: internal function, test via getValue indirectly
+              // If getValue reverts for a position in this pool, check if ticks() ABI is the cause
+              t(success, "getFeeGrowthOutside reverts for configured pool — liquidation DoS possible");
+          }
+          return true;
+      }
+
+  - id: VO-O-07
+    tier: 2
+    type: property
+    description: >
+      _getTWAPPriceX96() (lines 428-437) computes:
+        if (!isToken0): poolTWAPPriceX96 = Q96 * Q96 / priceX96
+      where priceX96 = mulDiv(sqrtPriceX96, sqrtPriceX96, Q96).
+      For a token with an extremely low price (very cheap relative to referenceToken),
+      priceX96 can approach 1 (when sqrtPriceX96 ≈ TickMath.MIN_SQRT_RATIO).
+      The division Q96 * Q96 / 1 = 2^192 which fits in uint256 (max ~1.15e77),
+      but the resulting price for the cheap token (isToken0=false case) would be
+      astronomically large — 2^192 — representing the referenceToken as nearly
+      worthless relative to the cheap token. This inversion compounds with decimal
+      scaling. In extreme tick values (near MIN_TICK), the TWAP price computed in
+      _getReferencePoolPriceX96 could cause a computed collateral value that is
+      wildly inaccurate when the token is at the edges of Uniswap's valid tick range.
+      More practically: if the pool is near TickMath.MIN_TICK (-887272), the
+      computed TWAP price for the non-referenceToken (isToken0=false) yields a
+      price that overvalues the collateral token massively.
+    attack_scenario: >
+      Attacker creates or finds a low-liquidity pool for token X (isToken0=false
+      relative to referenceToken). The pool is thinly traded and the current tick
+      is near MIN_TICK (token X is nearly worthless vs referenceToken). Because
+      _getTWAPPriceX96 computes Q96^2 / priceX96, when priceX96 is tiny, the
+      returned poolTWAPPriceX96 is enormous. If the oracle is in TWAP mode for X,
+      it reports X as extremely valuable. Attacker deposits X NFT as collateral,
+      borrows maximum against it, defaults. This requires either a misconfigured
+      oracle pool or the ability to manipulate a thin pool to MIN_TICK.
+    solidity: |
+      // Invariant: TWAP price must be bounded within realistic price ranges
+      // for any configured token
+      function invariant_twap_price_within_bounds() public view returns (bool) {
+          for (uint256 i = 0; i < configuredTokens.length; i++) {
+              address token = configuredTokens[i];
+              TokenConfig memory cfg = oracle.feedConfigs(token);
+              if (cfg.mode == IV3Oracle.Mode.CHAINLINK) continue;
+              // Price should be within [2^-64, 2^64] of referenceToken (rough sanity bound)
+              try oracle.getTokenValue(token, 1e18, referenceToken) returns (uint256 value) {
+                  // 1e18 tokens should be worth between 1e-6 and 1e30 referenceToken units
+                  t(value >= 1 && value <= type(uint128).max,
+                    "TWAP price outside realistic bounds — possible pool at extreme tick");
+              } catch {}
+          }
+          return true;
+      }
+
+  - id: VO-O-08
+    tier: 2
+    type: property
+    description: >
+      cachedChainlinkReferencePriceX96 caching in getValue() and getTokenValue().
+      In _populatePrices() (lines 516-519), cachedChainlinkReferencePriceX96 is
+      populated when token0 is priced and reused for token1. The cache is only
+      set when _getReferenceTokenPriceX96 returns a non-zero chainlinkReferencePriceX96,
+      which happens only when the token uses a Chainlink-based mode (usesChainlink=true).
+      If token0 uses TWAP-only mode, the cache stays 0, and token1 re-fetches the
+      Chainlink reference price independently. This is logically correct but creates
+      an asymmetry: token0 TWAP + token1 CHAINLINK_TWAP_VERIFY will call the
+      Chainlink reference feed TWICE. In a single block, both calls should return
+      the same value (Chainlink is deterministic per block). However, at a block
+      boundary (if the call spans two blocks — impossible in EVM), they could differ.
+      Actual risk: INFORMATIONAL. No exploit path found. Document for completeness.
+      The more interesting observation: if token0 == referenceToken, the first call
+      returns (Q96, 0), leaving cache=0. Token1's Chainlink path then fetches
+      referenceToken price fresh — this is CORRECT behavior. No bug here.
+    attack_scenario: >
+      No direct attack path found. The caching is correct: if the first token
+      does not use Chainlink, no cache is set, and the second token fetches fresh.
+      Within a single EVM transaction, Chainlink feeds are deterministic (same
+      block = same answer), so two independent calls return identical values.
+      The only theoretical scenario is if a Chainlink proxy contract is reentrancy-
+      susceptible and returns different values on recursive calls — not a Chainlink
+      design pattern and not applicable here (getValue is view).
+    solidity: |
+      // Invariant: getValue must be idempotent — calling twice in same block returns same result
+      function invariant_getValue_idempotent() public view returns (bool) {
+          if (trackedTokenIds.length == 0) return true;
+          uint256 tokenId = trackedTokenIds[0];
+          (uint256 v1, uint256 fv1, uint256 p0_1, uint256 p1_1) =
+              oracle.getValue(tokenId, referenceToken, false);
+          (uint256 v2, uint256 fv2, uint256 p0_2, uint256 p1_2) =
+              oracle.getValue(tokenId, referenceToken, false);
+          t(v1 == v2, "getValue not idempotent — cachedChainlinkReferencePriceX96 race");
+          t(p0_1 == p0_2, "price0X96 not idempotent");
+          t(p1_1 == p1_2, "price1X96 not idempotent");
+          return true;
+      }

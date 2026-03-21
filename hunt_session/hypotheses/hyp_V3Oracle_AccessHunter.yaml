@@ -1,0 +1,334 @@
+component: V3Oracle
+hunter: AccessHunter
+timestamp: "2026-03-21"
+focus: "Privilege escalation, emergencyAdmin abuse, owner misconfiguration vectors, sequencer bypass, referenceToken edge cases"
+
+hypotheses:
+
+  - id: VO-A-01
+    tier: 1
+    type: property
+    description: >
+      emergencyAdmin can switch ANY configured token (including the referenceToken's
+      indirect pricing chain) from a dual-oracle mode (CHAINLINK_TWAP_VERIFY /
+      TWAP_CHAINLINK_VERIFY) to TWAP-only mode with zero timelocks or on-chain delays.
+      This removes the Chainlink safety net entirely. A compromised or malicious
+      emergencyAdmin can make the oracle trivially manipulable via flash-loan-driven
+      TWAP manipulation, since twapSeconds config is whatever was set by owner and
+      emergencyAdmin cannot change it — but switching to TWAP alone removes the
+      cross-check. There is NO restriction on which tokens emergencyAdmin can affect.
+    attack_scenario: >
+      1. emergencyAdmin (any EOA set by owner) calls setOracleMode(WETH, Mode.TWAP).
+      2. WETH is now priced exclusively from the Uniswap TWAP pool.
+      3. Attacker flash-loans massive WETH, manipulates the pool price over twapSeconds
+         (feasible if twapSeconds is short — owner could have set it to 60s or even 0s
+         which uses spot price, not TWAP at all since _getReferencePoolPriceX96 uses
+         pool.slot0 when twapSeconds == 0).
+      4. Inflated collateral value allows attacker to borrow more than collateral is worth
+         from V3Vault, draining the lending pool.
+      5. emergencyAdmin is NOT the owner — it can be a separate hot wallet that is
+         cheaper to compromise. No multisig requirement is enforced by the contract.
+    severity: High
+    solidity: |
+      // Property: emergencyAdmin should NOT be able to downgrade from dual-oracle to single-oracle
+      function property_emergencyAdmin_cannot_downgrade_to_single_oracle(address token, V3Oracle.Mode mode) public {
+          // If current mode requires both oracles, emergencyAdmin cannot switch to single
+          V3Oracle.TokenConfig memory cfg = oracle.feedConfigs(token);
+          bool isDual = cfg.mode == V3Oracle.Mode.CHAINLINK_TWAP_VERIFY ||
+                        cfg.mode == V3Oracle.Mode.TWAP_CHAINLINK_VERIFY;
+
+          vm.prank(emergencyAdmin);
+          try oracle.setOracleMode(token, mode) {
+              // If this succeeds and the new mode is single-oracle, that's the bug
+              V3Oracle.TokenConfig memory newCfg = oracle.feedConfigs(token);
+              bool isNowSingle = newCfg.mode == V3Oracle.Mode.TWAP || newCfg.mode == V3Oracle.Mode.CHAINLINK;
+              if (isDual && isNowSingle) {
+                  // BUG: emergencyAdmin downgraded safety from dual to single oracle
+                  t(false, "emergencyAdmin downgraded dual-oracle to single-oracle");
+              }
+          } catch {}
+      }
+
+  - id: VO-A-02
+    tier: 1
+    type: property
+    description: >
+      setOracleMode performs NO validation that the token is already configured
+      (feedConfigs[token].mode != NOT_SET) before writing to feedConfigs[token].mode.
+      The function sets feedConfigs[token].mode = mode unconditionally. This means
+      emergencyAdmin (or owner) can call setOracleMode on a token address that was
+      never configured via setTokenConfig, partially initializing its config struct
+      with a non-NOT_SET mode but with zeroed-out feed, pool, twapSeconds, etc.
+      Subsequently calling getValue() on a position containing that token will reach
+      _getReferenceTokenPriceX96 with a valid mode but zero/null feed, causing an
+      unexpected execution path rather than a clean NotConfigured revert.
+    attack_scenario: >
+      1. Owner never calls setTokenConfig(MALICIOUS_TOKEN, ...).
+      2. emergencyAdmin calls setOracleMode(MALICIOUS_TOKEN, Mode.CHAINLINK).
+      3. feedConfigs[MALICIOUS_TOKEN].mode = CHAINLINK, but feed = address(0), maxFeedAge = 0, etc.
+      4. _getChainlinkPriceX96 is called with address(0) as feed → staticcall to address(0)
+         returns empty bytes → answer = 0 → triggers ChainlinkPriceError revert.
+      5. More dangerous: if mode is TWAP with pool = address(0), _getTWAPPriceX96 calls
+         pool.observe() on address(0), which succeeds as a staticcall returning 0s, producing
+         a zero TWAP price → priceX96 = 0 → getValue returns 0 value for the position,
+         effectively treating any position holding this token as worthless collateral,
+         enabling theft via liquidation of healthy positions.
+    severity: Medium
+    solidity: |
+      function property_setOracleMode_requires_existing_config(address token) public {
+          // Precondition: token not configured
+          V3Oracle.TokenConfig memory before = oracle.feedConfigs(token);
+          if (before.mode != V3Oracle.Mode.NOT_SET) return; // skip if already configured
+
+          vm.prank(emergencyAdmin);
+          try oracle.setOracleMode(token, V3Oracle.Mode.CHAINLINK) {
+              // If we reach here, an unconfigured token now has mode = CHAINLINK
+              // with feed = address(0). This is the bug state.
+              V3Oracle.TokenConfig memory after_ = oracle.feedConfigs(token);
+              t(after_.mode == V3Oracle.Mode.NOT_SET, "setOracleMode set mode on unconfigured token");
+          } catch {}
+      }
+
+  - id: VO-A-03
+    tier: 1
+    type: property
+    description: >
+      setMaxPoolPriceDifference(0) by owner makes every getValue() call revert via
+      _requireMaxDifference. The check is: differenceX10000 / verifyPriceX96 > 0
+      (which is true for any non-zero difference), AND maxDifferenceX10000 < type(uint16).max
+      (0 < 65535 = true). So setting maxPoolPriceDifference = 0 disables all oracle
+      calls. Conversely, setting it to type(uint16).max (65535) bypasses the check
+      entirely because the second condition (maxDifferenceX10000 < type(uint16).max)
+      becomes false. This means owner can either freeze ALL liquidations and borrowing
+      (DoS via 0) or remove ALL pool price manipulation protection (via 65535),
+      enabling flash-loan price manipulation attacks.
+    attack_scenario: >
+      Path A (DoS): Owner sets maxPoolPriceDifference = 0. Every getValue() call on any
+      tokenId reverts at _requireMaxDifference in _populatePrices. V3Vault cannot price
+      any collateral → liquidations impossible → protocol frozen. Any position can
+      accumulate unlimited bad debt until owner changes it back.
+
+      Path B (manipulation enablement): Owner sets maxPoolPriceDifference = 65535.
+      The condition `maxDifferenceX10000 < type(uint16).max` is false → check skipped
+      entirely. Attacker can manipulate the underlying Uniswap pool price to any value
+      and getValue() will still succeed, returning the manipulated price as valid.
+      Attacker borrows against inflated collateral value.
+    severity: Medium
+    solidity: |
+      function property_maxPoolPriceDifference_not_zero_or_max() public view {
+          uint16 diff = oracle.maxPoolPriceDifference();
+          t(diff > 0, "maxPoolPriceDifference is 0 — all oracle calls will revert");
+          t(diff < type(uint16).max, "maxPoolPriceDifference is max — manipulation check bypassed");
+      }
+
+  - id: VO-A-04
+    tier: 2
+    type: property
+    description: >
+      setSequencerUptimeFeed(address(0)) by owner silently disables the L2 sequencer
+      check. On Base/Optimism where the contract is deployed, this means the oracle
+      will happily return stale prices from Chainlink feeds that have not been updated
+      during sequencer downtime. The sequencerUptimeFeed can also be set to an
+      arbitrary address; if that address returns sequencerAnswer = 0 and startedAt > 0
+      and timeSinceUp > 600, it always appears "up" — a no-op. If it returns
+      sequencerAnswer = 0 but startedAt = block.timestamp (freshly recovered), the
+      grace period check would incorrectly pass if an attacker controls the oracle
+      address and returns favourable values. There is no validation that the feed
+      address implements AggregatorV3Interface correctly.
+    attack_scenario: >
+      1. Owner (or attacker who compromised owner) calls setSequencerUptimeFeed(address(0)).
+      2. Sequencer goes down on Base. Chainlink feeds stop updating.
+      3. Oracle continues returning stale prices (as long as updatedAt + maxFeedAge >= block.timestamp).
+      4. If maxFeedAge is generous (e.g., 86400 = 1 day), prices remain valid for 24h
+         post-sequencer failure, enabling arbitrage against stale prices while actual
+         market has moved significantly.
+    severity: Medium
+    solidity: |
+      function property_sequencerFeed_not_zero_on_l2() public view {
+          // On L2 deployments, sequencerUptimeFeed must not be address(0)
+          // This property should only be checked when chain is L2 (Base, Optimism)
+          address feed = oracle.sequencerUptimeFeed();
+          t(feed != address(0), "sequencerUptimeFeed is zero — L2 sequencer check bypassed");
+      }
+
+  - id: VO-A-05
+    tier: 2
+    type: property
+    description: >
+      setTokenConfig can be called by owner at any time with no timelock or position-
+      check guard. Specifically, owner can reduce twapSeconds (e.g., from 3600 to 0)
+      on a token that is actively used as collateral in V3Vault. twapSeconds = 0 causes
+      _getReferencePoolPriceX96 to use pool.slot0() (spot price) instead of TWAP.
+      Spot price is trivially manipulable in a single block via flash loans. Owner can
+      also reduce maxDifference to 0, causing all subsequent oracle calls to revert if
+      there's any spread between Chainlink and TWAP (DoS). Or increase maxDifference
+      to type(uint16).max (same as VO-A-03 bypass). No announcement period required.
+    attack_scenario: >
+      1. Attacker compromises owner key (or is the owner in a rug scenario).
+      2. Owner calls setTokenConfig(WBTC, feed, 3600, pool, 0, Mode.TWAP_CHAINLINK_VERIFY, 65535).
+         twapSeconds = 0 → spot price used. maxDifference = 65535 → cross-check disabled.
+      3. Same block: attacker flash-loans WBTC, manipulates pool spot price by 10x.
+      4. Oracle returns 10x WBTC price for that block. Attacker borrows 10x normal value.
+      5. Attacker repays flash loan and walks away with borrowed funds.
+    severity: Medium
+    solidity: |
+      function property_twapSeconds_minimum_for_active_tokens(address token) public view {
+          V3Oracle.TokenConfig memory cfg = oracle.feedConfigs(token);
+          if (cfg.mode == V3Oracle.Mode.NOT_SET) return;
+          bool usesTwap = cfg.mode == V3Oracle.Mode.CHAINLINK_TWAP_VERIFY
+                       || cfg.mode == V3Oracle.Mode.TWAP_CHAINLINK_VERIFY
+                       || cfg.mode == V3Oracle.Mode.TWAP;
+          if (usesTwap) {
+              // twapSeconds = 0 means spot price — manipulable in one block
+              t(cfg.twapSeconds >= 300, "twapSeconds < 5min — spot price manipulation possible");
+          }
+      }
+
+  - id: VO-A-06
+    tier: 2
+    type: property
+    description: >
+      setTokenConfig forces feedConfigs[referenceToken].mode = Mode.CHAINLINK
+      unconditionally (line 279), ignoring the mode parameter passed in. However,
+      setOracleMode(referenceToken, Mode.TWAP) called by emergencyAdmin will successfully
+      override this to TWAP. But _getReferenceTokenPriceX96 short-circuits at line 327:
+      `if (token == referenceToken) { return (Q96, cachedChainlinkReferencePriceX96); }`
+      — the referenceToken never goes through the mode dispatch at all. Its price is
+      always returned as Q96 (i.e., 1:1 with itself). So setOracleMode on referenceToken
+      changes feedConfigs[referenceToken].mode but that value is NEVER read in
+      _getReferenceTokenPriceX96. This is a dead write — emergencyAdmin spends gas but
+      achieves nothing, which could be confusing. However, _getChainlinkPriceX96 DOES
+      read feedConfigs[referenceToken].feed via the feedConfig struct, so the Chainlink
+      price of referenceToken (needed for denominaing all other token prices) is read
+      from feedConfigs[referenceToken] on every chainlink price calculation. Corrupting
+      feedConfigs[referenceToken] via setOracleMode is a no-op on the mode field but
+      leaves the feed/maxFeedAge intact — the real risk is setTokenConfig overwriting
+      feedConfigs[referenceToken] entirely, replacing the feed with a malicious one.
+    attack_scenario: >
+      Owner calls setTokenConfig(referenceToken, maliciousFeed, ...) replacing the
+      Chainlink feed for the reference token. All subsequent chainlink price calculations
+      for ALL tokens denominate against the malicious feed output. A malicious feed can
+      return any price, inflating or deflating every position's collateral value
+      simultaneously. This is an owner-level "nuclear option" that affects all positions.
+    severity: Low
+    notes: >
+      setOracleMode on referenceToken is a no-op for pricing (mode field unused) but
+      may confuse monitoring systems watching for mode change events. The real attack
+      surface is setTokenConfig on referenceToken, which is onlyOwner.
+    solidity: |
+      function property_referenceToken_mode_change_is_noop(address token) public {
+          if (token != oracle.referenceToken()) return;
+          // Changing mode on referenceToken has no effect on pricing
+          // because _getReferenceTokenPriceX96 returns Q96 before checking mode.
+          // Property: emergencyAdmin cannot actually change referenceToken pricing behavior.
+          V3Oracle.Mode before = oracle.feedConfigs(token).mode;
+          vm.prank(emergencyAdmin);
+          try oracle.setOracleMode(token, V3Oracle.Mode.TWAP) {} catch {}
+          // Even if mode changed, price returned must still be Q96
+          // (verified by external price call returning same value as pre-change)
+          t(true, "referenceToken mode change is no-op — informational");
+      }
+
+  - id: VO-A-07
+    tier: 1
+    type: property
+    description: >
+      setEmergencyAdmin has no zero-address check and no event-based timelock. Owner
+      can set emergencyAdmin = address(0) which effectively means: nobody can call
+      setOracleMode except owner (since msg.sender != address(0) always). This is a
+      silent downgrade of the emergency response capability — if oracle is deployed on
+      Base and sequencer goes down, the intended fast-path via emergencyAdmin to switch
+      tokens to a safer mode no longer exists without owner's multisig latency.
+      More critically, owner can set emergencyAdmin = owner(), giving the owner account
+      dual control — this is by design but worth noting as it removes the separation of
+      duties assumption. No validation prevents emergencyAdmin from being set to a
+      contract that calls back into the oracle (though setOracleMode is non-reentrant
+      in practice since it's a simple storage write).
+    attack_scenario: >
+      1. Owner (or attacker) calls setEmergencyAdmin(address(0)).
+      2. Actual emergency occurs (Chainlink feed goes stale, needs mode switch to TWAP).
+      3. No EOA can call setOracleMode without going through owner (multisig with 48h delay).
+      4. During the 48h window, oracle continues using stale Chainlink data.
+      5. Positions get mispriced → bad liquidations or bad debt accumulates.
+    severity: Low
+    solidity: |
+      function property_emergencyAdmin_not_zero() public view {
+          t(oracle.emergencyAdmin() != address(0), "emergencyAdmin is zero — emergency mode switch disabled");
+      }
+
+  - id: VO-A-08
+    tier: 1
+    type: property
+    description: >
+      Ownable2Step pendingOwner attack surface: when owner initiates a transfer via
+      transferOwnership(newOwner), the pendingOwner can accept at any time via
+      acceptOwnership(). There is a window between transferOwnership and
+      acceptOwnership where both old owner and new owner have elevated trust:
+      old owner can still call all onlyOwner functions, while pendingOwner can observe
+      the mempool and frontrun by calling acceptOwnership right before an old-owner
+      transaction (e.g., owner calling setTokenConfig to add a new token). Post-
+      acceptance, all pending owner transactions from old owner will fail with
+      Unauthorized. But more importantly, if owner calls setEmergencyAdmin(attacker)
+      and then tries to revoke it by calling transferOwnership and then revoking, there
+      is a race condition. The new owner (after accepting) inherits whatever
+      emergencyAdmin was last set, including a malicious one, and must explicitly call
+      setEmergencyAdmin again to fix it. This is an operational issue, not a direct
+      exploit, but in a compromise scenario the window matters.
+    attack_scenario: >
+      1. Legitimate owner calls transferOwnership(newOwner).
+      2. Old owner is compromised between transferOwnership and acceptOwnership.
+      3. Attacker (as old owner) calls setEmergencyAdmin(attacker_wallet) and
+         setSequencerUptimeFeed(address(0)) before acceptOwnership.
+      4. newOwner calls acceptOwnership, inheriting a poisoned oracle state.
+      5. Attacker can still call setOracleMode as emergencyAdmin, manipulating pricing.
+    severity: Low
+    solidity: |
+      function property_ownership_transfer_does_not_leave_poisoned_state() public view {
+          // After ownership transfer completes, critical params should be in safe state
+          // This is a monitoring/invariant property, not directly testable in unit test
+          // Real check: emergencyAdmin != any known attacker address
+          // Verify: sequencerUptimeFeed != address(0) (on L2)
+          t(oracle.emergencyAdmin() != address(0), "oracle admin state poisoned post-transfer");
+      }
+
+  - id: VO-A-09
+    tier: 2
+    type: property
+    description: >
+      When setTokenConfig is called on a token whose pool has referenceToken as token1
+      (isToken0 = false), the TWAP price is computed as Q96 * Q96 / priceX96. If
+      priceX96 from the pool is extremely small (close to 0, possible if pool is
+      at extreme ticks), this division produces a near-overflow result. Combined with
+      a mid-session setTokenConfig call (no timelock) that replaces a TWAP pool with
+      a thin/low-liquidity pool, an attacker can grief positions priced via that TWAP.
+      The pool validation in setTokenConfig only checks that one token is `token` and
+      the other is `referenceToken` — it does NOT check liquidity depth, pool age
+      (observe() history), fee tier, or whether the pool has ever been used. Owner can
+      replace a deep pool with a shallow one mid-session.
+    attack_scenario: >
+      1. Owner calls setTokenConfig(TOKEN_X, feed, age, thinPool, twapSeconds, mode, diff).
+      2. thinPool has TOKEN_X/referenceToken but near-zero liquidity.
+      3. Attacker moves thinPool price to extreme ticks in a single swap (cheap due to
+         thin liquidity). If twapSeconds is short, TWAP reflects this quickly.
+      4. Oracle returns manipulated price for TOKEN_X.
+      5. Attacker uses TOKEN_X position as collateral to borrow more than position value.
+    severity: Medium
+    solidity: |
+      function property_oracle_pool_has_sufficient_history(address token) public view {
+          V3Oracle.TokenConfig memory cfg = oracle.feedConfigs(token);
+          if (cfg.mode == V3Oracle.Mode.NOT_SET) return;
+          bool usesTwap = cfg.mode == V3Oracle.Mode.CHAINLINK_TWAP_VERIFY
+                       || cfg.mode == V3Oracle.Mode.TWAP_CHAINLINK_VERIFY
+                       || cfg.mode == V3Oracle.Mode.TWAP;
+          if (usesTwap && address(cfg.pool) != address(0) && cfg.twapSeconds > 0) {
+              // Pool must have observe() history >= twapSeconds
+              // If not, pool.observe() will revert with OLD, breaking all pricing
+              uint32[] memory secondsAgos = new uint32[](1);
+              secondsAgos[0] = cfg.twapSeconds;
+              try cfg.pool.observe(secondsAgos) returns (int56[] memory, uint160[] memory) {
+                  // OK
+              } catch {
+                  t(false, "TWAP pool lacks sufficient observe() history for twapSeconds");
+              }
+          }
+      }

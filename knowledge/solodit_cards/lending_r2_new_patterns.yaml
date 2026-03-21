@@ -1,0 +1,370 @@
+# New lending bug patterns from Solodit Round 2 (lending-026 through lending-033)
+# Derived from 716 audit findings, deduplicated against lending-001 through lending-025
+
+- id: lending-026
+  pattern: cross-chain-lending-state-desync
+  name: "Cross-chain lending: collateral/debt state desync between chains"
+  causa_raiz: >
+    Cross-chain lending protocols maintain collateral on one chain and debt on
+    another, synchronizing via messaging (LayerZero, etc.). The source chain
+    sends collateral value to the destination chain for borrow validation, but
+    does NOT include existing borrows from that collateral. This lets users
+    borrow against the same collateral on multiple chains simultaneously. Also:
+    cross-chain liquidation passes the wrong amount type (seize amount instead
+    of repay amount), decimal mismatches between chains are not normalized, and
+    debt tracking after cross-chain repayment uses incorrect array indices.
+  como_funciona: >
+    1. User deposits collateral on Chain A worth $10,000.
+    2. User calls borrowCrossChain() to borrow $8,000 on Chain B. Source chain sends raw collateral value, not net of existing borrows.
+    3. User calls borrowCrossChain() again to borrow $8,000 on Chain C. Same collateral supports both borrows.
+    4. Total debt: $16,000 against $10,000 collateral. Protocol is undercollateralized.
+    5. OR: cross-chain liquidation encodes seizeTokens (collateral amount) as repayment amount, causing debt to be under-repaid or over-repaid.
+    6. OR: token decimals differ between chains (USDC 6 on Ethereum, 18 on another), amounts are not normalized, user receives 1e12x more than intended.
+  invariante: "sum(borrows across ALL chains) <= collateralValue * maxLTV; cross-chain messages must normalize decimals"
+  que_mirar:
+    - "borrowCrossChain"
+    - "CrossChainRouter"
+    - "_handleBorrowCrossChainRequest"
+    - "seizeTokens vs repayAmount"
+    - "LayerZero"
+    - "lzSend"
+    - "crossChainCollaterals"
+    - "decimals normalization"
+  como_se_arregla: "Include existing cross-chain borrows when validating new borrow requests. Normalize token decimals at message boundaries. Use repayAmount (not seizeAmount) for debt reduction in cross-chain liquidation. Implement atomic cross-chain state locks."
+  trampas:
+    - "Message ordering is not guaranteed across chains -- race conditions are inherent"
+    - "Failed cross-chain messages can leave state permanently desynchronized"
+    - "Different token addresses on different chains may represent the same asset"
+  incidentes:
+    - "LEND -- Cross-chain borrow ignores existing debt in collateral validation (high, 20+ finders)"
+    - "LEND -- Cross-chain liquidation uses seize amount instead of repay amount (high, 15 finders)"
+    - "LEND -- Users lose funds due to token decimal mismatches across chains (high)"
+    - "LEND -- Malicious liquidator liquidates without providing collateral cross-chain (high, 18 finders)"
+    - "LEND -- Incorrect debt tracking in _updateRepaymentState (high, 14 finders)"
+    - "LEND -- Multiple cross-chain borrows using same collateral (high)"
+    - "Autonomint -- H-20: borrowing::liquidate() sends wrong liquidation index to destination chain (high)"
+    - "Autonomint -- H-37: treasury.updateYieldsFromLiquidatedLrts() updates yield on wrong chain (high)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, cross-chain, LayerZero, state-desync, double-borrow, decimals, liquidation]
+
+- id: lending-027
+  pattern: stablecoin-depeg-health-assumption
+  name: "Hardcoded stablecoin peg assumption in health factor / LTV checks"
+  causa_raiz: >
+    Lending protocols that issue or accept stablecoins often hardcode the
+    assumption that 1 stablecoin == $1 in their health factor, LTV, and
+    liquidation calculations. The debt side uses raw token amounts instead of
+    converting to USD via an oracle. When the stablecoin depegs (even slightly),
+    the unit mismatch between USD-valued collateral and token-denominated debt
+    causes incorrect health assessments: positions may appear healthy when
+    actually insolvent (depeg down) or be unfairly liquidated (depeg up).
+  como_funciona: >
+    1. Protocol values collateral in USD via oracle: collateralValueUSD = amount * oraclePrice.
+    2. Protocol values debt in raw token units assuming 1:1 peg: debtValueUSD = debtTokenAmount.
+    3. Health factor = collateralValueUSD * LTV / debtValueUSD (but debt is in token units, not USD).
+    4. Stablecoin depegs to $0.95. Real debt value is $0.95 per token.
+    5. Protocol still treats debt as $1 per token. Health factor is understated.
+    6. Positions that should be healthy get liquidated unfairly.
+    7. OR depeg to $1.05: debt is undervalued, positions appear healthier than reality, silent insolvency.
+  invariante: "health factor calculation must use USD-denominated values for BOTH collateral AND debt"
+  que_mirar:
+    - "healthFactor"
+    - "getLTV"
+    - "userDebt"
+    - "collateralValue"
+    - "1e18 (assumed price)"
+    - "no oracle for debt token"
+    - "isStable"
+    - "== 1"
+  como_se_arregla: "Use an oracle for the debt token as well, even for stablecoins. Apply the debt token price when calculating health factor. Add a circuit breaker that pauses the protocol if the stablecoin depegs beyond a threshold."
+  trampas:
+    - "Many protocols intentionally assume peg as a design choice -- check if there is explicit depeg handling"
+    - "The bug only manifests during depeg events which may be rare but catastrophic"
+    - "Some stablecoins have secondary oracles (Chainlink USDC/USD) that can be used"
+  incidentes:
+    - "USG-Tangent -- USG peg assumption in on-chain safety checks causes incorrect liquidation (medium, 8 finders)"
+    - "The Standard Smart Vault -- USD stablecoins incorrectly assumed to always be at peg (high)"
+    - "Colbfinance -- Incorrect collateral calculation due to inverted oracle math for near-peg assets (medium)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, stablecoin, depeg, health-factor, oracle, peg-assumption, unit-mismatch]
+
+- id: lending-028
+  pattern: debt-share-rounding-rebase
+  name: "Debt share value manipulation via rounding truncation and rate changes"
+  causa_raiz: >
+    Protocols that use shares to track debt (batch debt shares, borrow shares)
+    are vulnerable when truncation-based integer math is combined with the
+    ability to change the rate that determines share value. An attacker can
+    repeatedly increase the debt share value (e.g., via rate changes), causing
+    accumulated truncation errors that effectively forgive debt. Similarly,
+    borrowers can be left with residual debt shares after full repayment (shares
+    round up), or borrow without generating shares at all (shares round down to
+    zero for dust amounts).
+  como_funciona: >
+    1. Debt is tracked as: userDebt = batchDebt * userShares / totalShares.
+    2. Attacker calls setBatchManagerAnnualInterestRate() repeatedly, each time updating shares.
+    3. Each share update truncates: newShares = oldDebt * newTotalShares / newTotalDebt.
+    4. Accumulated truncation over many calls reduces effective debt significantly.
+    5. Attacker borrows a full Trove worth of debt but owes nearly nothing after rebase.
+    6. OR: user repays full debt amount, but shares round up, leaving 1 share of "phantom debt".
+    7. OR: user borrows dust amount, shares round down to 0, free borrowing.
+  invariante: "sum(userDebt via shares) == totalDebt (within 1 wei per user tolerance)"
+  que_mirar:
+    - "_updateBatchShares"
+    - "totalDebtShares"
+    - "borrowShares"
+    - "debtSharesOf"
+    - "mulDiv"
+    - "roundUp vs roundDown"
+    - "setBatchManagerAnnualInterestRate"
+    - "convertToShares"
+  como_se_arregla: "Use virtual shares offset for debt tracking. Round debt shares AGAINST the borrower (round up on borrow, round down on repay). Enforce minimum borrow amount that always produces at least 1 share. Limit frequency of rate changes that trigger share recalculation."
+  trampas:
+    - "1 wei of dust per operation is normal -- only large accumulated truncation is a bug"
+    - "Rate change functions may be admin-only, reducing exploitability"
+    - "Some protocols use ray math (1e27) which has much less truncation"
+  incidentes:
+    - "Bold -- Batch shares math can be rebased to forgive entire Trove debt via rounding + rate changes (high)"
+    - "Sharwafinance -- Borrowers left with debt shares after full repayment (medium)"
+    - "Sharwafinance -- Users can borrow tokens without generating debt shares (critical)"
+    - "Meso Lending -- Removal of incorrect debt shares (medium)"
+    - "ZeroLend One -- Wrong calculation of supply/debt balance of a position (high)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, debt-shares, rounding, truncation, rebase, rate-change, batch]
+
+- id: lending-029
+  pattern: index-overflow-dos-dust-supply
+  name: "Interest/reward index overflow when totalSupply is dust, causing permanent DoS"
+  causa_raiz: >
+    Lending protocols use scaled balance mechanisms where an index tracks
+    cumulative interest or reward accrual per unit of token. The index is stored
+    in a fixed-size integer (e.g., uint104, uint128). When the total supply of
+    the underlying asset is extremely small (dust), the per-unit accrual becomes
+    enormous, causing the index to overflow its storage type. Once overflowed,
+    all transfers and state updates that touch the index revert permanently,
+    bricking the market or reward distribution.
+  como_funciona: >
+    1. Market is created with very small totalSupply (e.g., 1 wei of aToken).
+    2. Rewards or interest accrue normally, but per-unit index grows as rewards/totalSupply.
+    3. With dust totalSupply, index grows rapidly: index += rewardsPerSecond * elapsed / totalSupply.
+    4. Index exceeds type(uint104).max or type(uint128).max.
+    5. All subsequent operations that read/update the index revert with overflow.
+    6. Token transfers, deposits, withdrawals all permanently bricked for that market.
+    7. First depositor attack variant: attacker creates dust market, triggers DoS.
+  invariante: "index < type(uint_storage_type).max at all times; totalSupply must be above minimum for index accrual"
+  que_mirar:
+    - "uint104"
+    - "uint128"
+    - "scaledBalance"
+    - "liquidityIndex"
+    - "rewardIndex"
+    - "totalScaledSupply"
+    - "handleAction"
+    - "type(uint104).max"
+  como_se_arregla: "Cap the index to a maximum value. Use larger storage types (uint256). Enforce minimum totalSupply before enabling reward accrual. Skip accrual when totalSupply is below a threshold."
+  trampas:
+    - "This can take time to manifest -- index grows slowly with normal supply but explodes with dust"
+    - "May be triggered by first-depositor attack (lending-010) as a secondary effect"
+    - "Reward distributors and interest accumulators have separate indices -- check both"
+  incidentes:
+    - "Astera/Cod3x Lend -- Index reaches type(uint104).max when totalSupply is dust, DoS aToken transfers (high)"
+    - "Astera/Cod3x Lend -- RewardsController inconsistent scaling in handleAction causes transfer DoS (high)"
+    - "Dahlia -- Inflation of zero totalBorrowShares to disable borrowing (medium)"
+    - "Folks Finance -- Infinite interest rate bug when supply is dust (high)"
+    - "Sentiment V2 -- Super Pool shares inflated by bad debt leading to overflows (medium)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, index, overflow, DoS, dust, totalSupply, scaled-balance, rewards]
+
+- id: lending-030
+  pattern: leverage-unwind-amount-mismatch
+  name: "Leveraged vault unwind/deleverage uses wrong amounts, token, or path"
+  causa_raiz: >
+    Leveraged lending vaults (looping strategies) automate borrow-deposit cycles
+    to amplify yield. The unwind/deleverage process reverses this: withdraw
+    collateral, swap to repay token, repay debt. Multiple bugs cluster here:
+    wrong token sent to user, incorrect swap amounts, flash loan fees not
+    accounted, shares-to-assets conversion errors, and fee bypass during
+    deleverage. The complexity of multi-step atomic operations across lending
+    pool + DEX + vault creates many opportunities for amount mismatches.
+  como_funciona: >
+    1. User calls removeLeverage() to exit their leveraged position.
+    2. Protocol takes flash loan to repay debt, freeing collateral.
+    3. Collateral is withdrawn and swapped to underlying asset.
+    4. BUG: swap amount uses pre-fee balance, or wrong token address, or wrong share conversion.
+    5. User receives less than expected, or protocol retains excess, or the tx reverts.
+    6. OR: flash loan fee is not subtracted from available amount, causing shortfall.
+    7. OR: closeFee is only applied to one token path, easily bypassed by using alternate path.
+  invariante: "user receives full collateral value minus fees; no tokens stuck in intermediate contracts"
+  que_mirar:
+    - "removeLeverage"
+    - "unwind"
+    - "deleverage"
+    - "flashLoanFee"
+    - "harvest"
+    - "_removeLeverage"
+    - "redeemShares"
+    - "closeFee"
+    - "swapAmount"
+  como_se_arregla: "Calculate swap/repay amounts from actual balances after each step (not predicted amounts). Account for flash loan fees. Apply close fees at the vault level before any token routing. Verify no tokens are stuck after operation."
+  trampas:
+    - "Leveraged vaults are complex multi-step operations -- trace the full flow carefully"
+    - "Slippage during deleverage swaps is expected -- only accounting bugs are real findings"
+    - "Some leftover tokens may be by design (dust tolerance)"
+  incidentes:
+    - "Peapods -- _removeLeverage() provides incorrect amounts when swapping (high)"
+    - "Peapods -- removeLeverage sends wrong token to user (high)"
+    - "Peapods -- _removeLeverage uses incorrect amount when redeeming lending pair shares (high)"
+    - "Peapods -- closeFee only collected for pTKN, easily bypassed (medium)"
+    - "BakerFi -- Harvesting strategy doesn't account flashloan fee (medium)"
+    - "BakerFi -- Leftover collateral from debt adjustment lost during harvest (high)"
+    - "Beets Looped Sonic -- UNWIND_ROLE can extract profit via repeated slippage arbitrage (medium)"
+    - "Numa -- leverageStrategy reentrancy crashes token price (high)"
+    - "Elfi -- Deleveraging results in zero borrowed amount while maintaining leveraged position (high)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, leverage, unwind, deleverage, flash-loan, swap, amount-mismatch, vault]
+
+- id: lending-031
+  pattern: emode-isolation-config-residual
+  name: "E-Mode/isolation mode config changes leave stale elevated parameters"
+  causa_raiz: >
+    Aave-fork E-Mode allows elevated collateral factors and LTV for correlated
+    asset groups. When an asset is removed from an E-Mode category, or when
+    isolation mode configuration is changed, existing positions may retain the
+    old elevated parameters. Users in E-Mode with the removed asset continue
+    getting higher collateral factor than the default, leading to
+    undercollateralized positions. Similarly, once a position enters isolation
+    mode, there may be no mechanism to exit it.
+  como_funciona: >
+    1. Admin adds Asset X to E-Mode category with 95% LTV (default is 75%).
+    2. Users deposit Asset X and borrow at 95% LTV.
+    3. Admin removes Asset X from E-Mode category.
+    4. Existing users STILL get 95% LTV because their E-Mode flag is not cleared.
+    5. Their positions are now undercollateralized relative to the true risk.
+    6. If price drops, bad debt accrues because the effective LTV was too high.
+    7. OR: user enters isolation mode, but no function exists to exit it, permanently limiting their account.
+  invariante: "if asset not in E-Mode category, collateral factor must equal default; isolation mode must be exitable"
+  que_mirar:
+    - "supportEMode"
+    - "setEModeCategory"
+    - "removeAsset"
+    - "_getCollateralFactor"
+    - "_getLiquidationThreshold"
+    - "isInIsolationMode"
+    - "exitIsolationMode"
+    - "configureEModeCategory"
+  como_se_arregla: "When removing an asset from E-Mode, force all users using that asset in E-Mode to revert to default parameters. Provide an explicit exitIsolationMode function. Validate positions against current (not cached) E-Mode parameters."
+  trampas:
+    - "E-Mode removal is a rare admin action, but the impact on existing positions is immediate"
+    - "Some protocols cache E-Mode parameters at borrow time, making changes even harder to propagate"
+  incidentes:
+    - "NUTS Finance/Cod3x Lend -- E-Mode misconfiguration causing inaccurate collateral accounting (medium)"
+    - "Resolv -- No mechanism to exit isolation mode once entered (medium)"
+    - "BendDAO -- Updating asset collateral params can lead to arbitrary liquidation (medium)"
+    - "Sentiment V2 -- LTV of 98% would be extremely dangerous (medium)"
+    - "Duality Focus -- Undercollateralized loans possible, no upper bound on collateral factor (medium)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, E-Mode, isolation-mode, config, collateral-factor, LTV, stale-parameters]
+
+- id: lending-032
+  pattern: minipool-subpool-borrow-bypass
+  name: "Sub-pool/minipool borrows from restricted main pool reserves"
+  causa_raiz: >
+    Hierarchical lending architectures (main pool + minipools/sub-pools) allow
+    sub-pools to borrow from the main pool. If access controls on the main pool
+    do not properly filter sub-pool borrow requests, minipools can borrow from
+    reserves that are flagged as non-borrowable, frozen, or restricted. The
+    minipool owner can also create positions that are unliquidatable from the
+    main pool's perspective, imposing bad debt on main pool depositors.
+  como_funciona: >
+    1. Main lending pool has Reserve X marked as non-borrowable (governance decision).
+    2. Minipool is a separate contract that interacts with main pool as a borrower.
+    3. Minipool's borrow function does not check main pool's reserve restrictions.
+    4. Minipool borrows from Reserve X, bypassing the non-borrowable flag.
+    5. OR: Minipool owner creates a position where the minipool itself is the borrower, but liquidation logic cannot access the minipool's internal positions.
+    6. If minipool defaults, bad debt is imposed on the main pool with no recourse.
+  invariante: "sub-pool borrows must respect ALL main pool reserve restrictions; sub-pool positions must be liquidatable by main pool"
+  que_mirar:
+    - "minipool"
+    - "subPool"
+    - "isBorrowableReserve"
+    - "validateBorrow"
+    - "liquidateMiniPool"
+    - "flowLimiter"
+    - "reserveIsActive"
+    - "reserveIsFrozen"
+  como_se_arregla: "Enforce main pool reserve restrictions in minipool borrow paths. Ensure minipool positions are visible and liquidatable by the main pool. Set flow limits and borrow caps per minipool."
+  trampas:
+    - "Minipools may have different risk parameters by design -- only RESTRICTION BYPASS is a bug"
+    - "Liquidation of minipool positions requires understanding the hierarchical ownership model"
+  incidentes:
+    - "Astera/Cod3x Lend -- Minipools can borrow from lending pool reserves that are not borrowable (high)"
+    - "Astera/Cod3x Lend -- Minipool owner can create unliquidatable loan, imposing bad debt on main pool (medium)"
+    - "Astera/Cod3x Lend -- Mini pool reserves for unique tokens can be reinitialised (medium)"
+    - "Astera/Cod3x Lend -- variableBorrowIndex only updated if currentLiquidityRate nonzero in minipool (medium)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, minipool, sub-pool, borrow-bypass, access-control, bad-debt, hierarchical]
+
+- id: lending-033
+  pattern: front-run-bad-debt-socialization
+  name: "Front-running bad debt socialization by closing/reopening positions"
+  causa_raiz: >
+    When bad debt from a liquidation is socialized (redistributed) across all
+    open positions in a pool, users who can predict the socialization event can
+    close their positions before it happens and reopen afterward, avoiding their
+    share of the loss. This shifts a disproportionate amount of bad debt onto
+    remaining depositors/borrowers who could not exit in time.
+  como_funciona: >
+    1. Alice sees a large position is about to be liquidated with bad debt.
+    2. Alice closes her Trove/position before the liquidation executes.
+    3. Liquidation happens, bad debt is redistributed among remaining open Troves.
+    4. Alice reopens her Trove immediately after the redistribution.
+    5. Alice avoided her share of the bad debt entirely.
+    6. Remaining users absorb Alice's portion, suffering greater losses.
+    7. With multiple positions, this can be automated to systematically dodge all bad debt events.
+  invariante: "no user should be able to avoid bad debt socialization by timing position open/close around liquidation"
+  que_mirar:
+    - "redistributeDebt"
+    - "socializeLoss"
+    - "closeTrove"
+    - "openTrove"
+    - "redistributionSnapshot"
+    - "pending redistribution"
+    - "applyPendingRewards"
+    - "StabilityPool"
+  como_se_arregla: "Implement a cooldown period after opening a position before it can be closed. Record pending redistributions for all addresses (not just open positions). Use snapshot-based socialization that includes recently-closed positions."
+  trampas:
+    - "In practice, closing and reopening has gas costs that may make this uneconomical for small amounts"
+    - "Some protocols use StabilityPool instead of redistribution, partially mitigating this"
+    - "Block-level atomicity makes this easy on L2s with cheap gas"
+  incidentes:
+    - "Bima -- Users can prevent getting bad debt by withdrawing just before liquidation (medium)"
+    - "Bima -- Bad debt redistribution not happening between liquidations in batch mode (high)"
+    - "Panoptic -- Withdrawing before bad debt event increases losses for remaining LPs (medium)"
+    - "Exactly Protocol -- Bad debt not cleared when earningsAccumulator is below fixed-pool bad debt (medium)"
+    - "ZeroLend One -- When bad debt accumulated, loss not shared amongst all suppliers (high)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [lending, bad-debt, front-running, socialization, redistribution, timing, dodge]

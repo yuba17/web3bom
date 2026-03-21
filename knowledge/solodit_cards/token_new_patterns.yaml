@@ -1,0 +1,452 @@
+# New token vulnerability patterns derived from Solodit findings
+# Patterns NOT covered by token-001 through token-008
+# Generated: 2026-03-19 from 112 Solodit findings (token category)
+
+- id: token-009
+  pattern: erc777-reentrancy-hooks
+  name: "ERC777 token hooks enable reentrancy in ERC20-assuming protocols"
+  causa_raiz: "ERC777 tokens implement tokensToSend (before transfer) and tokensReceived (after transfer) hooks via ERC1820 registry. Protocols that assume ERC20 transfer is atomic and non-reentrant are vulnerable when ERC777 tokens trigger callbacks mid-transfer."
+  como_funciona: |
+    1. Protocol accepts arbitrary ERC20 tokens (no whitelist).
+    2. Attacker registers ERC1820 tokensToSend hook for their address.
+    3. Attacker calls protocol function that triggers safeTransferFrom.
+    4. ERC777 tokensToSend hook fires BEFORE balances update.
+    5. Attacker re-enters protocol function during hook callback.
+    6. Protocol reads stale balances/state, allowing double-spend or state corruption.
+    7. After reentrancy completes, original transfer finalizes.
+  invariante: |
+    // No state change should be possible mid-transfer
+    // assert(reentrancyGuard == LOCKED) during any token transfer callback
+    assert(!entered); // ReentrancyGuard must be active on all token-handling functions
+  que_mirar:
+    - "rg 'safeTransferFrom|safeTransfer' --type sol | rg -v 'nonReentrant|ReentrancyGuard'"
+    - "rg 'balanceOf.*before.*balanceOf.*after' --type sol"
+    - "Does the protocol have ReentrancyGuard on ALL functions that handle tokens?"
+    - "Does the protocol explicitly block ERC777 or rely on a token whitelist?"
+    - "Check if balance-before/after pattern is used (vulnerable to ERC777 tokensToSend)"
+  como_se_arregla: "Apply nonReentrant modifier to ALL functions that transfer tokens. Or explicitly block ERC777 tokens. Follow CEI pattern strictly -- update all state BEFORE external calls."
+  trampas:
+    - "If protocol has ReentrancyGuard on all entry points, not exploitable."
+    - "If protocol uses a strict token whitelist excluding ERC777, not a finding."
+    - "ERC777 is rare in production -- judges may downgrade if no concrete ERC777 token is in scope."
+  incidentes:
+    - "PolygonZkEVM Bridge -- ERC777 tokensToSend hook reentrancy drains bridge via duplicate deposit leaves (Critical)"
+    - "Caviar -- ERC777 reentrancy in buy() allows purchasing at considerable discount (High)"
+    - "Buffer Finance -- ERC777 re-enter resolveQueuedTrades to steal funds (Medium)"
+    - "Buffer Finance -- ERC777 bypasses maxLiquidity check via provide() reentrancy (Medium)"
+    - "SIZE -- ERC777 with tax enables auction theft via re-entrancy in createAuction (Medium)"
+    - "Inverse Finance -- ERC777 reentrancy during withdraw drains all collateral (Medium)"
+    - "Debt DAO -- ERC777 hook lets lender draw extra credit tokens from borrower (Medium)"
+    - "Debt DAO -- ERC777 reentrancy in _close lets lender steal other lenders' funds (Medium)"
+    - "RabbitHole -- ERC777/ERC1155 rewardToken reentrancy locks funds permanently (Medium)"
+    - "Reserve -- ERC777 reentrancy during redeem() steals RToken holders' funds (Medium)"
+    - "Sense -- Reentrancy in GClaimManager exit() via token callback (Medium)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, erc777, reentrancy, hooks, erc1820, callback, CEI]
+
+- id: token-010
+  pattern: permit-frontrun-dos
+  name: "ERC-2612 permit front-running causes DoS on bundled operations"
+  causa_raiz: "Permit signatures are deterministic and publicly visible in the mempool. When permit() is called as part of a multi-step function (e.g., removeLiquidityWithPermit), an attacker can extract the signature, call permit() directly to consume the nonce, and the original bundled transaction reverts because the permit has already been used."
+  como_funciona: |
+    1. User signs ERC-2612 permit and submits tx calling functionWithPermit(amount, deadline, v, r, s).
+    2. Attacker monitors mempool, extracts permit parameters from pending tx.
+    3. Attacker front-runs by calling token.permit(owner, spender, amount, deadline, v, r, s) directly.
+    4. Attacker's tx succeeds, consuming the nonce.
+    5. User's original tx reverts because permit() fails (nonce already used).
+    6. User loses gas fees and operation is DoS'd.
+  invariante: |
+    // Permit calls in multi-step functions must not revert the entire operation
+    // try token.permit(...) catch {} -- permit failure should be non-fatal
+    assert(functionSucceeds || allowanceAlreadySufficient);
+  que_mirar:
+    - "rg 'permit\\(' --type sol | rg -v 'try|catch'"
+    - "Is permit() wrapped in try/catch?"
+    - "Does the function check existing allowance before calling permit?"
+    - "rg 'WithPermit|withPermit|_permit' --type sol"
+  como_se_arregla: "Wrap permit() in try/catch. If permit reverts, check if allowance is already sufficient (attacker's front-run still granted the approval). Pattern: try token.permit(...) catch {} require(token.allowance(owner, spender) >= amount)."
+  trampas:
+    - "This is a well-documented pattern (Trust Security Jan 2024). Judges may mark as informational if impact is just gas griefing."
+    - "If the protocol already wraps permit in try/catch, not a finding."
+    - "Front-running only works on chains with public mempools (not on L2s with private sequencers)."
+  incidentes:
+    - "Audit 507 (RouterV2) -- removeLiquidityWithPermit DoS via permit front-running (Medium)"
+    - "EYWA (RouterV2) -- permit front-running blocks start() function (Medium)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, erc2612, permit, frontrunning, dos, signature, nonce]
+
+- id: token-011
+  pattern: malicious-token-injection-dos
+  name: "Malicious/weird token injection bricks protocol operations"
+  causa_raiz: "Protocol accepts arbitrary token deposits without validation. Attacker deposits a malicious ERC20 (reverting on transfer, zero-transfer-reverting, or ERC721 masquerading as ERC20) which poisons the token list. Subsequent operations iterate all tokens and revert on the malicious one, bricking payouts/claims for all users."
+  como_funciona: |
+    1. Protocol allows anyone to deposit/fund with any ERC20 token address.
+    2. Attacker deposits a malicious token that: (a) reverts on transfer(), or (b) reverts on zero-amount transfer, or (c) is actually an ERC721.
+    3. Malicious token gets added to protocol's internal token address list.
+    4. When protocol tries to pay out / claim, it iterates ALL token addresses.
+    5. Transfer of malicious token reverts, reverting the entire payout transaction.
+    6. All legitimate funds become permanently locked.
+  invariante: |
+    // Payout must succeed for all legitimate tokens even if one token transfer fails
+    // for (token in tokenList) { try token.transfer(to, amount) catch {} }
+    assert(legitimateTokensCanBeWithdrawn);
+  que_mirar:
+    - "Can anyone add arbitrary token addresses to the protocol?"
+    - "Does payout/claim iterate a token list and revert if ANY transfer fails?"
+    - "rg 'tokenAddresses|depositedTokens|tokenList' --type sol"
+    - "rg 'for.*token.*transfer' --type sol"
+    - "Are zero-amount transfers handled (some tokens revert on transfer(0))?"
+  como_se_arregla: "Validate token addresses on deposit (whitelist). Use try/catch when iterating token transfers. Skip zero-balance tokens. Separate ERC20/ERC721 handling with interface checks."
+  trampas:
+    - "If protocol has a token whitelist controlled by admin, not exploitable by attacker."
+    - "If payouts are per-token (not iterating a list), this pattern does not apply."
+  incidentes:
+    - "OpenQ -- Malicious ERC20 with blacklist bricks bounty payouts (High)"
+    - "OpenQ -- Zero-transfer-reverting token permanently breaks percentage tier bounties (High)"
+    - "OpenQ -- ERC721 deposited as ERC20 bricks all bounty payouts (High)"
+    - "reNFT -- Malicious ERC20 tipped via Seaport locks rental assets forever (High)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, malicious-token, dos, griefing, token-list, iteration, zero-transfer]
+
+- id: token-012
+  pattern: solmate-no-code-check
+  name: "Solmate SafeTransferLib does not check token contract existence"
+  causa_raiz: "Solmate's SafeTransferLib (unlike OpenZeppelin's SafeERC20) does not verify that the token address contains code. Calls to a non-existent contract return success (EVM behavior), so transfers to/from destroyed or not-yet-deployed token addresses silently succeed without moving any tokens."
+  como_funciona: |
+    1. Protocol uses Solmate's SafeTransferLib for token transfers.
+    2. Token address has no deployed code (self-destructed, not yet deployed, or wrong address).
+    3. safeTransfer/safeTransferFrom is called -- EVM returns success (no revert).
+    4. Protocol updates internal state as if transfer succeeded.
+    5. No tokens actually moved -- attacker gets credit for phantom deposit.
+    6. Attacker withdraws real tokens against phantom balance.
+  invariante: |
+    // Token address must have code before any transfer
+    assert(token.code.length > 0);
+  que_mirar:
+    - "rg 'SafeTransferLib|safetransfer' --type sol | rg -i 'solmate'"
+    - "Does the protocol use Solmate (not OpenZeppelin) for token transfers?"
+    - "Is there an explicit code.length > 0 check before transfers?"
+    - "Can token addresses be set by users or only by admin?"
+  como_se_arregla: "Add explicit check: require(token.code.length > 0). Or switch to OpenZeppelin SafeERC20 which includes this check. Or validate token address on registration/deposit."
+  trampas:
+    - "Only applies to Solmate SafeTransferLib, NOT OpenZeppelin SafeERC20."
+    - "If all token addresses are admin-set and verified, impact is limited."
+    - "On some chains, CREATE2 makes address predictable but deployment timing matters."
+  incidentes:
+    - "SIZE -- Solmate SafeTransferLib no code check enables honeypot attack (Medium)"
+    - "Bond Protocol -- Solmate safetransfer/safetransferfrom no code size check leads to funding loss (Medium)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, solmate, code-check, phantom-transfer, SafeTransferLib]
+
+- id: token-013
+  pattern: erc721-unsafe-transfer
+  name: "Using ERC721 transferFrom instead of safeTransferFrom loses NFTs"
+  causa_raiz: "ERC721.transferFrom() does not check if the recipient can handle ERC721 tokens (no onERC721Received callback). If the recipient is a contract without ERC721 receiver support, the NFT is permanently locked. Similarly, _mint() without _safeMint() has the same issue."
+  como_funciona: |
+    1. Protocol transfers an ERC721 using transferFrom() instead of safeTransferFrom().
+    2. Recipient is a smart contract (multisig, vault, another protocol).
+    3. Recipient contract does not implement onERC721Received().
+    4. Transfer succeeds (NFT moves) but recipient cannot interact with or retrieve the NFT.
+    5. NFT is permanently frozen in the recipient contract.
+  invariante: |
+    // All ERC721 transfers to external addresses must use safeTransferFrom
+    // All ERC721 mints must use _safeMint
+    assert(recipientCanHandleERC721 || recipientIsEOA);
+  que_mirar:
+    - "rg 'transferFrom.*tokenId|transferFrom.*nft' --type sol | rg -v 'safeTransferFrom'"
+    - "rg '_mint\\(' --type sol | rg -v '_safeMint'"
+    - "Does the protocol send NFTs to user-supplied addresses?"
+    - "Could the recipient be a contract (multisig, vault)?"
+  como_se_arregla: "Use safeTransferFrom() for all ERC721 transfers. Use _safeMint() for all ERC721 mints. Add onERC721Received check if custom transfer logic is needed."
+  trampas:
+    - "safeTransferFrom introduces a callback which can be a reentrancy vector -- evaluate tradeoff."
+    - "If recipient is always an EOA (user wallet), transferFrom is safe."
+    - "Some protocols intentionally use transferFrom to avoid reentrancy from onERC721Received."
+  incidentes:
+    - "DODO -- transferFrom instead of safeTransferFrom for ERC721 (Medium)"
+    - "FrankenDAO -- ERC721 transferFrom freezes NFT in non-receiver contract (Medium)"
+    - "FrankenDAO -- _mint instead of _safeMint for ERC721 freezes token (Medium)"
+    - "Golom -- transferFrom instead of safeTransferFrom for ERC721 (Medium)"
+    - "PoolTogether -- transferFrom on ERC721 awards may freeze in contract winners (Medium)"
+    - "Putty -- _mint instead of _safeMint for position NFTs (Medium)"
+    - "Holograph -- Incorrect ERC721 safeTransferFrom parameter order (Medium)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, erc721, nft, safeTransferFrom, safeMint, frozen-nft]
+
+- id: token-014
+  pattern: erc20-erc721-type-confusion
+  name: "ERC721/ERC1155 accepted where only ERC20 expected causes permanent lock"
+  causa_raiz: "ERC721 and ERC20 share overlapping function signatures (transferFrom, balanceOf). Protocol expecting only ERC20 can accidentally accept ERC721 tokens. The ERC721 gets deposited via transferFrom(from, to, tokenId) but cannot be withdrawn via ERC20 transfer(to, amount) which does not exist on ERC721."
+  como_funciona: |
+    1. Protocol function accepts any token address, expects ERC20.
+    2. Attacker passes an ERC721 contract address.
+    3. ERC721.transferFrom(from, to, tokenId) succeeds (same signature as ERC20).
+    4. ERC721.balanceOf(address) returns count of NFTs (looks like ERC20 balance).
+    5. On withdrawal, protocol calls token.transfer(to, amount) -- not present on ERC721.
+    6. Withdrawal reverts, funds permanently locked.
+  invariante: |
+    // Token type must be validated before accepting deposits
+    // assert(IERC165(token).supportsInterface(type(IERC20).interfaceId))
+    // or assert(!IERC165(token).supportsInterface(type(IERC721).interfaceId))
+  que_mirar:
+    - "Does the protocol validate token type (ERC165 supportsInterface check)?"
+    - "Can users provide arbitrary token addresses to deposit functions?"
+    - "rg 'transferFrom.*amount|transferFrom.*_amount' --type sol"
+    - "Are there separate code paths for ERC20 vs ERC721?"
+  como_se_arregla: "Add ERC165 interface check to reject ERC721/ERC1155. Or maintain a strict token whitelist. Or use separate deposit functions for different token standards."
+  trampas:
+    - "If protocol has an admin-curated token whitelist, not exploitable."
+    - "Some tokens support both ERC721 and ERC1155 (The Sandbox) -- check for dual-standard tokens."
+  incidentes:
+    - "OpenQ -- ERC721 deposited via fundBountyToken bricks all payouts (High)"
+    - "Linea TokenBridge -- ERC721 bridged one-way, permanently stuck (High)"
+    - "Infinity NFT Marketplace -- Dual ERC721/ERC1155 tokens break _transferNFTs (High)"
+    - "Infinity NFT Marketplace -- _transferNFTs succeeds without actually transferring if token has no ERC721/1155 support (High)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, erc721, erc20, type-confusion, interface-check, ERC165]
+
+- id: token-015
+  pattern: mutable-decimals-attack
+  name: "Untrusted token decimals() can be mutated intra-transaction"
+  causa_raiz: "Protocol reads token.decimals() from an untrusted external contract without caching. If the token is malicious or upgradeable, decimals() can return different values within the same transaction, causing scaling calculations to use inconsistent bases."
+  como_funciona: |
+    1. Protocol calls token.decimals() multiple times during a single transaction.
+    2. Malicious token returns 18 on first call (during deposit valuation).
+    3. Malicious token returns 6 on second call (during share calculation).
+    4. Protocol calculates shares based on 6 decimals but valued deposit at 18 decimals.
+    5. Attacker receives 1e12x more shares than deserved.
+    6. Attacker withdraws, draining pool.
+  invariante: |
+    // decimals() must be cached once and reused
+    uint8 cachedDecimals = token.decimals(); // cache at registration
+    // All subsequent uses must reference cachedDecimals, never re-call decimals()
+    assert(usedDecimals == cachedDecimals);
+  que_mirar:
+    - "rg 'decimals\\(\\)' --type sol -- count calls per function"
+    - "Is decimals() called more than once in the same code path?"
+    - "Is the decimal value cached in storage at token registration time?"
+    - "Can the token address be an upgradeable proxy (decimals could change)?"
+  como_se_arregla: "Cache decimals() in an immutable variable at token registration/initialization. Never call decimals() on untrusted tokens during runtime calculations."
+  trampas:
+    - "If protocol only supports well-known tokens (USDC, WETH), risk is low."
+    - "On-chain tokens with fixed decimals (non-upgradeable) cannot mutate."
+    - "Connext finding: incorrect decimals in initializeSwap cannot be corrected -- design flaw, not attack."
+  incidentes:
+    - "Sense -- Untrusted ERC-20 decimals() return values mutated intra-transaction (High)"
+    - "Connext -- Incorrect decimal in initializeSwap cannot be corrected, permanently wrong calculations (Medium)"
+    - "Notional -- Typo checks primaryDecimals instead of secondaryDecimals, missing validation (Medium)"
+  severidad: high
+  confianza: media
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, decimals, mutable, cache, scaling, untrusted]
+
+- id: token-016
+  pattern: blacklist-freezes-protocol
+  name: "USDC/USDT blacklist on single address freezes entire protocol flow"
+  causa_raiz: "Protocol has a critical code path that MUST transfer tokens to a specific address (recipient, escrow, treasury). If that address gets added to USDC/USDT blacklist, the transfer reverts and the entire protocol operation (cancel, claim, settle) is permanently blocked."
+  como_funciona: |
+    1. Protocol function (cancel, settle, claim) must transfer USDC to recipient address.
+    2. Recipient gets added to USDC blacklist (by Circle).
+    3. USDC.transfer(recipient, amount) reverts.
+    4. Entire function reverts -- no fallback path.
+    5. All users' funds in that flow are permanently locked.
+    6. Even admin cannot rescue because the function has no skip/alternative path.
+  invariante: |
+    // Critical operations must not be blockable by single-address token blacklist
+    // assert(canCompleteWithout(specificRecipient)) or assert(hasAlternativePath)
+  que_mirar:
+    - "rg 'cancel|settle|claim|close' --type sol -- do they transfer tokens?"
+    - "Is there a single recipient whose blacklisting blocks everyone?"
+    - "Are there try/catch or pull-over-push patterns for token distributions?"
+    - "rg 'safeTransfer.*recipient|transfer.*lender|transfer.*borrower' --type sol"
+  como_se_arregla: "Use pull-over-push pattern (recipients claim their own funds). Add try/catch on individual transfers. Store failed transfers in escrow mapping for later claim. Provide admin rescue function."
+  trampas:
+    - "This extends token-007 (pausable/blacklistable) but is about SPECIFIC address blacklisting, not global pause."
+    - "Many judges accept this as a known centralization risk and mark informational."
+    - "Only report if there is a concrete flow where one blacklisted address blocks OTHER users."
+  incidentes:
+    - "NounsDAO -- USDC blacklisted recipient blocks cancel() for everyone (Medium)"
+    - "reNFT -- Blocklisted payment ERC20 recipient causes rented NFT to be stuck in Safe (Medium)"
+    - "SIZE -- Bidders cannot withdraw unused funds if one token transfer fails (High)"
+  severidad: medium
+  confianza: media
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, blacklist, USDC, USDT, dos, frozen-funds, pull-pattern]
+
+- id: token-017
+  pattern: deposit-same-token-double-accounting
+  name: "depositToken == rewardToken or collateralToken causes double-counting"
+  causa_raiz: "Protocol treats deposit token and reward/collateral token as independent, but does not handle the case where they are the same address. Functions that calculate 'excess' or 'available' balance for one role include tokens earmarked for the other role, enabling extraction of funds belonging to other users."
+  como_funciona: |
+    1. Protocol has depositToken and rewardToken as separate concepts.
+    2. Admin or design allows same token address for both roles.
+    3. recoverTokens() / sweep() calculates excess as balanceOf(this) - depositedAmount.
+    4. But rewardToken balance is ALSO in balanceOf(this).
+    5. Function treats reward balance as "excess deposit" (or vice versa).
+    6. Attacker extracts tokens belonging to the other accounting category.
+  invariante: |
+    // If depositToken == rewardToken, excess calculation must account for both
+    // uint256 excess = balance - depositAccounting - rewardAccounting;
+    assert(recoverableAmount <= balance - totalDeposits - totalRewards);
+  que_mirar:
+    - "rg 'recoverToken|rescueToken|sweep|skim|excess' --type sol"
+    - "Can depositToken == rewardToken? Is there a check preventing it?"
+    - "rg 'balanceOf.*address.*this.*sub|balanceOf.*this.*minus' --type sol"
+    - "How is 'excess' or 'recoverable' balance calculated?"
+  como_se_arregla: "Either prohibit depositToken == rewardToken with require(). Or calculate excess accounting for ALL reservations: excess = balance - sum(all_reserved_amounts)."
+  trampas:
+    - "If protocol explicitly requires different tokens, not a finding."
+    - "Admin-only token setting may reduce severity."
+  incidentes:
+    - "Streaming (C4) -- recoverTokens() double-counts when depositToken == rewardToken, draining funds (High)"
+    - "Amun -- Unused ERC20 tokens not refunded; same-token overlap allows theft (High)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, accounting, double-counting, same-token, recover, sweep]
+
+- id: token-018
+  pattern: missing-return-value-wsteth-adapter
+  name: "Missing or wrong return value in token wrapper/adapter silently zeros amount"
+  causa_raiz: "Token adapter/wrapper function forgets to return the converted amount. Caller receives default value (0) and proceeds with zero-amount operations. In Solidity, a function declared as returning uint256 that does not explicitly return a value will return 0."
+  como_funciona: |
+    1. Token adapter wraps underlying token (e.g., stETH -> wstETH).
+    2. Wrapper function performs the wrap but FORGETS to return the resulting amount.
+    3. Caller receives 0 as the return value (Solidity default).
+    4. Caller uses 0 as the deposit amount, minting 0 shares.
+    5. User loses their wrapped tokens (sent to adapter) but receives nothing.
+  invariante: |
+    // Every function with a return value must explicitly return a non-zero value on success
+    // assert(returnedAmount > 0) when inputAmount > 0
+  que_mirar:
+    - "rg 'function wrap|function unwrap|function convert' --type sol"
+    - "Do wrapper functions have return statements for ALL code paths?"
+    - "Are return values used by callers (not discarded)?"
+    - "Compile with warnings enabled -- missing return triggers a warning"
+  como_se_arregla: "Add explicit return statement. Enable compiler warnings for missing returns. Test that wrapper return values match actual token balance changes."
+  trampas:
+    - "Solidity 0.8+ may warn but does not error on missing return."
+    - "If return value is discarded by caller, the missing return is harmless."
+  incidentes:
+    - "Sense WstETHAdapter -- wrapUnderlying() missing return value zeros out deposit (High)"
+    - "BadgerDAO -- WrappedIbbtcEth stale pricePerShare used for mint/burn, wrong conversion (High)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, wrapper, adapter, return-value, silent-zero, wstETH]
+
+- id: token-019
+  pattern: erc1155-batch-callback-reentrancy
+  name: "ERC1155 safeTransferFrom/safeBatchTransfer callbacks enable reentrancy"
+  causa_raiz: "ERC1155 safeTransferFrom and safeBatchTransferFrom invoke onERC1155Received/onERC1155BatchReceived on the recipient. If the protocol transfers ERC1155 tokens before updating state, the recipient contract can re-enter during the callback, similar to ERC777 but via ERC1155 hooks."
+  como_funciona: |
+    1. Protocol uses ERC1155 safeTransferFrom to distribute rewards/assets.
+    2. Transfer triggers onERC1155Received callback on recipient contract.
+    3. Recipient re-enters the protocol during callback.
+    4. Protocol state has not been updated yet (transfer happened before state update).
+    5. Attacker exploits stale state to claim again or manipulate balances.
+  invariante: |
+    // State must be updated BEFORE ERC1155 safeTransfer calls
+    // assert(stateUpdated == true) before any safeTransferFrom
+  que_mirar:
+    - "rg 'safeTransferFrom.*1155|safeBatchTransferFrom' --type sol"
+    - "Is state updated BEFORE or AFTER the ERC1155 transfer?"
+    - "Is there a nonReentrant guard on the function?"
+    - "rg 'onERC1155Received|onERC1155BatchReceived' --type sol"
+  como_se_arregla: "Follow CEI pattern: update all state before calling safeTransferFrom. Apply nonReentrant modifier. Consider using transfer() (without safe) if reentrancy risk outweighs receiver-check benefit."
+  trampas:
+    - "If nonReentrant is present on all ERC1155-interacting functions, not exploitable."
+    - "Unlike ERC777, ERC1155 callbacks are expected and well-known -- judges may expect protocols to handle them."
+  incidentes:
+    - "Bridge Mutual -- ERC1155 safeTransferFrom callback reentrancy blocks all rewards (High)"
+    - "Sudoswap LSSVM2 -- ERC1155 onERC1155BatchReceived reentrancy via two pairs (Medium)"
+    - "ENS NameWrapper -- ERC1155 re-entrancy in _transferAndBurnFuses creates fake subdomain tokens (High)"
+    - "RabbitHole -- ERC1155 rewardToken reentrancy locks contract funds (Medium)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, erc1155, reentrancy, callback, safeTransferFrom, CEI]
+
+- id: token-020
+  pattern: approval-shadow-storage
+  name: "Custom ERC20 approval uses wrong storage mapping (shadow allowance)"
+  causa_raiz: "Contract inherits OpenZeppelin ERC20 but also declares its own internal allowances mapping. approve() writes to the custom mapping while transferFrom() reads from the inherited mapping (or vice versa). Allowances are effectively split across two storage locations."
+  como_funciona: |
+    1. Contract inherits from OpenZeppelin ERC20 (has _allowances mapping).
+    2. Developer adds a separate internal mapping(address => mapping(address => uint256)) allowances.
+    3. Custom approve() writes to the developer's mapping.
+    4. transferFrom() uses inherited _allowances (OpenZeppelin) which is still 0.
+    5. All transferFrom calls fail -- or worse, inherited mapping has stale approvals.
+    6. Users cannot transfer tokens, or old approvals persist unexpectedly.
+  invariante: |
+    // allowance(owner, spender) must equal the value set by the most recent approve(spender, amount)
+    // assert(token.allowance(owner, spender) == lastApprovedAmount)
+  que_mirar:
+    - "rg 'mapping.*address.*mapping.*address.*uint.*allowance' --type sol"
+    - "Does the contract declare its own allowances mapping alongside inherited ERC20?"
+    - "Does approve() call super.approve() or write to a custom mapping?"
+    - "Do transferFrom and approve use the SAME storage location?"
+  como_se_arregla: "Remove duplicate allowances mapping. Use super._approve() for all approval logic. Or fully override both approve() and transferFrom() to use the same storage."
+  trampas:
+    - "This is rare but catastrophic when it occurs."
+    - "Only applies to custom ERC20 implementations, not standard OpenZeppelin usage."
+  incidentes:
+    - "BadgerDAO -- approve uses internal _shares not rebalanced amount, spender spends more than intended (High)"
+  severidad: high
+  confianza: media
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, approval, storage, shadow, mapping, ERC20-custom]
+
+- id: token-021
+  pattern: token-transfer-to-incompatible-contract
+  name: "ERC20 transferred to contract that cannot handle or return them"
+  causa_raiz: "Protocol transfers ERC20 tokens to a contract address that has no mechanism to handle, forward, or return those tokens. Unlike ERC721's safeTransferFrom, ERC20 has no receiver callback, so tokens sent to incompatible contracts are silently and permanently locked."
+  como_funciona: |
+    1. Protocol transfers ERC20 tokens to a contract address (manager, escrow, module).
+    2. Receiving contract has no function to transfer ERC20 out.
+    3. Tokens arrive successfully but are permanently stuck.
+    4. No recovery mechanism exists in either the sending or receiving contract.
+  invariante: |
+    // Every contract that receives ERC20 must have a path to transfer them out
+    // assert(receivingContract.canTransferERC20Out() == true)
+  que_mirar:
+    - "Where do ERC20 transfers send tokens? Is the recipient a contract?"
+    - "Does the receiving contract have transfer/withdraw/rescue functions for ERC20?"
+    - "rg 'safeTransfer.*address.*contract|transfer.*manager|transfer.*escrow' --type sol"
+  como_se_arregla: "Ensure receiving contract can handle ERC20 (has withdraw/rescue function). Or transfer to the final recipient directly. Add rescue functions to all contracts that hold tokens."
+  trampas:
+    - "If receiving contract is upgradeable, admin can add rescue function later -- lower severity."
+    - "If amounts are small (dust), may be informational."
+  incidentes:
+    - "EYWA -- ERC20 transferred to s_emissionManager which cannot handle them (High)"
+    - "Backed Protocol -- safeTransferFrom traps fees in Papr Controller with no recovery (Medium)"
+    - "NounsDAO -- Extra funds sent to Payer contract cannot be withdrawn without canceling stream (Medium)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [token, erc20, stuck-funds, incompatible-receiver, rescue]

@@ -1,0 +1,406 @@
+# Oracle vulnerability patterns -- Round 2
+# Patterns oracle-025 through oracle-032 (new, not in oracle-001 to oracle-024)
+# Source: 443 Solodit oracle findings (R2 batch), clustered by root cause, LOW severity excluded
+
+- id: oracle-025
+  pattern: pyth-atomic-same-tx-update-arbitrage
+  name: "Pyth oracle updated atomically by user in same transaction enables arbitrage"
+  causa_raiz: >
+    Pyth oracles are pull-based: anyone can call updatePriceFeeds() with fresh
+    off-chain price data. Unlike Chainlink where updates are pushed by nodes and
+    visible in the mempool, Pyth updates can be bundled by the user into the same
+    transaction as their protocol interaction. An attacker fetches two Pyth price
+    snapshots (T1 and T2) where price moved significantly. In a single tx they:
+    (1) interact with protocol at stale on-chain price, (2) push the new Pyth
+    update, (3) interact again at the new price. This is atomic -- no mempool
+    visibility, no front-running needed. The attack applies to any protocol that
+    reads Pyth price and allows the caller to also push the update.
+  como_funciona: >
+    1. Attacker observes Pyth off-chain price has moved from $100 to $105.
+    2. In a single transaction: addLiquidity() at old on-chain price ($100).
+    3. Calls pyth.updatePriceFeeds() with the $105 price proof.
+    4. Calls removeLiquidity() -- shares now valued at $105.
+    5. Nets 5% profit minus fees, all atomic in one tx.
+    6. Variant: deposit collateral at low price, push update, borrow at high price.
+  invariante: >
+    // Price used for action must not change within same transaction
+    assert(priceAtDeposit == priceAtWithdrawal || block.number > depositBlock);
+    // Or: use worst-of-two-epochs pricing for LP operations
+  que_mirar:
+    - "grep: updatePriceFeeds, parsePriceFeedUpdates, pyth.*update"
+    - "grep: addLiquidity.*removeLiquidity, deposit.*withdraw in same function scope"
+    - "Can the caller push a Pyth update AND interact in the same tx?"
+    - "Is there a cooldown between deposit and withdrawal?"
+    - "Does protocol use price-epoch system (worst price of last 2 epochs)?"
+  como_se_arregla: >
+    Implement price-epoch system: for deposits use highest price of last 2 epochs,
+    for withdrawals use lowest. Alternatively, enforce minimum hold period (at least
+    1 block) between deposit and withdrawal. Use maxOracleAge to reject very stale
+    on-chain prices that indicate a pending large update. Track min/max prices per
+    epoch and use adversarial pricing for each direction.
+  trampas:
+    - "Unlike Chainlink sandwich, no mempool visibility needed -- fully atomic"
+    - "maxOracleAge alone doesn't prevent this -- attacker pushes fresh update"
+    - "Works with any pull-based oracle (Pyth, API3 with OEV, RedStone)"
+  incidentes:
+    - "XPress/LPManager -- Pyth atomic update: addLiquidity at low, removeLiquidity at high in same tx (CRITICAL, MixBytes)"
+    - "Hanji/LPManager -- identical pattern to XPress (CRITICAL, MixBytes)"
+    - "CAP Labs -- oracle sandwiching on Chainlink mint/burn, recommends fee > deviation threshold (MEDIUM, TrailOfBits)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, pyth, pull-oracle, atomic-update, same-transaction, arbitrage, liquidity]
+
+- id: oracle-026
+  pattern: composite-oracle-arithmetic-overflow
+  name: "Composite/multi-hop oracle overflow bricks price feed permanently"
+  causa_raiz: >
+    Composite oracle contracts chain multiple price feeds (e.g., stETH/ETH *
+    ETH/USD or multi-leg Chainlink feeds). The intermediate multiplication uses
+    high-precision fixed-point (e.g., 36-decimal scaling) and the result can
+    overflow uint256 when any underlying feed reports a large value. For assets
+    exceeding ~$100K in wei-denominated feeds, the product exceeds 2^256.
+    The overflow causes a revert, not a wrong price, which permanently bricks
+    every contract relying on this oracle -- including liquidation, lending,
+    and pricing logic. Unlike oracle-006 (decimal mismatch, wrong price) this
+    is a hard revert from arithmetic overflow.
+  como_funciona: >
+    1. Composite oracle normalizes each feed: rate = price * 10^(36 - feedDecimals).
+    2. Multiplies compositePrice *= rate / SCALING_FACTOR (36-decimal fixed-point).
+    3. When price > ~$100K in wei denomination, intermediate product exceeds 2^256.
+    4. Solidity 0.8+ reverts with arithmetic overflow.
+    5. Every downstream contract calling getPrice() also reverts permanently.
+    6. Liquidations freeze, deposits/withdrawals freeze, protocol is bricked.
+  invariante: >
+    // Composite oracle must never revert for any plausible price range
+    // Test: price feeds returning up to $1M equivalent should not overflow
+    assert(compositeOracle.getPrice() > 0); // should never revert
+  que_mirar:
+    - "grep: compositePrice.*rate, SCALING_FACTOR.*36, SCALING_DECIMALS"
+    - "grep: mulDiv, mul.*div.*PRECISION"
+    - "Is intermediate multiplication done with overflow-safe mulDiv?"
+    - "What is the maximum plausible price for each underlying feed?"
+    - "Are there more than 2 feeds chained together?"
+  como_se_arregla: >
+    Use 512-bit safe math (OpenZeppelin's Math.mulDiv) for intermediate products.
+    Reduce SCALING_DECIMALS from 36 to 18 if possible.
+    Add explicit overflow checks with meaningful error messages.
+    Test with maximum realistic prices for all underlying feeds.
+  trampas:
+    - "Works fine at current prices but breaks when asset price doubles"
+    - "Only manifests with specific feed decimal combinations"
+    - "36-decimal intermediate precision is common in composite oracles but dangerous"
+  incidentes:
+    - "NUTS Finance ChainlinkOracleComposite -- getPrice overflows at $100K, freezes all integrated contracts (HIGH, MixBytes)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, composite, overflow, multi-hop, arithmetic, dos, permanent-brick]
+
+- id: oracle-027
+  pattern: yield-bearing-wrapper-exchange-rate-assumption
+  name: "Yield-bearing wrapper token exchange rate hardcoded or misassumed"
+  causa_raiz: >
+    Protocols integrate yield-bearing tokens (Pendle PT/SY, ERC4626 vaults,
+    wstETH) but assume a fixed 1:1 exchange rate between the wrapper and its
+    underlying. In reality: (a) Pendle SY != underlying YT due to slippage and
+    accrued yield; (b) ERC4626 convertToAssets changes as yield accrues;
+    (c) getPtToSyRate() returns values with market-specific decimals (not always
+    1e18); (d) wstETH/stETH ratio increases over time. Using a hardcoded ratio
+    or assuming fixed decimals in the rate function causes systematic mispricing
+    of collateral, inflating borrowing capacity or preventing liquidation.
+  como_funciona: >
+    1. Protocol prices Pendle PT via: PT_price = getPtToSyRate * underlyingPrice / 1e18.
+    2. Assumes 1 SY = 1 underlying (hardcoded), but actual ratio is 0.97.
+    3. PT price is overstated by 3%, enabling overborrowing.
+    4. Variant: getPtToSyRate returns 27-decimal value for certain markets, but
+       code divides by 1e18 -> price inflated by 1e9.
+    5. Variant: ERC4626 share price used as oracle; attacker donates to inflate
+       convertToAssets, manipulating the oracle within same tx.
+    6. Liquidation reverts or never triggers because collateral appears healthy.
+  invariante: >
+    // Exchange rate must be dynamically fetched, not assumed 1:1
+    assert(syToUnderlyingRate == SY.exchangeRate()); // not hardcoded 1e18
+    // Rate decimals must match the specific market
+    assert(rateDecimals == market.rateDecimals());
+  que_mirar:
+    - "grep: getPtToSyRate, convertToAssets, exchangeRate, stEthPerToken"
+    - "grep: 1e18.*underlyingPrice, / 1e18.*rate"
+    - "Is the SY-to-underlying rate dynamically fetched or hardcoded?"
+    - "Does getPtToSyRate decimal assumption hold for ALL markets?"
+    - "Can convertToAssets be manipulated via donation in same tx?"
+    - "Is wstETH priced as 1:1 with stETH?"
+  como_se_arregla: >
+    Query SY.exchangeRate() dynamically for each conversion.
+    Read rate decimals from the specific Pendle market, not assume 1e18.
+    For ERC4626 oracles: use TWAP of share price, not instantaneous convertToAssets.
+    For wstETH: always multiply by stEthPerToken from Lido contract.
+    Cross-validate derived price against direct Chainlink feed when available.
+  trampas:
+    - "Rate is close to 1:1 for new markets but diverges as yield accrues"
+    - "Different Pendle markets return getPtToSyRate with different decimals"
+    - "ERC4626 donation attack requires only small amount for low-TVL vaults"
+  incidentes:
+    - "USG Tangent OraclePendlePT -- assumes 1 SY = 1 underlying, overstates PT price (MEDIUM, Sherlock)"
+    - "USG Tangent OraclePendlePT -- getPtToSyRate assumed 1e18 but some markets return 1e27 (MEDIUM, Sherlock)"
+    - "Usual ETH0 -- no on-chain depeg check for LST collateral; wstETH price assumption breaks over time (MEDIUM, Sherlock)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, pendle, erc4626, yield-bearing, wrapper, exchange-rate, sy-token, wsteth]
+
+- id: oracle-028
+  pattern: batch-oracle-report-fee-double-counting
+  name: "Batch oracle report processing causes fee double-counting"
+  causa_raiz: >
+    When an oracle system submits multiple asset price reports in a single batch
+    transaction, each individual report triggers protocol fee calculation independently.
+    The fee calculation uses the time elapsed since the last fee timestamp, but
+    the timestamp only updates when the base asset report is processed. If non-base
+    assets are processed first, each one accrues fees for the same time period,
+    resulting in N-fold fee overcharge (where N is the number of non-base reports
+    before the base report). This is a report-ordering vulnerability specific to
+    multi-asset oracle update batches.
+  como_funciona: >
+    1. Oracle submits batch: [tokenA_report, tokenB_report, base_report].
+    2. tokenA_report: calculateFee uses (block.timestamp - lastFeeTimestamp) -> accrues full period fees.
+    3. tokenB_report: timestamp still not updated -> accrues same full period fees again.
+    4. base_report: finally updates lastFeeTimestamp.
+    5. Protocol charged 3x the intended fees for this batch.
+    6. If there are 10 non-base assets, fees are 11x the intended amount.
+  invariante: >
+    // Fees should be calculated exactly once per time period
+    uint256 feesBefore = totalFeesMinted;
+    oracle.submitReports(reports);
+    uint256 feesAfter = totalFeesMinted;
+    assert(feesAfter - feesBefore <= expectedFeesForPeriod * 110 / 100); // 10% tolerance
+  que_mirar:
+    - "grep: submitReports, handleReport, calculateFee, feeTimestamp"
+    - "grep: updateState.*baseAsset, timestamps.*vault"
+    - "Does fee timestamp update only for base asset?"
+    - "Are multiple reports processed in a single tx?"
+    - "Does report ordering affect fee calculation?"
+  como_se_arregla: >
+    Update fee timestamp BEFORE processing any reports in the batch, or
+    only calculate fees once per batch (not per report). Alternatively,
+    process base asset report first to set the timestamp before other reports.
+    Add batch-level fee calculation that considers all reports atomically.
+  trampas:
+    - "Individual report processing looks correct in isolation"
+    - "Bug only manifests when multiple non-base reports precede base report"
+    - "Fee overcharge compounds: more assets = worse overcharge"
+  incidentes:
+    - "Mellow Flexible Vaults -- Oracle.submitReports double-counts protocol fees for non-base assets (HIGH, Sherlock)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, batch-report, fee-calculation, double-counting, report-ordering, multi-asset]
+
+- id: oracle-029
+  pattern: oracle-aggregation-cherry-picking
+  name: "Non-deterministic oracle selection allows user cherry-picking"
+  causa_raiz: >
+    Multi-oracle aggregation systems require users to submit price data from a
+    subset of available oracles meeting a minimum weight threshold. When multiple
+    valid subsets exist, a sophisticated user can choose the subset that produces
+    the most favorable aggregated price. During volatile periods, oracle sources
+    naturally diverge, widening the range of achievable prices. Additionally,
+    mean-based outlier detection shifts the reference point based on which oracles
+    are included, making the filter non-deterministic -- borderline values are
+    included or excluded based on the specific combination submitted.
+  como_funciona: >
+    1. Protocol has 3 oracles weighted 1/1/1 with threshold 2.
+    2. Oracle A reports $100, Oracle B reports $101, Oracle C reports $98.
+    3. User wanting high price submits {A, B} -> aggregated $100.50.
+    4. User wanting low price submits {B, C} -> aggregated $99.50.
+    5. $1.00 difference exploitable across deposit/borrow cycle.
+    6. Mean-based outlier detection compounds the issue: including/excluding
+       one oracle shifts the mean, which changes which oracles pass the
+       outlier filter, producing cascading non-determinism.
+  invariante: >
+    // All valid oracle subsets must produce prices within acceptable range
+    // Or: require ALL oracles, not a subset
+    assert(maxAggPrice - minAggPrice <= MAX_ACCEPTABLE_SPREAD);
+  que_mirar:
+    - "grep: collect.*price, aggregate.*oracle, weight.*threshold"
+    - "grep: outlier.*mean, outlier.*average, filterPrice"
+    - "Can users choose which oracle sources to submit?"
+    - "Is there a minimum requirement to submit ALL available oracles?"
+    - "Does outlier detection use mean-based or median-based filtering?"
+  como_se_arregla: >
+    Require users to submit ALL registered price feeds, not a subset.
+    Use median-based outlier filtering instead of mean-based.
+    Implement deterministic oracle selection (primary, secondary, fallback)
+    where primary+secondary must agree within threshold.
+    Prevent user from choosing which oracles to include.
+  trampas:
+    - "Works fine in low-volatility conditions when all oracles agree"
+    - "Mean-based filtering is academically common but operationally fragile"
+    - "Weight threshold seems secure but allows subset selection"
+  incidentes:
+    - "Bucket Protocol V2 -- non-deterministic oracle selection lets user cherry-pick favorable subset (LOW->MEDIUM, Quantstamp)"
+    - "Bucket Protocol V2 -- mean-sensitive outlier detection produces non-deterministic aggregated price (LOW, Quantstamp)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, aggregation, cherry-picking, non-deterministic, outlier-detection, mean, median]
+
+- id: oracle-030
+  pattern: oracle-failure-silent-zero-propagation
+  name: "Oracle failure silently returns zero, cascading through dependent calculations"
+  causa_raiz: >
+    When an oracle fails (stale data, feed down, access revoked), the error-handling
+    returns 0 instead of reverting. This zero propagates through multiplication chains
+    in dependent calculations (voting power, collateral value, reward accrual),
+    silently producing zero output. Unlike oracle-004 (zero price FROM oracle), this
+    pattern is about the protocol's error handler converting oracle failures to zero,
+    then using that zero in critical calculations without any further check. The zero
+    is semantically "no data" but is treated as "value is zero."
+  como_funciona: >
+    1. Oracle feed returns stale data or reverts.
+    2. Protocol's getPriceAt() catches error, returns 0 (not revert).
+    3. Downstream: votingPower = stake * getTokenPriceAt() = stake * 0 = 0.
+    4. Operator loses all voting power despite having active stake.
+    5. Votes pass with incorrect quorum because staked operators show 0 power.
+    6. Variant: reward accrual uses stale oracle -> getAccruedYield() underpays.
+    7. Variant: collateral valuation -> loan appears worthless, triggers false liquidation.
+  invariante: >
+    // Oracle failure must either revert or propagate a sentinel value
+    // that downstream consumers check explicitly
+    (bool success, uint256 price) = oracle.tryGetPrice();
+    assert(success || operationReverted);
+    // Zero price must never silently enter calculations
+    assert(price > 0 || !priceUsedInCalculation);
+  que_mirar:
+    - "grep: return.*success.*0, return.*false.*0, catch.*return 0"
+    - "grep: getPriceAt.*return.*0, getPrice.*catch"
+    - "grep: stakeToVotingPower.*getTokenPrice, reward.*oracle.*price"
+    - "Do oracle error handlers return 0 or revert?"
+    - "Do downstream consumers check for zero price?"
+    - "Is 0 a valid price in any supported asset?"
+  como_se_arregla: >
+    Oracle error handlers should revert, not return 0.
+    If returning 0 is needed for non-critical paths, wrap in (bool success, uint256 price)
+    and require callers to check success flag.
+    Add explicit require(price > 0) before any multiplication.
+    Separate "oracle unavailable" from "price is zero" with distinct return values.
+  trampas:
+    - "Returning 0 on failure seems safer than reverting but silently corrupts"
+    - "Zero propagates through multiplication without triggering any check"
+    - "Only manifests during actual oracle downtime -- hard to test"
+  incidentes:
+    - "Symbiotic -- ChainlinkPriceFeed.getPriceAt returns 0 on failure, zeroes operator voting power (MEDIUM, Cyfrin)"
+    - "NUTS Finance -- zero price cast from negative passes through, halts liquidation (MEDIUM, MixBytes)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, silent-zero, error-handling, voting-power, cascading-failure, propagation]
+
+- id: oracle-031
+  pattern: flat-oracle-price-ignores-pool-imbalance
+  name: "Oracle-priced AMM ignores pool imbalance, enabling infinite-size trades at flat price"
+  causa_raiz: >
+    Some DEX designs use oracle prices to center passive liquidity orders rather
+    than using a constant-product (x*y=k) curve. When the pool reflects orders
+    symmetrically around the oracle price with geometric spacing, an asymmetric
+    liquidity deposit (all on one side) causes every ask order to be placed at
+    the same oracle-derived price regardless of trade size. Unlike traditional
+    AMMs where large trades move the price, the oracle-priced pool sells unlimited
+    quantity at the flat oracle price. This is fundamentally different from spot
+    price manipulation (oracle-002) because here the oracle price IS correct --
+    the bug is that pool mechanics don't apply price impact.
+  como_funciona: >
+    1. Geometric pool reflects bid/ask orders around oracle-derived marginal price.
+    2. Attacker deposits liquidity asymmetrically (e.g., only quote token).
+    3. All ask-side orders collapse to the same price = oracle price.
+    4. Attacker (or any user) can buy unlimited base tokens at flat oracle price.
+    5. No price impact regardless of trade size.
+    6. Liquidity providers suffer losses: sold all base tokens at no premium.
+    7. Attacker can buy large amounts cheaply, then sell on other venues.
+  invariante: >
+    // Effective execution price must increase with trade size
+    uint256 price_small = pool.getEffectivePrice(smallAmount);
+    uint256 price_large = pool.getEffectivePrice(largeAmount);
+    assert(price_large >= price_small);
+  que_mirar:
+    - "grep: reflect_curve, oracle_querier, marginal_price, geometric"
+    - "grep: bid_starting_price, ask_starting_price, tick_spacing"
+    - "Does pool pricing depend on reserve balances or only oracle?"
+    - "What happens when liquidity is deposited asymmetrically?"
+    - "Is there price impact proportional to trade size?"
+  como_se_arregla: >
+    Incorporate pool balance/inventory into price reflection logic.
+    Apply price impact based on actual reserves, not just oracle price.
+    Limit maximum order size per price level.
+    Validate that ask prices increase with cumulative volume.
+    Consider hybrid model: oracle-centered with balance-weighted spread.
+  trampas:
+    - "Symmetric deposits work fine -- bug only appears with asymmetric liquidity"
+    - "Oracle price is correct -- the issue is the pool mechanics, not the oracle"
+    - "Standard AMM invariant testing misses this because x*y=k doesn't apply"
+  incidentes:
+    - "Dango DEX -- asymmetric liquidity in geometric pool allows purchase at flat oracle price, unbounded size (HIGH, Sherlock)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, amm, geometric-pool, flat-price, price-impact, asymmetric-liquidity, passive-orders]
+
+- id: oracle-032
+  pattern: cross-oracle-decimal-normalization-in-comparison
+  name: "Cross-oracle comparison fails due to different decimal precision between providers"
+  causa_raiz: >
+    When protocols use multiple oracle providers (e.g., API3 + eOracle, Chainlink +
+    Pyth) for price validation or fallback, the raw prices from different providers
+    may have different decimal precision. If the protocol compares these prices
+    directly without normalizing decimals first, the delta calculation produces
+    nonsensical results. A 5% divergence check between an 18-decimal price and an
+    8-decimal price will always find them "divergent," causing the protocol to
+    permanently fall back to one oracle or reject all prices. This differs from
+    oracle-006 (single oracle decimal mismatch) because here both oracles return
+    correct prices -- the comparison logic between them is broken.
+  como_funciona: >
+    1. Protocol queries API3 oracle: returns price with 18 decimals ($3000e18).
+    2. Protocol queries eOracle: returns price with 8 decimals ($3000e8).
+    3. Delta check: abs(3000e18 - 3000e8) / 3000e8 = enormous percentage.
+    4. Exceeds maxPriceDelta threshold, API3 price is rejected.
+    5. Protocol always falls back to eOracle regardless of which is fresher.
+    6. If eOracle is stale, protocol uses stale price with no fallback.
+    7. Variant: DoS when both oracles are required to agree but never can.
+  invariante: >
+    // Cross-oracle comparison must normalize decimals first
+    uint256 priceA_normalized = priceA * 10**(targetDecimals - decimalsA);
+    uint256 priceB_normalized = priceB * 10**(targetDecimals - decimalsB);
+    uint256 delta = abs(priceA_normalized - priceB_normalized);
+    assert(delta * BPS / priceB_normalized <= maxDeltaBps);
+  que_mirar:
+    - "grep: _absDiff.*Price, deltaBps, maxPriceDelta"
+    - "grep: api3.*eOracle, chainlink.*pyth.*compare"
+    - "grep: decimals.*getLatestPrice, feedDecimals.*compare"
+    - "Are prices from different oracles normalized before comparison?"
+    - "Do both oracle providers use the same decimal precision?"
+    - "What happens when the delta check fails -- DoS or silent fallback?"
+  como_se_arregla: >
+    Normalize all oracle prices to a common precision (e.g., 18 decimals)
+    BEFORE any comparison or delta calculation.
+    Read decimals() from each provider dynamically.
+    Test with oracle pairs that have different decimal precisions.
+    Ensure fallback logic works correctly when comparison fails.
+  trampas:
+    - "Both oracles return correct prices -- the bug is only in comparison logic"
+    - "Works fine when both providers happen to use same decimals"
+    - "Manifests as permanent fallback to one oracle, not obvious as a bug"
+  incidentes:
+    - "Malda MixedPriceOracleV4 -- API3 (18 dec) vs eOracle (8 dec) comparison always divergent, permanent fallback (MEDIUM, Sherlock)"
+    - "Malda -- getUnderlyingPrice DoS for tokens where oracle decimals differ (MEDIUM, Sherlock)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit R2"
+  tags: [oracle, cross-oracle, decimal-normalization, comparison, api3, eoracle, multi-provider, fallback]

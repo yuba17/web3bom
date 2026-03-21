@@ -1,0 +1,189 @@
+protocol: revert-lend
+component: V3Vault
+file: src/V3Vault.sol
+domain: lending
+hunter: FlowHunter
+generated_at: "2026-03-20T12:00:00Z"
+
+invariants:
+  - id: VV-01
+    tier: 1
+    type: property
+    description: "CROSS-VALIDATED with oracle-hunter VV-O-05. Liquidation of staked position: health check uses ignoreFees=true (feeValue=0, fullValue=liquidity only). After _unstakeIfNeeded, CLGauge.withdraw syncs fee growth, populating tokensOwed0/1 with staking-period fees. _sendPositionValue then collects ALL fees (uint128.max) but liquidatorCost was computed from fee-excluded fullValue. Liquidator extracts staking-period fees for free."
+    attack_scenario: "1. Position staked in Aerodrome gauge for extended period (fees accumulate). 2. Position becomes unhealthy. 3. Liquidator calls liquidate(). 4. Health check at L742: ignoreFees=true → fullValue excludes fees, feeValue=0. 5. _unstakeIfNeeded at L748: CLGauge.withdraw calls pool.burn(0) syncing feeGrowthInside, populating tokensOwed with staking-period fees. 6. _calculateLiquidation at L750: uses deflated fullValue (no fees). 7. _sendPositionValue at L770: full liquidation path sets fees0=fees1=uint128.max, collecting ALL tokensOwed (staking fees). Partial liquidation also sets fees=uint128.max (L1129-1130). Liquidator pays based on fee-excluded value but receives liquidity + all staking fees. The fee delta is extracted at the expense of the borrower (who would normally receive remaining value after debt coverage). IMPORTANT: MockGauge in tests does NOT replicate CLGauge fee sync behavior, so this is only detectable on mainnet fork."
+    solidity: |
+      // Check that liquidation accounting is consistent pre/post unstake
+      // This tests that staked position liquidation doesn't create value discrepancy
+      (uint256 debtExchangeRateX96, uint256 lendExchangeRateX96) = vault._updateGlobalInterest();
+      uint256 tokenId = ...; // staked position with debt
+
+      // Get pre-unstake values (ignoreFees=true for staked)
+      (uint256 fullValueBefore, uint256 feeValueBefore,,) = oracle.getValue(tokenId, asset, true);
+
+      // Unstake
+      gaugeManager.unstakeIfStaked(tokenId);
+
+      // Get post-unstake values (ignoreFees=false now)
+      (uint256 fullValueAfter, uint256 feeValueAfter,,) = oracle.getValue(tokenId, asset, false);
+
+      // If these differ significantly, liquidation used wrong values
+      // Allow 1% tolerance for rounding
+      lte(fullValueAfter - fullValueBefore, fullValueBefore / 100, "VV-01: post-unstake value differs >1% from pre-unstake");
+    ghost_vars: []
+    validated: false
+    priority: high
+    confidence: 75
+    notes: "CROSS-VALIDATED with oracle-hunter. Real Aerodrome CLGauge.withdraw() calls pool.burn(0) to sync feeGrowthInside, populating tokensOwed with fees accrued during staking period. Oracle._getFees reads tokensOwed (L562-563), so post-unstake getLiquidityAndFees returns non-zero fees. But in _sendPositionValue, feeValue=0 (from pre-unstake health check), so ALL fees go to liquidator via uint128.max. Impact scales with: (a) staking duration, (b) pool trading volume, (c) position liquidity. Needs fork test to quantify. MockGauge does NOT replicate this (no pool.burn call)."
+
+  - id: VV-02
+    tier: 2
+    type: property
+    description: "Token replacement in onERC721Received during transform can shift totalDebtShares between different collateral tokens without proper limit validation when the old and new NFTs have different underlying token pairs."
+    attack_scenario: "A transformer replaces a position with token pair (tokenA, tokenB) with a new position using (tokenC, tokenB). _cleanupLoan reduces totalDebtShares for tokenA and tokenB. _updateAndCheckCollateral increases for tokenC and tokenB. The increase check at L1316-1330 validates collateralValueLimitFactorX32 for tokenC and tokenB. But if tokenC has a higher limit or is newly configured, an attacker could concentrate debt backing in a specific collateral token by repeatedly doing transform+replace cycles, potentially exceeding the intended risk concentration limits for the vault. More critically: if collateralFactorX32 for tokenC is higher than tokenA, the new position gets more borrowing power with the same liquidity, potentially allowing further borrowing without the position becoming unhealthy."
+    solidity: |
+      // Track totalDebtShares per token across transform replacements
+      // Invariant: totalDebtShares for any token should not exceed its collateralValueLimit
+      uint256 lentAssets = vault._convertToAssets(vault.totalSupply(), lendExchangeRateX96, Math.Rounding.Up);
+
+      (uint32 collateralFactorX32_0, uint32 collateralValueLimitFactorX32_0, uint192 totalDebtShares_0) = vault.tokenConfigs(token0);
+      (uint32 collateralFactorX32_1, uint32 collateralValueLimitFactorX32_1, uint192 totalDebtShares_1) = vault.tokenConfigs(token1);
+
+      if (collateralValueLimitFactorX32_0 < type(uint32).max) {
+          uint256 debtValue_0 = vault._convertToAssets(totalDebtShares_0, debtExchangeRateX96, Math.Rounding.Up);
+          lte(debtValue_0, lentAssets * collateralValueLimitFactorX32_0 / Q32, "VV-02: token0 debt exceeds collateral value limit");
+      }
+      if (collateralValueLimitFactorX32_1 < type(uint32).max) {
+          uint256 debtValue_1 = vault._convertToAssets(totalDebtShares_1, debtExchangeRateX96, Math.Rounding.Up);
+          lte(debtValue_1, lentAssets * collateralValueLimitFactorX32_1 / Q32, "VV-02: token1 debt exceeds collateral value limit");
+      }
+    ghost_vars: []
+    validated: false
+    priority: high
+    confidence: 45
+    notes: "The check in _updateAndCheckCollateral (L1307-1330) does validate limits on the NEW token pair. But the check uses current totalDebtShares which includes the just-added shares. The concern is whether the limit check is granular enough — it checks each token independently, but doesn't consider the net effect of the swap. Also, the _cleanupLoan for old token happens BEFORE _updateAndCheckCollateral for new token, so the reduction happens first, then the increase is checked. Seems correct. Lowering confidence — likely by design but worth fuzzing."
+
+  - id: VV-03
+    tier: 1
+    type: property
+    description: "In liquidate(), _handleReserveLiquidation modifies lastLendExchangeRateX96 (L1217) but _cleanupLoan at L779 uses the original state.newLendExchangeRateX96 from L734. This means the collateral value limit check in _updateAndCheckCollateral during cleanup uses a stale lend exchange rate."
+    attack_scenario: "When a bad-debt liquidation triggers reserve socialization, lastLendExchangeRateX96 decreases. But _cleanupLoan passes the OLD rate to _updateAndCheckCollateral. The collateralValueLimit check at L1314 computes lentAssets using the old (higher) lendExchangeRateX96 instead of the new (lower) one. Since _cleanupLoan reduces debt shares (oldShares > newShares=0), it enters the L1303-1306 branch which just decreases totalDebtShares — the limit check at L1312-1330 only fires on increase (else branch). So this specific case doesn't trigger the wrong check. BUT: the stale rate is also used for _updateAndCheckCollateral's internal accounting. Since cleanup only decreases shares, the stale rate doesn't cause a revert or incorrect limit check. However, if a concurrent borrow happens in the same block AFTER this liquidation, the interest rate update is cached (lastExchangeRateUpdate == block.timestamp) and returns the socialized rate. So the stale rate in _cleanupLoan is harmless for cleanup itself but signals a code smell."
+    solidity: |
+      // After a liquidation with reserve socialization:
+      // Check that lastLendExchangeRateX96 matches what was used in cleanup
+      // This is a code-smell check — the cleanup uses old rate but only for decrease path
+      uint256 storedRate = vault.lastLendExchangeRateX96();
+      // If socialization happened, storedRate < original rate from _updateGlobalInterest
+      // This invariant checks the rate is self-consistent
+      t(storedRate > 0, "VV-03: lend exchange rate is zero after liquidation");
+    ghost_vars:
+      - "uint256 internal ghost_preLiquidationLendRate;"
+    validated: false
+    priority: medium
+    confidence: 40
+    notes: "Investigated deeply. The stale rate in _cleanupLoan is used only for the decrease path of _updateAndCheckCollateral which doesn't use lentAssets. So there's no actual exploit from this stale rate. The math hunter should double-check the exchange rate consistency. Marking as tier 1 for investigation but low confidence of actual exploit."
+
+  - id: VV-04
+    tier: 2
+    type: property
+    description: "The transformedTokenId sentinel is used as a reentrancy guard for liquidate() and decreaseLiquidityAndCollect() (L648, L728) but NOT for deposit/withdraw/repay ERC4626 operations. While transform is active, a malicious transformer could call deposit() or withdraw() on the vault to manipulate the available liquidity before calling borrow()."
+    attack_scenario: "An allowlisted transformer (audited but malicious/compromised) during transform: (1) calls vault.borrow() to extract assets, (2) calls vault.deposit() from a separate account to add liquidity, allowing more borrows, (3) calls vault.borrow() again. The borrow safety buffer check is skipped in transform mode (L630). The final health check at L579 only checks if the loan is healthy, not if the vault's global limits were manipulated. However: deposit requires transferring tokens IN, so the transformer needs capital. And borrow at L610-612 checks globalDebtLimit and at L613-616 checks dailyDebtIncreaseLimitLeft. These limits are NOT bypassed in transform mode. So the transformer can't borrow more than the limits allow regardless. The real question: can the transformer manipulate oracle prices during the transform to make the collateral appear more valuable for the final health check?"
+    solidity: |
+      // Invariant: debtSharesTotal should never exceed globalDebtLimit in shares
+      // even during transform mode
+      uint256 debtExchangeRateX96 = vault.lastDebtExchangeRateX96();
+      uint256 currentDebtShares = vault.debtSharesTotal();
+      uint256 globalLimit = vault.globalDebtLimit();
+      uint256 limitInShares = globalLimit * Q96 / debtExchangeRateX96; // approximate
+      lte(currentDebtShares, limitInShares + 1, "VV-04: debtSharesTotal exceeds globalDebtLimit");
+    ghost_vars: []
+    validated: false
+    priority: medium
+    confidence: 35
+    notes: "Global limits are enforced in borrow() regardless of transform mode. The health check skip only affects per-loan health, not global limits. This is likely safe by design. The real risk is if the transformer can manipulate oracle.getValue() — but that's oracle-hunter territory. Sending note to oracle-hunter."
+
+  - id: VV-05
+    tier: 2
+    type: property
+    description: "In decreaseLiquidityAndCollect(), the function unstakes (L658), then updates interest (L660), then decreases liquidity and collects (L663-679), then re-stakes (L683), then checks health (L687). The re-stake via _stake calls gaugeManager.stakePosition which triggers CLGauge.deposit which collects pre-stake fees to GaugeManager. These collected fees reduce the position's value. But the health check at L687 uses _isStaked(tokenId) which returns true (just staked), so ignoreFees=true, excluding fee value from collateral. The position's liquidity was just reduced by the user, AND fees were collected to owner during re-stake. The health check correctly uses post-operation state."
+    attack_scenario: "A borrower with a staked position calls decreaseLiquidityAndCollect to withdraw most liquidity and fees. The re-stake at L683 realizes any remaining fees to the owner. The health check at L687 with ignoreFees=true means the position is valued only on liquidity (which was just reduced). If the remaining liquidity is barely enough to cover the debt, the health check should catch it. BUT: there's a timing issue — between unstake (L658) and re-stake (L683), the NFT is in the vault. During this window, interest is updated (L660), liquidity decreased (L663), and fees collected (L670-679). The collect at L679 sends tokens to params.recipient (external call). If recipient is a contract, it gets a callback, but since this is an ERC20 transfer via NonfungiblePositionManager.collect, there's no ERC721 callback. Safe."
+    solidity: |
+      // After decreaseLiquidityAndCollect, verify position remains healthy
+      // This tests the CEI pattern is respected
+      uint256 tokenId = ...; // target token
+      uint256 debtExchangeRateX96 = vault.lastDebtExchangeRateX96();
+      uint256 debt = loans[tokenId].debtShares * debtExchangeRateX96 / Q96;
+      (bool isHealthy,,,) = vault._checkLoanIsHealthy(tokenId, debt, true);
+      t(isHealthy, "VV-05: position unhealthy after decreaseLiquidityAndCollect");
+    ghost_vars: []
+    validated: false
+    priority: medium
+    confidence: 30
+    notes: "CEI appears to be followed. The external calls (decreaseLiquidity, collect) happen before state changes (re-stake, health check). The health check is the last operation. The vulnerability would require a callback that modifies vault state between collect and health check, but collect doesn't trigger callbacks to the vault. Likely safe."
+
+  - id: VV-06
+    tier: 1
+    type: property
+    description: "Multicall allows batching multiple vault operations atomically. A user could batch repay(tokenId, smallAmount) + borrow(tokenId, largeAmount) in one multicall. Each call independently updates global interest (cached per block, so no re-computation). The repay increases dailyDebtIncreaseLimitLeft, then borrow consumes it. This effectively lets a user 'recycle' daily debt limit within a single transaction."
+    attack_scenario: "Assume dailyDebtIncreaseLimitLeft = 100 USDC. User has 200 USDC debt. User multicalls: (1) repay 150 USDC → dailyDebtIncreaseLimitLeft becomes 250, (2) borrow 250 USDC → dailyDebtIncreaseLimitLeft becomes 0. Net effect: user repaid 150 but borrowed 250, net increase of 100 USDC. But the daily limit was 100 USDC. The user effectively borrowed 250 against a 100 limit by recycling. However: the net position change IS only +100 USDC of debt (250 - 150). The daily limit is meant to cap NET daily increase. The repay+borrow pattern achieves net +100 which is within the 100 limit. So this might actually be correct behavior. BUT: if the user repays and immediately reborrows, they're bypassing the spirit of the daily limit which is meant to prevent rapid debt accumulation. The actual debt increase is 100, matching the limit. Likely by design."
+    solidity: |
+      // Track net daily debt change across multicall batches
+      // Before: debtSharesTotal = X, dailyDebtIncreaseLimitLeft = L
+      // After multicall of repay+borrow:
+      //   net debt change should be <= original dailyDebtIncreaseLimitLeft
+      uint256 debtBefore = ghost_debtSharesTotal_snapshot;
+      uint256 debtAfter = vault.debtSharesTotal();
+      uint256 limitBefore = ghost_dailyDebtLimitLeft_snapshot;
+      if (debtAfter > debtBefore) {
+          uint256 increase = debtAfter - debtBefore;
+          uint256 increaseAssets = increase * vault.lastDebtExchangeRateX96() / Q96;
+          lte(increaseAssets, limitBefore, "VV-06: net debt increase exceeds daily limit snapshot");
+      }
+    ghost_vars:
+      - "uint256 internal ghost_debtSharesTotal_snapshot;"
+      - "uint256 internal ghost_dailyDebtLimitLeft_snapshot;"
+    validated: false
+    priority: low
+    confidence: 50
+    notes: "CROSS-VALIDATED with math-hunter: CONFIRMED as real but by design (QA/informational). The daily limit tracks NET new debt creation, not gross borrows. L1038 comment: 'when amounts are repayed - they maybe borrowed again'. Same at L1001 for lend limits. The globalDebtLimit (L610) provides the hard cap on total outstanding debt. Daily limit is a rate limiter on NET new debt. Downgrading to low priority."
+
+  - id: VV-07
+    tier: 2
+    type: property
+    description: "CROSS-VALIDATED with math-hunter. In liquidation, _handleReserveLiquidation (L1228-1229) reduces dailyDebtIncreaseLimitLeft for the haircut. Then L767 adds liquidatorCost back unconditionally. The final value can exceed the post-haircut daily cap."
+    attack_scenario: "Math-hunter concrete example: Pre-haircut cap=1000, used=900, left=100. Haircut: capReduction=200, left=max(0,100-200)=0. Post-haircut cap=800. L767: left=0+500(liquidatorCost)=500. Now 500 remaining but post-haircut cap is 800 with 900 already used — the 500 addition makes it seem like 400 more can be borrowed when really the cap has been exceeded. In practice: the daily limit can be inflated beyond its intended cap after bad-debt socialization + liquidation. However, globalDebtLimit (L610) still provides a hard ceiling on total outstanding debt."
+    solidity: |
+      // Invariant: dailyDebtIncreaseLimitLeft should never exceed the calculated daily cap
+      uint256 lendExchangeRateX96 = vault.lastLendExchangeRateX96();
+      uint256 currentCap = vault._calculateDailyIncreaseLimit(lendExchangeRateX96, vault.dailyDebtIncreaseLimitMin(), MAX_DAILY_DEBT_INCREASE_X32);
+      uint256 currentLeft = vault.dailyDebtIncreaseLimitLeft();
+      lte(currentLeft, currentCap + 1, "VV-07: dailyDebtIncreaseLimitLeft exceeds daily cap");
+    ghost_vars: []
+    validated: false
+    priority: high
+    confidence: 70
+    notes: "CROSS-VALIDATED with math-hunter at 70% confidence. The haircut at L1228 adjusts left DOWN without accounting for the upcoming liquidatorCost addition at L767. The ordering is: haircut reduces left → liquidatorCost inflates left. Final left can exceed post-haircut cap. Practical impact limited by globalDebtLimit hard ceiling. Severity: Medium — daily rate limit bypass in bad-debt socialization scenarios."
+
+false_positives:
+  - hunter: FlowHunter
+    id: VV-FP-01
+    reason: "Transform mode health check skip in borrow() is by design. The final health check at L579 after transform completes catches all cumulative borrowing. Global limits (debt limit, daily limit) are still enforced in each borrow call. The skip only applies to per-loan health, not global safety."
+    investigated_at: "2026-03-20T12:00:00Z"
+
+  - hunter: FlowHunter
+    id: VV-FP-02
+    reason: "onERC721Received callback during remove() — CEI is followed (state changes at L810 before external call at L811). The safeTransferFrom callback is on the recipient, not back to the vault. Even if recipient re-enters, tokenOwner is already cleared so no double-remove possible."
+    investigated_at: "2026-03-20T12:00:00Z"
+
+  - hunter: FlowHunter
+    id: VV-FP-03
+    reason: "GaugeManager.unstakePosition sends NFT back to vault via safeTransferFrom with abi.encode(owner) as data. This triggers onERC721Received. During liquidation flow (which calls _unstakeIfNeeded), transformedTokenId=0, so it enters the new deposit path. But tokenOwner[tokenId] is already set (existing position), so the `if (tokenOwner[tokenId] == address(0))` check at L415 is false, and nothing happens — the function returns the selector. Safe."
+    investigated_at: "2026-03-20T12:00:00Z"
+
+  - hunter: FlowHunter
+    id: VV-FP-04
+    reason: "ERC4626 deposit/withdraw do not have reentrancy via callbacks because the underlying asset is a standard ERC20 (eg USDC) transferred via SafeERC20. No ERC777 tokensReceived callback. The asset is immutable, set in constructor."
+    investigated_at: "2026-03-20T12:00:00Z"
+    pending_briefing_update:
+      action: add_to_trampas
+      briefing: lending.md
+      content: "V3Vault asset is immutable ERC20 — no ERC777 callback risk on deposit/withdraw unless the asset itself is ERC777-compatible."

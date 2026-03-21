@@ -1,0 +1,641 @@
+# New staking patterns derived from 203 Solodit findings
+# Patterns NOT covered by staking-001 through staking-008
+
+- id: staking-009
+  pattern: boost-multiplier-retroactive-application
+  name: "Boost/multiplier applied retroactively to past unclaimed rewards"
+  causa_raiz: >
+    When a staking contract applies a boost multiplier (from locking, veToken weight,
+    or time bonus) inside the earned() function without first checkpointing accrued
+    rewards at the old multiplier, any change in multiplier retroactively inflates
+    or deflates all unclaimed rewards. The pattern: earned = balance * boost *
+    (rewardPerToken - userRewardPerTokenPaid). If boost changes without snapshotting
+    rewards first, the new boost multiplies the entire delta.
+  como_funciona: |
+    1. User stakes tokens at day 0 with no lock (boost = 1x)
+    2. Rewards accrue for 90 days at 1x multiplier
+    3. User calls setLockStatus() or increases lock duration, boost becomes 2x
+    4. earned() now returns balance * 2x * fullDelta — retroactively doubling 90 days of rewards
+    5. User claims inflated rewards and optionally unlocks after minimum period
+    6. OR: admin changes monsterMultiplier/baseVotes parameter, changing voting power mid-stake
+       causing unstake to underflow (voting power at unstake > voting power at stake)
+  invariante: |
+    assert(rewardsClaimedByUser <= rewardsAccruedAtCurrentMultiplier + rewardsSnapshotAtOldMultiplier);
+    // Before any multiplier change: rewards[user] must be checkpointed
+  que_mirar:
+    - "getBoost(_account) or multiplier used inside earned()"
+    - "setLockStatus or extendLock without calling updateReward first"
+    - "monsterMultiplier or baseVotes changed by admin without re-snapshotting"
+    - "getTokenVotingPower used in both stake and unstake independently"
+    - "Lock duration extension without reward checkpoint"
+  como_se_arregla: "Always call updateReward(user) / checkpoint accrued rewards BEFORE changing any multiplier, boost, or voting power parameter. Snapshot voting power at stake time for unstake calculation."
+  trampas:
+    - "If boost only applies to future rewards (post-checkpoint), this is not vulnerable"
+    - "Multiplier changes by admin that only affect new stakes are safe"
+  incidentes:
+    - "Meta — setLockStatus() retroactively applies boost to 90 days of unclaimed rewards (HIGH)"
+    - "FrankenDAO — admin changing monsterMultiplier causes unstake underflow, locking NFTs (HIGH)"
+    - "NeoTokyo — totalPoints changes from stake/unstake retroactively affect all existing positions (HIGH, C4)"
+    - "BOB-Staking — Bonuses obtainable without proper locking due to flawed lock period (HIGH)"
+    - "Nayms — Stake boost inflation via repeated stake/unstake inflates next interval boost (HIGH, Quantstamp)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [boost, multiplier, retroactive, lock, veToken, checkpoint, voting-power]
+
+- id: staking-010
+  pattern: reward-token-lifecycle-mismatch
+  name: "Reward token add/remove/re-add breaks accounting permanently"
+  causa_raiz: >
+    When reward tokens are removed from a staking contract, the global accumulator
+    (accumulatedRewardsPerShare in the struct) is deleted, but per-user tracking
+    (userRewardDebts mapping by token address) persists. If the same token is
+    re-added, the global tracker resets to zero while user trackers retain old values,
+    causing underflow on claim. Separately, removing a reward token while users have
+    unclaimed balances makes those rewards permanently unclaimable.
+  como_funciona: |
+    1. Reward token X is active, users accumulate rewards, accRewardsPerShare = 100
+    2. User A has userRewardDebt[X] = 50, meaning 50 units already claimed
+    3. Admin removes token X — struct deleted, accRewardsPerShare gone
+    4. User A's userRewardDebt[X] = 50 persists in mapping
+    5. Admin re-adds token X — accRewardsPerShare starts at 0
+    6. User A tries to claim: 0 - 50 = underflow revert
+    7. OR: users with unclaimed rewards when token removed lose them forever
+  invariante: |
+    // On reward token removal: all user debts for that token must be zero or claimable
+    assert(userRewardDebt[user][removedToken] == 0 || claimOnlyModeEnabled);
+  que_mirar:
+    - "removeRewardToken or similar function that deletes from array"
+    - "addRewardToken that doesn't check if token was previously removed"
+    - "userRewardDebts stored in mapping(address => mapping(address => uint256))"
+    - "Claim function iterating current rewardTokens array only"
+    - "rewardsPerSecond with no end timestamp (infinite accrual)"
+  como_se_arregla: "Never fully delete reward token state. Move removed tokens to 'claim-only' mode. On re-add, verify no stale user debts exist or reset them. Add endTimestamp to reward accrual."
+  trampas:
+    - "If protocol never re-adds removed tokens, underflow path is unreachable"
+    - "Infinite reward accrual is only a problem if contract balance is insufficient"
+  incidentes:
+    - "Olympusdao — Removed reward tokens permanently lose unclaimed balances (MEDIUM, Sherlock)"
+    - "Olympusdao — Re-added reward tokens cause underflow on claim (MEDIUM, Sherlock)"
+    - "Olympusdao — Internal reward tokens accrue indefinitely, over-commit and break all claims (MEDIUM, Sherlock)"
+    - "Olympusdao — Cached rewards underflow freezes user rewards temporarily (MEDIUM, Sherlock)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [reward-token, add-remove, lifecycle, underflow, accounting, mapping-persistence]
+
+- id: staking-011
+  pattern: withdrawal-without-reward-settlement
+  name: "Withdraw/unstake path skips reward settlement, losing unclaimed rewards"
+  causa_raiz: >
+    Multiple withdrawal paths exist (withdraw, withdrawETH, exit, emergencyWithdraw,
+    redeem) but not all of them call the reward settlement function before reducing
+    the user's balance. When balance drops to zero, all future reward calculations
+    return zero and unclaimed rewards are orphaned in the contract. The withdrawal
+    update logic may also reset claimed[] to max or zero rewards[] without transferring.
+  como_funciona: |
+    1. User has staked balance and accrued unclaimed rewards
+    2. User calls withdrawETH() or alternative withdrawal path
+    3. This path burns LP tokens / reduces balance but does NOT call _distributeRewards()
+    4. User's balance is now 0, earned() returns 0
+    5. Unclaimed rewards are permanently orphaned in the contract
+    6. OR: on new deposit, _setClaimedToMax() overwrites unclaimed rewards
+  invariante: |
+    // Before any balance reduction: pending rewards must be settled
+    assert(pendingRewards(user) == 0 || rewardsTransferred);
+    // After withdrawal: user.rewards >= rewardsBeforeWithdrawal
+  que_mirar:
+    - "withdrawETH or exit functions that don't call updateReward"
+    - "_setClaimedToMax called on deposit without first distributing"
+    - "_withdrawUpdateRewardState resetting userRewardDebts BEFORE computing difference"
+    - "Multiple withdrawal paths — check EACH one settles rewards"
+    - "balance burned before reward calculation"
+  como_se_arregla: "Call updateReward(user) or distribute pending rewards in EVERY withdrawal/deposit path. Never zero claimed/debt state before computing outstanding rewards."
+  trampas:
+    - "If rewards are auto-compounded into stake, withdrawal implicitly includes them"
+    - "emergencyWithdraw intentionally forfeits rewards in some designs"
+  incidentes:
+    - "Stakehouse — withdrawETH() burns LP without distributing rewards, orphaning them (HIGH, C4)"
+    - "Stakehouse — _onDepositETH sets claimed to max, erasing unclaimed rewards (HIGH, C4)"
+    - "Olympusdao — _withdrawUpdateRewardState resets claimed before computing diff, inflating cache (HIGH, Sherlock)"
+    - "Blueberry — Re-depositing to Ichi farm sends ICHI rewards to spell contract, not user (HIGH, Sherlock)"
+    - "SynthVault (Spartan) — withdraw forfeits all accumulated rewards (HIGH)"
+    - "Hybra Finance — Users emergency withdrawing lose all past accrued rewards (MEDIUM)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [withdrawal, reward-settlement, orphaned-rewards, balance-zero, multiple-paths]
+
+- id: staking-012
+  pattern: staking-exchange-rate-manipulation
+  name: "Asymmetric exchange rate between stake and unstake enables drain"
+  causa_raiz: >
+    Staking mints receipt tokens at a fixed 1:1 ratio but burning/unstaking uses
+    the current exchange rate (which includes accumulated rewards), or vice versa.
+    This asymmetry allows attackers to loop stake->unstake to extract rewards
+    without genuine time commitment. Also applies when exchange rate is updated
+    manually (not atomically), enabling front-running.
+  como_funciona: |
+    1. Protocol mints stToken at 1:1 with baseToken on stake
+    2. Rewards accumulate, exchange rate of stToken/baseToken increases above 1:1
+    3. Attacker stakes X baseToken, receives X stToken (1:1 mint)
+    4. Attacker unstakes X stToken, receives X * exchangeRate baseToken (>X)
+    5. Profit = X * (exchangeRate - 1), repeat until rewards drained
+    6. OR: manual updateExchangeRate() call allows front-running with wrap/unwrap
+  invariante: |
+    // Mint and burn must use the SAME exchange rate
+    assert(stTokenMinted == baseTokenDeposited * stTokenSupply / totalBaseControlled);
+    assert(baseTokenReturned == stTokenBurned * totalBaseControlled / stTokenSupply);
+  que_mirar:
+    - "stake() minting at 1:1 while unstake() uses exchangeRate"
+    - "mint(msg.sender, amount) without dividing by exchange rate"
+    - "updateExchangeRate() as separate public/manual function"
+    - "wrap/unwrap with different rate calculations"
+    - "burnTicket or similar intermediate step between stake and unstake"
+  como_se_arregla: "Always use current exchange rate for BOTH minting and burning. Make exchange rate updates atomic with state changes. Never allow 1:1 mint when exchange rate > 1."
+  trampas:
+    - "If exchange rate is always 1:1 (no reward accumulation in rate), this doesn't apply"
+    - "Cooldown periods between stake and unstake mitigate the loop"
+  incidentes:
+    - "Aria/RWIPStaking — stRWIP minted 1:1 but burned at exchange rate, attacker drains all rewards (HIGH, Cantina)"
+    - "wstTAO — Manual updateExchangeRate() enables front-running wrap at favorable rate (HIGH, Quantstamp)"
+    - "Thala LSD — Inflation attack on zero total stake via exchange rate manipulation (MEDIUM, OtterSec)"
+    - "Mantle Network — Fixed exchange rate at unstaking fails to socialize slashing (MEDIUM)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [exchange-rate, mint-burn-asymmetry, drain, front-running, wrap-unwrap]
+
+- id: staking-013
+  pattern: reward-distribution-when-zero-supply
+  name: "Rewards distributed when totalSupply is zero are permanently lost"
+  causa_raiz: >
+    When notifyRewardAmount() or reward distribution occurs while totalStaked == 0,
+    the rewardPerToken accumulator cannot increase (division by zero is skipped or
+    returns stored value). Rewards allocated during this period are never assigned
+    to anyone and become locked in the contract. Similarly, division by zero in
+    gauge weight distribution causes permanent DoS.
+  como_funciona: |
+    1. All stakers withdraw, totalSupply drops to 0
+    2. Reward distribution triggers (notifyRewardAmount or epoch transition)
+    3. rewardPerToken() returns rewardPerTokenStored unchanged (totalSupply == 0 branch)
+    4. Rewards for this period are allocated but rewardPerToken doesn't increase
+    5. When new staker deposits, rewardPerToken starts fresh — gap period rewards are lost
+    6. OR: totalWeightLocked == 0 causes division by zero, blocking all state transitions
+  invariante: |
+    // If totalSupply == 0 during reward period, those rewards must be recoverable
+    assert(rewardsDistributed + recoverableRewards == totalAllocated);
+    // Division by totalWeight must handle zero case
+    assert(totalWeight > 0 || distributionSkipped);
+  que_mirar:
+    - "rewardPerToken() with if (totalSupply == 0) return rewardPerTokenStored"
+    - "notifyRewardAmount callable when totalStaked == 0"
+    - "Division by totalWeight or totalPoints without zero check"
+    - "epoch or cycle advancement blocked by zero denominator"
+    - "Rewards sent to contract before any staker exists"
+  como_se_arregla: "Queue rewards when totalSupply == 0 and distribute when first staker arrives. Add zero-check before division in distribution. Allow admin to recover rewards from zero-supply periods."
+  trampas:
+    - "Some protocols intentionally allow rewards to accumulate for first staker"
+    - "Dust amounts of totalSupply (1 wei) avoid the zero case but create rounding issues"
+  incidentes:
+    - "Wenwin — Rewards sent to staking contract with zero stakers are locked forever (MEDIUM, C4)"
+    - "Convergence — totalWeightLocked==0 causes division by zero, locking all CVG permanently (MEDIUM, Sherlock)"
+    - "Tigris Trade — distribute() skips epoch update when totalShares==0, breaking later bonds (MEDIUM, C4)"
+    - "Locke — UnaccruedSeconds don't increase when nobody staking, rewards lost (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [zero-supply, lost-rewards, division-by-zero, DoS, epoch-lock]
+
+- id: staking-014
+  pattern: slashing-bypass-via-frontrun
+  name: "Slashing mechanism bypassed via frontrunning or withdrawal timing"
+  causa_raiz: >
+    Slashing functions can be blocked or circumvented because: (1) staking in the
+    same block triggers checkpoint protection that also blocks slash, (2) withdrawal
+    delay can be initiated before slash is processed, (3) node operators can avoid
+    slash by manipulating minipool timing or error states. The slashing amount may
+    also be miscalculated due to stale reward estimates.
+  como_funciona: |
+    1. Slasher submits slash(user) transaction to mempool
+    2. User sees pending slash, front-runs with stake(1 wei) in same block
+    3. checkpointProtection modifier reverts slash because stake modified in same block
+    4. User repeats indefinitely while withdrawal delay counts down
+    5. Once delay expires, user withdraws all funds — slash never executed
+    6. OR: node operator triggers recordStakingError() to avoid slash while keeping rewards
+  invariante: |
+    // Slash must not be blockable by the slashee's own actions
+    assert(slashExecutable || slasheeCannotInterfere);
+    // Slashed amount must reflect actual expected rewards
+    assert(slashedAmount <= expectedRewards(duration, amount));
+  que_mirar:
+    - "checkpointProtection modifier applied to both slash and stake"
+    - "Same-block restriction that can be triggered by slashee"
+    - "withdrawDelay countdown concurrent with slash window"
+    - "recordStakingError not resetting reward eligibility"
+    - "getExpectedAVAXRewardsAmt using inaccurate rate calculations"
+  como_se_arregla: "Exempt slash() from checkpoint protection. Use Flashbots or private mempool for slash. Freeze withdrawals when slash is pending. Reset reward eligibility on staking errors."
+  trampas:
+    - "If slashing is admin-only via timelock, frontrunning is less practical"
+    - "Protocols without slashing mechanism are not affected"
+  incidentes:
+    - "Telcoin — stake(1) frontrun blocks slash via checkpointProtection, bypass slashing while withdrawal delay runs (MEDIUM, Sherlock)"
+    - "GoGoPool — Node operator avoids slash via recordStakingError while keeping reward eligibility (MEDIUM, C4)"
+    - "GoGoPool — Node operator slashed for full duration despite 14-day reward cycle (HIGH, C4)"
+    - "GoGoPool — MinipoolManager slash amount wrong due to inaccurate reward estimation (MEDIUM, C4)"
+  severidad: high
+  confianza: media
+  verificado: true
+  fuente: "Solodit"
+  tags: [slashing, frontrun, checkpoint, bypass, withdrawal-delay, node-operator]
+
+- id: staking-015
+  pattern: claimed-tracking-on-transfer
+  name: "Token transfer breaks per-user reward tracking (claimed/debt not adjusted)"
+  causa_raiz: >
+    When staking receipt tokens or LP tokens are transferred between users, the
+    claimed[] or rewardDebt mapping for the sender is not adjusted downward. The
+    sender retains a claimed[] value computed for their old (higher) balance. This
+    can cause: (1) underflow when computing sender's future rewards, (2) DoS on
+    sender's subsequent operations, (3) orphaned rewards that nobody can claim.
+    The receiver gets tokens without corresponding debt, potentially over-claiming.
+  como_funciona: |
+    1. User A has 100 LP tokens, claimed[A] = 80 (based on 100 tokens worth of rewards)
+    2. User A transfers 50 LP tokens to User B
+    3. claimed[A] remains 80, but A now only has 50 tokens
+    4. Max claimable for 50 tokens might be 60 — but claimed[A] = 80 > 60
+    5. A's claim underflows: 60 - 80 = revert
+    6. B has 50 tokens with claimed[B] = 0, can claim rewards they didn't earn
+    7. A cannot transfer, claim, or interact — permanently DoS'd
+  invariante: |
+    // claimed[user] must never exceed maxClaimable for user's current balance
+    assert(claimed[user] <= accumulatedPerToken * balanceOf(user));
+    // On transfer: adjust both sender and receiver claimed proportionally
+  que_mirar:
+    - "Transfer of staking/LP tokens without adjusting claimed[] or rewardDebt"
+    - "_beforeTokenTransfer or _afterTokenTransfer hooks missing reward adjustment"
+    - "claimed[user][token] as absolute value vs proportional to balance"
+    - "Underflow in accumulatedPerToken * balance - claimed"
+    - "beforeTokenTransfer calling _distributeRewards but not adjusting claimed"
+  como_se_arregla: "In _beforeTokenTransfer: settle pending rewards for both sender and receiver, then adjust claimed[]/rewardDebt proportionally. Or make receipt tokens non-transferable."
+  trampas:
+    - "If receipt tokens are non-transferable (soulbound), this doesn't apply"
+    - "If transfer hook settles AND adjusts claimed, it's safe"
+  incidentes:
+    - "Stakehouse — Transfer of GiantMevAndFeesPool tokens leaves claimed[] too high, causing DoS and orphaned rewards (HIGH, C4)"
+    - "Stakehouse — When users transfer GiantLP, some rewards lost (MEDIUM, C4)"
+    - "Yield — Transferring wCVX to another account duplicates protocol earned yield (HIGH)"
+    - "RabbitHole — NFT transfer after claim lets seller front-run buyer, buyer gets worthless claimed NFT (MEDIUM, C4)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [transfer, claimed-tracking, rewardDebt, underflow, DoS, LP-token]
+
+- id: staking-016
+  pattern: interest-accrual-desync-in-rewards
+  name: "Reward denominator includes accrued interest but user numerator does not"
+  causa_raiz: >
+    In lending/staking hybrids where debt accrues interest, the global reward
+    accumulator uses totalDebt (with interest applied) as denominator, but individual
+    user debt may not have interest applied at the same time. When another user's
+    action triggers global interest accrual but not the claiming user's, the
+    claimant's share is computed with stale (smaller) numerator against inflated
+    denominator, losing rewards.
+  como_funciona: |
+    1. Global debt = 100, User debt = 50, rewardIntegral = 0
+    2. Time passes, 10% interest accrues
+    3. Another user triggers action that updates totalDebt to 110 (interest applied globally)
+    4. 100 reward tokens arrive, rewardIntegral = 100/110 = 0.909
+    5. Original user claims: 50 * 0.909 = 45.45 (should be 50)
+    6. Loss because user's debt wasn't updated to 55 before reward calculation
+  invariante: |
+    assert(userDebtWithInterest / totalDebtWithInterest == userFairShare);
+    // Interest must be accrued for user BEFORE computing their reward share
+  que_mirar:
+    - "rewardIntegral using totalActiveDebt or totalBorrows as denominator"
+    - "_applyPendingRewards or accrueInterest called globally but not per-user"
+    - "updateIntegrals using stale user balance"
+    - "Reward per debt token with interest accrual"
+    - "MasterChef-style rewards on debt positions"
+  como_se_arregla: "Always accrue interest for the specific user before computing their reward share. Or use a time-weighted approach that accounts for interest growth."
+  trampas:
+    - "If interest accrual is atomic for all users, desync doesn't occur"
+    - "Small interest rates over short periods may produce negligible drift"
+  incidentes:
+    - "Bima — TroveManager rewardIntegral uses interest-inflated totalDebt but user debt is stale, losing ~10% of rewards (HIGH, Cantina)"
+    - "Sway — Imprecise reward distribution using total_stakes without accounting for pending unapplied rewards (MEDIUM, Otter Audits)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [interest, debt, desync, reward-integral, lending, trove]
+
+- id: staking-017
+  pattern: unstake-accounting-total-vs-user
+  name: "Unstake reduces total shares instead of user shares, zeroing all rewards"
+  causa_raiz: >
+    The unstake function reads the total shares for the current cycle/pool and
+    subtracts the total from itself (shares -= shares, effectively zeroing it)
+    instead of subtracting only the user's portion. This destroys the denominator
+    for all reward calculations, causing all users to lose rewards. Related: unstake
+    not deducting from user's StakingInfo allows repeated unstake to drain contract.
+  como_funciona: |
+    1. Multiple users have staked, totalShares = 1000
+    2. User A (100 shares) calls unstake()
+    3. Bug: shares = _rewardPoolShares[poolId][cycleId] (= 1000)
+    4. _rewardPoolShares[poolId][cycleId] -= shares (1000 - 1000 = 0)
+    5. All users' reward calculations now divide by 0 or return 0
+    6. OR: unstake doesn't deduct from user.stakedAmount, allowing repeated calls
+  invariante: |
+    // Unstake must only reduce user's share, not total
+    assert(_rewardPoolShares[poolId][cycleId] >= userShares);
+    assert(postUnstakeTotalShares == preUnstakeTotalShares - userShares);
+    // User balance must decrease on unstake
+    assert(stakingInfo[user].amount == preAmount - unstakeAmount);
+  que_mirar:
+    - "shares = totalShares[poolId] followed by totalShares[poolId] -= shares"
+    - "Unstake reading total instead of user-specific balance"
+    - "Missing balance deduction in initiateUnstake or unstake"
+    - "Same orderId reusable across multiple unstake calls"
+  como_se_arregla: "Read user's share amount specifically. Deduct user shares from total. Mark orderId as consumed after unstake. Add invariant test: totalShares == sum(userShares)."
+  trampas:
+    - "If only one user exists, totalShares == userShares and bug is invisible"
+  incidentes:
+    - "Surge — Unstake zeroes ALL pool shares instead of user's shares, destroying rewards for everyone (HIGH, Shieldify)"
+    - "Sapien — initiateUnstake/unstake never deduct from StakingInfo, allowing repeated drain (HIGH, Quantstamp)"
+    - "Stakehouse — Unstaking doesn't update sETHUserClaimForKnot mapping (HIGH, C4)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [unstake, total-shares, accounting, drain, zeroing]
+
+- id: staking-018
+  pattern: reward-rate-change-retroactive
+  name: "Reward rate changes applied retroactively to past periods"
+  causa_raiz: >
+    When rewardRate or rewardRatePerDay changes (via admin action or epoch
+    transition), the new rate is applied to calculate rewards for the entire
+    staking duration rather than only from the change point forward. Users
+    who unstake after a rate increase receive inflated rewards; after a decrease,
+    they receive less than earned. Unprotected changeRewardSpeed allows
+    unauthorized rate manipulation to drain contracts.
+  como_funciona: |
+    1. User stakes at time T0 with rewardRate = R1
+    2. At time T1, admin changes rewardRate to R2
+    3. User unstakes at T2, rewards calculated as: amount * R2 * (T2 - T0)
+    4. Should be: amount * R1 * (T1 - T0) + amount * R2 * (T2 - T1)
+    5. If R2 > R1, user gets excess rewards; if R2 < R1, user loses rewards
+    6. OR: attacker deploys vault using target staking contract, calls changeRewardSpeed
+       to set absurdly high rate, drains 99% of reward balance
+  invariante: |
+    // Rewards must be checkpointed before rate change
+    assert(rewardsAccrued == sum(rate_i * duration_i) for each rate period i);
+    // changeRewardSpeed must be access-controlled to the staking contract's admin
+  que_mirar:
+    - "rewardRatePerDay or rewardRate used with full (unstakeTime - stakeTime) duration"
+    - "changeRewardSpeed or setRewardRate without updateReward checkpoint"
+    - "Permissionless changeRewardSpeed via vault deployment"
+    - "Reward calculation: amount * currentRate * totalDuration (no segmentation)"
+    - "Missing access control on reward rate modification"
+  como_se_arregla: "Checkpoint all user rewards before any rate change. Calculate rewards per-period with the rate active during that period. Restrict reward rate changes to authorized callers only with rate caps."
+  trampas:
+    - "If rate only changes once (at deployment), no retroactive issue"
+    - "Linear distribution (Synthetix rewardRate = amount / duration) handles this via lastTimeRewardApplicable"
+  incidentes:
+    - "DIAWhitelistedStaking — Rewards use current rewardRatePerDay for entire duration, ignoring historical changes (HIGH, Hacken)"
+    - "Popcorn — Anyone deploys vault to call changeRewardSpeed, drains 99% of reward tokens in 12 seconds (HIGH, C4)"
+    - "Aries Market — add_reward/remove_reward don't update farm.timestamp, double-counting same time_diff (MEDIUM, Otter Audits)"
+    - "Salty — Compounding reduction of pendingRewards means higher call frequency distributes fewer total rewards (MEDIUM, C4)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [reward-rate, retroactive, rate-change, access-control, drain]
+
+- id: staking-019
+  pattern: validator-selection-dos
+  name: "Validator selection logic DoS from stopped/exited validators or duplicates"
+  causa_raiz: >
+    In liquid staking protocols, the validator selection algorithm incorrectly
+    handles exited/stopped validators. Using (funded - stopped) as the selection
+    metric picks exhausted operators over available ones. When stopped == funded
+    and no keys remain, the function returns empty results, permanently blocking
+    new deposits from being staked. Duplicate validator addition wastes depositor
+    funds by sending >32 ETH to one validator.
+  como_funciona: |
+    1. Operator A has funded=10, stopped=10, keys=10 (fully exhausted)
+    2. Operator B has funded=0, stopped=0, keys=10 (fully available)
+    3. Selection loop picks minimum (funded - stopped): A has 0, B has 0
+    4. A is selected first (lower index), but has 0 available keys
+    5. Function returns empty array — no validators can be selected
+    6. All new ETH deposits cannot be staked, accumulating idle in contract
+    7. OR: duplicate validator keys receive >32 ETH, wasting capital
+  invariante: |
+    // Selection must pick operators with available (unfunded) keys
+    assert(selectedOperator.keys - selectedOperator.funded > 0);
+    // No duplicate validator keys
+    assert(unique(validatorKeys));
+  que_mirar:
+    - "_hasFundableKeys using stopped in calculation"
+    - "pickNextValidators returning empty when available operators exist"
+    - "funded - stopped as selection metric"
+    - "addValidators without deduplication check"
+    - "_getNextValidatorsFromActiveOperators loop logic"
+  como_se_arregla: "Do not use stopped in fundable key calculation. Available keys = min(keys, limit) - funded. Add deduplication on validator key addition. Skip exhausted operators in selection loop."
+  trampas:
+    - "If protocol has no validator exit mechanism, stopped is always 0"
+    - "Single-operator protocols don't have selection issues"
+  incidentes:
+    - "Liquid Collective — _hasFundableKeys returns true for exhausted operators, DoS staking (CRITICAL, Spearbit)"
+    - "Liquid Collective — Selection picks operator with funded==stopped, returns empty, blocking all staking (CRITICAL, Spearbit)"
+    - "Liquid Collective — Wrong index for stopped validator count in exit selection (HIGH, Spearbit)"
+    - "Liquid Collective — Duplicate validators waste depositor capital (MEDIUM, Spearbit)"
+    - "Liquid Collective — removeValidators frontrun changes key set unexpectedly (HIGH, Spearbit)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [validator, selection, DoS, liquid-staking, stopped, funded, exhausted]
+
+- id: staking-020
+  pattern: voting-with-expired-lock
+  name: "Voting power retained after lock expiry or used across delegation boundaries"
+  causa_raiz: >
+    veToken or staking-based governance allows voting with positions whose lock
+    has expired but hasn't been withdrawn. The contract checks lock existence but
+    not remaining lock duration relative to epoch length. Users can vote, withdraw,
+    re-stake, and vote again in the same epoch. Separately, delegation mechanics
+    can trap delegatees or remove votes from wrong address on unstake.
+  como_funciona: |
+    1. User locks tokens for 2 years, receives veToken voting power
+    2. Lock expires, user doesn't withdraw
+    3. Voting function checks lock.amount > 0 but not lock.end > block.timestamp + epochDuration
+    4. User votes in current epoch with expired lock
+    5. User withdraws locked tokens (lock.amount = 0)
+    6. User re-stakes minimal amount, votes again in same epoch
+    7. OR: malicious delegate creates proposals continuously, trapping delegatees
+    8. OR: unstake by approved operator removes votes from msg.sender instead of owner
+  invariante: |
+    // Voting requires lock.end > currentEpoch.end
+    assert(lock.end > block.timestamp + epochDuration);
+    // Each user can only vote once per epoch per token
+    assert(votesUsed[epoch][tokenId] <= 1);
+    // Unstake removes votes from token owner, not caller
+  que_mirar:
+    - "Vote function checking lock.amount but not lock.end"
+    - "Remaining lock period vs epoch duration validation"
+    - "withdraw + restake + vote in same epoch"
+    - "lockedWhileVotesCast modifier applied to unstake/delegate"
+    - "Delegate creating proposals to prevent delegatee unstaking"
+    - "votingPower subtracted from msg.sender vs ownerOf(tokenId)"
+  como_se_arregla: "Require remainingLockTime > epochDuration for voting. Track votes per epoch per tokenId. Allow emergency unstake regardless of delegate's proposal status. Subtract voting power from owner, not msg.sender."
+  trampas:
+    - "Expired locks with zero power naturally can't vote in some implementations"
+    - "If delegation is disabled, trap scenario doesn't apply"
+  incidentes:
+    - "MagicSea/MlumStaking — Vote with expired lock, withdraw, restake, vote again in same epoch (HIGH, Sherlock)"
+    - "FrankenDAO — Delegate traps delegatees indefinitely via continuous proposals (MEDIUM, Sherlock)"
+    - "FrankenDAO — Unstake removes votes from msg.sender not owner (HIGH, Sherlock)"
+    - "KittenSwap — Weight loss from invalid pool votes diluting valid gauge allocation (MEDIUM, Pashov)"
+    - "Hybra Finance — Dust vote on one pool prevents poke() (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [voting, expired-lock, veToken, delegation, epoch, governance]
+
+- id: staking-021
+  pattern: cross-contract-reward-interface-mismatch
+  name: "External reward claiming fails due to incorrect interface or reentrancy lock conflict"
+  causa_raiz: >
+    When a staking protocol integrates with external reward sources (Curve gauges,
+    Berachain RewardVaults, Compound COMP, Aura/Convex), the interface used to
+    claim rewards may have wrong function signatures, or the claim flow creates
+    reentrancy lock conflicts (nonReentrant on getReward calls notifyRewardAmount
+    which is also nonReentrant). Separately, claimToTreasury may sweep reward
+    tokens along with reserves when the reward token is also a market token.
+  como_funciona: |
+    1. Protocol integrates external reward vault with getReward(address)
+    2. External vault's actual signature is getReward(address, address)
+    3. All calls to claim rewards revert — rewards permanently locked
+    4. OR: getReward() acquires nonReentrant lock, calls voter.distribute()
+    5. distribute() calls back notifyRewardAmount() which also requires nonReentrant
+    6. Second lock acquisition reverts — reward distribution permanently broken
+    7. OR: claimToTreasury(cCOMP) sweeps both reserves AND user reward COMP
+  invariante: |
+    // External interface must match actual function signature
+    assert(IVault(vault).getReward.selector == externalVault.getReward.selector);
+    // Cross-contract calls must not create reentrancy lock deadlock
+    assert(noDeadlockInCallChain(getReward -> distribute -> notifyRewardAmount));
+  que_mirar:
+    - "Interface definitions for external reward vaults (getReward parameters)"
+    - "nonReentrant on both getReward and notifyRewardAmount in call chain"
+    - "claimToTreasury with token that is also a reward token"
+    - "External gauge claim functions with different signatures across versions"
+    - "Reentrancy guard: global vs per-function in cross-contract calls"
+  como_se_arregla: "Verify external interfaces against deployed contracts. Temporarily release reentrancy lock before cross-contract reward distribution calls. Separate reserve sweeping from reward token accounting."
+  trampas:
+    - "If protocol uses same codebase as external reward source, interface matches"
+    - "Single-contract systems don't have cross-contract lock issues"
+  incidentes:
+    - "D2 — Wrong getReward interface for Berachain RewardVaults, all BGT rewards locked (HIGH, Cyfrin)"
+    - "Hyperstable — nonReentrant on getReward conflicts with notifyRewardAmount callback, breaking distribution (MEDIUM, Pashov)"
+    - "Morpho — claimToTreasury(COMP) sweeps user COMP rewards along with reserves (MEDIUM, Spearbit)"
+    - "Notional Finance — Inability to claim rewards from Curve gauge (HIGH)"
+    - "Sentiment — CurveLPStaking gauge rewards cannot be claimed (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [interface, external-rewards, reentrancy-lock, curve, berachain, COMP]
+
+- id: staking-022
+  pattern: griefing-via-zero-amount-or-spam
+  name: "Zero-amount operations or spam transactions grief staking state"
+  causa_raiz: >
+    Functions that accept arbitrary amounts (including 0) or can be called by
+    anyone on behalf of others can be used to grief: (1) transferring 0 tokens
+    resets reward multipliers, (2) staking 1 wei for a victim during warmup
+    creates a DoS, (3) permissionless getReward(user) claims at unfavorable
+    time, (4) flooding stake/unstake requests bloats state or delays confirmations.
+  como_funciona: |
+    1. Attacker transfers 0 reward tokens to victim
+    2. Transfer hook triggers: newPosition == prevPosition condition met
+    3. Victim's reward multiplier reset to 1x (from higher earned multiplier)
+    4. Zero cost to attacker, permanent damage to victim's rewards
+    5. OR: attacker calls stake(1 wei, victim) during warmup period
+    6. Victim's warmup resets, cannot claim until new warmup expires
+    7. Attacker repeats to permanently DoS victim's claiming
+  invariante: |
+    // Zero-amount transfers must not modify reward state
+    assert(multiplier_after_zero_transfer == multiplier_before);
+    // Staking on behalf of others must not reset their state
+    assert(warmupExpiry_after_thirdPartyStake == warmupExpiry_before);
+    // getReward must not be callable at arbitrary times by third parties
+  que_mirar:
+    - "Transfer of 0 amount triggering state changes"
+    - "stake(amount, recipient) callable by anyone"
+    - "getReward(user) permissionless — can force claim at bad time"
+    - "stake/unstake with tiny amounts flooding confirmation queue"
+    - "DoS via warmup period reset on any stake event"
+  como_se_arregla: "Require amount > 0 for all state-changing operations. Make third-party staking opt-in. Restrict getReward to msg.sender or approved callers. Rate-limit stake/unstake requests."
+  trampas:
+    - "If zero-amount transfers are properly no-ops (early return), safe"
+    - "If warmup doesn't reset on additional stakes, DoS path is blocked"
+  incidentes:
+    - "SMRewardDistributor — 0-token transfer resets victim's reward multiplier to 1 permanently (HIGH, Cantina)"
+    - "Yieldy — stake(1 wei, victim) resets warmup period, permanent DoS on claiming (HIGH)"
+    - "NeoTokyo — permissionless getReward(user) forces claim when totalPoints is high, reducing rewards (HIGH, C4)"
+    - "Recall — Flooding stake/unstake requests DoS confirmChange, blocking validator collateral claims (MEDIUM, C4)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [griefing, zero-amount, spam, DoS, warmup, multiplier-reset]
+
+- id: staking-023
+  pattern: staked-balance-used-outside-staking
+  name: "Staked tokens usable for other purposes without unstaking"
+  causa_raiz: >
+    When staked tokens or their receipt tokens can be used for other purposes
+    (providing liquidity, transferring, spending) without triggering unstake
+    logic, the user maintains phantom staking balance and continues earning
+    rewards on tokens they effectively withdrew. Missing balance checks allow
+    staked tokens to be directed elsewhere.
+  como_funciona: |
+    1. User stakes 100 tokens, receives staking position
+    2. User calls provideLiquidity(100) using same tokens — no check against staked balance
+    3. Staking contract still shows user has 100 staked (phantom balance)
+    4. User continues earning staking rewards on 100 tokens
+    5. After LP lock period, user withdraws liquidity tax-free
+    6. User has both: liquidity withdrawal proceeds + ongoing staking rewards on phantom balance
+  invariante: |
+    // Available balance must exclude staked amount
+    assert(availableBalance(user) == totalBalance(user) - stakedBalance(user));
+    // Staked tokens cannot be transferred or used elsewhere
+    assert(stakedTokens.locked == true);
+  que_mirar:
+    - "provideLiquidity or addLiquidity not checking getAvailableBalance"
+    - "Staked tokens transferable without reducing staking position"
+    - "Multiple uses of same token balance (stake + LP + collateral)"
+    - "Receipt tokens usable as collateral while original is staked"
+  como_se_arregla: "Check available (non-staked) balance before any token use. Lock staked tokens explicitly. Deduct from staking position when tokens are used elsewhere."
+  trampas:
+    - "If staking uses a separate token (receipt/wrapper), original is free to use"
+    - "Composability may intentionally allow receipt token use as collateral"
+  incidentes:
+    - "FluidLocker — Staked tokens withdrawn via provideLiquidity without unstaking, earning rewards on phantom balance (HIGH, Sherlock)"
+    - "ZeroLend — OmnichainStaking allows burning voting power to unstake any NFT, swapping cheap lock for expensive one (HIGH, Immunefi)"
+    - "CasimirManager — Stake 1 ETH to fill validator then immediately unstake, forcing validator exit with 64 ETH (HIGH, Pashov)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [phantom-balance, staked-tokens, liquidity, double-use, available-balance]

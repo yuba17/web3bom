@@ -1,0 +1,320 @@
+protocol: revert-lend
+component: V3Vault
+file: src/V3Vault.sol
+domain: lending
+hunter: OracleHunter
+generated_at: "2026-03-20T00:00:00Z"
+
+invariants:
+  - id: VV-O-01
+    tier: 2
+    type: property
+    description: "Pool price manipulation can block liquidations by triggering maxPoolPriceDifference revert in V3Oracle._populatePrices(). If an attacker manipulates the Uni V3 pool spot price beyond the configured maxPoolPriceDifference threshold, ALL oracle.getValue() calls revert, preventing liquidation of unhealthy positions."
+    attack_scenario: >
+      1. Attacker has an undercollateralized position approaching liquidation threshold.
+      2. Attacker uses a flash loan to manipulate the Uniswap V3 pool spot price significantly (e.g., a large swap).
+      3. V3Oracle._populatePrices() line 529 calls _requireMaxDifference(priceX96, derivedPoolPriceX96, maxPoolPriceDifference).
+      4. Since pool spot price diverges from oracle-derived price, this check reverts PriceDifferenceExceeded.
+      5. liquidate() at line 742 calls _checkLoanIsHealthy which calls oracle.getValue() which calls _populatePrices() -- revert.
+      6. Liquidation is blocked. The comment at V3Oracle line 523-524 acknowledges this: 'liquidations will be disabled' but relies on arbitrageurs to restore price.
+      7. In low-liquidity pools, the attacker can sustain this manipulation cheaply across multiple blocks, delaying liquidation while position accrues more bad debt.
+      Impact: Protocol accrues bad debt that gets socialized to lenders via _handleReserveLiquidation.
+    solidity: |
+      // This is a known design tradeoff acknowledged in V3Oracle comments.
+      // The invariant checks whether oracle reverts block liquidations:
+      // For each unhealthy loan, oracle.getValue() must not revert.
+      // This is hard to test as a property -- needs fork + price manipulation.
+      // Pseudo-invariant: if a loan's debt > collateral, liquidate() should succeed.
+      uint256 debt = _convertToAssets(loans[tokenId].debtShares, lastDebtExchangeRateX96, Math.Rounding.Up);
+      try oracle.getValue(tokenId, address(asset), _isStaked(tokenId)) returns (uint256 fv, uint256, uint256, uint256) {
+          // Oracle didn't revert -- good
+          t(true, "VV-O-01: oracle accessible");
+      } catch {
+          // Oracle reverted -- if loan is unhealthy, liquidation is blocked
+          t(false, "VV-O-01: oracle reverted, potential liquidation block");
+      }
+    ghost_vars: []
+    validated: false
+    priority: high
+    confidence: 55
+    notes: >
+      The protocol explicitly acknowledges this in V3Oracle._populatePrices() comments (lines 522-524).
+      The mitigation is that arbitrageurs will restore pool prices. This is likely a known/accepted risk,
+      but in thin liquidity pools on Aerodrome Slipstream, sustained manipulation may be cheaper than assumed.
+      Confidence low because this is likely 'by design' and excluded from bounty scope.
+
+  - id: VV-O-02
+    tier: 1
+    type: property
+    description: "Staked position liquidation gives liquidator free uncollected fees. When a staked position is liquidated, _checkLoanIsHealthy() sets ignoreFees=true, so fullValue and feeValue exclude fees. But _sendPositionValue() on full liquidation (line 1115-1118) sends ALL liquidity and ALL fees (type(uint128).max). Liquidator receives fees that were not included in the liquidation cost calculation."
+    attack_scenario: >
+      1. Borrower stakes their position in a gauge (via stakePosition).
+      2. Position accumulates significant trading fees over time (tokensOwed0/1 grow).
+      3. Position becomes unhealthy (debt > collateralValue based on fee-excluded fullValue).
+      4. Liquidator calls liquidate().
+      5. _checkLoanIsHealthy (line 742) uses ignoreFees=true because position is staked.
+         fullValue = liquidity value only (no fees). feeValue = 0.
+      6. _calculateLiquidation (line 750) computes liquidatorCost based on this reduced fullValue.
+      7. _unstakeIfNeeded (line 748) returns NFT to vault.
+      8. _sendPositionValue (line 770) receives liquidationValue=fullValue (both exclude fees).
+         At line 1115: liquidationValue == fullValue -> takes ALL liquidity + ALL fees (uint128.max).
+      9. Liquidator pays cost based on fee-excluded value but receives the full position INCLUDING fees.
+      Impact: Liquidator extracts value that should belong to the borrower (uncollected fees on staked position).
+      The borrower's fees are effectively confiscated without being accounted for in liquidation cost.
+    solidity: |
+      // After a staked position liquidation, verify the liquidator didn't receive
+      // more value than fullValue used in liquidation calculation.
+      // This requires comparing oracle.getValue with ignoreFees=true vs false.
+      (uint256 fullValueNoFees, uint256 feeValueNoFees,,) = oracle.getValue(tokenId, address(asset), true);
+      (uint256 fullValueWithFees, uint256 feeValueWithFees,,) = oracle.getValue(tokenId, address(asset), false);
+      // If there are uncollected fees, liquidator gets free value
+      uint256 freeValue = fullValueWithFees - fullValueNoFees;
+      // freeValue should be 0 for fair liquidation, or accounted in cost
+      lte(freeValue, 1, "VV-O-02: liquidator receives unaccounted fee value");
+    ghost_vars: []
+    validated: true
+    priority: high
+    confidence: 85
+    notes: >
+      CONFIRMED by math-hunter cross-reference (2026-03-20). The math trace is fully verified:
+      1. _checkLoanIsHealthy (staked, ignoreFees=true) -> fullValue excludes fees, feeValue=0
+      2. _unstakeIfNeeded returns NFT to vault (fees still uncollected on the position)
+      3. _calculateLiquidation computes liquidatorCost against fee-EXCLUDED fullValue
+      4. _sendPositionValue: for full liquidation (liquidationValue==fullValue), liquidator gets
+         ALL liquidity + ALL fees (type(uint128).max) but only paid for fee-excluded value.
+      For partial liquidation: feeValue=0 forces else branch (line 1127), fees set to max,
+      so same issue -- ALL fees go to liquidator regardless of partial proportion.
+      Result: uncollected trading fees on staked positions are given to liquidator for free.
+      Impact scales with accumulated fees on active Slipstream positions.
+      Borrower loses their uncollected fees during any liquidation of a staked position.
+
+  - id: VV-O-03
+    tier: 2
+    type: property
+    description: "Oracle uses derivedSqrtPriceX96 (from Chainlink/TWAP) for LiquidityAmounts.getAmountsForLiquidity() but the actual pool operates at a different sqrtPriceX96. For concentrated liquidity positions near tick boundaries, a small price discrepancy between oracle-derived price and actual pool price can cause large differences in token0/token1 split, leading to over/under-valuation of collateral."
+    attack_scenario: >
+      1. Consider a narrow-range position with tickLower=100, tickUpper=102 (very concentrated).
+      2. Oracle derives price at tick 101 (derivedSqrtPriceX96).
+      3. Actual pool price is at tick 99 (just below the range).
+      4. Oracle calculates amounts as if position is in-range (gives mix of token0+token1).
+      5. Actual position is out-of-range (100% in token0).
+      6. If token0 is less valuable than token1, oracle OVERvalues the position.
+      7. Borrower can borrow more than their position is actually worth.
+      8. If price stays out-of-range, position can't cover the debt -> bad debt.
+      Impact: Systematic overvaluation of narrow-range positions near boundaries leads to undercollateralized loans.
+    solidity: |
+      // Compare oracle valuation using derivedSqrtPrice vs actual pool price
+      // For positions near tick boundaries, these can diverge significantly
+      (uint256 oracleValue,,,) = oracle.getValue(tokenId, address(asset), false);
+      // Get actual amounts from pool
+      (,,,uint128 liquidity,,,,,,,,) = nonfungiblePositionManager.positions(tokenId);
+      // The discrepancy grows with concentration (narrow tick range)
+      // This is hard to test as a simple property -- needs specific position setup
+      t(oracleValue > 0, "VV-O-03: oracle value check");
+    ghost_vars: []
+    validated: false
+    priority: medium
+    confidence: 50
+    notes: >
+      The maxPoolPriceDifference check in V3Oracle._populatePrices() mitigates this somewhat
+      by reverting if pool price diverges too much from oracle price. But even within the allowed
+      tolerance (e.g., 4% maxPoolPriceDifference), a concentrated position can have significant
+      valuation error. The derivedSqrtPriceX96 calculation at V3Oracle line 532 uses oracle price
+      not pool price, which is the correct design (avoids manipulation), but creates this edge case.
+      Confidence 50% because the maxPoolPriceDifference bound limits the damage.
+
+  - id: VV-O-04
+    tier: 2
+    type: property
+    description: "V3Oracle._getChainlinkPriceX96 checks maxFeedAge but TWAP has no explicit staleness check. If the TWAP pool has very low activity, the TWAP can represent a very old price. In TWAP_CHAINLINK_VERIFY mode, the TWAP is used as primary price and Chainlink only verifies. A stale TWAP in a low-activity pool could pass the maxDifference check if Chainlink is also stale (at maxFeedAge boundary)."
+    attack_scenario: >
+      1. Token X is configured with TWAP_CHAINLINK_VERIFY mode, twapSeconds=300.
+      2. The TWAP reference pool for token X has very low volume.
+      3. Token X's real market price drops 20% due to external event.
+      4. TWAP pool hasn't been traded in hours, so TWAP still reflects old (higher) price.
+      5. Chainlink feed updates but is close to maxFeedAge, so it reports a slightly stale price.
+      6. maxDifference check passes because both TWAP and Chainlink are similarly stale.
+      7. Borrower's collateral (position with token X) is overvalued.
+      8. Borrower borrows maximum against inflated collateral.
+      9. When TWAP catches up (next trade in the pool), position becomes instantly undercollateralized.
+      Impact: Loans created against stale TWAP prices lead to instant bad debt when prices catch up.
+    solidity: |
+      // Check that TWAP price is reasonably fresh by comparing to Chainlink
+      // In TWAP modes, there's no explicit freshness check on the TWAP itself
+      // The pool.observe() will return data regardless of last trade time
+      // This invariant verifies that TWAP and current spot aren't diverged beyond tolerance
+      t(true, "VV-O-04: TWAP staleness check placeholder");
+    ghost_vars: []
+    validated: false
+    priority: medium
+    confidence: 45
+    notes: >
+      The TWAP inherently has lag by design (that's the point of time-weighting).
+      With twapSeconds=300 (5 min), a sudden 20% price drop would take 5 minutes to
+      fully reflect. The maxDifference between TWAP and Chainlink provides some protection.
+      However, for very low liquidity TWAP pools where trades are infrequent, the TWAP
+      effectively represents a very old price. The risk is bounded by maxDifference tolerance.
+      Low confidence because this is inherent to TWAP design and the protocol seems aware.
+
+  - id: VV-O-05
+    tier: 1
+    type: property
+    description: "In liquidation, _checkLoanIsHealthy (line 742) is called with withBuffer=false for the unhealthy check, but _sendPositionValue uses oracle.getLiquidityAndFees for partial liquidations. Between the health check and _sendPositionValue, the position is unstaked (_unstakeIfNeeded line 748). If unstaking changes fee state (e.g., auto-collecting fees to gauge or pool), the fees0/fees1 returned by getLiquidityAndFees may differ from what was expected, causing incorrect partial liquidation amounts."
+    attack_scenario: >
+      1. Position is staked in gauge with large uncollected fees.
+      2. Liquidation begins: _checkLoanIsHealthy at line 742 with ignoreFees=true.
+         fullValue excludes fees. feeValue=0.
+      3. _unstakeIfNeeded at line 748 unstakes the position.
+         Unstaking from Aerodrome gauge may trigger fee collection/realization.
+      4. _calculateLiquidation uses fee-excluded fullValue.
+      5. _sendPositionValue at line 770 is called.
+         Since liquidationValue != fullValue (partial), it calls oracle.getLiquidityAndFees().
+         After unstaking, fee state may have changed (tokensOwed updated by unstake process).
+      6. The fees0, fees1 from getLiquidityAndFees reflect POST-unstake state.
+         But feeValue in the liquidation math was 0 (pre-unstake, ignoreFees=true).
+      7. Division at line 1131: liquidity = (liquidationValue - feeValue) * liquidity / (fullValue - feeValue)
+         With feeValue=0: liquidity = liquidationValue * liquidity / fullValue
+         But now actual feeValue > 0 after unstake, so the proportion is wrong.
+      Impact: Liquidator receives incorrect proportion of liquidity vs fees in partial liquidation of staked positions.
+    solidity: |
+      // Before and after unstake, fee values should be consistent with liquidation math
+      // This requires tracking state across the liquidation flow
+      // Ghost: capture feeValue from health check, compare to actual fees after unstake
+      (uint256 preFullValue, uint256 preFeeValue,,) = oracle.getValue(tokenId, address(asset), true);
+      // After unstake, fees may have changed
+      (uint128 liquidity, uint128 fees0, uint128 fees1) = oracle.getLiquidityAndFees(tokenId);
+      // If preFeeValue was 0 but actual fees exist, partial liquidation math is inconsistent
+      t(true, "VV-O-05: fee consistency across unstake");
+    ghost_vars: []
+    validated: true
+    priority: high
+    confidence: 90
+    notes: >
+      TRIPLE-CONFIRMED by math-hunter + flow-hunter (2026-03-20). Complete trace verified:
+      1. Aerodrome CLGauge.withdraw() calls pool.burn(tickLower, tickUpper, 0) to sync fee growth
+      2. After unstake: feeGrowthInside0LastX128 updated, tokensOwed0/1 populated with staking-period fees
+      3. Oracle._getFees() = uncollectedFees (~0, just synced) + tokensOwed (significant) = staking-period fees
+      4. feeValue=0 from health check -> always takes else branch (line 1127)
+      5. fees0=fees1=uint128.max -> liquidator collects ALL tokensOwed (staking fees) for free
+      CRITICAL: MockGauge in tests does NOT replicate CLGauge.withdraw() fee sync behavior.
+      This bug is INVISIBLE in unit tests -- only detectable on mainnet fork with real Aerodrome gauges.
+      Severity: Medium+ (borrower loss of staking-period fees, scales with position activity and stake duration).
+
+  - id: VV-O-06
+    tier: 2
+    type: property
+    description: "The collateral factor is min(factor0, factor1) per _calculateTokenCollateralFactorX32 (line 1236-1241). For a position that is entirely out-of-range (100% in one token), the collateral factor of the OTHER token (which the position holds 0 of) is irrelevant. Yet the min() still constrains the collateral value. This is conservative (safe for protocol) but could be exploited in reverse: if both factors are high but one token is worthless, the oracle still values the position."
+    attack_scenario: >
+      1. Position has token0=USDC (collateralFactor=80%) and token1=VOLATILE (collateralFactor=50%).
+      2. Position is entirely out-of-range on the USDC side (holds only USDC, 0 VOLATILE).
+      3. Collateral factor = min(80%, 50%) = 50%.
+      4. Borrower's USDC-only position gets 50% collateral factor instead of the 80% it deserves.
+      This is conservative and SAFE for the protocol but unfair to the borrower.
+      The reverse case is more interesting:
+      5. Position holds only VOLATILE (out of range on volatile side).
+      6. VOLATILE's oracle price is manipulated upward (within tolerance).
+      7. CollateralFactor = min(80%, 50%) = 50% -- this limits overvaluation.
+      Impact: Min collateral factor protects against the worst case. This is by design.
+    solidity: |
+      // Verify collateral factor is always min(factor0, factor1)
+      (,, address token0, address token1,,,,,,,,) = nonfungiblePositionManager.positions(tokenId);
+      uint32 f0 = tokenConfigs[token0].collateralFactorX32;
+      uint32 f1 = tokenConfigs[token1].collateralFactorX32;
+      uint32 expected = f0 > f1 ? f1 : f0;
+      uint32 actual = _calculateTokenCollateralFactorX32(tokenId);
+      eq(uint256(actual), uint256(expected), "VV-O-06: collateral factor is min");
+    ghost_vars: []
+    validated: false
+    priority: low
+    confidence: 90
+    notes: >
+      This is by design and is the conservative/safe approach. Not a bug.
+      Included for completeness as it relates to oracle price -> collateral value flow.
+
+  - id: VV-O-07
+    tier: 2
+    type: property
+    description: "V3Oracle._getReferencePoolPriceX96 with twapSeconds=0 uses raw slot0 spot price (line 444-445). If a token is configured in TWAP mode but twapSeconds=0, the 'TWAP' is actually just the manipulable spot price. The Mode enum allows TWAP with twapSeconds=0 via setTokenConfig since there's no validation that twapSeconds > 0 when mode uses TWAP."
+    attack_scenario: >
+      1. Admin configures token with Mode.TWAP and twapSeconds=0 (misconfiguration).
+      2. _getTWAPPriceX96 calls _getReferencePoolPriceX96 with twapSeconds=0.
+      3. This returns the raw pool.slot0() spot price instead of a TWAP.
+      4. Attacker flash-loans to manipulate pool spot price.
+      5. Oracle returns manipulated price.
+      6. No TWAP protection since twapSeconds=0.
+      Impact: If admin misconfigures twapSeconds=0 with TWAP mode, price manipulation is trivial.
+    solidity: |
+      // Check that TWAP-mode tokens have twapSeconds > 0
+      // This is an admin misconfiguration check
+      TokenConfig memory config = feedConfigs[token];
+      if (config.mode == Mode.TWAP || config.mode == Mode.TWAP_CHAINLINK_VERIFY || config.mode == Mode.CHAINLINK_TWAP_VERIFY) {
+          gt(uint256(config.twapSeconds), 0, "VV-O-07: TWAP mode requires twapSeconds > 0");
+      }
+    ghost_vars: []
+    validated: false
+    priority: medium
+    confidence: 60
+    notes: >
+      V3Oracle.setTokenConfig() does not validate twapSeconds > 0 when mode includes TWAP.
+      However, this requires admin misconfiguration. For CHAINLINK_TWAP_VERIFY mode with
+      twapSeconds=0, the verify price would use spot price, and if Chainlink is primary,
+      the maxDifference check would still catch manipulation. Risk is highest in pure TWAP mode.
+      Admin-dependent bugs are often excluded from bounties but this is a code-level check that's missing.
+
+  - id: VV-O-08
+    tier: 1
+    type: property
+    description: "In _sendPositionValue (V3Vault line 1102-1144), partial liquidation fee proportioning uses integer division: fees0 = SafeCast.toUint128(liquidationValue * fees0 / feeValue) at line 1125-1126. If feeValue is very small but non-zero (dust fees), and liquidationValue is much larger, this can overflow before the division when liquidationValue * fees0 exceeds uint256. For uint128 fees and uint256 values, liquidationValue * fees0 can theoretically overflow."
+    attack_scenario: >
+      1. Position has very large uncollected fees (fees0 close to uint128.max).
+      2. liquidationValue is large (billions in 18-decimal token).
+      3. liquidationValue * fees0 overflows uint256.
+      4. SafeCast.toUint128 on the result either reverts or returns wrong value.
+      5. Liquidation fails or sends wrong amounts.
+      Impact: Liquidation of positions with very large fees could revert, blocking liquidation.
+    solidity: |
+      // Check that liquidationValue * fees doesn't overflow
+      // liquidationValue is uint256, fees0 is uint128
+      // Max fees0 = 2^128 - 1, liquidationValue could be up to ~10^77 (unlikely)
+      // In practice, liquidationValue * uint128.max = V * 3.4e38
+      // This overflows uint256 only if V > 2^256 / 2^128 = 2^128, which is unrealistic for asset values
+      // False alarm -- uint256 has enough room for realistic values
+      t(true, "VV-O-08: overflow check in partial liquidation fee math");
+    ghost_vars: []
+    validated: false
+    priority: low
+    confidence: 20
+    notes: >
+      After analysis, this is extremely unlikely. uint256 can hold up to ~1.15e77.
+      liquidationValue * fees0 would need liquidationValue > 2^128 (~3.4e38) to overflow,
+      which is unrealistic for any real asset denomination. FALSE POSITIVE.
+
+false_positives:
+  - hunter: OracleHunter
+    id: VV-FP-01
+    reason: >
+      VV-O-08 overflow in _sendPositionValue fee proportioning is practically impossible.
+      uint256 has 78 digits of precision. Even with max uint128 fees (~3.4e38) and
+      a trillion-dollar position (~1e30 in wei), the product ~3.4e68 is well within uint256 range.
+    investigated_at: "2026-03-20T00:00:00Z"
+
+  - hunter: OracleHunter
+    id: VV-FP-02
+    reason: >
+      VV-O-06 min collateral factor for out-of-range positions is by design.
+      Using min(factor0, factor1) is the conservative approach that protects the protocol.
+      The 'unfairness' to borrowers with out-of-range positions entirely in one token is
+      an accepted tradeoff for simplicity and safety. Not a bug.
+    investigated_at: "2026-03-20T00:00:00Z"
+
+  - hunter: OracleHunter
+    id: VV-FP-03
+    reason: >
+      VV-O-01 pool price manipulation blocking liquidations is explicitly acknowledged
+      in V3Oracle._populatePrices() comments (lines 522-524). The protocol accepts this
+      risk and relies on arbitrageurs to restore pool prices. This is a known design tradeoff.
+    investigated_at: "2026-03-20T00:00:00Z"
+    pending_briefing_update:
+      action: add_to_trampas
+      briefing: lending.md
+      content: "V3Oracle maxPoolPriceDifference check blocks ALL operations including liquidations when pool is manipulated. This is by design per comments at V3Oracle lines 522-524."

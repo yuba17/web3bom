@@ -1,0 +1,362 @@
+# Round 2 staking patterns derived from 995 NEW Solodit findings
+# Patterns NOT covered by staking-001 through staking-023
+
+- id: staking-024
+  pattern: reward-claim-tracking-not-keyed-by-token
+  name: "Reward claim epoch tracker not keyed by reward token, claiming one token blocks all others"
+  causa_raiz: >
+    In multi-token reward systems, the lastEpochClaimed mapping is keyed only
+    by user address (or operator address) and NOT by the reward token. When a
+    staker/operator claims rewards for token A at epoch N, the contract updates
+    lastEpochClaimed[user] = N for ALL tokens. If token B rewards for epochs
+    < N have not been distributed yet, those rewards become permanently
+    unreachable because the claim loop starts from lastEpochClaimed + 1.
+  como_funciona: |
+    1. Protocol distributes rewards in two tokens: TOKEN_A and TOKEN_B
+    2. Epoch 4 arrives; rewards for TOKEN_A epoch 1 are distributed
+    3. Operator claims TOKEN_A rewards -> lastEpochClaimed[operator] = 4
+    4. Epoch 5: TOKEN_B rewards for epoch 2 are now distributed
+    5. Operator tries to claim TOKEN_B for epoch 2
+    6. Claim loop starts at epoch 5 (lastEpochClaimed + 1), skipping epoch 2 entirely
+    7. TOKEN_B rewards for epochs 1-4 are permanently lost
+  invariante: |
+    // lastEpochClaimed must be tracked per (user, token) pair
+    assert(lastEpochClaimed[user][tokenA] independent of lastEpochClaimed[user][tokenB]);
+    // Claiming token A must not affect claimability of token B
+  que_mirar:
+    - "lastEpochClaimed or lastEpochClaimedOperator keyed only by address"
+    - "Single mapping(address => uint48) instead of mapping(address => mapping(address => uint48))"
+    - "Claim function accepting rewardToken parameter but updating global epoch tracker"
+    - "Multiple reward tokens with asynchronous distribution schedules"
+    - "claimRewards iterating from lastEpochClaimed to currentEpoch without per-token offset"
+  como_se_arregla: "Key the lastEpochClaimed mapping by both user address AND reward token address. Each token's claim progress must be independent. Alternatively, track claims per (epoch, user, token) triple."
+  trampas:
+    - "If all reward tokens are always distributed in the same epoch, this is not exploitable"
+    - "Single-token reward systems are unaffected"
+  incidentes:
+    - "Suzaku Core - lastEpochClaimedStaker/Curator/Operator not keyed by reward token, claiming one token blocks all others (HIGH, Cyfrin)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [multi-token, reward-claim, epoch, mapping-key, permanent-loss]
+
+- id: staking-025
+  pattern: future-epoch-stake-cache-manipulation
+  name: "Permissionless caching of future epoch stakes locks in manipulable values"
+  causa_raiz: >
+    Functions that cache operator/validator stake values per epoch lack validation
+    that the requested epoch is in the past or current. When called with a future
+    epoch, checkpoint-based lookups (upperLookupRecent) return the CURRENT values
+    for future timestamps. Once cached with the totalStakeCached flag set to true,
+    the values are immutable for that epoch. An attacker with high current stake
+    can cache future epochs, then reduce their stake before those epochs arrive,
+    locking in inflated reward shares.
+  como_funciona: |
+    1. Operator has 1000 ETH staked in current epoch N
+    2. Operator calls calcAndCacheStakes(epoch=N+5, assetClassId) -- no epoch validation
+    3. Cache stores operatorStakeCache[N+5][assetClass][operator] = 1000 ETH
+    4. totalStakeCached[N+5][assetClass] = true (immutable flag)
+    5. Operator unstakes 900 ETH before epoch N+5 arrives
+    6. When epoch N+5 occurs, reward distribution uses cached 1000 ETH instead of actual 100 ETH
+    7. Operator receives 10x their fair share of rewards
+  invariante: |
+    // Cache must only be set for past/current epochs
+    assert(epoch <= currentEpoch || !totalStakeCached[epoch][assetClass]);
+    // Cached values must reflect actual stake at epoch start
+    assert(cachedStake[epoch][operator] == actualStake(epochStartTs, operator));
+  que_mirar:
+    - "calcAndCacheStakes or similar function without epoch <= currentEpoch check"
+    - "totalStakeCached flag that prevents recalculation once set"
+    - "upperLookupRecent returning latest values for future timestamps"
+    - "Permissionless (public/external) cache functions"
+    - "forceUpdateNodes or rebalancing that reads cached values"
+  como_se_arregla: "Add strict epoch validation: require(epoch <= currentEpoch). Alternatively, only allow caching in the distributeRewards flow where the epoch is guaranteed to be past."
+  trampas:
+    - "If cache functions are access-controlled to trusted roles, risk is lower"
+    - "If cache can be overwritten (no immutable flag), this is mitigated"
+  incidentes:
+    - "Suzaku Core - calcAndCacheStakes allows future epoch caching, locking in manipulable stake values (HIGH, Cyfrin)"
+    - "Suzaku Core - forceUpdateNodes compromised by premature cache entries (HIGH, Cyfrin)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [epoch, cache, future, stake-manipulation, immutable-flag, restaking]
+
+- id: staking-026
+  pattern: gauge-kill-destroys-accumulated-rewards
+  name: "Gauge deactivation zeroes accumulated rewards without settling or preserving them"
+  causa_raiz: >
+    When an admin or emergency council kills a gauge, the killGauge function sets
+    claimable[gauge] = 0 and/or redirects future emissions to the minter, but does
+    NOT first settle pending rewards by calling updateGauge or _claimFees. The
+    totalWeight used for reward distribution is also not adjusted, causing remaining
+    active gauges to receive less than their fair share (rewards calculated against
+    stale totalWeight that includes the killed gauge). If the gauge is later revived,
+    it starts with zero claimable, permanently losing pre-kill rewards.
+  como_funciona: |
+    1. Gauge A has 100 KITTEN in claimable rewards and 30% of totalWeight
+    2. Emergency council calls killGauge(gaugeA)
+    3. claimable[gaugeA] = 0 -- 100 KITTEN permanently lost
+    4. totalWeight still includes gaugeA's weight (not adjusted)
+    5. Next notifyRewardAmount distributes to active gauges using stale totalWeight
+    6. Active gauges each receive less because totalWeight is inflated
+    7. Killed gauge's weight share of emissions goes nowhere (stuck in contract)
+    8. If gauge is revived, it restarts with 0 claimable -- pre-kill rewards unrecoverable
+  invariante: |
+    // Before kill: settle all pending rewards
+    assert(claimable[gauge] == fullySettledRewards || rewardsTransferredToMinter);
+    // After kill: totalWeight must be adjusted
+    assert(totalWeight == sum(activeGaugeWeights));
+  que_mirar:
+    - "killGauge setting claimable[gauge] = 0 without calling updateGauge first"
+    - "totalWeight not decremented when gauge is killed"
+    - "_claimFees only called inside notifyRewardAmount (unreachable for killed gauges)"
+    - "reviveGauge not restoring previous claimable amount"
+    - "isAlive check inside reward accrual causing silent skip without weight adjustment"
+  como_se_arregla: "Call updateGauge and _claimFees before killing. Transfer claimable amount to minter or reserve. Decrement totalWeight by the killed gauge's weight. On revive, restore from reserve or start fresh with adjusted totalWeight."
+  trampas:
+    - "If claimable is transferred to minter (not zeroed), funds are recoverable"
+    - "If protocol never kills gauges, this is not reachable"
+    - "Some protocols intentionally burn killed gauge rewards"
+  incidentes:
+    - "KittenSwap - killGauge zeros claimable without settling, 100% reward loss (HIGH, Pashov)"
+    - "KittenSwap - gauge fees stuck in pair contract after kill because _claimFees unreachable (MEDIUM, Pashov)"
+    - "KittenSwap - gauge still usable after killing, no deposit check (LOW, Pashov)"
+    - "Hyperstable - missing claimable reward transfer in killGauge (LOW, Pashov)"
+    - "RAAC - emergencyShutdown causes gauge to lose accumulated rewards at next distribution (MEDIUM, CodeHawks)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [gauge, kill, reward-loss, totalWeight, ve-DEX, emergency, settlement]
+
+- id: staking-027
+  pattern: reward-stream-reset-via-dust-donation
+  name: "Dust token donation resets reward stream duration, diluting per-second distribution"
+  causa_raiz: >
+    Reward contracts that detect new rewards via balanceOf delta (unseen reward
+    pattern) recalculate rewardPerSecond using the formula:
+    (newAmount + leftover) / rewardStreamTime. If anyone can trigger this
+    recalculation (e.g. by sending 1 wei of reward token to the contract), the
+    entire leftover is re-spread over a fresh rewardStreamTime. Repeated dust
+    donations keep resetting the distribution timer, effectively freezing reward
+    delivery to near-zero per second.
+  como_funciona: |
+    1. Admin sends 1000 USDC as rewards, rewardPerSecond = 1000/604800 (1 week)
+    2. After 3 days, 571 USDC distributed, 429 USDC leftover
+    3. Attacker sends 1 wei USDC to contract
+    4. Anyone calls claimRewards which triggers trackUnseenReward
+    5. Unseen = 1 wei, rewardPerSecond = (1 + 429e6) / 604800 = same leftover spread over fresh week
+    6. Effective distribution rate halved compared to intended schedule
+    7. Attacker repeats every few hours, keeping rewards near-frozen
+    8. Cost: only gas + 1 wei per attack
+  invariante: |
+    // Unseen reward detection must not be triggerable with dust amounts
+    assert(unseenAmount >= minRewardThreshold || noRecalculation);
+    // rewardPerSecond should not decrease due to external token transfers
+  que_mirar:
+    - "trackUnseenReward or _handleUnseenReward reading balanceOf delta"
+    - "rewardPerSecond recalculated with (newAmount + leftover) / fullDuration"
+    - "No minimum threshold on unseen reward amount"
+    - "Public/permissionless functions triggering reward tracking"
+    - "balanceOf-based reward detection instead of notifyRewardAmount pattern"
+  como_se_arregla: "Use explicit notifyRewardAmount with access control instead of balanceOf detection. If using unseen pattern, require minimum unseen amount threshold. Alternatively, only extend remaining duration proportionally to new amount."
+  trampas:
+    - "If reward detection is access-controlled (only admin), dust attack is blocked"
+    - "If minimum unseen threshold is enforced, dust amounts are filtered"
+    - "Standard Synthetix notifyRewardAmount pattern is immune to this"
+  incidentes:
+    - "DefiApp/MFDLogic - Dust reward token donation resets rewardPerSecond, extending vesting for all users (MEDIUM, Cantina)"
+    - "Kwenta - USDC 6-decimal precision + frequent updates cause rewardPerToken to round to zero (MEDIUM, Sherlock)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dust, donation, reward-stream, balanceOf, griefing, rewardPerSecond]
+
+- id: staking-028
+  pattern: stake-on-behalf-hijacks-user-state
+  name: "Permissionless stake-on-behalf overwrites victim's delegation, multiplier, or warmup"
+  causa_raiz: >
+    When a staking function accepts a (amount, receiver, delegatee) tuple and
+    the caller can specify any receiver, the function overwrites the receiver's
+    delegatee without the receiver's consent. By staking 1 wei for a victim with
+    a new delegatee, the attacker hijacks the victim's entire voting power.
+    Similarly, stake-on-behalf can reset warmup timers, flood lock arrays causing
+    OOG on withdrawal, or overwrite reward accumulator state.
+  como_funciona: |
+    1. Victim has 1000 veTokens delegated to validatorA
+    2. Attacker calls stake(1 wei, victim, attacker) -- stakes 1 wei for victim
+    3. _delegate(victim, attacker) overwrites victim's delegation to point to attacker
+    4. Attacker now controls victim's 1000 veToken voting power
+    5. Attacker stakes 1 wei for multiple large holders, accumulating majority voting power
+    6. Attacker submits and passes malicious governance proposal
+    7. OR: attacker floods victim's userLocks array with tiny stakes -> OOG on withdrawal
+  invariante: |
+    // Delegation change must require receiver's consent
+    assert(msg.sender == receiver || receiver.approved(msg.sender));
+    // Stake-on-behalf must not modify receiver's existing delegation
+    assert(delegatee_after == delegatee_before || msg.sender == receiver);
+    // userLocks array length must be bounded per user
+    assert(userLocks[user].length <= MAX_LOCKS);
+  que_mirar:
+    - "stake(amount, receiver, delegatee) where receiver != msg.sender allowed"
+    - "_delegate(receiver, delegatee) called unconditionally in stake"
+    - "No minimum stake amount allowing 1 wei attacks"
+    - "userLocks or StakedLock array grows unbounded on each stake call"
+    - "Warmup period reset on any stake event including third-party stakes"
+  como_se_arregla: "Require msg.sender == receiver for delegation changes, or only call _delegate when msg.sender == receiver. Set minimum stake amount. Cap userLocks array length per user. Do not reset warmup on third-party stakes."
+  trampas:
+    - "If stake-on-behalf is restricted to approved callers, attack surface is limited"
+    - "If delegation is separate from staking (standalone delegate() function), this specific path may not exist"
+  incidentes:
+    - "Virtuals Protocol - Anyone calls stake(1 wei, victim, attacker) to hijack delegation and voting power (HIGH, C4)"
+    - "Virtuals Protocol - Validator score initialized to maxScore, earn full rewards without participation (HIGH, C4)"
+    - "DefiApp - Flooding userLocks array via permissionless stake-on-behalf causes OOG on withdrawal (HIGH, Cantina)"
+    - "Yieldy - stake(1 wei, victim) resets warmup period, permanent DoS on claiming (HIGH)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [delegation-hijack, stake-on-behalf, voting-power, griefing, OOG, array-flooding]
+
+- id: staking-029
+  pattern: reward-accumulator-uninitialized-for-new-stakes
+  name: "New staker's reward accumulator initialized to zero, claims all historical rewards"
+  causa_raiz: >
+    When a new staker enters the system, their per-user reward accumulator
+    (rewardAccumulator, userRewardPerTokenPaid, inflationIndex, or similar) is
+    not initialized to the current global accumulator value. The earned() function
+    computes rewards as: globalAccumulator - userAccumulator. Since userAccumulator
+    starts at 0, the new staker is credited with ALL rewards accumulated since
+    contract deployment, not just rewards since they staked.
+  como_funciona: |
+    1. Contract deployed, globalAccumulator starts at 0
+    2. Rewards accumulate for 90 days, globalAccumulator reaches 1000
+    3. Existing stakers have userAccumulator = 500 (claimed partway through)
+    4. New staker arrives, stakes 100 tokens
+    5. newStaker.userAccumulator = 0 (never initialized)
+    6. earned(newStaker) = 100 * (1000 - 0) = 100,000 (should be 0)
+    7. New staker claims 100,000 reward tokens, draining from existing stakers
+    8. Repeatable: stake -> claim -> unstake -> repeat with new address
+  invariante: |
+    // On stake: user accumulator must be set to current global accumulator
+    assert(newStore.rewardAccumulator == globalRewardAccumulator);
+    // earned() for a brand new stake must return 0
+    assert(earned(newStaker) == 0 immediately after staking);
+  que_mirar:
+    - "_internalStakeForAddress not setting rewardAccumulator to current global value"
+    - "updateReward modifier skipped for new stakers (if staker.lastStakedEpoch == 0)"
+    - "userRewardPerTokenPaid remaining 0 when vestingRate is 0 at stake time"
+    - "Conditional _updateRewards only called if staker.lastStakedEpoch > 0"
+    - "inflationIndex or gInflationIndex not assigned to new user"
+  como_se_arregla: "Always initialize userRewardPerTokenPaid (or equivalent) to the current global rewardPerToken at the time of staking. Do not skip updateReward for first-time stakers. Set newStore.rewardAccumulator = currentGlobalAccumulator in _internalStakeForAddress."
+  trampas:
+    - "If the protocol has no accumulated rewards before first stake, this is harmless"
+    - "Synthetix-style contracts with updateReward modifier on stake() are immune if modifier runs unconditionally"
+  incidentes:
+    - "DIA Staking - rewardAccumulator not initialized on stake creation, new stakers claim all historical rewards (CRITICAL, MixBytes)"
+    - "NodeOps - lastStakedEpoch not set, _updateRewards skipped for new stakers, claim rewards from epoch 0 (HIGH, Halborn)"
+    - "NodeOps - _updateRewards double-counts: staker.rewards += staker.rewards + calculated, exponential inflation (HIGH, Halborn)"
+    - "TempleGold - userRewardPerTokenPaid = 0 for new stakes because vestingRate is 0, claims all past rewards (HIGH, CodeHawks)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [accumulator, initialization, historical-rewards, drain, first-staker, rewardPerToken]
+
+- id: staking-030
+  pattern: two-step-unstake-missing-state-persistence
+  name: "Two-step unstake process loses withdrawal request between initiate and complete"
+  causa_raiz: >
+    Many staking protocols split unstaking into two steps: (1) initiate unstake
+    (burn receipt tokens, start cooldown), and (2) complete withdrawal (transfer
+    underlying). If the initiate step burns tokens or adjusts balances but fails
+    to persist the withdrawal request in storage (e.g. withdrawalRequests[user]),
+    the user's tokens are destroyed with no record of the pending withdrawal.
+    The complete step checks withdrawalRequests and finds nothing, so the user
+    receives nothing. Also occurs when fallback paths (validator unstake vs
+    buffer unstake) have asymmetric state writes.
+  como_funciona: |
+    1. User calls unstake(amount) which burns their staking receipt tokens
+    2. Contract checks buffer: insufficient balance, falls back to validator unstake
+    3. Validator unstake path returns amountUnstaked but does NOT write withdrawalRequests[user]
+    4. User's receipt tokens are already burned (irreversible)
+    5. User calls withdraw() which reads withdrawalRequests[msg.sender] -- empty
+    6. withdraw() reverts or returns 0 -- user receives nothing
+    7. User has lost both receipt tokens AND underlying tokens
+    8. No recovery mechanism exists
+  invariante: |
+    // Every code path that burns receipt tokens MUST persist withdrawal request
+    assert(receiptBurned => withdrawalRequests[user].amount > 0);
+    // After unstake: user must have either tokens returned OR withdrawal request saved
+    assert(tokensReturned || withdrawalRequests[user].amount == unstakeAmount);
+  que_mirar:
+    - "Multiple unstake code paths (buffer vs validator) with different state writes"
+    - "Fallback paths that return early without persisting withdrawalRequests"
+    - "receipt token burn before withdrawal request storage write"
+    - "withdrawalRequests populated in one path but not the other"
+    - "stakingDelayStartTime not reset after claimUnstake, blocking future stakes"
+    - "Concurrent unstake requests sharing same currentWithheldETH without reservation"
+  como_se_arregla: "Ensure ALL code paths that burn receipt tokens also persist the withdrawal request. Use a single unified state write after all branching logic. Add invariant check: if tokens burned, withdrawalRequest must be non-zero."
+  trampas:
+    - "If protocol only has a single unstake path (no fallback), this doesn't apply"
+    - "If receipt tokens are not burned until withdrawal completes, tokens are safe"
+  incidentes:
+    - "Mystic Finance - Validator unstake fallback path burns frxETH but doesn't save withdrawalRequests, permanent fund loss (HIGH, Kann)"
+    - "Mystic Finance - Multiple concurrent unstake() calls share same currentWithheldETH, later withdrawals fail (MEDIUM, Kann)"
+    - "SXT - stakingDelayStartTime not reset after claimUnstake, blocks future staking (MEDIUM, Pashov)"
+    - "Casimir - fulfillUnstakes uses stale withdrawnEffectiveBalance, over-fulfills and causes underflow DoS (MEDIUM, Cyfrin)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [two-step-unstake, withdrawal-request, state-persistence, fund-loss, fallback-path]
+
+- id: staking-031
+  pattern: reward-to-wrong-recipient-after-custody-transfer
+  name: "Rewards sent to current token holder instead of original staker after custody transfer"
+  causa_raiz: >
+    When staked NFT positions (Uniswap V3 NFPs, veTokens, validator NFTs) are
+    transferred to a staking gauge/contract, ownership changes to the contract.
+    If the reward claim function uses ownerOf(tokenId) to determine the recipient,
+    it sends rewards to the contract itself (the current owner) instead of the
+    original depositor. The rewards become permanently trapped. Similarly, after
+    operator key reassignment, claim-by-key maps to the new operator address,
+    allowing the new operator to re-claim already-claimed rewards.
+  como_funciona: |
+    1. User deposits NFP tokenId into CLGauge, ownership transfers to gauge contract
+    2. Rewards accumulate for tokenId
+    3. User calls getReward(tokenId) which internally calls _getReward
+    4. _getReward does: owner = nfp.ownerOf(tokenId) -- returns gauge contract address
+    5. Reward transferred from gauge to gauge (self-transfer), permanently trapped
+    6. OR: Operator key X was assigned to operatorA, who claimed epoch 5 rewards
+    7. Key X reassigned to operatorB
+    8. operatorB claims epoch 5 rewards using key X -- claimed[epoch][recipient] is different
+    9. Double claim: same rewards paid to both operatorA and operatorB
+  invariante: |
+    // Reward recipient must be the depositor, not current NFT owner
+    assert(rewardRecipient == originalDepositor[tokenId]);
+    // claimed[epoch] must be keyed by operatorKey, not resolved address
+    assert(claimed[epoch][operatorKey] prevents re-claim after key reassignment);
+  que_mirar:
+    - "getReward using nfp.ownerOf(tokenId) as transfer recipient"
+    - "NFT custody transferred to staking contract on deposit"
+    - "No mapping from tokenId to original depositor address"
+    - "operatorByKey() resolving to different address after key reassignment"
+    - "claimed mapping keyed by resolved address instead of operator key"
+  como_se_arregla: "Store original depositor address on deposit, use it as reward recipient. For operator rewards, key claimed mapping by operatorKey bytes32 instead of resolved address."
+  trampas:
+    - "If staking contract doesn't take NFT custody (uses approval instead), ownerOf is correct"
+    - "If operator keys are immutable (never reassigned), double-claim is impossible"
+  incidentes:
+    - "KittenSwap - CLGauge._getReward sends KITTEN to nfp.ownerOf() which is the gauge itself, 100% rewards lost (CRITICAL, Pashov)"
+    - "Tanssi - ODefaultOperatorRewards tracks claimed by recipient address, key reassignment enables double-claim (MEDIUM, Pashov)"
+    - "Blueberry - Re-depositing to Ichi farm sends ICHI rewards to spell contract, not user (HIGH, Sherlock)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [custody-transfer, ownerOf, wrong-recipient, NFT, operator-key, double-claim]

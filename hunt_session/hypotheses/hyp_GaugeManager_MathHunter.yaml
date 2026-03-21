@@ -1,0 +1,334 @@
+component: GaugeManager
+hunter: MathHunter
+timestamp: "2026-03-21"
+focus: "Overflow, rounding, precision, reward fee math, leftover underflow, slippage protection bypass"
+
+# ─── DEEP MATH ANALYSIS ────────────────────────────────────────────────────
+# Constants:
+#   Q64  = 2^64  = 18_446_744_073_709_551_616
+#   Q96  = 2^96
+#   Q160 = 2^160
+#   MAX_REWARD_X64 = floor(Q64 / 50) = 368_934_881_474_191_032  (~2%)
+#   REWARD_MAX_PRICE_DIFFERENCE_X64 = 368_934_881_474_191_032   (same constant, ~2%)
+#
+# KEY COMPOUND FORMULA CHAIN (_addLiquidity):
+#   maxAddAmount0  = amount0Out * Q64 / (rewardX64 + Q64)       [floor division]
+#   amountAdded0  <= maxAddAmount0                               [NPM: cannot exceed desired]
+#   rewardAmount0  = amountAdded0 * rewardX64 / Q64             [floor division]
+#   leftover0      = amount0Out - amountAdded0 - rewardAmount0  [must not underflow]
+#
+# ALGEBRAIC PROOF (leftover0 >= 0):
+#   rewardAmount0 = floor(amountAdded0 * rewardX64 / Q64)
+#   amountAdded0 + rewardAmount0 <= amountAdded0 + amountAdded0 * rewardX64 / Q64
+#                                 = amountAdded0 * (Q64 + rewardX64) / Q64
+#   amountAdded0 <= maxAddAmount0 = floor(amount0Out * Q64 / (Q64 + rewardX64))
+#                                 <= amount0Out * Q64 / (Q64 + rewardX64)
+#   Therefore: amountAdded0 * (Q64 + rewardX64) / Q64 <= amount0Out
+#   QED: leftover0 >= 0, no underflow possible with correct NPM.
+#
+# CRITICAL OVERFLOW FOUND in Swapper._validateSwap (line 200):
+#   amountIn * (Q64 - maxPriceDifferenceX64)  ← plain uint256 multiply, NOT FullMath
+#   Q64 - maxPriceDifferenceX64 ≈ 1.748e19 ≈ 2^63.9
+#   Overflows when: amountIn > type(uint256).max / (Q64 - maxPriceDifferenceX64)
+#                            ≈ 2^256 / 2^64 = 2^192
+#   With Solidity 0.8.0 this REVERTS (DoS), not silent wrap.
+#   For swap0For1: amountOutMin = FullMath.mulDiv(OVERFLOWED_VAL, priceX96, Q160)
+#   If amountIn is in [2^128, 2^192]: overflow → revert → DoS on _swapThroughPool
+#   Practical: 2^128 ≈ 3.4e38. For AERO (supply ~1.9B = 1.9e27 wei), this is safe.
+#   But for tokens with very low decimal (0-6 decimals) or rebasing tokens, risk increases.
+#
+# AERO LEFTOVER ACCOUNTING:
+#   requestedAero0 = aeroAmount * aeroSplitBps / 10_000       [floor]
+#   requestedAero1 = aeroAmount - requestedAero0               [exact complement]
+#   spentAero = spentAero0 + spentAero1 = requestedAero0 + requestedAero1 = aeroAmount
+#   leftoverAero = aeroAmount - spentAero = 0  ALWAYS (by construction)
+#   Note: spentAero tracks amountIn passed to swap, NOT actual consumed amount.
+#   If a swap internally doesn't spend full amountIn (partial fill), the accounting
+#   would be wrong. But Uniswap V3 exactInput always consumes full amountIn — safe.
+#
+# _sendDepositDeltas UNDERFLOW GUARD:
+#   Only transfers when token0After > token0Before (guarded by `>`).
+#   If gauge deposit TAKES tokens (unexpected fee retention), delta is silently 0.
+#   No underflow. But: silent fund loss if gauge takes more than it should.
+# ───────────────────────────────────────────────────────────────────────────
+
+hypotheses:
+  - id: GM-M-01
+    tier: 1
+    type: property
+    description: >
+      Slippage protection bypass via overflow in _validateSwap (Swapper.sol line 200).
+      The expression `amountIn * (Q64 - maxPriceDifferenceX64)` uses plain Solidity
+      multiplication. With Solidity 0.8.0, this REVERTS (not wraps) when
+      amountIn > 2^192. The revert causes a DoS on _swapThroughPool, which means
+      compoundRewards permanently reverts for positions with token balances > 2^192 wei.
+      While 2^192 is beyond realistic ERC20 supplies at 18 decimals, tokens with 0-6
+      decimals or non-standard supplies could hit this threshold.
+    attack_scenario: >
+      A position uses a gauge for a token pair including a low-decimal or high-supply token
+      (e.g., 0-decimal token where 1 unit = 1 wei). An attacker donates enough of that token
+      to the position or the pool such that the AERO swap amount exceeds 2^192 wei.
+      compoundRewards then permanently DoSes for that tokenId: the position is withdrawn from
+      gauge, swap fails, position is never re-deposited. Owner cannot call unstakePosition
+      because the position is already out of the gauge but stuck in GaugeManager.
+      More realistically: if AERO reward accumulates to > 2^128 wei (3.4e20 AERO tokens),
+      the overflow triggers. At current supply this is impossible, but an entirely different
+      token used as "aeroToken" could hit this.
+    solidity: |
+      // Property: _validateSwap must not revert for any realistic token amount
+      // Bound: amountIn <= 2^128 (max realistic ERC20 supply with 18 decimals)
+      // Invariant: for amountIn in [0, 2^128], _validateSwap completes without revert
+      //
+      // In Chimera handler for _swapThroughPool:
+      uint256 MAX_SAFE_AMOUNT_IN = type(uint128).max;
+      // Fuzz amountIn in [0, MAX_SAFE_AMOUNT_IN] and verify no arithmetic overflow revert
+      // The critical multiplication: amountIn * (Q64 - REWARD_MAX_PRICE_DIFFERENCE_X64)
+      // Q64 - REWARD_MAX_PRICE_DIFFERENCE_X64 = 18_446_744_073_709_551_616 - 368_934_881_474_191_032
+      //                                       = 18_077_809_192_235_360_584
+      // Max safe amountIn before overflow = type(uint256).max / 18_077_809_192_235_360_584
+      //                                   ≈ 2^192 / 1.808e19 ≈ 2^192 / 2^63.9 ≈ 2^128.1
+      // So: amountIn <= 2^128 is safe, amountIn > 2^128 may overflow
+      lte(
+        ghost_swapAmountIn,
+        MAX_SAFE_AMOUNT_IN,
+        "GM-M-01: swap amountIn exceeds safe multiply bound for _validateSwap"
+      );
+    validated: true
+    priority: medium
+    confidence: 70
+    notes: >
+      The overflow reverts (Solidity 0.8) rather than silently bypassing slippage.
+      This is a DoS/liveness bug, NOT a slippage bypass. Severity: Medium (liveness).
+      Would be Critical if it silently wrapped to 0 (old Solidity), but it doesn't.
+      AERO token supply ~1.9B tokens = 1.9e27 wei << 2^128 -- SAFE for current AERO.
+      Risk is real only for misconfigured token pairs or future token changes.
+      Confidence 70 because the overflow boundary is mathematically precise.
+
+  - id: GM-M-02
+    tier: 1
+    type: property
+    description: >
+      totalRewardX64 must always be <= MAX_REWARD_X64 = floor(Q64/50).
+      setCompoundReward enforces this (only allows decreasing). However, the invariant
+      is worth monitoring: any violation allows the protocol to extract > 2% fee from
+      every compoundRewards call. With amountAdded of 1e18, a 1-unit increase in
+      totalRewardX64 above MAX extracts an extra ~5.4e-20 tokens per call — immaterial
+      individually but wrong by contract specification.
+    attack_scenario: >
+      If a storage collision (proxy upgrade), reentrancy, or future governance change
+      sets totalRewardX64 > MAX_REWARD_X64, then every compoundRewards call extracts
+      > 2% from user positions without consent. Over many positions this accrues
+      significant value. Since setCompoundReward is onlyOwner with a one-way cap,
+      this requires a privileged attack path. Severity: High IF reached.
+    solidity: |
+      // Invariant: totalRewardX64 never exceeds the published 2% cap
+      uint256 currentReward = gaugeManager.totalRewardX64();
+      lte(
+        currentReward,
+        uint256(gaugeManager.MAX_REWARD_X64()),
+        "GM-M-02: totalRewardX64 exceeds MAX_REWARD_X64 cap — fee extraction above 2%"
+      );
+    validated: true
+    priority: high
+    confidence: 85
+    notes: >
+      This invariant should never be violated by the current code (setCompoundReward has
+      correct guard). Value is as a regression/mutation test sentinel. If it fires in fuzzing,
+      something extraordinary happened (storage collision etc).
+
+  - id: GM-M-03
+    tier: 1
+    type: property
+    description: >
+      In _sendLeftoversAndRewards, the calculation `leftover0 = amount0Out - amountAdded0 - rewardAmount0`
+      must never underflow. The algebraic proof shows it cannot with a correct NPM
+      (amountAdded0 <= maxAddAmount0 is guaranteed by the allowance ceiling).
+      However: if the gauge's deposit() call internally calls increaseLiquidity or modifies
+      the position such that effective amountAdded0 seen by GaugeManager differs from
+      what NPM reported, the invariant could break. This is a trust-boundary assumption.
+    attack_scenario: >
+      A malicious or buggy gauge wrapper calls increaseLiquidity directly during deposit,
+      causing NPM to report amountAdded0 > maxAddAmount0 to GaugeManager. The subtraction
+      `amount0Out - amountAdded0 - rewardAmount0` underflows → revert. Position is now
+      in a stuck state: withdrawn from gauge (line 276), swap completed, addLiquidity called,
+      deposit called — all irreversible. The position NFT is in the gauge. Owner can call
+      unstakePosition to recover, but the compounded swap proceeds are stranded.
+    solidity: |
+      // Post-condition after compoundRewards completes:
+      // amountAdded0 <= maxAddAmount0 = amount0Out * Q64 / (rewardX64 + Q64)
+      // Equivalently: amountAdded0 * (rewardX64 + Q64) <= amount0Out * Q64
+      //
+      // In Chimera: after each compoundRewards call, verify:
+      uint256 rewardX64 = gaugeManager.totalRewardX64();
+      uint256 Q64_val = 2**64;
+      // ghost_amountAdded0 captured from event RewardsCompounded
+      // ghost_amount0Out = captured from _swapAeroForPosition state
+      lte(
+        ghost_amountAdded0 * (rewardX64 + Q64_val),
+        ghost_amount0Out * Q64_val,
+        "GM-M-03: amountAdded0 exceeds maxAddAmount0 — leftover underflow possible"
+      );
+    validated: true
+    priority: high
+    confidence: 72
+    notes: >
+      Algebraically proven safe with correct NPM. Risk is non-zero only with
+      non-standard gauge wrappers. Critical to test on fork where real Aerodrome
+      gauges are used — mock artifacts could false-positive this invariant.
+
+  - id: GM-M-04
+    tier: 1
+    type: property
+    description: >
+      Two-hop swap routing (AERO -> otherToken -> targetToken) applies TWAP and
+      slippage checks PER HOP (each at max 2% deviation). The COMBINED slippage
+      across both hops is unchecked. An adversary can manipulate each pool by just
+      under 2%, passing both per-hop checks while extracting ~3.8% total from the
+      compounding user. Since MAX_REWARD_X64 = 2%, this makes two-hop compounding
+      net negative for the position owner (sandwich > protocol fee earned).
+    attack_scenario: >
+      Attacker sees compoundRewards pending for a position that uses two-hop routing
+      (AERO has no direct rewardBasePool for targetToken).
+      Step 1: Sandwich attack — manipulate intermediatePool (AERO->weth) by 1.9% just before tx.
+      Step 2: Compound tx executes — hop1 passes TWAP check (1.9% < 2%), hop2 is unaffected.
+      Step 3: Attacker closes position in intermediatePool — profits ~1.9% of AERO swapped.
+      Net result: position owner "compounds" but receives ~1.9% less value than fair price,
+      while paying 2% protocol fee. Compounding is net negative for the user.
+      Note: This requires MEV capability (flashbots/searcher) to be profitable.
+    solidity: |
+      // Property: for two-hop routing, combined output value must meet minimum threshold
+      // Each hop allows 2% slippage => combined tolerance should be ~(1-0.02)^2 = ~96%
+      // Currently each hop independently allows up to 2% => combined up to ~3.96% loss
+      //
+      // Invariant: amountOut of two-hop swap >= amountIn * (1 - 2*REWARD_MAX_PRICE_DIFFERENCE_X64/Q64)
+      // i.e., in aero terms, value preservation across both hops
+      //
+      // In Q64 fixed-point:
+      // combined_min_ratio = (Q64 - REWARD_MAX_PRICE_DIFFERENCE_X64)^2 / Q64
+      //                    = (0.98)^2 * Q64 = 0.9604 * Q64
+      // Current code only enforces 0.98 * Q64 per hop, not 0.9604 * Q64 combined
+      //
+      // This invariant cannot be expressed purely on-chain without oracle price data.
+      // Test on fork: measure actual amountOut vs TWAP-implied fair value for two-hop paths.
+      // If actual output < 0.96 * TWAP_fair_output, the two-hop tolerance is too loose.
+      lte(
+        ghost_spentAero * (Q64 - 2 * REWARD_MAX_PRICE_DIFFERENCE_X64) / Q64,
+        ghost_totalAmountOutInAeroTerms,
+        "GM-M-04: two-hop combined slippage exceeds per-hop tolerance — MEV extractable"
+      );
+    validated: false
+    priority: medium
+    confidence: 58
+    notes: >
+      This is a design-level concern, not necessarily a code bug. The per-hop TWAP check
+      is the intended design. Whether the combined tolerance is acceptable is a protocol
+      decision. Confidence 58 — the math is correct but the "attack" requires MEV
+      capability and the profit is bounded by the tolerance gap.
+      Only testable on fork with real oracle prices. Mark as Design Issue, not Critical.
+
+  - id: GM-M-05
+    tier: 2
+    type: property
+    description: >
+      rewardAmount0 uses floor division (amountAdded0 * rewardX64 / Q64).
+      For amountAdded0 < Q64 / rewardX64 = Q64 / MAX_REWARD_X64 = 50, the reward
+      rounds to 0. The protocol earns zero fee on positions that add < 50 wei of token0.
+      This is dust (immaterial) but means the owner receives MORE than (1 - fee_rate)
+      of amountAdded0. The invariant checks rounding direction: protocol should never
+      round UP its own fee (that would violate the fee cap).
+    attack_scenario: >
+      No direct attack. This is a rounding fairness invariant. If rewardAmount0 somehow
+      rounds UP (ceiling division), the protocol takes slightly more than rewardX64/Q64.
+      With amountAdded0 = 1 wei and rewardX64 = MAX_REWARD_X64:
+      floor(1 * MAX_REWARD_X64 / Q64) = 0 (correct — no fee on dust).
+      A ceiling division would give 1 (incorrect — 100% fee on dust). Not a real attack
+      vector but important for auditability.
+    solidity: |
+      // Property: rewardAmount0 <= amountAdded0 * rewardX64 / Q64 (exact floor)
+      // Equivalently: rewardAmount0 * Q64 <= amountAdded0 * rewardX64
+      // (avoids division, uses products to avoid precision loss in the check itself)
+      uint256 rewardX64 = gaugeManager.totalRewardX64();
+      // ghost_rewardAmount0 and ghost_amountAdded0 captured post-compound
+      lte(
+        ghost_rewardAmount0 * (2**64),
+        ghost_amountAdded0 * rewardX64,
+        "GM-M-05: protocol fee rounded UP — extracts more than declared rate"
+      );
+    validated: false
+    priority: low
+    confidence: 55
+    notes: >
+      Mathematically impossible to violate with Solidity 0.8 integer division (always floor).
+      Tier 2 — this is a confirmation/regression invariant. If it fires, something
+      is deeply wrong with the EVM. Useful for mutation testing (replace / with mulCeil).
+
+  - id: GM-M-06
+    tier: 1
+    type: property
+    description: >
+      The `_sendDepositDeltas` function silently skips forwarding tokens when the gauge's
+      deposit() call REDUCES the GaugeManager token balance below the pre-deposit snapshot.
+      This is guarded by `token0After > token0Before` (line 365). If the gauge retains
+      tokens (e.g., takes a deposit fee or fails to collect fees to GaugeManager), the
+      delta is 0 and no tokens are forwarded. The user's pre-stake accrued fees are silently
+      lost — retained by the gauge or burned. This is a FUND LOSS scenario for stakers.
+    attack_scenario: >
+      A gauge implementation that charges a deposit fee or has a bug where `collect()` sends
+      fees to the wrong address would cause `token0After < token0Before` in _sendDepositDeltas.
+      The guard prevents the underflow revert but silently discards the fee forwarding.
+      The position owner (vault) loses the pre-stake accrued fees that should have been
+      forwarded. With Aerodrome CLGauge this appears safe (fees go to msg.sender = GaugeManager).
+      But future gauge upgrades or alternative gauge integrations could trigger this.
+    solidity: |
+      // Property: _sendDepositDeltas must always forward the full delta to recipient
+      // i.e., if gauge.deposit() sends any token0/token1 to GaugeManager,
+      // those amounts must reach the owner (not accumulate in GaugeManager as dust)
+      //
+      // Ghost: track token0 balance of GaugeManager before/after stakePosition
+      uint256 gmBalBefore = IERC20(token0).balanceOf(address(gaugeManager));
+      // [call stakePosition]
+      uint256 gmBalAfter = IERC20(token0).balanceOf(address(gaugeManager));
+      // GaugeManager should not retain any token0 from this staking operation
+      // (it has no token0 balance in steady state — only transient during operations)
+      // If gmBalAfter > gmBalBefore, deposit fees were NOT forwarded (silent loss for user)
+      lte(
+        gmBalAfter,
+        gmBalBefore,
+        "GM-M-06: GaugeManager retained token0 after stakePosition — deposit delta not forwarded"
+      );
+    validated: true
+    priority: medium
+    confidence: 60
+    notes: >
+      The current Aerodrome CLGauge implementation forwards collect() proceeds to msg.sender
+      (GaugeManager). So in practice this is safe with the current gauges. Confidence 60
+      because it relies on gauge behavior outside GaugeManager's control. The `>` guard
+      is the correct defensive choice — better to lose dust than revert. But it means any
+      gauge that takes fees during deposit causes silent user fund loss.
+      Worth noting as a trust assumption in the audit report.
+
+false_positives:
+  - id: FP-M-01
+    description: >
+      leftoverAero = 0 is NOT a bug. By construction, requestedAero0 + requestedAero1 =
+      aeroAmount, and spentAero records amountIn (not actual consumed). So leftoverAero
+      is always 0. If a fuzzer reports "owner never receives AERO leftover from compound",
+      that is correct and expected behavior, not a finding.
+
+  - id: FP-M-02
+    description: >
+      rewardAmount0/1 = 0 for small amountAdded values (< 50 wei) is expected floor rounding.
+      Not a fee evasion attack — just arithmetic. Do not report as a bug.
+
+  - id: FP-M-03
+    description: >
+      amount0Out * Q64 overflow (2^192 threshold) is a theoretical DoS that is
+      practically unreachable for AERO (supply ~1.9e27 wei << 2^192). If a mock
+      sets amount0Out > 2^192, the revert is a false positive from the mock, not a
+      real finding. Only valid if a real deployed token with > 2^192 wei total supply exists.
+
+  - id: FP-M-04
+    description: >
+      The two-hop slippage concern (GM-M-04) may be intentional design. The per-hop
+      2% TWAP check is a known and accepted tolerance. Do not report as a Critical —
+      frame as a Design Issue if at all. Confirm with protocol team before submitting.

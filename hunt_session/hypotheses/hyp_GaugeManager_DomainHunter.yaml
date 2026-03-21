@@ -1,0 +1,395 @@
+component: GaugeManager
+hunter: DomainHunter
+date: 2026-03-21
+focus: cross-component interactions, state consistency, economic attacks
+
+hypotheses:
+
+  - id: GM-D-01
+    tier: 1
+    type: property
+    description: >
+      Health check evaluates staked positions with feeValue=0 (ignoreFees=true), then
+      _unstakeIfNeeded runs, then _sendPositionValue is called with the stale feeValue=0.
+      Post-unstake, oracle.getLiquidityAndFees() may return non-zero fees (accrued as NFT
+      collectable fees after gauge.withdraw restores them). _sendPositionValue uses feeValue=0,
+      so it never enters the 'liquidationValue <= feeValue' branch and always takes a liquidity
+      proportion. If the real collectable fees after unstake are large (e.g. gauge has been
+      accumulating them on gauge-side), the liquidator receives more than liquidationValue worth
+      of assets, extracting extra value at the expense of the borrower's residual equity.
+    attack_scenario: >
+      Borrower stakes a position with large accumulated in-gauge fees. Price drops just enough
+      to make it liquidatable. Liquidator calls liquidate(). Health check computes fullValue
+      WITHOUT fees (ignoreFees=true) → collateralValue is low → notHealthy. _unstakeIfNeeded
+      moves NFT back to vault; gauge.withdraw transfers gauge-side fee accounting back to NFT.
+      _sendPositionValue receives feeValue=0 but oracle.getLiquidityAndFees() now reports
+      large fees0/fees1. liquidationValue < fullValue so partial liquidation path is used.
+      With feeValue=0, liquidity = (liquidationValue - 0) * liquidity / (fullValue - 0).
+      fees0 = type(uint128).max, fees1 = type(uint128).max (else branch always taken when
+      feeValue=0). Liquidator collects ALL fees plus liquidationValue worth of liquidity.
+      Borrower loses more than the penalty-bounded liquidationValue.
+    solidity: |
+      // After liquidation, borrower residual equity must be >= (fullValue - liquidationValue)
+      // accounting for actual collected amounts
+      function invariant_liquidation_respects_penalty_cap(uint256 tokenId) external {
+          // Pre-conditions: position is staked, was liquidated this block
+          // Check: amount0 + amount1 (in asset terms) <= liquidationValue + dust
+          // This invariant is hard to express as a simple assertion without fork state.
+          // Expressed as: feeValue at health-check time should == feeValue at sendPositionValue time.
+          // The inconsistency: health check calls oracle with ignoreFees=true (feeValue=0),
+          // but _sendPositionValue calls oracle.getLiquidityAndFees() which DOES count fees.
+          // So feeValue used in sendPositionValue calculation implicitly is 0 (from state),
+          // but actual collectable fees are > 0 after unstake.
+          bool staked = IGaugeManager(gaugeManager).tokenIdToGauge(tokenId) != address(0);
+          if (!staked) return; // only applies to staked positions
+          // Property: liquidation payout <= liquidationValue (with small slippage tolerance)
+          // Cannot be expressed in pure Solidity without executing liquidation — needs fork PoC
+          assert(true); // placeholder — this is a Tier 1 finding requiring fork PoC
+      }
+    validated: false
+    priority: high
+    confidence: 65
+    notes: >
+      The core issue: health check path sets feeValue=0 for staked positions. This value
+      is passed to _sendPositionValue. But _sendPositionValue calls oracle.getLiquidityAndFees()
+      independently, getting real fees0/fees1. Since feeValue parameter is 0 and liquidationValue
+      is never <= 0, the code always takes max fees + proportional liquidity. If actual fees
+      are large post-unstake, liquidator over-receives. Confidence 65 because it requires
+      gauge-side fees to be significant AND position to be partially liquidatable (not full).
+      Full liquidation (liquidationValue == fullValue) takes everything anyway — no extra harm.
+
+  - id: GM-D-02
+    tier: 1
+    type: state-consistency
+    description: >
+      During compoundRewards(), tokenIdToGauge[tokenId] remains set to gauge address while
+      the NFT is physically in GaugeManager (not in the gauge). The sequence is:
+      gauge.withdraw() → NFT in GaugeManager → increaseLiquidity() → gauge.deposit() → NFT back in gauge.
+      During this window, vault._isStaked(tokenId) returns TRUE (tokenIdToGauge != 0).
+      If the vault's health check is triggered during this window (via a view call or
+      loanInfo()), it uses ignoreFees=true on a position that no longer needs that treatment.
+      More critically: vault.stakePosition() checks nonfungiblePositionManager.ownerOf(tokenId) == vault
+      BEFORE staking. During compound, ownerOf returns GaugeManager. No direct exploit from this
+      alone — but if any external observer (e.g. keeper bot) calls liquidate() during the compound
+      window, the _isStaked check returns true → health uses ignoreFees → may differ from reality.
+    attack_scenario: >
+      Borderline position. Borrower calls compoundRewards() to increase collateral value.
+      Between gauge.withdraw() and gauge.deposit(), a liquidator (or keeper) in the same block
+      (different tx, MEV) calls liquidate(). _isStaked() returns true (tokenIdToGauge still set).
+      Health check runs with ignoreFees=true. But vault._unstakeIfNeeded() is called → gaugeManager
+      .unstakeIfStaked() → _unstakePosition → tokenIdToGauge[tokenId] is set → tries to call
+      gauge.withdraw() on a position that is NOT in the gauge (it's in GaugeManager mid-compound).
+      Gauge.withdraw() will REVERT (token not owned by gauge). This could cause a DoS of liquidation
+      for positions mid-compound. The borrower could use this to temporarily block liquidation.
+    solidity: |
+      // Invariant: if tokenIdToGauge[tokenId] != 0, then NFT must be owned by that gauge
+      function invariant_gauge_mapping_implies_custody(uint256 tokenId) external view {
+          address gauge = IGaugeManager(gaugeManager).tokenIdToGauge(tokenId);
+          if (gauge == address(0)) return;
+          // If mapping says staked, NFT must be in gauge (or gauge's sub-custodian)
+          // Since gauge may use sub-custodians, we check: NFT NOT in vault and NOT in GaugeManager
+          address nftOwner = nonfungiblePositionManager.ownerOf(tokenId);
+          assert(nftOwner != address(vault));
+          assert(nftOwner != address(gaugeManager));
+          // NFT should be in gauge or gauge's sub-custodian
+      }
+    validated: false
+    priority: high
+    confidence: 55
+    notes: >
+      The DoS-of-liquidation via mid-compound state is real but requires MEV exploitation in
+      the same block. The compound window is a single transaction — in normal block execution,
+      no other tx can interleave. BUT if the borrower calls compoundRewards and it reverts
+      mid-way (e.g. slippage on swap), the NFT could be stuck in GaugeManager with tokenIdToGauge
+      still set. However, compoundRewards has nonReentrant and would revert atomically.
+      The invariant about custody consistency is valid as an invariant to monitor.
+      Confidence lowered because mid-compound window is within a single atomic tx.
+
+  - id: GM-D-03
+    tier: 1
+    type: economic
+    description: >
+      setGauge() can update poolToGauge[pool] to a new gauge address for an existing pool,
+      but tokenIdToGauge[tokenId] entries for already-staked positions in the OLD gauge are
+      NOT migrated. They continue to point to the old gauge. All subsequent operations
+      (claimRewards, unstakePosition, compoundRewards) will use the old gauge address.
+      If the old gauge is deprecated/killed by Aerodrome governance (or its rewards stop),
+      positions are permanently stuck staked to a dead gauge. Worse: if setGauge is called
+      while positions are staked (e.g. because of a gauge migration), unstakePosition will
+      use the stale old gauge. The old gauge's withdraw() is called — if it reverts (killed
+      gauge), the position is permanently stuck. _unstakeIfNeeded during liquidation will
+      also revert, making the position unliquidatable.
+    attack_scenario: >
+      Admin calls setGauge(pool, newGauge) to migrate to a new Aerodrome gauge (routine
+      gauge migration). All positions staked to oldGauge now have stale tokenIdToGauge entries.
+      These positions cannot be unstaked via normal flow. During liquidation, _unstakeIfNeeded
+      → unstakeIfStaked → _unstakePosition → IGauge(oldGauge).withdraw(tokenId) → REVERTS
+      (old gauge killed or tokenId not found). Liquidation reverts. Borrower is protected
+      from liquidation indefinitely. Protocol accumulates bad debt.
+    solidity: |
+      // Invariant: for any staked tokenId, the gauge in tokenIdToGauge must still be
+      // the canonical gauge for that position's pool
+      function invariant_staked_gauge_is_current(uint256 tokenId) external view {
+          address storedGauge = IGaugeManager(gaugeManager).tokenIdToGauge(tokenId);
+          if (storedGauge == address(0)) return;
+          (,, address token0, address token1, uint24 feeOrTickSpacing,,,,,,,) =
+              nonfungiblePositionManager.positions(tokenId);
+          // Get the pool
+          IUniswapV3Pool pool = _getPool(token0, token1, feeOrTickSpacing);
+          address currentGauge = IGaugeManager(gaugeManager).poolToGauge(address(pool));
+          // If gauge has been migrated, staked positions are orphaned
+          assert(storedGauge == currentGauge);
+      }
+    validated: false
+    priority: high
+    confidence: 70
+    notes: >
+      This is a real operational risk. Aerodrome does migrate gauges (they've done it before
+      with ve(3,3) systems). The missing invariant: setGauge should either reject pool migration
+      if positions are staked, or provide a migration path. No such mechanism exists.
+      Severity depends on whether Aerodrome kills old gauges (making withdraw() revert) or just
+      stops emitting rewards (withdraw still works). If withdraw still works on deprecated gauges,
+      this is Low/Medium (bad UX, stale rewards). If it reverts, it's High (liquidation DoS).
+      Confidence 70 on the invariant being breakable; severity depends on gauge behavior.
+
+  - id: GM-D-04
+    tier: 2
+    type: property
+    description: >
+      _sendDepositDeltas forwards token0/token1 fees collected during IGauge.deposit() to the
+      position owner. This uses the owner address from vault.ownerOf(tokenId) at stake time.
+      If the owner is a contract that cannot receive ERC20 tokens (e.g. no fallback, reverts on
+      transfer), the entire stakePosition() call reverts. This allows a borrower (owner of
+      a vaulted position) to permanently DoS the staking of their own position — but only their own.
+      More interestingly: during unstake flow, _claimAndSendRewardsBestEffort uses try/catch for
+      AERO rewards but _sendDepositDeltas (only in stakePosition and compoundRewards) does NOT.
+      If an owner becomes a contract post-stake (e.g. CREATE2), AERO delivery reverts on unstake.
+    attack_scenario: >
+      Borrower deploys a contract as their address (CREATE2 with revert-on-ERC20-receive).
+      They use this address as their borrower address. They call stakePosition(tokenId).
+      stakePosition calls IGauge.deposit() which collects fees and sends them to GaugeManager.
+      _sendDepositDeltas tries to transfer token0/token1 to the borrower-contract → REVERT.
+      This doesn't hurt the borrower (they can't stake), but if the protocol REQUIRES staking
+      for some incentive, the borrower loses access to gauge rewards.
+      For unstake during liquidation: _claimAndSendRewardsBestEffort uses try/catch so AERO
+      failure doesn't block liquidation. No liquidation DoS here.
+    solidity: |
+      // Invariant: stakePosition must succeed even when fee delta is 0
+      // (i.e. when no pre-stake fees have accrued)
+      // Weaker version: if pre-stake fee delta = 0, no transfer attempt should be made
+      function invariant_stake_succeeds_with_zero_fees(uint256 tokenId) external {
+          // Pre-condition: position has 0 accrued fees before staking
+          // stakePosition() should not revert due to transfer of 0 amount
+          // _sendDepositDeltas has: if (token0After > token0Before) → only transfers if delta > 0
+          // So this is actually safe for zero-fee case. Owner-revert only when fees are non-zero.
+          // Property: amount transferred to owner == fees realized during gauge deposit
+          uint256 t0Before = IERC20(token0).balanceOf(owner);
+          vault.stakePosition(tokenId);
+          uint256 t0After = IERC20(token0).balanceOf(owner);
+          // t0After - t0Before == fees0 realized during gauge.deposit
+          assert(t0After >= t0Before); // owner balance never decreases during stake
+      }
+    validated: false
+    priority: medium
+    confidence: 40
+    notes: >
+      The DoS scenario requires a contract-owner that reverts on ERC20 receive AND has
+      non-zero pre-stake fees. Low-medium severity because: (1) it only blocks their own
+      staking, (2) no fund loss, (3) owner is typically an EOA. Not worth pursuing as a
+      finding unless there's a creative composability angle. Marked confidence 40.
+
+  - id: GM-D-05
+    tier: 1
+    type: accounting
+    description: >
+      In compoundRewards(), _sendLeftoversAndRewards computes:
+        leftover0 = state.amount0Out - state.amountAdded0 - state.rewardAmount0
+        leftover1 = state.amount1Out - state.amountAdded1 - state.rewardAmount1
+      rewardAmount is computed as: amountAdded * rewardX64 / Q64.
+      The formula implies: rewardAmount0 <= amountAdded0 (since rewardX64 <= Q64 in theory).
+      However, maxAddAmount0 = amount0Out * Q64 / (rewardX64 + Q64).
+      So amount0Out - amountAdded0 - rewardAmount0 should be >= 0.
+      BUT: if increaseLiquidity does not consume all maxAddAmount (e.g. position is out of range),
+      amountAdded0 can be 0 while amountAdded1 = full amount. Then rewardAmount0 = 0.
+      leftover0 = amount0Out - 0 - 0 = amount0Out (all sent to owner). This is correct.
+      The subtle bug: if swapAeroForPosition creates amount0Out but ALSO the protocol already
+      holds residual token0 from a previous failed compound (interrupted mid-execution,
+      impossible due to nonReentrant, but...), then token0Before in _sendDepositDeltas could
+      include old residual. Actually the balance snapshots are taken fresh each time, so this
+      is safe. No bug here — but verify rewardAmount can never underflow.
+    attack_scenario: >
+      User calls compoundRewards with aeroSplitBps = 0 (all AERO to token1 side).
+      amount0Out = 0, amount1Out = X.
+      maxAddAmount0 = 0, maxAddAmount1 = X * Q64 / (rewardX64 + Q64).
+      If position is single-sided (only token0 range), increaseLiquidity gets amountAdded0=0,
+      amountAdded1=0 (position out of range for token1). rewardAmount0=0, rewardAmount1=0.
+      leftover0 = 0 - 0 - 0 = 0. leftover1 = X - 0 - 0 = X → all X sent to owner.
+      Protocol earns 0 reward. This is a low-impact protocol fee avoidance: by choosing
+      aeroSplitBps such that all AERO is swapped to the wrong token for the position range,
+      the liquidity add fails silently and all proceeds go to owner with no protocol fee taken.
+    solidity: |
+      // Invariant: protocol reward is taken proportional to liquidity actually added
+      // If no liquidity added, protocol reward = 0 (by design). This is exploitable.
+      function invariant_compound_protocol_reward_nonnegative(
+          uint256 tokenId, uint256 aeroSplitBps
+      ) external {
+          uint256 aero = IGauge(tokenIdToGauge[tokenId]).earned(tokenId);
+          if (aero == 0) return;
+          uint256 protocolToken0Before = IERC20(token0).balanceOf(address(gaugeManager));
+          uint256 protocolToken1Before = IERC20(token1).balanceOf(address(gaugeManager));
+          vault.compoundRewards(tokenId, 0, aeroSplitBps, block.timestamp);
+          uint256 protocolToken0After = IERC20(token0).balanceOf(address(gaugeManager));
+          uint256 protocolToken1After = IERC20(token1).balanceOf(address(gaugeManager));
+          // Protocol reward can legitimately be 0 if position is out of range
+          // so this invariant would only fire if protocol reward is NEGATIVE (impossible)
+          assert(protocolToken0After >= protocolToken0Before);
+          assert(protocolToken1After >= protocolToken1Before);
+      }
+    validated: false
+    priority: low
+    confidence: 80
+    notes: >
+      The protocol fee avoidance (choosing aeroSplitBps to direct all AERO to out-of-range
+      token) is by design according to the contract logic — if no liquidity is added, no fee
+      is taken. This is a protocol design choice, not a bug. Confidence 80 that the invariant
+      holds (protocol balance never decreases), but the fee avoidance is expected behavior.
+      Real severity: low/informational.
+
+  - id: GM-D-06
+    tier: 1
+    type: state-consistency
+    description: >
+      The onERC721Received guard checks: from == address(vault) OR from == tokenIdToGauge[tokenId].
+      This means ANY address equal to vault can send any NFT to GaugeManager and it gets accepted,
+      regardless of whether tokenId is tracked. More critically: during the compound flow,
+      gauge.withdraw() transfers NFT from gauge to GaugeManager. The guard checks
+      from == tokenIdToGauge[tokenId] which is the gauge address. This is correct.
+      BUT: if a malicious gauge (added by owner via setGauge with a compromised pool check)
+      sends an arbitrary tokenId to GaugeManager, GaugeManager accepts it because
+      from == tokenIdToGauge[tokenId] is satisfied IF that tokenId was previously staked
+      in that gauge. This creates a vector where a deprecated-but-trusted gauge can
+      re-send an already-unstaked tokenId back to GaugeManager, corrupting custody.
+      However, this requires a compromised/malicious gauge — trusted admin configuration.
+    attack_scenario: >
+      1. Position tokenId is staked: tokenIdToGauge[tokenId] = gaugeA.
+      2. Position is later UNSTAKED: _unstakePosition() calls gaugeA.withdraw() which sends
+         NFT to GaugeManager, then GaugeManager sends NFT to vault. tokenIdToGauge is deleted.
+      3. But: step 2's gauge.withdraw() triggers onERC721Received BEFORE tokenIdToGauge is
+         deleted (delete happens after safeTransferFrom). So: from = gaugeA, check passes.
+      4. Now if gaugeA is malicious and calls NPM.safeTransfer(gaugeManager, tokenId) again
+         AFTER unstake (tokenId is now in vault), GaugeManager would check:
+         from = gaugeA, tokenIdToGauge[tokenId] = 0 (deleted), so gaugeA != 0 → REVERT.
+      Actually this is safe because tokenIdToGauge is deleted. No bug here after re-analysis.
+    solidity: |
+      // Invariant: after unstakePosition completes, tokenIdToGauge[tokenId] == 0
+      // AND NFT is owned by vault
+      function invariant_post_unstake_state_clean(uint256 tokenId) external view {
+          // If tokenIdToGauge is 0, NFT must be in vault
+          address gauge = IGaugeManager(gaugeManager).tokenIdToGauge(tokenId);
+          if (gauge == address(0) && vault.ownerOf(tokenId) != address(0)) {
+              // Token is tracked in vault but not staked
+              assert(nonfungiblePositionManager.ownerOf(tokenId) == address(vault));
+          }
+      }
+    validated: false
+    priority: medium
+    confidence: 30
+    notes: >
+      After re-analysis, the onERC721Received guard appears safe because the delete happens
+      atomically within the same transaction. The concern about re-sending from old gauge
+      doesn't hold because tokenIdToGauge is cleared. This is more of a confirmation that
+      the design is correct. Confidence 30 of finding a real bug here — this invariant is
+      worth testing to CONFIRM correctness, not because we expect it to fail.
+
+  - id: GM-D-07
+    tier: 1
+    type: economic
+    description: >
+      During liquidation of a STAKED position, the sequence is:
+      1. _checkLoanIsHealthy() → ignoreFees=true → feeValue=0 → collateralValue = fullValue_no_fees * CF
+      2. _calculateLiquidation(debt, fullValue_no_fees, collateralValue) → liquidationValue
+      3. _unstakeIfNeeded() → gauge.withdraw() → NFT back in vault (with gauge-accumulated fees)
+      4. _sendPositionValue(tokenId, liquidationValue, fullValue_no_fees, feeValue=0, recipient)
+         → oracle.getLiquidityAndFees(tokenId) → returns (liquidity, real_fees0, real_fees1)
+         → since feeValue=0: fees0=max, fees1=max, liquidity = liquidationValue * liquidity / fullValue_no_fees
+         → NPM.collect(tokenId, recipient, max, max) → collects ALL gauge-accrued fees + liquidity portion
+      The liquidator receives: (liquidationValue worth of liquidity) PLUS (all post-unstake fees).
+      The total value received by liquidator exceeds liquidationValue by the fee amount.
+      The borrower is shortchanged: they receive (fullValue_actual - liquidator_overpayment) as residual,
+      but there IS no residual collection mechanism. The borrower just loses the excess fees.
+      This is a direct fund loss to the borrower, bounded by the gauge-accrued fees.
+    attack_scenario: >
+      Setup: USDC/ETH position staked for 30 days, accumulated 500 USDC in gauge-accrued fees.
+      Position liquidity value: 10,000 USDC. Total actual value post-unstake: 10,500 USDC.
+      Debt: 8,500 USDC. collateralFactor = 90%.
+      Health check (ignoreFees=true): collateralValue = 10,000 * 0.9 = 9,000 < 8,500 → Not healthy.
+      liquidationValue = 8,500 * (1 + penalty) ≈ 9,200 USDC.
+      _sendPositionValue: liquidity_to_remove = 9,200 * totalLiquidity / 10,000 = 92% of liquidity.
+      fees collected: max (type(uint128).max) = all 500 USDC fees.
+      Liquidator receives: 9,200 worth of liquidity + 500 USDC fees = 9,700 USDC for paying 8,500 USDC.
+      That's 1,200 USDC profit (14%) vs intended ~8% penalty.
+      Borrower loses 500 USDC extra (the gauge-accrued fees) beyond the liquidation penalty.
+    solidity: |
+      // Fork PoC structure (pseudocode — needs real Aerodrome gauge on Base fork)
+      // 1. Create position, stake, wait N blocks for fee accrual
+      // 2. Drop oracle price to make position unhealthy
+      // 3. Liquidator calls liquidate()
+      // 4. Assert: liquidator received value <= liquidationValue + dust
+      function test_liquidation_overpayment_staked_position() external {
+          // Setup: stake position with fees accrued in gauge
+          uint256 tokenId = _createAndStakePosition();
+          _accrueFees(tokenId, 30 days);
+          _dropPrice(10); // make unhealthy
+
+          uint256 liquidatorBalanceBefore = asset.balanceOf(liquidator);
+          uint256 liquidatorTokensBefore = _positionValueOf(liquidator);
+
+          vm.prank(liquidator);
+          vault.liquidate(LiquidateParams(tokenId, liquidator, 0, 0, block.timestamp));
+
+          uint256 liquidatorCost = liquidatorBalanceBefore - asset.balanceOf(liquidator);
+          uint256 liquidatorReceived = _positionValueOf(liquidator) - liquidatorTokensBefore;
+
+          // Invariant: liquidator profit <= MAX_LIQUIDATION_PENALTY * debt
+          uint256 maxAllowedProfit = debt * MAX_LIQUIDATION_PENALTY_X32 / Q32;
+          assertLe(liquidatorReceived - liquidatorCost, maxAllowedProfit + 1 ether);
+      }
+    validated: false
+    priority: high
+    confidence: 72
+    notes: >
+      This is a refinement of GM-D-01 with clearer mechanics. The core issue is the
+      feeValue mismatch: health check computes with ignoreFees=true (feeValue=0), but
+      _sendPositionValue uses feeValue=0 from the health check state while independently
+      querying oracle.getLiquidityAndFees() which returns real fees. Since feeValue=0,
+      the code path always takes max fees (fees0=max, fees1=max) plus proportional liquidity.
+      This is a REAL accounting inconsistency that causes liquidator over-payment at borrower's expense.
+      Confidence 72: requires gauge-accrued fees to be significant (non-zero) AND partial liquidation
+      (not full). Full liquidation takes everything anyway. Needs fork PoC to confirm real fee
+      amounts in Aerodrome Slipstream gauges. This finding likely survived previous audits
+      because it requires understanding the ignoreFees → feeValue=0 chain.
+
+false_positives:
+  - id: FP-01
+    description: >
+      compoundRewards increases collateral without vault re-check. Initially seemed concerning
+      but is actually safe: adding liquidity can only INCREASE position value, which can only
+      IMPROVE health. The vault's next health check (on any borrow/liquidate call) will see
+      the improved value. No exploit path.
+    reason: beneficial for protocol — more collateral never creates unhealthy state
+
+  - id: FP-02
+    description: >
+      borrower calls unstakePosition() in same block before liquidation, changing _isStaked
+      return value. Analysis: if borrower unstakes before liquidation, the position arrives
+      at liquidation with ignoreFees=false (feeValue includes real fees). This actually
+      INCREASES collateralValue (fees included), potentially making position healthy again
+      and reverting NotLiquidatable. This is a valid griefing/sandwich but NOT a fund loss —
+      the position is genuinely worth more with fees included.
+    reason: by design — unstaking returns full position value to health check
+
+  - id: FP-03
+    description: >
+      totalRewardX64 can only be DECREASED (setCompoundReward rejects increases). Seemed
+      like it could be a griefing vector but it's an intentional admin safety mechanism.
+    reason: explicit invariant in code, by design

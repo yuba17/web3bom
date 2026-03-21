@@ -1,0 +1,353 @@
+# New ERC-4626 Vault Bug Patterns — Round 2 Extraction from Solodit (619 findings)
+# Patterns vault-024 through vault-031
+# Only HIGH/MEDIUM severity with concrete attack paths
+# Deduplicated against vault-001 through vault-023
+
+- id: vault-024
+  pattern: async-redeem-liquidity-reservation-gap
+  name: "Async redemption queue does not reserve liquidity, causing insolvency"
+  causa_raiz: >
+    Vaults implementing asynchronous redemption (ERC-7540 or custom queues) have
+    multiple fulfillment paths: queue-based processing, manual/instant fulfillment,
+    and direct requestRedeem. When some paths mark shares as claimable without
+    incrementing a reservedLiquidity counter, multiple fulfillments can each pass
+    the liquidity check independently. The result is sum(claimable assets) exceeds
+    vault.totalAssets() - reservedLiquidity, making the vault insolvent for late
+    claimers. A related variant allows inflating totalRedemption by submitting
+    the same shares under different operator addresses without validation.
+  como_funciona: |
+    1. Vault has two fulfillment paths: queue processor (increments reservedLiquidity) and manual/instant (does not)
+    2. Alice requests redeem via queue -> processed -> reservedLiquidity += aliceAssets
+    3. Bob requests redeem via instant/manual path -> shares marked claimable, but reservedLiquidity NOT incremented
+    4. Charlie requests via manual path -> also passes liquidity check (Bob's claim not reserved)
+    5. sum(Alice + Bob + Charlie claimable) > vault.totalAssets()
+    6. Last claimer's transaction reverts — funds are effectively stolen by earlier claimers
+  invariante: |
+    // Sum of all claimable assets must never exceed available liquidity
+    assert(totalClaimableAssets <= vault.totalAssets());
+    // reservedLiquidity must account for ALL fulfilled requests, regardless of path
+  que_mirar:
+    - "Multiple fulfillment paths: processUpTo*, fulfillRedeemRequest, instant requestRedeem"
+    - "reservedLiquidity only incremented in some code paths"
+    - "requestRedeem operator parameter not validated against prior requests"
+    - "req.totalRedemption inflated by submitting same shares with different operators"
+    - "ERC-7540 vaults with partial redemption at different share prices"
+  como_se_arregla: "Increment reservedLiquidity in ALL fulfillment paths. Validate that operator+owner combination is unique per request. Check available liquidity = totalAssets - reservedLiquidity before every fulfillment."
+  trampas:
+    - "Vaults with only one fulfillment path (queue only) are not affected"
+    - "If instant redemption is disabled, the gap does not exist"
+  incidentes:
+    - "Accountable (Cyfrin) — manual fulfillRedeemRequest doesn't reserve liquidity, causing over-commitment (MEDIUM)"
+    - "Accountable (Cyfrin) — fulfillRedeemRequest ignores processingMode, uses currentPrice instead of request-time price (HIGH)"
+    - "Astrolab (Pashov) — requestRedeem inflates totalRedemption via unvalidated operator param, DoS entire vault (CRITICAL)"
+    - "Harmonixfinance (Pashov) — withdrawal mechanism fails when share price declines between initiation and execution (MEDIUM)"
+    - "Harmonixfinance (Pashov) — withdrawal initiators lose value when share price increases before execution (MEDIUM)"
+    - "Vaultcraft — misconfigured bounds in async vault cause underpayment during redeem fulfillment (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, erc7540, async-redeem, redemption-queue, liquidity-reservation, insolvency]
+
+- id: vault-025
+  pattern: pending-withdrawal-inflates-share-price
+  name: "Pending withdrawals not excluded from totalAssets inflates share price"
+  causa_raiz: >
+    When a vault processes redemption in two steps (request -> fulfill/claim), the
+    assets earmarked for pending withdrawals remain in the vault's balance and are
+    counted in totalAssets(). However, the corresponding shares are either burned
+    or locked (transferred to vault). This creates a mismatch: totalAssets includes
+    assets already owed to withdrawers, but totalSupply has decreased. The inflated
+    share price causes new depositors to receive fewer shares, and any profit/loss
+    that occurs between request and fulfillment is misattributed. When withdrawals
+    are finalized, the share price corrects, harming depositors who entered during
+    the inflated period.
+  como_funciona: |
+    1. User A requests redeem of 100 shares -> shares burned/locked, but 100 assets remain in vault
+    2. totalAssets still includes the 100 assets; totalSupply decreased by 100 shares
+    3. Share price = totalAssets / totalSupply is now inflated
+    4. User B deposits during this period -> receives fewer shares than fair value
+    5. When User A's withdrawal is finalized, share price corrects downward
+    6. User B's position is now worth less than deposited
+  invariante: |
+    // totalAssets used for share pricing must exclude pending withdrawal amounts
+    uint256 effectiveTotalAssets = vault.totalAssets() - vault.pendingWithdrawalAmount();
+    uint256 pricePerShare = effectiveTotalAssets * 1e18 / vault.totalSupply();
+    // pricePerShare must not change due to pending withdrawal creation
+  que_mirar:
+    - "totalAssets() includes balanceOf(this) without subtracting pendingWithdrawals"
+    - "Shares burned on requestRedeem but assets not moved to escrow"
+    - "_pendingWithdrawalAmount not subtracted in getTotalDeposited() or totalAssets()"
+    - "Two-step withdrawal where assets stay in vault between request and claim"
+    - "ethWithdrawn/stableWithdrawn counters not updated on withdrawal processing"
+  como_se_arregla: "Subtract pending withdrawal amounts from totalAssets() when calculating share price. Move assets to a separate escrow contract on request. Track withdrawal counters and shares accurately on every withdrawal."
+  trampas:
+    - "Vaults with instant atomic withdrawals are not affected"
+    - "If assets are moved to escrow immediately on request, the issue does not apply"
+  incidentes:
+    - "YuzuUSD (Pashov) — pending withdrawals in YuzuILP not considered in totalAssets (HIGH)"
+    - "Nexus (Pashov) — ethWithdrawn/stableWithdrawn and shares not updated on withdrawal, share price includes withdrawn portion (CRITICAL)"
+    - "Omo (Pashov) — pending withdrawal tokens in redeem() still counted in share price (HIGH)"
+    - "Tagus v2 — _pendingWithdrawalAmount can be arbitrarily reset, inflating getTotalDeposited (HIGH)"
+    - "Saffron Lido (Sherlock) — totalEarnings incorrect when withdrawing after ending, vault insolvent (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, pending-withdrawal, totalAssets, share-price, two-step-withdrawal, escrow]
+
+- id: vault-026
+  pattern: fee-retained-in-pool-inflates-remaining-shares
+  name: "Withdrawal/redemption fees remain in pool, inflating share price for remaining holders"
+  causa_raiz: >
+    When a vault charges a fee on withdrawal or redemption, the fee is deducted from
+    the assets returned to the user. However, the fee amount stays in the vault's
+    poolSize/totalAssets without being separated into a fee reserve. Since the
+    withdrawer's shares are burned but the fee's worth of assets remains, the
+    effective share price increases for remaining holders. This creates a systematic
+    fee avoidance vector: later redeemers benefit from accumulated fees of earlier
+    redeemers, reducing their effective fee rate. The first withdrawers subsidize
+    the last withdrawers. Attackers can also use this to avoid fees entirely by
+    depositing right before a large redemption and withdrawing right after.
+  como_funciona: |
+    1. Vault has 1000 assets, 1000 shares (price = 1.0), 5% withdrawal fee
+    2. User A redeems 500 shares -> receives 475 assets, 25 assets (fee) stays in vault
+    3. Vault now has 525 assets, 500 shares -> price = 1.05
+    4. User B redeems 500 shares -> receives 525 * 0.95 = 498.75 assets
+    5. User B's effective fee was (525 - 498.75) / 525 = 5%, but they got an extra 23.75 from A's fee
+    6. Attacker variant: deposit before large redemption, withdraw after to capture fee windfall
+  invariante: |
+    // Fee amount must be transferred to feeRecipient or separated from pool
+    assert(feeReserve == cumulativeFeesCollected);
+    // Remaining shares should not appreciate from fee collection
+  que_mirar:
+    - "Fee deducted from user but not transferred to feeRecipient in same tx"
+    - "poolSize or totalAssets not decremented by fee amount on withdrawal"
+    - "Fee remains in contract balance, inflating totalAssets for remaining shares"
+    - "No separate feeReserve or pendingFees tracking"
+    - "Performance fee calculated on totalAssets that includes uncollected withdrawal fees"
+  como_se_arregla: "Transfer fees to feeRecipient immediately on withdrawal. Or track fees in a separate feeReserve that is excluded from totalAssets(). Ensure poolSize is decremented by the full pre-fee amount (not just the post-fee amount sent to user)."
+  trampas:
+    - "If fees are minted as shares to feeRecipient, the dilution is correct and this is not a bug"
+    - "Very small fee rates (<0.1%) make the exploitation economically negligible"
+  incidentes:
+    - "YuzuUSD (Pashov) — fees in YuzuILP._withdraw and StakedYuzuUSD._initiateRedeem remain in poolSize, enabling fee avoidance (HIGH)"
+    - "Mellow Flexible Vaults (Sherlock) — redeems through RedeemQueue avoid paying management and performance fee by burning shares before fee accrual (HIGH)"
+    - "Mellow Flexible Vaults (Sherlock) — incorrect performance fee calculation uses wrong formula for price-to-share conversion (HIGH)"
+    - "Terplayer (Pashov) — mint/redeem fees deducted but never transferred to treasury, protocol loses all revenue (CRITICAL)"
+    - "Tokemak (Spearbit) — streaming fee calculated on totalAssets instead of profit, excessive fee share minting (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, withdrawal-fee, fee-avoidance, poolSize, totalAssets, fee-reserve, performance-fee]
+
+- id: vault-027
+  pattern: rehypothecation-dos-via-flashloan
+  name: "Vault rehypothecation DoS via flashloan draining underlying"
+  causa_raiz: >
+    When a lending protocol's aToken (or similar receipt token) uses an ERC4626 vault
+    for idle fund yield, the vault rebalances during deposit/withdraw by pulling from
+    or depositing to the vault. During a flashloan, the underlying tokens are
+    temporarily transferred out. If the vault's balance check happens during the
+    flashloan (before repayment), the vault sees insufficient assets and the
+    rebalancing reverts. An attacker can exploit this to permanently DoS all vault
+    deposits and withdrawals by taking flashloans every block, or trigger a
+    permanent DoS by causing the vault to enter a stuck state.
+  como_funciona: |
+    1. Lending pool's aToken deposits idle funds into ERC4626 vault for yield (rehypothecation)
+    2. On any deposit/withdraw, aToken calls _rebalance() which may withdraw from vault
+    3. Attacker takes flashloan of the underlying asset from the same pool
+    4. During flashloan, aToken.transferUnderlyingTo() calls _rebalance() -> tries to withdraw from vault
+    5. Vault has no assets (they're out via flashloan) -> revert
+    6. All user deposits/withdrawals to the pool are blocked during the flashloan
+    7. Attacker repeats every block to create persistent DoS
+  invariante: |
+    // Vault operations must not be blockable by flashloan-induced temporary balance changes
+    // _rebalance should handle the case where vault balance is temporarily zero
+  que_mirar:
+    - "_rebalance() called inside transferUnderlyingTo() during flashloan path"
+    - "Vault withdrawal attempted when balance is temporarily zero due to flashloan"
+    - "No try/catch around vault interaction in rebalance"
+    - "Flash loan and deposit/withdraw sharing same underlying pool and vault"
+  como_se_arregla: "Use try/catch for vault interactions during rebalance. Skip vault withdrawal if balance is temporarily insufficient. Separate flashloan liquidity from vault-deposited liquidity."
+  trampas:
+    - "If the protocol does not support flashloans, this vector does not exist"
+    - "If vault deposits are in a separate contract from lending pool, rebalance is isolated"
+  incidentes:
+    - "Astera (Spearbit) — DoSing vault rehypothecation through flashloans on AToken (HIGH)"
+    - "Cod3x Lend (Spearbit) — identical AToken rehypothecation DoS via flashloan (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, rehypothecation, flashloan, dos, rebalance, atoken, lending]
+
+- id: vault-028
+  pattern: cross-vault-agent-misattribution
+  name: "Shared agent/account attributes all positions to every connected vault"
+  causa_raiz: >
+    When multiple vaults share a common agent/account that deploys capital (e.g., a
+    DeFi agent executing strategies), each vault's totalAssets() sums up ALL
+    positions held by the shared agent, not just positions funded by that specific
+    vault. This double/triple-counts the same capital across multiple vaults,
+    inflating each vault's totalAssets and share price. Additionally, a malicious
+    agent registered to a vault can deploy a reverting oracle or invalid contract,
+    causing totalAssets() to revert and permanently bricking the vault.
+  como_funciona: |
+    1. Vault A lends 100 USDC to shared Agent, Vault B lends 200 USDC to same Agent
+    2. Agent deploys all 300 USDC into a single LP position
+    3. Vault A.totalAssets() iterates over Agent's positions -> sees 300 USDC LP position -> reports 300
+    4. Vault B.totalAssets() also sees the same 300 USDC LP position -> reports 300
+    5. Combined reported totalAssets = 600, but actual assets = 300
+    6. Depositors into either vault receive shares at inflated price
+    7. Variant: malicious agent registers with reverting oracle, totalAssets() reverts forever -> vault bricked
+  invariante: |
+    // Each vault's totalAssets must only include positions funded by that vault
+    assert(vaultA.totalAssets() + vaultB.totalAssets() <= totalActualAssets + tolerance);
+    // totalAssets() must not revert due to any single agent's state
+  que_mirar:
+    - "totalAssets() iterating over shared accounts/agents without per-vault attribution"
+    - "No tracking of which vault funded which position in the shared agent"
+    - "Whitelisted user can register an agent that causes totalAssets() to revert"
+    - "accountList iterated in totalAssets() includes agents from multiple vaults"
+  como_se_arregla: "Track per-vault funding in the agent: each position must be tagged with the source vault. Use try/catch when querying agent positions. Require vault-owner approval for agent registration."
+  trampas:
+    - "Single-vault agents with no shared accounts are not affected"
+    - "If all agents are trusted/permissioned, the DoS variant requires admin compromise"
+  incidentes:
+    - "Omo (Pashov) — cross-vault misattribution in OmoAgent leads to incorrect vault valuation, all agent positions counted by every vault (HIGH)"
+    - "Omo (Pashov) — malicious account with invalid oracle permanently disables vault via totalAssets revert (HIGH)"
+    - "Suzaku Core — vault rewards incorrectly scaled by cross-asset-class operator totals instead of asset-class-specific shares (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, cross-vault, agent, misattribution, totalAssets, double-counting, dos]
+
+- id: vault-029
+  pattern: read-only-reentrancy-vault-state
+  name: "Read-only reentrancy exposes stale vault share state to external protocols"
+  causa_raiz: >
+    During a vault's withdraw or deposit operation, an external call to a strategy
+    or token contract occurs BEFORE internal state (totalAssets, totalSupply,
+    balances) is updated. While the vault itself is protected by nonReentrant,
+    external protocols that read the vault's state (share price, totalAssets,
+    balanceOf) during the callback window see stale values. If those protocols
+    use the stale vault state for pricing, collateral valuation, or liquidation
+    decisions, they make incorrect decisions. This is a cross-protocol read-only
+    reentrancy attack.
+  como_funciona: |
+    1. Attacker calls vault.withdraw() which triggers strategy.withdraw() external call
+    2. During strategy.withdraw(), a callback or intermediate state exists
+    3. Vault's nonReentrant prevents re-calling vault functions
+    4. But external protocol (e.g., lending market) reads vault.convertToAssets() during callback
+    5. Value is stale (pre-withdrawal), making attacker's collateral appear more valuable
+    6. Attacker borrows against inflated collateral value in the lending market
+    7. After vault.withdraw() completes, state updates -> collateral value drops -> bad debt
+  invariante: |
+    // Vault state must be consistent before any external call
+    // External reads of vault state during operations must return post-operation values
+  que_mirar:
+    - "External call (strategy.withdraw, token.transfer) before state update in vault"
+    - "nonReentrant on vault but state updates AFTER external call"
+    - "Vault shares used as collateral in lending protocols"
+    - "convertToAssets() or totalAssets() readable during mid-operation callback"
+    - "Balancer-style read-only reentrancy pattern"
+  como_se_arregla: "Update all internal state BEFORE making external calls (checks-effects-interactions). Use a reentrancy guard that also prevents view function reads during operations. Add a grace period or snapshot mechanism for external price queries."
+  trampas:
+    - "If no external protocol uses the vault's share price as an oracle, this has no impact"
+    - "If state updates happen before the external call, no stale window exists"
+    - "Vault-only nonReentrant is NOT sufficient — the vulnerability is cross-protocol"
+  incidentes:
+    - "Balmy (Spearbit) — potential read-only reentrancy pattern in Earn-Vault withdraw, state updated after strategy.withdraw external call (MEDIUM)"
+    - "Sentiment V2 (Sherlock) — non-liquidateable positions created by exploiting rebalanceBadDebt to decrease share price, read by lending protocol (MEDIUM)"
+  severidad: medium
+  confianza: media
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, read-only-reentrancy, cross-protocol, stale-state, collateral, pricing]
+
+- id: vault-030
+  pattern: cooldown-yield-accrual-bypass
+  name: "Cooldown period bypassed because yield accrues on shares during withdrawal process"
+  causa_raiz: >
+    Vaults with a cooldown/unstaking period record the number of shares at initiation
+    time but redeem them at the current (higher) share price at execution time. The
+    shares continue earning yield during the entire cooldown period, even though
+    they are conceptually "in transit." This means users get yield for the cooldown
+    period risk-free (they've already decided to leave). An attacker can game this
+    by entering the vault, immediately initiating cooldown, waiting for cooldown to
+    pass while earning yield, then unstaking at a profit. The cooldown is meant to
+    prevent exactly this kind of short-term yield extraction.
+  como_funciona: |
+    1. Vault has cooldownDuration = 7 days, current share price = 1.0
+    2. Attacker deposits large amount, receives shares
+    3. Attacker immediately calls cooldownShares() -> records shares to withdraw
+    4. During 7-day cooldown, yield accrues, share price increases to 1.01
+    5. After cooldown, attacker calls unstake() -> shares redeemed at 1.01 price
+    6. Attacker extracts 1% yield for 7 days of risk-free holding
+    7. Repeat: deposit -> cooldown -> unstake cycle for continuous yield farming
+  invariante: |
+    // Shares in cooldown should not earn yield, OR
+    // Withdrawal amount should be fixed at cooldown-initiation share price
+    uint256 cooldownAssets = cooldowns[user].underlyingShares * priceAtCooldownStart;
+    assert(withdrawnAssets <= cooldownAssets);
+  que_mirar:
+    - "cooldowns[owner].underlyingShares stores share count, redeemed at current price"
+    - "No snapshot of share price at cooldown initiation"
+    - "Shares continue accruing yield/interest during cooldown period"
+    - "unstake() uses current convertToAssets instead of cooldown-time rate"
+    - "VoteModule or staking lock that can be bypassed by timing around epoch boundaries"
+  como_se_arregla: "Snapshot the share price at cooldown initiation and use that for redemption. Or convert shares to assets immediately on cooldown and hold assets (not shares) in escrow. Alternatively, exclude cooldown shares from yield distribution."
+  trampas:
+    - "If cooldown period is very short (<1 day), yield accrual is negligible"
+    - "If share price is fixed (1:1), there is no yield to capture"
+  incidentes:
+    - "Level (Spearbit) — cooldown period bypassed as users gain yield during withdrawal process in StakedlvlUSD (MEDIUM)"
+    - "Etherex (Spearbit) — VoteModule unlockTime can be bypassed by depositing before epoch flip and withdrawing before lock is set (LOW)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, cooldown, unstaking, yield-accrual, bypass, share-price, epoch]
+
+- id: vault-031
+  pattern: vault-self-deposit-circular-inflation
+  name: "Vault deposits into itself creating circular unit inflation"
+  causa_raiz: >
+    When a vault's provisioner or strategy mechanism allows arbitrary deposit/mint
+    calls without restricting the target, the vault can be made to deposit into
+    itself. This creates circular accounting: the vault mints new shares to itself
+    backed by tokens it already controls, inflating totalSupply and totalAssets
+    in a loop. The shares become unbacked as the vault's "assets" are just its
+    own share tokens. On redemption, the circular backing unravels and the vault
+    becomes insolvent.
+  como_funciona: |
+    1. Vault has 1000 real assets, 1000 shares
+    2. Provisioner/executor calls vault.deposit(vault, 500) -> vault deposits 500 into itself
+    3. Vault mints 500 new shares to itself, now holds 500 of its own shares as "assets"
+    4. totalAssets appears to be 1500 (1000 real + 500 circular), totalSupply = 1500
+    5. Share price appears unchanged but 500 shares are backed by vault's own shares, not real assets
+    6. External user redeems -> vault tries to liquidate its own shares -> recursive unwinding
+    7. Vault becomes insolvent as circular shares have no real backing
+  invariante: |
+    // Vault must never hold its own shares as assets
+    assert(vault.balanceOf(address(vault)) == 0 || vault_shares_excluded_from_totalAssets);
+    // Deposit target must not be self
+  que_mirar:
+    - "Provisioner or strategy allows arbitrary deposit/mint target addresses"
+    - "No check preventing vault.deposit(address(vault), ...)"
+    - "Vault balance includes its own share tokens in totalAssets"
+    - "requestDeposit or mint callable with vault address as receiver"
+  como_se_arregla: "Add explicit check: require(target != address(this)) in all deposit/mint paths. Exclude vault's own shares from totalAssets calculation. Restrict provisioner's deposit targets to a whitelist."
+  trampas:
+    - "If deposit target is always msg.sender or hardcoded, self-deposit is impossible"
+    - "If vault shares are ERC20 and the vault never holds its own, no risk"
+  incidentes:
+    - "Aera v3 (Spearbit) — vault can deposit into itself via Provisioner leading to artificial unit inflation (MEDIUM)"
+  severidad: medium
+  confianza: media
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, self-deposit, circular, inflation, provisioner, totalAssets, insolvency]

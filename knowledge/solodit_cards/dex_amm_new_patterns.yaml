@@ -1,0 +1,569 @@
+# DEX/AMM New Patterns from Solodit (249 findings analyzed)
+# Patterns NOT covered by existing dex-001 through dex-010
+# Generated: 2026-03-19
+
+- id: dex-011
+  pattern: on-chain-slippage-calculation
+  name: "Slippage calculated on-chain from current pool state is useless"
+  causa_raiz: >
+    Protocol computes minAmountOut by querying the pool's current reserves
+    (e.g., via Quoter, getAmountOut, or getReserves) in the SAME transaction
+    as the swap. Since an attacker can manipulate reserves before the query,
+    the computed minimum tracks the manipulated price, providing zero protection.
+  como_funciona: |
+    1. Protocol calls quoter.quoteExactInput() or router.getAmountOut() on-chain
+    2. Applies a small percentage (e.g., 5%) as "slippage tolerance" to the result
+    3. Uses this value as minAmountOut in the subsequent swap
+    4. Attacker front-runs: swaps to move the price 30%
+    5. Protocol's on-chain query returns the manipulated (lower) price
+    6. Protocol sets minAmountOut to 95% of the ALREADY BAD price
+    7. Swap executes at manipulated price, passing the useless slippage check
+    8. Attacker back-runs to reverse, capturing the full spread
+  invariante: "assert(amountOut >= userSpecifiedMinOut) where userSpecifiedMinOut is provided off-chain, NOT computed on-chain from pool state"
+  que_mirar:
+    - "getAmountOut.*reserve"
+    - "quoteExactInput"
+    - "quoter"
+    - "minTokens.*getAmountOut"
+    - "minAmountOut.*calculated"
+    - "amountOutMinimum.*IQuoter"
+  como_se_arregla: "minAmountOut MUST be calculated off-chain (frontend) using an independent price source and passed as a function parameter. Never derive slippage from the same pool being swapped."
+  trampas:
+    - "Using an oracle price on-chain to compute minAmountOut is acceptable if the oracle is manipulation-resistant (e.g., Chainlink)"
+    - "On-chain TWAP-based slippage is ok if the TWAP window is long enough (30+ min)"
+  incidentes:
+    - "Gacha Protocol -- _swap() calculates minTokens from getAmountOut on-chain, 5% slippage tolerance is meaningless (HIGH)"
+    - "Derby -- Vault.claimTokens() and MainVault.withdrawRewards() use IQuoter on-chain for slippage, sandwichable (HIGH)"
+    - "Blueberry Update -- IchiSpell uses sqrtPriceLimitX96 instead of proper minAmountOut, partial swaps result (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, amm, slippage, on-chain-calculation, sandwich, quoter, getAmountOut]
+
+- id: dex-012
+  pattern: reserve-order-mismatch
+  name: "Uniswap V2 reserve order assumed but not validated"
+  causa_raiz: >
+    UniswapV2Pair.getReserves() returns (reserve0, reserve1) where token0
+    is the numerically smaller address. Protocols that call getReserves()
+    and assume a fixed token ordering (e.g., WETH is always reserve0) will
+    swap reserve values when the assumption is wrong, producing incorrect
+    price calculations, wrong swap amounts, or DoS.
+  como_funciona: |
+    1. Protocol calls pair.getReserves() and assigns (wethReserve, tokenReserve)
+    2. But pair.token0() may be the other token if its address is smaller
+    3. reserve0 and reserve1 are swapped relative to protocol's expectation
+    4. getAmountOut is called with wrong reserveIn/reserveOut
+    5. Result: wildly incorrect output amount, or minTokens so high the swap reverts
+    6. If minTokens ends up too LOW, attacker extracts the difference via sandwich
+  invariante: "assert(token0 == pair.token0() ? reserve0 : reserve1 == expectedReserveForToken0)"
+  que_mirar:
+    - "getReserves()"
+    - "wethReserve.*tokenReserve"
+    - "reserve0.*reserve1"
+    - "getPair"
+    - "token0()"
+  como_se_arregla: "Always call pair.token0() to determine which reserve corresponds to which token. Sort token addresses before assigning reserves."
+  trampas:
+    - "On some chains/forks, WETH address may happen to be token0 in test pairs but not in production"
+  incidentes:
+    - "Gacha Protocol -- _swap() assigns (wethReserve, tokenReserve) without checking token0 ordering (CRITICAL)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, uniswap-v2, reserve-order, token0, getReserves, address-sorting]
+
+- id: dex-013
+  pattern: hardcoded-fee-in-router
+  name: "Router uses hardcoded fee but pool has custom/dynamic fees"
+  causa_raiz: >
+    Router or library math assumes a fixed fee (e.g., UniV2's 0.3% = 997/1000)
+    but the actual pool charges a different or dynamic fee set via the factory.
+    This mismatch causes getAmountIn/getAmountOut to return incorrect values,
+    either overcharging users or enabling fee-free arbitrage paths.
+  como_funciona: |
+    1. Router's getAmountIn hardcodes fee as 997/1000 (0.3%)
+    2. Pool's actual fee is set via factory.getFee() and may be 0.01% to 1%
+    3. If pool fee > hardcoded fee: router quotes less input than needed, swap may revert or produce partial fill
+    4. If pool fee < hardcoded fee: router quotes more input than needed, user overpays
+    5. Arbitrageur exploits the discrepancy to extract value
+  invariante: "assert(routerFee == pool.actualFee) for every supported pool"
+  que_mirar:
+    - "997"
+    - "1000"
+    - "10000"
+    - "getAmountOut.*hardcoded"
+    - "getFee"
+    - "swapFee"
+    - "poolFee"
+  como_se_arregla: "Query the pool's actual fee from the factory at runtime. Pass pool and factory references to getAmountIn/getAmountOut functions."
+  trampas:
+    - "Standard UniV2 forks with immutable 0.3% fee are not affected"
+    - "Velodrome, Solidly, and similar forks commonly have variable fees"
+  incidentes:
+    - "Velodrome Finance -- UniswapV2Library.getAmountIn hardcodes 997 fee but pools have custom fees via factory (MEDIUM)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, fee, hardcoded, router, getAmountIn, factory, dynamic-fee]
+
+- id: dex-014
+  pattern: reward-distribution-frontrun
+  name: "Reward/fee distribution frontrunnable via deposit-claim-withdraw"
+  causa_raiz: >
+    Protocol distributes rewards or fees by updating a per-share accumulator
+    (pointsPerShare, feeIntegral) in a single lump-sum transaction. An attacker
+    who deposits a large amount just before the distribution captures a
+    disproportionate share of rewards, then withdraws immediately after.
+    This is the DEX equivalent of the vault donation attack applied to
+    staking/LP reward pools.
+  como_funciona: |
+    1. Admin/keeper calls distributeRewards() or accruePremium() to add N reward tokens
+    2. pointsPerShare increases by N / totalStaked in a single block
+    3. Attacker front-runs: deposits massive amount, taking 50%+ of pool
+    4. Distribution executes: attacker earns 50%+ of newly added rewards
+    5. Attacker back-runs: withdraws stake + claimed rewards
+    6. Net: attacker stole majority of rewards intended for long-term stakers
+  invariante: "assert(rewardPerTokenIncreasePerBlock <= maxRewardRate) -- rewards must drip over time, not lump-sum"
+  que_mirar:
+    - "distributeRewards"
+    - "depositFees"
+    - "feeIntegral"
+    - "pointsPerShare"
+    - "accruePremium"
+    - "rewardPerToken"
+  como_se_arregla: "Use a rewardRate-based gradual release model (e.g., Synthetix StakingRewards pattern). Distribute rewards over a time window, not instantaneously. Enforce minimum lock duration."
+  trampas:
+    - "MIN_LOCK_DURATION > 1 block mitigates flash loan but not well-funded attackers"
+    - "Synthetix-style drip over 7 days is generally safe"
+  incidentes:
+    - "Merit Circle -- front-run distributeRewards() to steal newly added rewards (MEDIUM)"
+    - "Backd -- BkdLocker.depositFees() lump-sum distribution frontrunnable (MEDIUM)"
+    - "Rubicon -- BathPair.rebalancePair() creates share price surge exploitable by front-run (HIGH)"
+    - "Carapace -- accruePremiumAndExpireProtections() sandwichable for instant profit (HIGH)"
+    - "OpenZeppelin Uniswap Hooks -- LimitOrderHook accrued fees stolen by large last-minute LP (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, rewards, frontrun, deposit-withdraw, pointsPerShare, staking, fee-distribution]
+
+- id: dex-015
+  pattern: lp-token-sold-during-reinvest
+  name: "LP/BPT tokens accidentally sold during reward reinvestment"
+  causa_raiz: >
+    Vault reinvest/compound functions swap reward tokens for underlying assets.
+    The token validation (_isInvalidRewardToken) fails to exclude the pool's own
+    LP/BPT tokens, allowing them to be accidentally or maliciously sold during
+    the reinvestment process. Since LP tokens represent the vault's total value,
+    selling them drains the vault.
+  como_funciona: |
+    1. Vault holds LP/BPT tokens representing its pool position
+    2. Reward claim produces CRV, CVX, BAL, etc.
+    3. Reinvest function swaps reward tokens to underlying
+    4. Token validation does not exclude LP/BPT from sellable tokens
+    5. Attacker (or misconfigured keeper) sells LP/BPT tokens as if they were rewards
+    6. Vault loses its pool position, shareholders lose funds
+  invariante: "assert(_isInvalidRewardToken(lpToken) == true) -- LP/BPT must never be sold"
+  que_mirar:
+    - "_isInvalidRewardToken"
+    - "reinvestReward"
+    - "compound"
+    - "CURVE_POOL_TOKEN"
+    - "BPT"
+    - "sweep"
+    - "sellToken"
+  como_se_arregla: "Explicitly add LP/BPT tokens to the _isInvalidRewardToken blocklist. For sweep functions, exclude pool tokens. Use an allowlist of sellable tokens rather than a blocklist."
+  trampas:
+    - "Composable Balancer pools include BPT in the pool tokens array -- easy to miss"
+    - "Protocol tokens that also serve as LP tokens (e.g., Curve LP = pool token)"
+  incidentes:
+    - "Notional Update 4 -- AuraStakingMixin._isInvalidRewardToken does not exclude BPT, can be sold during reinvestment (MEDIUM)"
+    - "Gauntlet/Aera Vault -- sweep() allows Treasury to withdraw pool BPTs, bypassing all safeguards (CRITICAL)"
+    - "Notional Update 2 -- EXACT_IN_BATCH allows arbitrary route, reward tokens or Convex deposit tokens can be sold (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, vault, reinvest, lp-token, bpt, reward, sweep, token-validation]
+
+- id: dex-016
+  pattern: read-only-reentrancy-lp-price
+  name: "Read-only reentrancy manipulates LP token price during callback"
+  causa_raiz: >
+    Curve/Balancer pools send ETH (via .call) during remove_liquidity before
+    updating internal state. A callback during the ETH transfer can read stale
+    pool state (virtual_price, getRate, balances) that temporarily shows an
+    incorrect value. Any protocol that reads pool price during this window
+    gets a manipulated value.
+  como_funciona: |
+    1. Attacker calls pool.remove_liquidity() with ETH involved
+    2. Pool sends ETH to attacker's contract via .call{value: ...}
+    3. Attacker's receive() callback triggers before pool updates internal balances
+    4. During callback, pool.get_virtual_price() returns stale (suppressed) value
+    5. Downstream protocol reads manipulated virtual_price for collateral valuation
+    6. Attacker triggers liquidation of healthy positions at suppressed price
+    7. Pool finishes remove_liquidity, virtual_price returns to normal
+  invariante: "assert(virtualPrice == expectedVirtualPrice within tolerance) OR use reentrancy guard on view functions"
+  que_mirar:
+    - "get_virtual_price"
+    - "getRate"
+    - "remove_liquidity"
+    - "receive()"
+    - "fallback()"
+    - "raw_call"
+  como_se_arregla: "Use Balancer's reentrancy guard check (burn minimum gas to trigger guard). Do not read Curve virtual_price in the same transaction as a liquidity removal. Use Chainlink oracle for LP pricing."
+  trampas:
+    - "Only affects pools with native ETH (not WETH) due to .call callback"
+    - "Balancer pools with reentrancy guard since Aug 2023 are patched"
+    - "Vyper < 0.3.1 had broken reentrancy guards making this worse"
+  incidentes:
+    - "Sentiment Update 2 -- wstETH-ETH Curve LP virtual_price suppressed via read-only reentrancy, triggers false liquidations ($potential millions) (HIGH)"
+    - "Cron Finance TWAMM -- Balancer read-only reentrancy affects getVirtualReserves, getVirtualPriceOracle (HIGH)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, reentrancy, read-only, virtual-price, curve, balancer, callback, liquidation]
+
+- id: dex-017
+  pattern: decimal-mismatch-in-swap-math
+  name: "Decimal difference between tokens breaks swap/slippage math"
+  causa_raiz: >
+    Swap calculations, slippage checks, or LP valuation formulas assume all
+    tokens have the same decimals (typically 18). When tokens with different
+    decimals are paired (e.g., USDC/6 with WETH/18), the math produces values
+    off by orders of magnitude, causing incorrect prices, broken slippage
+    protection, or DoS via overflow/underflow.
+  como_funciona: |
+    1. Token A has 18 decimals, Token B has 6 decimals
+    2. Swap math computes: minReceived = (amount * slippageTol) / DENOMINATOR
+    3. amount is in Token A decimals (18), but minReceived is compared against Token B output (6 decimals)
+    4. minReceived is 1e12 too large -- swap ALWAYS reverts (DoS)
+    5. OR: minReceived is 1e12 too small -- slippage protection is meaningless
+    6. LP valuation using oraclePrice without decimal normalization over/undervalues positions
+  invariante: "assert(all amounts in swap math are normalized to same decimal base before comparison)"
+  que_mirar:
+    - "decimals()"
+    - "10 **"
+    - "primaryDecimals"
+    - "secondaryDecimals"
+    - "PRECISION"
+    - "tokenPrecisionMultipliers"
+    - "scaledDiv"
+  como_se_arregla: "Normalize all token amounts to a common precision (e.g., 18 decimals) before performing math. Apply tokenPrecisionMultipliers from the pool's config. Check decimal compatibility at pool creation."
+  trampas:
+    - "Pairs of same-decimal tokens (WETH/DAI both 18) are not affected"
+    - "cTokens have 8 decimals regardless of underlying -- easy to miss"
+  incidentes:
+    - "Notional Update 2 -- Curve vault undervalues LP when tokens have different decimals (HIGH)"
+    - "Connext -- _slippageTol does not adjust for decimal differences, DoS or no protection (MEDIUM)"
+    - "Illuminate -- Sense PT has IBT decimals (8) vs underlying (6), slippage check blocks redeem (HIGH)"
+    - "Isomorph -- swapping 100 tokens to check price breaks for WBTC (8 decimals) due to massive value (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, decimals, precision, normalization, slippage, overflow, cross-token]
+
+- id: dex-018
+  pattern: uniswap-return-value-mishandled
+  name: "Uniswap V3 swap return value not negated or misinterpreted"
+  causa_raiz: >
+    UniswapV3Pool.swap() returns (int256 amount0, int256 amount1) where the
+    output amount is NEGATIVE for exact-input swaps (tokens going out of the pool
+    to the user). If the caller does not negate the negative value before casting
+    to uint256, the result overflows, causing DoS or incorrect amounts.
+    Similarly, sqrtPriceLimitX96 does not revert on breach -- it causes partial
+    fills, which is NOT slippage protection.
+  como_funciona: |
+    1. Protocol calls pool.swap() with exactInput
+    2. Return value amount1 is negative (e.g., -1000 USDC going to user)
+    3. Protocol casts int256(-1000) to uint256 WITHOUT negation
+    4. Result: uint256(type(int256).min - 1000) = massive overflow value
+    5. SafeCast or subsequent math reverts, causing complete DoS
+    6. OR: sqrtPriceLimitX96 causes partial fill, leftover tokens stuck in contract
+  invariante: "assert(amountOut == uint256(-(zeroForOne ? amount1 : amount0))) -- negate before cast"
+  que_mirar:
+    - "pool.swap("
+    - "int256.*uint256"
+    - "amount0.*amount1"
+    - "sqrtPriceLimitX96"
+    - "MIN_SQRT_RATIO"
+    - "MAX_SQRT_RATIO"
+    - "toUint128"
+  como_se_arregla: "Always negate the negative return value before casting to uint256 (follow Uniswap SwapRouter reference). Use amountOutMinimum check AFTER the swap, not sqrtPriceLimitX96 as slippage protection."
+  trampas:
+    - "sqrtPriceLimitX96 is NOT a revert-on-breach parameter -- it is a partial-fill boundary"
+    - "ExactOutput swaps return positive for the input side"
+  incidentes:
+    - "Maia DAO -- RootBridgeAgent._gasSwapIn/Out does not negate UniV3 return, DoS via overflow (MEDIUM)"
+    - "Blueberry -- IchiSpell uses sqrtPriceLimitX96 as slippage but it causes partial swaps, not reverts (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, uniswap-v3, return-value, negation, overflow, sqrtPriceLimitX96, partial-swap]
+
+- id: dex-019
+  pattern: cross-chain-swap-token-stuck
+  name: "Tokens stuck in protocol when cross-chain destination swap fails"
+  causa_raiz: >
+    Cross-chain DEX/bridge protocols perform a swap on the destination chain
+    after bridging. If the destination swap reverts (due to slippage, manipulation,
+    or changed conditions), the bridge's try-catch sends tokens to the protocol
+    contract address instead of the user. These tokens become stuck or stealable.
+  como_funciona: |
+    1. User initiates cross-chain swap: source chain -> bridge -> destination swap
+    2. Bridge delivers tokens to destination, calls protocol's completion function
+    3. Destination swap reverts (e.g., price moved, attacker sandwiched)
+    4. Bridge's try-catch catches the revert, sends tokens to fallback address (protocol contract)
+    5. Tokens sit in protocol contract, not in user's wallet
+    6. Attacker (or anyone) calls sweep/withdraw to steal the stuck tokens
+    7. OR: user has no way to recover tokens, funds permanently lost
+  invariante: "assert(tokenBalance(user) >= bridgedAmount OR tokenBalance(user) >= refundedAmount) -- user must receive tokens in all paths"
+  que_mirar:
+    - "sgReceive"
+    - "onCall"
+    - "try.*catch"
+    - "CompleteBridgeTokens"
+    - "swapAndComplete"
+    - "fallback.*receiver"
+  como_se_arregla: "On swap failure, send tokens directly to the user's wallet (not the protocol contract). Implement a user-claimable escrow for failed swaps. Never leave tokens in a sweepable contract."
+  trampas:
+    - "Stargate, Amarok, NXTP all have try-catch on destination -- each handles failure differently"
+    - "If receiver is an Executor contract with proper access control, tokens may be safe"
+  incidentes:
+    - "LI.FI -- Destination chain swap failure leaves tokens in protocol, attacker drains via sandwich + sweep (HIGH)"
+    - "Connext -- Users forced to accept any slippage on destination, no cancel function (HIGH)"
+    - "DODO Cross-Chain DEX -- _doMixSwap returns original amount without swap when swapData empty, bypasses token type check (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, cross-chain, bridge, stuck-tokens, destination-swap, try-catch, sweep]
+
+- id: dex-020
+  pattern: pool-creation-validation-gap
+  name: "Pool created with parameters incompatible with swap math"
+  causa_raiz: >
+    Pool factory allows creating pools with N assets or specific curve types
+    but the swap/liquidity math only handles a subset of configurations. The
+    pool is deployed and accepts deposits but swaps produce incorrect results
+    or revert, permanently trapping funds or enabling arbitrage.
+  como_funciona: |
+    1. Factory allows creating 3-asset constant-product pool
+    2. Swap math only handles 2-asset pairs (standard x*y=k)
+    3. Pool is deployed, users deposit 3 tokens
+    4. Swap between token A and C uses isolated pair math, not full 3-asset invariant
+    5. Invariant breaks: attacker swaps A->B->C extracting value from the broken curve
+    6. OR: removeLiquidity math designed for constant-product fails on stableswap Well functions
+  invariante: "assert(pool.curveType is supported by swap/add/remove math for pool.numTokens)"
+  que_mirar:
+    - "createPool"
+    - "initializePool"
+    - "N_COINS"
+    - "numTokens"
+    - "poolType"
+    - "Well.*function"
+  como_se_arregla: "Validate at pool creation that the number of assets and curve type match what the swap math supports. Block unsupported combinations in the factory."
+  trampas:
+    - "2-asset pools with standard curves are typically safe"
+    - "Generalized AMM frameworks (Beanstalk Wells, Balancer custom pools) are high-risk"
+  incidentes:
+    - "MANTRA DEX -- Factory allows 3-asset CPMM pools but swap math only handles 2-asset pairs (HIGH)"
+    - "MANTRA DEX -- Stableswap does disjoint swaps breaking the n-dimensional invariant (HIGH)"
+    - "Beanstalk/Basin -- removeLiquidity logic only correct for ConstantProduct, not other Well functions (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, pool-creation, factory, validation, curve-type, multi-asset, invariant-mismatch]
+
+- id: dex-021
+  pattern: stableswap-fee-bypass-via-imbalanced-deposit
+  name: "Stableswap pool skewed free of fees via single-sided liquidity"
+  causa_raiz: >
+    Stableswap pools charge swap fees to maintain peg. But single-sided
+    (imbalanced) liquidity deposits effectively perform a swap without paying
+    the swap fee. An attacker can deposit one token, withdraw balanced, and
+    repeat to arbitrage the pool or skew it for free.
+  como_funciona: |
+    1. Stableswap pool has tokens A and B in equal amounts (balanced)
+    2. Attacker deposits a large amount of ONLY token A (single-sided)
+    3. Pool does not charge swap fee on the imbalanced deposit
+    4. Pool is now skewed: more A, less B
+    5. Attacker withdraws proportionally (balanced): receives some A and some B
+    6. Net effect: attacker swapped A for B without paying the swap fee
+    7. Repeat to extract value or manipulate pool state
+  invariante: "assert(feeCharged >= expectedSwapFee) for any operation that changes pool ratios"
+  que_mirar:
+    - "add_liquidity.*imbalanced"
+    - "single.*deposit"
+    - "calc_token_amount"
+    - "fee.*deposit"
+    - "coverage_ratio"
+  como_se_arregla: "Charge an imbalance fee on single-sided deposits proportional to the implicit swap being performed. Curve V2 handles this via virtual_price adjustment."
+  trampas:
+    - "Balanced deposits (proportional) do not incur this issue"
+    - "Small imbalances may be dust-level and not exploitable"
+  incidentes:
+    - "MANTRA DEX -- Stableswap pool can be skewed free of fees via imbalanced deposits (HIGH)"
+    - "PlatypusFinance -- Multiple exploits targeting coverage ratio manipulation in stableswap (HIGH, $10.5M total)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, stableswap, fee-bypass, imbalanced-deposit, single-sided, coverage-ratio]
+
+- id: dex-022
+  pattern: uniswap-v3-solc-version-mismatch
+  name: "Uniswap V3 math libraries ported to Solidity >=0.8 without unchecked"
+  causa_raiz: >
+    Uniswap V3 core libraries (TickMath, FullMath, LiquidityAmounts) were
+    written for Solidity <0.8 which has unchecked arithmetic by default.
+    These libraries intentionally rely on overflow/underflow behavior.
+    When ported to >=0.8 without wrapping in unchecked{}, the math reverts
+    on values that V3 handles correctly, causing DoS or incorrect results.
+  como_funciona: |
+    1. Protocol copies TickMath.sol, FullMath.sol from Uniswap V3 repo
+    2. Changes pragma to >=0.8.0 for project compatibility
+    3. Does NOT wrap function bodies in unchecked{}
+    4. FullMath.mulDiv(type(uint).max, type(uint).max, type(uint).max) reverts instead of returning type(uint).max
+    5. Swap or liquidity calculations that rely on overflow behavior revert
+    6. Users cannot swap or add liquidity, causing DoS
+  invariante: "assert(FullMath.mulDiv(a, b, c) returns same value as Uniswap V3 reference for all inputs)"
+  que_mirar:
+    - "pragma solidity ^0.8"
+    - "FullMath"
+    - "TickMath"
+    - "LiquidityAmounts"
+    - "mulDiv"
+    - "unchecked"
+  como_se_arregla: "Wrap all function bodies in unchecked{} blocks when porting Uniswap V3 math libraries to Solidity >=0.8. Use the official @uniswap/v3-core npm package which already handles this."
+  trampas:
+    - "Functions that don't rely on overflow (pure addition) don't need unchecked"
+    - "Already patched in recent @uniswap/v3-core releases"
+  incidentes:
+    - "Astaria -- FullMathUniswap, LiquidityAmounts, TickMath ported to 0.8 without unchecked, reverts on edge cases (MEDIUM)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, uniswap-v3, solidity, compiler, unchecked, overflow, FullMath, TickMath]
+
+- id: dex-023
+  pattern: admin-param-change-sandwichable
+  name: "Admin parameter change causes AMM price shift exploitable via sandwich"
+  causa_raiz: >
+    When an admin/governance transaction changes a pool parameter (fee rate,
+    amplification factor, liquidity sensitivity, weight) that affects the
+    AMM's pricing, the parameter change transaction itself becomes sandwichable.
+    An attacker positions themselves before the parameter change and profits
+    from the price discontinuity.
+  como_funciona: |
+    1. Admin submits tx to change pool parameter (e.g., swap fee, amp factor, weights)
+    2. Attacker sees pending admin tx in mempool
+    3. Attacker front-runs: takes position that benefits from the parameter change
+    4. Admin tx executes: pool price shifts due to new parameters
+    5. Attacker back-runs: closes position at new price, captures the delta
+    6. Cost of attack is minimal (just gas + swap fees)
+  invariante: "assert(maxPriceImpact(paramChange) < threshold) OR use timelock with gradual change"
+  que_mirar:
+    - "setFee"
+    - "setAmplification"
+    - "updateWeights"
+    - "rampA"
+    - "setLsf"
+    - "enableTrading"
+  como_se_arregla: "Use gradual parameter changes (ramp over time, not instant). Apply timelock to parameter changes. Pause trading during weight changes. Use updateWeightsGradually instead of instant updates."
+  trampas:
+    - "Timelocked changes with >24h delay are generally safe due to arbitrage equilibrium"
+    - "Curve's rampA already uses gradual change over days"
+  incidentes:
+    - "TermMax Market -- setLsf() causes AMM price shift, sandwichable (HIGH)"
+    - "Gauntlet/Aera Vault -- enableTradingWithWeights allows instant weight change while trading is active (MEDIUM)"
+    - "Gauntlet/Aera Vault -- finalize() front-runnable, attacker forces Treasury to accept bad token distribution (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, admin, parameter-change, sandwich, weights, amplification, fee, governance]
+
+- id: dex-024
+  pattern: permissionless-caller-controls-swap-params
+  name: "Permissionless function lets caller control swap routing or recipient"
+  causa_raiz: >
+    A permissionless function (e.g., rebalance, reinvest, compound, settle)
+    accepts caller-provided parameters for an internal swap: DEX address,
+    route, fee tier, recipient, or calldata. A malicious caller can set
+    parameters to route swaps through illiquid pools, set recipient to their
+    own address, or craft calldata that drains tokens.
+  como_funciona: |
+    1. Permissionless function accepts swap parameters from caller
+    2. Caller sets fee = 10000 (routes to illiquid pool) for easier sandwich
+    3. OR: caller sets recipient in 0x order to their own address
+    4. OR: caller provides EXACT_IN_BATCH route that sells vault's LP tokens
+    5. Swap executes with caller's malicious parameters
+    6. Protocol/vault loses funds to the caller
+  invariante: "assert(swapRecipient == address(this)) AND assert(swapRoute uses approved pools only)"
+  que_mirar:
+    - "rebalance.*external"
+    - "reinvestReward.*public"
+    - "compound.*external"
+    - "settle.*external"
+    - "fee.*calldata"
+    - "route.*calldata"
+    - "recipient"
+  como_se_arregla: "Hardcode swap recipient to the protocol contract. Validate DEX, fee tier, and route against an allowlist. For 0x/aggregator integrations, validate recipient field in the order data."
+  trampas:
+    - "If caller can only choose among pre-approved DEXes and fee tiers, risk is lower"
+    - "Keeper-only functions with trusted EOA are less risky but still exploitable if key is compromised"
+  incidentes:
+    - "Notional -- 0x adaptor does not validate recipient, purchased tokens sent to attacker wallet (HIGH)"
+    - "Redacted Cartel -- AutoPxGmx.compound lets caller choose fee tier, routes through illiquid pool (MEDIUM)"
+    - "UXD Protocol -- rebalance lets caller specify payer account, drains approved users (HIGH)"
+    - "Notional -- reinvestReward caller sets suboptimal DEX/slippage, vault gets less (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, permissionless, swap-params, recipient, routing, caller-controlled, reinvest]
+
+- id: dex-025
+  pattern: wrong-init-code-hash
+  name: "Uniswap V2 pair address computed with wrong init code hash"
+  causa_raiz: >
+    CREATE2-based pair address computation uses an init code hash that must
+    match the factory's actual pair bytecode. When protocols use the wrong
+    hash (e.g., UniswapV2 hash on a SushiSwap factory, or vice versa),
+    the computed pair address is incorrect. Swaps route to a non-existent
+    or wrong pool, causing reverts or loss of funds.
+  como_funciona: |
+    1. Library uses CREATE2 to compute pair address: hash(0xff, factory, salt, INIT_CODE_HASH)
+    2. INIT_CODE_HASH is hardcoded from wrong factory version (e.g., UniV2 hash on Sushi factory)
+    3. Computed address does not match actual deployed pair
+    4. Swap call to wrong address reverts (DoS) or succeeds on a different pool (wrong price)
+    5. If a different contract happens to exist at that address, tokens may be lost
+  invariante: "assert(computedPairAddress == factory.getPair(tokenA, tokenB))"
+  que_mirar:
+    - "init code hash"
+    - "INIT_CODE_HASH"
+    - "hex\"e18a"
+    - "hex\"96e8"
+    - "pairFor"
+    - "CREATE2"
+  como_se_arregla: "Use the correct init code hash for the target factory. Better yet, call factory.getPair() instead of computing addresses. When supporting multiple DEX forks, store init code hash per factory."
+  trampas:
+    - "Different chains may deploy same factory with different init code hashes"
+    - "Upgradeable pair implementations change the hash"
+  incidentes:
+    - "Numoen -- UniswapV2Library uses SushiSwap init code hash instead of UniswapV2, computed pair addresses are wrong (MEDIUM)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [dex, uniswap-v2, init-code-hash, CREATE2, pair-address, factory, sushiswap]

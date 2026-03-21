@@ -1,0 +1,631 @@
+# New ERC-4626 Vault Bug Patterns — Extracted from Solodit (224 findings)
+# Patterns vault-009 through vault-021
+# Only HIGH/MEDIUM severity with concrete attack paths
+
+- id: vault-009
+  pattern: nested-vault-accounting-desync
+  name: "Nested vault redemption accounting desync"
+  causa_raiz: >
+    When a vault wraps another ERC4626 vault (meta-vault or yield aggregator pattern),
+    the outer vault calls inner.redeem() during withdrawal but fails to properly track
+    the assets flowing through the inner vault. The _withdraw accounting may double-count
+    yield, not decrement depositedBase correctly, or fail to account for the inner vault's
+    share-to-asset conversion rounding. The result is that the outer vault's internal
+    accounting diverges from actual token balances.
+  como_funciona: |
+    1. Outer vault (yVault) wraps inner vault (pVault) which wraps underlying (sUSDe)
+    2. During yield phase, yVault._withdraw calls pVault.redeem()
+    3. The withdrawal accounting adds yield to the assets variable but also decrements depositedBase by the inflated amount
+    4. This creates a discrepancy: depositedBase is decremented by more than the actual yield
+    5. Attacker repeats withdrawals to amplify the accounting error
+    6. Eventually the entire inner vault balance can be drained
+  invariante: |
+    assert(outerVault.totalAssets() <= innerVault.convertToAssets(innerVault.balanceOf(address(outerVault))) + outerVault.idleBalance());
+    // Outer vault's reported totalAssets must not exceed actual redeemable value from inner vault
+  que_mirar:
+    - "vault.redeem() or vault.withdraw() called inside another vault's _withdraw"
+    - "assets += previewYield or similar yield addition during withdrawal path"
+    - "depositedBase -= or similar state decrement that includes yield component"
+    - "Multiple vault layers: meta-vault, wrapper vault, yield vault stacking"
+  como_se_arregla: "Separate yield tracking from principal tracking. Never add yield to the withdrawal amount before decrementing principal. Use internal accounting that is independent of inner vault share price changes."
+  trampas:
+    - "Single-layer vaults (no nesting) are NOT affected"
+    - "If inner vault uses 1:1 exchange rate permanently, the rounding issue vanishes"
+  incidentes:
+    - "Strata (Cyfrin) — attacker drains sUSDe balance via incorrect pUSDeVault._withdraw accounting (HIGH)"
+    - "Strata (Cyfrin) — MetaVault.redeemRequiredBaseAssets only redeems from single vault, not aggregating across vaults (MEDIUM)"
+    - "Strata (Cyfrin) — DoS of meta vault withdrawals when one inner vault is paused (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, erc4626, nested-vault, meta-vault, accounting, yield, wrapper]
+
+- id: vault-010
+  pattern: sandwich-exchange-rate-frontrun
+  name: "Exchange rate frontrunning via deposit/withdraw sandwich"
+  causa_raiz: >
+    ERC4626 deposit and mint functions lack slippage protection parameters. When
+    vault operations change the exchange rate (yield accrual, interest payments,
+    loss reporting, rebalancing), an attacker can sandwich the rate-changing
+    transaction: deposit before the rate increase, redeem after. The EIP-4626
+    security considerations explicitly warn about this for EOA access. The same
+    applies to withdraw: redeem before a rate decrease, deposit after.
+  como_funciona: |
+    1. Attacker monitors mempool for transactions that will change the vault's exchange rate
+       (e.g., yield reporting, interest accrual, allocator rebalancing, loss reporting)
+    2. If rate will INCREASE: attacker deposits just before, getting shares at old (lower) rate
+    3. Rate-changing transaction executes, increasing totalAssets or decreasing totalSupply
+    4. Attacker redeems immediately after, getting assets at new (higher) rate
+    5. Profit = (newRate - oldRate) * sharesHeld, minus gas
+    6. For rate DECREASES: reverse — redeem before, deposit after
+  invariante: |
+    // No single address should profit more than dust from a deposit+redeem in the same block
+    uint256 sharesBefore = vault.balanceOf(attacker);
+    uint256 assetsBefore = asset.balanceOf(attacker);
+    // ... attacker deposits and redeems ...
+    assert(asset.balanceOf(attacker) <= assetsBefore + DUST_TOLERANCE);
+  que_mirar:
+    - "deposit() and mint() without minShares parameter"
+    - "withdraw() and redeem() without minAssets parameter"
+    - "Functions that change totalAssets or exchange rate callable by external actors"
+    - "lastTotalAssets or similar variable updated in a separate transaction"
+    - "onMorphoSupplyCollateral, onMorphoRepay or similar callbacks that update rate"
+  como_se_arregla: "Add slippage protection parameters (minSharesOut for deposit, maxSharesIn for withdraw). Implement time-weighted exchange rates or rate change limits per block. Use streaming yield distribution (linear unlock over time) instead of instant rate jumps."
+  trampas:
+    - "Vaults with time-locked yield streaming (xERC4626 pattern) are partially protected"
+    - "Small rate changes (<0.1%) may not be profitable after gas costs"
+    - "This is NOT a vulnerability if the protocol intentionally allows instant rate changes for governance"
+  incidentes:
+    - "LoopVaults (Pashov) — onMorphoSupplyCollateral/onMorphoRepay instantly modify exchange rate, frontrunnable (LOW but documented)"
+    - "Union Finance — exchangeRateStored() frontrunning on repayments to mint-then-redeem for profit (MEDIUM)"
+    - "Maple Finance — depositing during unrealized losses window gets inflated share price (MEDIUM)"
+    - "Gauntlet (Spearbit) — deposit and withdraw functions susceptible to sandwich attacks on Balancer pool (HIGH)"
+    - "GoGoPool — wrong reward distribution between early and late depositors due to late syncRewards() (MEDIUM)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, erc4626, sandwich, frontrunning, slippage, exchange-rate, mev]
+
+- id: vault-011
+  pattern: withdrawal-fee-accounting-mismatch
+  name: "Withdrawal fee not reflected in share/asset accounting"
+  causa_raiz: >
+    When a vault or underlying strategy charges a withdrawal fee, the actual
+    amount received is less than the amount requested. If the caller's accounting
+    uses the pre-fee amount to update internal state (e.g., pos.underlyingAmount,
+    totalLend, debt shares), a discrepancy emerges. The user retains phantom
+    collateral or the protocol's debt tracking becomes incorrect. This also applies
+    to deposit fees that aren't reflected in share calculations.
+  como_funciona: |
+    1. User deposits X assets, vault records pos.underlyingAmount = X
+    2. User withdraws, vault calls innerVault.withdraw(shareAmount)
+    3. Inner vault applies withdrawal fee: returns X - fee
+    4. But pos.underlyingAmount is only decremented by (X - fee), the actual return amount
+    5. Remaining phantom amount (fee) is still tracked as user's collateral
+    6. User can borrow against phantom collateral or the accounting becomes permanently broken
+  invariante: |
+    // After withdrawal, tracked amount must equal actual received amount
+    uint256 actualReceived = asset.balanceOf(user) - balanceBefore;
+    assert(pos.underlyingAmountReduction == sharesBurned_value_before_fee);
+    // OR: assert(pos.underlyingAmount == 0) when all shares are withdrawn
+  que_mirar:
+    - "withdrawalPenalty, withdrawFee, or fee deduction in withdraw/redeem path"
+    - "wAmount = vault.withdraw() where return value has fee already deducted"
+    - "pos.underlyingAmount -= wAmount where wAmount is post-fee"
+    - "bank.totalLend -= wAmount with post-fee amount"
+    - "depositFee used where withdrawFee should be (or vice versa)"
+  como_se_arregla: "Always decrement internal accounting by the pre-fee amount (the full share value), not the post-fee amount. Or track shares instead of underlying amounts. When all shares are burned, zero out the position completely."
+  trampas:
+    - "Vaults with 0% withdrawal fee are not affected"
+    - "If the fee is taken in shares (not assets), the accounting may be correct"
+  incidentes:
+    - "Blueberry (Sherlock) — BlueBerryBank#withdrawLend causes phantom collateral when soft/hard vault has withdraw fee (HIGH)"
+    - "Blueberry (Sherlock) — Interest component of underlying permanently locked because withdrawLend caps at initial deposit (HIGH)"
+    - "Blueberry (Sherlock) — doCutRewardsFee uses depositFee instead of withdrawFee (MEDIUM)"
+    - "Redacted Cartel (Code4rena) — maxWithdraw doesn't account for withdrawalPenalty, returns too-large amount (MEDIUM)"
+    - "Timeless (Spearbit) — exitToVaultShares rounds down burn amount, user receives more value than burned (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, erc4626, withdrawal-fee, accounting, phantom-collateral, fee-mismatch]
+
+- id: vault-012
+  pattern: erc4626-oracle-price-manipulation
+  name: "ERC4626 share price used as oracle is manipulable"
+  causa_raiz: >
+    When a lending protocol or other DeFi system uses an ERC4626 vault's
+    convertToAssets() or previewRedeem() as a price oracle for the vault's
+    LP token, the price is based on spot totalAssets/totalSupply which can
+    be manipulated within a single transaction via deposits, withdrawals,
+    or donations. Additionally, if vault.decimals() differs from
+    asset.decimals(), the oracle calculation produces wrong results.
+  como_funciona: |
+    1. Protocol uses vault.previewRedeem(10**decimals) * assetPrice as LP token price
+    2. Attacker deposits large amount into vault, inflating totalAssets
+    3. Oracle now reports inflated price for vault LP tokens
+    4. Attacker uses overvalued LP tokens as collateral to borrow
+    5. Attacker withdraws from vault, restoring original price
+    6. Attacker's loan is now undercollateralized, protocol has bad debt
+  invariante: |
+    // Oracle price must not change by more than X% within a single block
+    uint256 priceBefore = oracle.getPrice(vaultToken);
+    // ... any single transaction ...
+    uint256 priceAfter = oracle.getPrice(vaultToken);
+    assert(priceAfter <= priceBefore * 102 / 100); // max 2% change
+  que_mirar:
+    - "ERC4626Oracle or similar using previewRedeem/convertToAssets for pricing"
+    - "vault.decimals() used as asset.decimals() in oracle math"
+    - "No TWAP or time-weighted averaging on vault share price"
+    - "Vault LP tokens accepted as collateral in a lending protocol"
+  como_se_arregla: "Use a TWAP of the vault's exchange rate instead of spot price. Use asset.decimals() independently from vault.decimals(). Add manipulation resistance checks (e.g., compare against a rolling average)."
+  trampas:
+    - "Vaults with virtual shares offset have high manipulation cost — may not be economically viable"
+    - "If the oracle also checks the underlying asset price via Chainlink, the attack vector is limited to the share ratio"
+  incidentes:
+    - "Sentiment (Sherlock) — ERC4626Oracle vulnerable to price manipulation via deposit/withdraw (MEDIUM)"
+    - "Sentiment (Sherlock) — ERC4626Oracle wrong when vault decimals != asset decimals (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, erc4626, oracle, price-manipulation, collateral, lending, decimals]
+
+- id: vault-013
+  pattern: max-functions-non-compliant
+  name: "maxDeposit/maxWithdraw return values ignore actual limits"
+  causa_raiz: >
+    EIP-4626 requires maxDeposit/maxMint/maxWithdraw/maxRedeem to return the
+    actual maximum amount that would succeed if called. Many implementations
+    return naive values (e.g., balanceOf[user] or type(uint256).max) without
+    considering: (1) pause states, (2) internal caps, (3) per-user limits,
+    (4) time-based restrictions, (5) available liquidity. Integrators relying
+    on these functions for pre-flight checks get unexpected reverts.
+  como_funciona: |
+    1. Integrator calls vault.maxDeposit(user) to check how much can be deposited
+    2. maxDeposit returns a large value (e.g., type(uint256).max or remaining cap)
+    3. Integrator calls vault.deposit(maxDeposit_result)
+    4. Deposit reverts because an internal check (tvlCap, pause, time lock) wasn't reflected in maxDeposit
+    5. Integrator's transaction fails unexpectedly, potentially causing cascading failures in multi-step operations
+  invariante: |
+    // maxDeposit must never cause deposit to revert
+    uint256 max = vault.maxDeposit(user);
+    // vault.deposit(max, user) MUST NOT revert (assuming user has sufficient assets)
+    // Similarly for maxMint, maxWithdraw, maxRedeem
+  que_mirar:
+    - "maxDeposit returns type(uint256).max or does not check deposit cap"
+    - "maxWithdraw returns balanceOf[user] but withdrawal is time-locked"
+    - "maxRedeem doesn't check pause state"
+    - "Underlying pool/strategy has its own cap not reflected in max functions"
+    - "Withdrawal restricted to certain time windows (e.g., first Tuesday of month)"
+  como_se_arregla: "Override all max* functions to return 0 when the corresponding operation is disabled. Account for all internal caps, pause states, time locks, and underlying strategy limits."
+  trampas:
+    - "Some vaults intentionally return 0 during pause — this is CORRECT behavior"
+    - "Returning a slightly lower value than the true max is acceptable (conservative)"
+  incidentes:
+    - "Maia DAO (Code4rena) — maxWithdraw/maxRedeem return balanceOf during time-locked period instead of 0 (MEDIUM)"
+    - "GoGoPool (Code4rena) — maxWithdraw uses totalAssets() including unreleased rewards, causing underflow on beforeWithdraw (MEDIUM)"
+    - "Redacted Cartel (Code4rena) — maxWithdraw doesn't account for withdrawalPenalty (MEDIUM)"
+    - "Y2k Finance (Code4rena) — maxDeposit/maxMint/maxWithdraw/maxRedeem don't account for epoch locking (HIGH)"
+    - "Florence Finance (Code4rena) — ERC4626 standard not followed correctly in max functions (MEDIUM)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, erc4626, compliance, maxDeposit, maxWithdraw, integrator, dos]
+
+- id: vault-014
+  pattern: vault-reentrancy-on-deposit-withdraw
+  name: "Reentrancy during vault deposit/withdraw via callback tokens"
+  causa_raiz: >
+    When a vault accepts tokens with transfer callbacks (ERC777, ERC721 with
+    onReceived, or native ETH with receive()), an attacker can reenter the
+    vault during deposit or withdraw. If state updates happen after the
+    external call (violating checks-effects-interactions), the attacker can
+    manipulate share calculations, double-claim, or drain funds. This also
+    applies to vault-to-strategy interactions where the strategy makes external
+    calls before returning.
+  como_funciona: |
+    1. Attacker calls vault.deposit() with an ERC777 token or ETH
+    2. During the transfer, the token/ETH triggers a callback to the attacker's contract
+    3. Attacker reenters vault.withdraw() or vault.deposit() during the callback
+    4. Because state (totalSupply, totalAssets, balances) hasn't been updated yet, the reentrant call uses stale values
+    5. Attacker extracts more value than they deposited or gets extra shares
+  invariante: |
+    // Share price must not change during a single deposit or withdraw operation
+    // (i.e., no reentrancy between state reads and state writes)
+  que_mirar:
+    - "deposit() or withdraw() without nonReentrant modifier"
+    - "safeTransferFrom before _mint (ERC777 callback)"
+    - "External call to strategy.deposit() before updating vault state"
+    - "ETH transfers via .call{value:} before state update"
+    - "Missing nonReentrant on takeOverDebt, liquidate, or other fund-moving functions"
+  como_se_arregla: "Use nonReentrant modifier on all state-changing functions. Follow checks-effects-interactions: update all state before making external calls. Use pull-over-push pattern for ETH transfers."
+  trampas:
+    - "Standard ERC20 tokens without callbacks are NOT vulnerable"
+    - "If vault uses WETH wrapper instead of raw ETH, callback risk is eliminated"
+    - "Vaults that mint before transferring (not after) are also safe"
+  incidentes:
+    - "JPEG'd (Code4rena) — reentrancy in yVault.deposit via ERC777-like callback (HIGH)"
+    - "Real Wagmi #2 (Sherlock) — reenter takeOverDebt() during liquidation swap to duplicate position (HIGH)"
+    - "Hubble Exchange (Sherlock) — grief withdrawal queue via VUSD reentrancy in receive() (MEDIUM)"
+    - "Sandclock (Code4rena) — deposit() open to reentrancy attacks (HIGH)"
+    - "Sandclock (Code4rena) — withdrawers get more value via reentrant call (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, reentrancy, erc777, callback, deposit, withdraw, nonReentrant]
+
+- id: vault-015
+  pattern: reward-yield-distribution-desync
+  name: "Reward/yield distribution not synced with share changes"
+  causa_raiz: >
+    When a vault distributes rewards or yield based on a per-share accumulator
+    (rewardsPerShare or similar), new depositors who join after rewards accrue
+    but before their claimed amount is initialized can claim rewards they didn't
+    earn. Conversely, if the sync function isn't called on every deposit/withdraw,
+    the distribution becomes unfair — early withdrawers or late depositors get
+    disproportionate shares of rewards.
+  como_funciona: |
+    1. Vault accumulates rewards, sets amount_claimable_per_share = 0.1
+    2. New user deposits, gets shares, but their claimed[user] is not initialized to current accumulator value
+    3. User immediately calls claim() -> receives (shares * 0.1 - 0) = full reward allocation
+    4. This exceeds what the vault actually holds in rewards, causing insolvency
+    5. Last claimers cannot withdraw their rightful rewards
+  invariante: |
+    // On deposit, user's claimed amount must be initialized to prevent retroactive claiming
+    assert(position.amount_claimed == shares_issued * amount_claimable_per_share);
+    // Total claims must never exceed total rewards distributed
+    assert(totalClaimed <= totalRewardsDistributed);
+  que_mirar:
+    - "amount_claimable_per_share or rewardsPerShare accumulator pattern"
+    - "Missing initialization of claimed[user] on deposit/mint"
+    - "syncRewards() not called in beforeDeposit/beforeWithdraw hooks"
+    - "Reward calculation using current cliff/supply instead of historical values"
+    - "getReward() called for ALL users when one user withdraws"
+  como_se_arregla: "Initialize claimed[user] = shares * currentRewardsPerShare on every deposit. Call syncRewards before any deposit/withdraw. For cliff-based rewards (AURA/CVX), snapshot supply values at accrual time, not at claim time."
+  trampas:
+    - "Vaults using OpenZeppelin's RewardPerToken pattern correctly handle this"
+    - "If all deposits happen before any rewards, the issue doesn't manifest"
+  incidentes:
+    - "Fair Funding (Sherlock) — amount_claimable_per_share not initialized on deposit, vault becomes insolvent (HIGH)"
+    - "Blueberry Update #3 (Sherlock) — CVX/AURA reward calculation uses current supply across cliff boundaries (HIGH)"
+    - "GoGoPool (Code4rena) — late syncRewards() causes unfair reward distribution (MEDIUM)"
+    - "Stakehouse (Code4rena) — claimed[user][token] set to due instead of += due, allows double claiming (HIGH)"
+    - "Vader Protocol (Code4rena) — vault rewards gamed via fake synth deposit with inflated weight (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, rewards, yield, distribution, accumulator, insolvency, initialization]
+
+- id: vault-016
+  pattern: multi-token-vault-price-confusion
+  name: "Multi-token vault treats different-priced tokens as equal"
+  causa_raiz: >
+    When a vault accepts multiple tokens (e.g., DAI, USDC, USDT) and calculates
+    totalAssets or share price by summing raw balances (potentially normalized to
+    18 decimals but NOT price-adjusted), it creates arbitrage. An attacker deposits
+    the cheapest token and withdraws the most expensive one. Alternatively, mixing
+    normalized (18-decimal) and raw (6-decimal) amounts in calculations causes
+    massive over/under-estimation of balances.
+  como_funciona: |
+    1. Vault holds 1000 DAI + 1000 USDC + 1000 USDT, totalAssets = 3000 (summed without price consideration)
+    2. Attacker deposits 1000 of cheapest token (e.g., slightly depegged USDT at $0.99)
+    3. Vault mints shares based on totalAssets = 4000, totalSupply proportional
+    4. Attacker withdraws targeting the most expensive token (e.g., DAI at $1.01)
+    5. Profit = price difference * amount, repeated until vault is drained of expensive token
+  invariante: |
+    // Value deposited must equal value of shares received, regardless of token
+    uint256 depositValue = oracle.getPrice(depositToken) * depositAmount;
+    uint256 shareValue = vault.convertToAssets(sharesMinted) * averageTokenPrice;
+    assert(shareValue <= depositValue);
+  que_mirar:
+    - "balanceOfThis() summing multiple token balances without price weighting"
+    - "_normalizeDecimals used for some paths but not others"
+    - "Mixing 18-decimal normalized amounts with raw 6-decimal amounts"
+    - "withdraw(address _output) allowing user to choose withdrawal token"
+    - "balance() adding normalized and non-normalized values"
+  como_se_arregla: "Use oracle prices when converting between tokens. Never sum raw balances of different tokens. Normalize ALL balance sources consistently. Restrict withdrawal to the same token deposited, or use price-weighted accounting."
+  trampas:
+    - "Single-token vaults are NOT affected"
+    - "If all accepted tokens are truly fungible at 1:1 (e.g., same stablecoin on different bridges), risk is lower"
+  incidentes:
+    - "yAxis (Code4rena) — multi-token vault treats all tokens as equal, creating arbitrage (HIGH)"
+    - "yAxis (Code4rena) — balance() mixes normalized and non-normalized amounts (HIGH)"
+    - "yAxis (Code4rena) — withdraw mixes normalized and standard amounts, inflated USDC withdrawal (HIGH)"
+    - "yAxis (Code4rena) — withdrawals frontrun to drain specific stablecoins (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, multi-token, decimals, normalization, arbitrage, stablecoin, price]
+
+- id: vault-017
+  pattern: vault-strategy-dos-cascade
+  name: "Broken strategy/plugin cascades into vault-wide DoS"
+  causa_raiz: >
+    When a vault sequentially interacts with multiple strategies or underlying
+    protocols during deposit/withdraw, a single failing strategy blocks the
+    entire vault. Common causes: underlying protocol paused, utilization cap
+    hit, external withdrawal limit exceeded, or strategy state machine stuck.
+    Since deposit always goes to first strategy and withdraw iterates in order,
+    there's no fallback or skip mechanism.
+  como_funciona: |
+    1. Vault has strategies [Aave, Compound, Yearn] for yield
+    2. Aave protocol gets paused (legitimate governance action)
+    3. User tries to withdraw from vault
+    4. Vault tries to withdraw from Aave first -> reverts
+    5. Entire vault withdraw is blocked, funds inaccessible
+    6. Owner cannot remove or rebalance the strategy because that also requires withdrawing from Aave
+  invariante: |
+    // Vault operations must not be permanently blocked by any single strategy failure
+    // maxWithdraw should return 0 if withdrawal would revert
+  que_mirar:
+    - "Sequential strategy iteration without try/catch or skip mechanism"
+    - "No per-strategy pause functionality at vault level"
+    - "removeStrategy requires withdrawing funds first"
+    - "Utilization caps on underlying protocols (e.g., Aave, RageTrade senior vault)"
+    - "External withdrawal limits (Lido MIN/MAX_WITHDRAWAL_AMOUNT)"
+    - "State machine that can get stuck (compound_failed, deposit_failed)"
+  como_se_arregla: "Implement per-strategy pause at vault level. Use try/catch for strategy interactions. Allow emergency strategy removal without withdrawal. Check underlying protocol state (paused()) before attempting operations."
+  trampas:
+    - "If the vault has only one strategy, the DoS is inherent to that strategy's availability"
+    - "Temporary pauses (< 24h) may be acceptable risk"
+  incidentes:
+    - "Mycelium (Sherlock) — one broken plugin blocks entire vault deposit/withdraw (MEDIUM)"
+    - "UXD Protocol (Sherlock) — RageTrade senior vault utilization cap locks deposits (HIGH)"
+    - "Notional (Sherlock) — Lido min/max withdrawal limits permanently lock user funds (HIGH)"
+    - "SteadeFi (Codehawks) — compound cancellation gets vault stuck at compound_failed status (MEDIUM)"
+    - "Isomorph (Sherlock) — stale price or circuit breaker blocks all vault interactions including adding collateral (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, strategy, dos, cascade, pause, plugin, withdrawal-limit]
+
+- id: vault-018
+  pattern: vault-totalassets-desync
+  name: "totalAssets desyncs from actual balance due to untracked flows"
+  causa_raiz: >
+    The vault's totalAssets() or internal accounting variable (yIntercept, slope,
+    totalLend, idleETH, etc.) diverges from the actual token balance because
+    certain fund flows are not properly tracked. This includes: partial auction
+    payments not decrementing yIntercept, ETH returned to pool without updating
+    idleETH, fee calculations not updating reserves, or strategy rebalancing
+    not syncing balances. The desync causes incorrect share pricing.
+  como_funciona: |
+    1. Vault tracks totalAssets via internal variable (not balanceOf)
+    2. An operation moves funds but fails to update the tracking variable
+       (e.g., auction pays partial amount, yIntercept not decremented)
+    3. totalAssets() now returns an inflated or deflated value
+    4. Share price = totalAssets / totalSupply is wrong
+    5. New depositors get too many or too few shares
+    6. Existing holders can extract value on the discrepancy
+  invariante: |
+    // Internal tracking must stay in sync with actual balances
+    assert(vault.totalAssets() == asset.balanceOf(vault) + vault.totalDeployed() - vault.pendingFees());
+  que_mirar:
+    - "yIntercept, slope, or similar accounting not updated in all code paths"
+    - "totalLend or totalBorrow not adjusted on fee/interest operations"
+    - "idleETH not updated when ETH is returned via non-standard path"
+    - "setPayee() or transferLien() not updating vault's accounting parameters"
+    - "bringUnusedETHBack or restoreVault not updating idle tracking"
+    - "depositedBase decremented incorrectly in yield phases"
+  como_se_arregla: "Audit every code path that moves tokens to/from the vault and ensure the accounting variable is updated. Use a single source of truth. Consider using balanceOf as a sanity check against internal accounting."
+  trampas:
+    - "Vaults using pure balanceOf for totalAssets have the opposite problem (donation vulnerability)"
+    - "Small discrepancies from rounding are expected and acceptable"
+  incidentes:
+    - "Astaria (Spearbit) — yIntercept not updated on partial Seaport auction payment (HIGH)"
+    - "Astaria (Spearbit) — WithdrawProxy.claim() updates yIntercept incorrectly (HIGH)"
+    - "Astaria (Spearbit) — setPayee doesn't update yIntercept/slope, vault owner can inflate totalAssets (HIGH)"
+    - "Astaria (Spearbit) — buyoutLien doesn't update new vault's slope/yIntercept (HIGH)"
+    - "Stakehouse (Code4rena) — bringUnusedETHBackIntoGiantPool doesn't increment idleETH (HIGH)"
+    - "Timeless (Spearbit) — xPYT auto-compound doesn't subtract pounder reward from assetBalance (HIGH)"
+    - "Elytra (Pashov) — TVL double-counts assets returned from strategy; receiveFromDepositPool doesn't track assets (HIGH)"
+    - "Tenbin — direct vault deposits counted as revenue leading to liquidity drain (HIGH)"
+    - "Tenbin — revenue accounting ignores losses, revenue drifts on outflows (HIGH/MEDIUM)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, totalAssets, accounting, desync, yIntercept, slope, internal-tracking]
+
+- id: vault-019
+  pattern: yield-claim-theft-via-balance-sweep
+  name: "Yield/reward theft by claiming full contract balance"
+  causa_raiz: >
+    A vault function sends the ENTIRE token balance of the contract to the
+    caller (asset.balanceOf(address(this))), rather than only the caller's
+    proportional share. When combined with operations that accumulate
+    unclaimed yield or rewards in the contract, a single caller can steal
+    all accumulated yield belonging to other users.
+  como_funciona: |
+    1. Vault holds pooled yield/rewards for multiple users in its balance
+    2. User calls eject(), claim(), or withdraw() which internally claims all accumulated yield
+    3. Function sends asset.balanceOf(address(this)) to the caller
+    4. Caller receives their share PLUS all other users' unclaimed yield
+    5. Other users can no longer claim their yield
+  invariante: |
+    // A user's withdrawal must never exceed their proportional share
+    uint256 userShare = vault.balanceOf(user) * vault.totalAssets() / vault.totalSupply();
+    assert(amountSent <= userShare + DUST_TOLERANCE);
+  que_mirar:
+    - "asset.transfer(receiver, asset.balanceOf(address(this)))"
+    - "Functions that claim yield for ALL holders but send to single caller"
+    - "combine() or claimYield() called inside withdraw/redeem that aggregates"
+    - "No separation between user's principal and pooled yield"
+  como_se_arregla: "Never send balanceOf(this) as the withdrawal amount. Track each user's yield separately. If combining operations (redeem + claim), only send the user's proportional share of both."
+  trampas:
+    - "If the vault has only one user, this is not exploitable"
+    - "Functions that sweep excess tokens to treasury are intentional, not a bug"
+  incidentes:
+    - "Sense (Sherlock) — AutoRoller#eject sends entire target balance including all users' YT yield to single caller (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, yield, theft, balanceOf, sweep, claim, proportional]
+
+- id: vault-020
+  pattern: settlement-fee-double-subtraction
+  name: "Settlement/management fee applied asymmetrically between global and local accounting"
+  causa_raiz: >
+    When a vault processes multiple users' deposits and redeems in the same
+    epoch/oracle version, settlement fees or management fees are shared among
+    all orders. However, the global state subtracts the fee once for deposits
+    AND once for redeems (double subtraction), while the local (per-user) state
+    correctly prorates the fee across all orders. This mismatch means users
+    get more shares/assets locally than the vault tracks globally, leading to
+    insolvency where the last user cannot redeem.
+  como_funciona: |
+    1. SettlementFee = $10, User1 deposits $10, User2 redeems $10 in same epoch
+    2. Global: deposits converted with full fee deducted -> 0 shares; redeems also -> 0 assets
+    3. Local: fee split across 2 orders -> each user pays $5 fee
+    4. User1 gets 5 shares locally, User2 gets $5 locally
+    5. Global says 0 shares added, 0 assets returned
+    6. Local says 5 shares added, $5 returned -> accounting mismatch grows over time
+    7. Eventually global underflow prevents last users from redeeming
+  invariante: |
+    // Sum of all local share changes must equal global share change
+    assert(sumLocalSharesAdded == globalSharesAdded);
+    assert(sumLocalAssetsReturned == globalAssetsReturned);
+  que_mirar:
+    - "_withoutSettlementFeeGlobal vs _withoutSettlementFeeLocal"
+    - "Settlement fee subtracted in full for both deposit and redeem paths globally"
+    - "Fee prorated by checkpoint.orders locally but not globally"
+    - "Management fee calculated differently for global vs per-user state"
+  como_se_arregla: "Weight the global settlement fee by the ratio of deposits vs redeems in the same epoch. Ensure global and local fee calculations are symmetric."
+  trampas:
+    - "If deposits and redeems never happen in the same epoch, the bug doesn't manifest"
+    - "Small fee amounts may cause the discrepancy to grow slowly"
+  incidentes:
+    - "Perennial V2 Update #2 (Sherlock) — _withoutSettlementFeeGlobal subtracts fee twice, local only once, systematic share/asset inflation (HIGH)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, settlement-fee, global-local, accounting-mismatch, epoch, insolvency]
+
+- id: vault-021
+  pattern: vault-access-control-missing
+  name: "Critical vault functions missing access control or input validation"
+  causa_raiz: >
+    Vault functions that should be restricted (fee minting, strategy management,
+    migration, payee changes) are either publicly callable or accept user-supplied
+    addresses without validation. Common patterns: mintYieldFee() lets anyone
+    specify the recipient, commitToLien() doesn't verify the vault is registered,
+    withdrawFromGauge() lets anyone burn and claim deposits, or the periphery
+    contract exposes unrestricted proxy-withdraw capability.
+  como_funciona: |
+    1. Attacker identifies a vault function without proper access control
+    2. For fee theft: calls mintYieldFee(yieldAmount, attackerAddress) to mint yield shares to themselves
+    3. For vault spoofing: creates fake vault, passes it to commitToLien, drains real vault
+    4. For deposit theft: calls withdrawFromGauge with victim's NFT ID, receives their tokens
+    5. For periphery theft: calls withdrawToken(victimAddress, ..., attackerAddress) exploiting approval
+  invariante: |
+    // Only authorized addresses can call privileged functions
+    // Fee recipient must match the configured _yieldFeeRecipient
+    // Vault addresses must be verified against registry
+  que_mirar:
+    - "external/public functions without onlyOwner, onlyManager, or similar modifier"
+    - "mintYieldFee with user-supplied _recipient parameter"
+    - "Vault address not checked against isValidVault()"
+    - "withdrawFromGauge public without msg.sender == nft.owner check"
+    - "Periphery withdraw/redeem where 'from' is user-supplied, not msg.sender"
+  como_se_arregla: "Add access control modifiers. Use msg.sender as the source of funds (not a user-supplied 'from' parameter). Validate vault addresses against a registry. For fee functions, use the configured recipient, not a parameter."
+  trampas:
+    - "Some functions are intentionally permissionless (e.g., liquidation, public harvest)"
+    - "Operator/approved patterns intentionally allow third-party calls"
+  incidentes:
+    - "PoolTogether (Code4rena) — mintYieldFee callable by anyone with arbitrary recipient (HIGH)"
+    - "Astaria (Spearbit) — commitToLien doesn't check vault is registered, allows draining via fake vault (CRITICAL)"
+    - "Isomorph (Sherlock) — anyone can withdraw user's Velo Deposit NFT after approval (HIGH)"
+    - "Rage Trade (Sherlock) — WithdrawPeriphery lets anyone withdraw/redeem another user's approved tokens (HIGH)"
+    - "Stakehouse (Code4rena) — giant pools drained via fake vault passing weak authenticity check (HIGH)"
+  severidad: critical
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, access-control, authorization, fee-theft, vault-spoofing, periphery]
+
+- id: vault-022
+  pattern: stored-total-assets-underflow-dos
+  name: "storedTotalAssets underflow blocks withdrawals during reward cycle"
+  causa_raiz: >
+    Vaults using the xERC4626 streaming rewards pattern track storedTotalAssets
+    separately from actual balance. storedTotalAssets only includes unlocked
+    rewards at cycle end, but totalAssets() (used for share pricing) includes
+    linearly unlocked rewards mid-cycle. When a user withdraws mid-cycle,
+    beforeWithdraw decrements storedTotalAssets by the withdrawal amount,
+    which may include unlocked rewards not yet in storedTotalAssets. This
+    causes an underflow revert, blocking all withdrawals until the cycle ends.
+  como_funciona: |
+    1. Alice deposits 100 tokens. storedTotalAssets = 100
+    2. Owner sends 100 reward tokens, calls syncRewards(). lastRewardAmount = 100
+    3. Mid-cycle: totalAssets() = 100 + 50 (linear unlock) = 150
+    4. Alice's shares worth 150 tokens (per convertToAssets)
+    5. Alice redeems all shares -> beforeWithdraw(150) tries storedTotalAssets -= 150
+    6. storedTotalAssets is still 100 -> underflow revert
+    7. Nobody can withdraw until rewards cycle completes
+  invariante: |
+    // storedTotalAssets must be >= totalAssets() at all times
+    // OR: beforeWithdraw must use min(amount, storedTotalAssets)
+  que_mirar:
+    - "storedTotalAssets -= amount in beforeWithdraw hook"
+    - "totalAssets() includes linearly unlocked rewards but storedTotalAssets doesn't"
+    - "syncRewards() only callable after rewardsCycleEnd"
+    - "Long rewardsCycleLength (14+ days) amplifies the window"
+  como_se_arregla: "Call syncRewards (without revert) before every deposit/withdraw to keep storedTotalAssets current. Or cap the decrement to min(amount, storedTotalAssets). Or use actual balance instead of storedTotalAssets for the decrement."
+  trampas:
+    - "If no rewards have been distributed, storedTotalAssets == totalAssets, no issue"
+    - "Very short reward cycles (<1 day) minimize the exposure window"
+  incidentes:
+    - "Tribe (Code4rena) — xERC4626.sol storedTotalAssets underflow blocks all withdrawals during reward cycle (MEDIUM)"
+    - "GoGoPool (Code4rena) — maxWithdraw/maxRedeem return values exceeding storedTotalAssets (MEDIUM)"
+  severidad: medium
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, xERC4626, storedTotalAssets, underflow, rewards, dos, withdrawal]
+
+- id: vault-023
+  pattern: decimal-mismatch-in-vault-operations
+  name: "Decimal mismatch between vault, asset, or strategy causes inflated/deflated amounts"
+  causa_raiz: >
+    When vault operations pass amounts between components with different decimal
+    expectations (e.g., vault uses 18 decimals, underlying USDC uses 6 decimals,
+    perp protocol returns 18-decimal amounts), failing to convert between decimal
+    scales causes amounts to be inflated by 10^12 or deflated by 10^12.
+    This leads to vault.deposit/withdraw using massively wrong amounts.
+  como_funciona: |
+    1. Perp protocol returns baseAmount in 18 decimals (e.g., 1e18 = 1 token)
+    2. Vault calls vault.withdraw(assetToken, baseAmount) with the raw 18-decimal value
+    3. Asset token (USDC) has 6 decimals, so the vault tries to withdraw 1e18 USDC = 1 trillion USDC
+    4. Transaction either reverts (if vault doesn't have that much) or massively over-withdraws
+  invariante: |
+    // All amounts passed to external functions must be in the target's native decimals
+    // assert(amountToDeposit <= 10 ** asset.decimals() * MAX_REASONABLE_AMOUNT)
+  que_mirar:
+    - "vault.deposit(token, amount) where amount comes from 18-decimal source but token has 6 decimals"
+    - "_normalizeDecimals applied inconsistently"
+    - "Missing decimals conversion between perp protocol and vault"
+    - "ERC4626 decimals() != underlying asset decimals()"
+  como_se_arregla: "Always convert amounts to the target token's decimals before passing to external functions. Create explicit conversion helpers and use them consistently."
+  trampas:
+    - "Tokens with 18 decimals (DAI, WETH) don't trigger this bug"
+    - "If all tokens in the system share the same decimals, no conversion needed"
+  incidentes:
+    - "UXD Protocol (Sherlock) — deposit/withdraw to vault with wrong decimals in PerpDepository (MEDIUM)"
+    - "yAxis (Code4rena) — balance() mixes normalized and non-normalized amounts (HIGH)"
+    - "Sentiment (Sherlock) — ERC4626Oracle wrong when vault decimals != asset decimals (HIGH)"
+    - "AFI Vault (Pashov) — flawed decimal conversion logic understates share amount for non-18-decimal assets (MEDIUM)"
+  severidad: high
+  confianza: alta
+  verificado: true
+  fuente: "Solodit"
+  tags: [vault, decimals, normalization, usdc, conversion, precision]
