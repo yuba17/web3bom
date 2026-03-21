@@ -1,0 +1,567 @@
+component: V3Oracle
+hunter: MathHunter
+timestamp: "2026-03-21"
+focus: "overflow/underflow in price calculations, rounding direction, fee growth precision, _sumMulDiv overflow, SafeCast.toUint160 overflow, chainlink division order, TickMath boundary edges, _requireMaxDifference boundary behavior"
+
+# ============================================================
+# ANÁLISIS PROFUNDO — V3Oracle.sol (698 líneas)
+# ============================================================
+#
+# CONTEXTO MATEMÁTICO CLAVE:
+#   Q96  = 2^96  ≈ 7.9e28
+#   Q128 = 2^128 ≈ 3.4e38
+#   sqrtPriceX96: uint160, máximo 2^160 - 1
+#   tick: int24, rango [-887272, 887272]
+#
+# FLUJO DE PRECIOS:
+#   _getReferenceTokenPriceX96 → retorna priceX96 (referenciado a referenceToken)
+#   _populatePrices → calcula derivedPoolPriceX96 y derivedSqrtPriceX96
+#   _sumMulDiv → calcula valor total de posición
+#   _getUncollectedFees → usa overflow wrapping intencional (patrón Uniswap)
+#
+# ============================================================
+# HALLAZGOS POR ÁREA
+# ============================================================
+#
+# [VO-M-01] _sumMulDiv: (r1 + r2) puede desbordarse overflow
+#   Líneas 542-545
+#   r1 = mulmod(a, b, denominator) → rango [0, denominator-1]
+#   r2 = mulmod(c, d, denominator) → rango [0, denominator-1]
+#   r1 + r2 → rango [0, 2*(denominator-1)] → puede exceder uint256 si denominator > 2^255
+#   En la práctica denominator = priceTokenX96 ≈ Q96 (2^96) — mucho menor que 2^255.
+#   Sin embargo, si priceTokenX96 fuera MUY pequeño (e.g., 1 wei), denominator=1,
+#   entonces r1=r2=0 siempre (mulmod(x,y,1)==0), sin overflow. Safe.
+#   Si denominator > 2^255: r1+r2 puede overflow. Pero priceTokenX96 es un precio
+#   en Q96 format, tipicamente < 2^200. Para que desborde need denominator > 2^255.
+#   Conclusión: teóricamente posible si priceTokenX96 es un valor astronomico (~2^255),
+#   pero en práctica imposible con precios reales. TIER 2 — corner case teórico.
+#
+# [VO-M-02] derivedSqrtPriceX96 = Math.sqrt(derivedPoolPriceX96) * 2^48 — SafeCast.toUint160 overflow
+#   Línea 532
+#   derivedPoolPriceX96 = mulDiv(price0X96, Q96, price1X96)
+#   Si price0X96 >> price1X96 (token0 much more valuable), derivedPoolPriceX96 → large.
+#   Math.sqrt(derivedPoolPriceX96) está en [0, 2^128] approximately
+#   Multiplicar * 2^48 puede dar hasta 2^176 — dentro de uint256
+#   SafeCast.toUint160 reverts si valor > 2^160-1.
+#   ATAQUE: Si price0X96 / price1X96 ratio > (2^160 / 2^48)^2 / Q96 ≈ 2^224 / Q96 = 2^128
+#   es decir: price0X96 > price1X96 * 2^128 — ratio de 2^128 entre precios
+#   Esto ocurre con tokens de EXTREMA diferencia de valor (e.g., 1 BTC vs 1 dust token).
+#   Si SafeCast reverts → getValue() reverts → posición NO LIQUIDABLE.
+#   IMPACTO: DoS en liquidaciones para posiciones con tokens de precio extremo.
+#   Pero: oráculos deben estar configurados, owner controla qué tokens entran.
+#   Probabilidad real: BAJA, pero el revert en liquidación es crítico si ocurre.
+#   TIER 2 — el owner puede configurar tokens extremos; el revert DoS-ea liquidaciones.
+#
+# [VO-M-03] _requireMaxDifference: overflow en (priceX96 - verifyPriceX96) * 10000
+#   Línea 167
+#   differenceX10000 = |priceX96 - verifyPriceX96| * 10000
+#   priceX96 puede ser hasta ~2^200 (para tokens de alta diferencia de precio)
+#   * 10000 = * ~2^13 → potencialmente ~2^213 — dentro de uint256 (max 2^256-1)
+#   No hay overflow en práctica para valores de precio reales.
+#   Pero hay otro bug: si verifyPriceX96 == 0, la condición short-circuits a revert.
+#   Si verifyPriceX96 > 0 pero MUY PEQUEÑO (1 wei), differenceX10000/verifyPriceX96
+#   podría ser artificialmente large, forzando revert aunque las diferencias son pequeñas
+#   en términos absolutos. Esto bloquea el oráculo si el precio de verificación es minúsculo.
+#   TIER 2 — edge case de precio near-zero.
+#
+# [VO-M-04] Chainlink price calculation — division order precision loss
+#   Líneas 356-363
+#   Caso: referenceTokenDecimals == feedConfig.tokenDecimals (línea 362):
+#     chainlinkPriceX96 = chainlinkPriceX96 * Q96 / chainlinkReferencePriceX96
+#   chainlinkPriceX96 viene de: SafeCast.toUint256(answer) * Q96 / (10^feedDecimals)  [línea 424]
+#   Si answer es pequeño (e.g., 1 for a very cheap token) y feedDecimals=8:
+#     _getChainlinkPriceX96 retorna: 1 * Q96 / 1e8 = 2^96 / 1e8 ≈ 7.9e28 / 1e8 = 7.9e20
+#   Luego: 7.9e20 * Q96 = 7.9e20 * 7.9e28 ≈ 6.2e49 → dentro de uint256 antes de dividir.
+#   La multiplicación (chainlinkPriceX96 * Q96) puede overflow si chainlinkPriceX96 > 2^160.
+#   chainlinkPriceX96 = answer * Q96 / 10^feedDecimals
+#   Para overflow en línea 362: answer * Q96 / 10^feedDecimals > 2^160
+#   → answer > 2^160 * 10^feedDecimals / Q96 = 2^64 * 10^feedDecimals
+#   Con feedDecimals=8: answer > 2^64 * 1e8 ≈ 1.8e27 — imposible para Chainlink prices.
+#   NO hay overflow en práctica.
+#
+#   Caso: referenceTokenDecimals > feedConfig.tokenDecimals (línea 356):
+#     chainlinkPriceX96 = (10^diff) * chainlinkPriceX96 * Q96 / chainlinkReferencePriceX96
+#   (10^diff) puede ser large (hasta diff=18: 10^18)
+#   chainlinkPriceX96 ≈ 7.9e20 (de arriba)
+#   10^18 * 7.9e20 * Q96 ≈ 10^18 * 7.9e20 * 7.9e28 ≈ 4.9e67 — overflow potencial en uint256!
+#   uint256 max ≈ 1.1e77, así que 4.9e67 está dentro. Safe para diff<=18.
+#   Para diff=20 (teórico): 10^20 * 7.9e20 * 7.9e28 ≈ 4.9e69 — aún dentro de uint256.
+#   La expresión completa (10^diff * chainlinkPriceX96 * Q96) requiere diff ≈ 38+ para overflow.
+#   En práctica, decimals diff <= 18. No hay overflow.
+#
+# [VO-M-05] _getTWAPPriceX96: Q96 * Q96 / priceX96 — division by zero risk
+#   Línea 435: poolTWAPPriceX96 = Q96 * Q96 / priceX96
+#   Si priceX96 == 0, esto reverts con division by zero.
+#   ¿Cuándo priceX96 == 0?
+#   _getReferencePoolPriceX96 retorna: FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, Q96)
+#   Si sqrtPriceX96 == 0, esto retorna 0. sqrtPriceX96 viene de slot0 o de TWAP.
+#   TWAP: sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick).
+#   TickMath.getSqrtRatioAtTick(-887272) retorna MIN_SQRT_RATIO = 4295128739 (no zero).
+#   Slot0: pool no inicializado tiene sqrtPriceX96=0, pero _getPool busca pool existente.
+#   Si pool existe pero nunca fue inicializado (improbable pero posible), sqrtPriceX96=0.
+#   IMPACTO: revert en division → DoS en getValue/getPositionBreakdown.
+#   TIER 2 — requiere pool no inicializado.
+#
+# [VO-M-06] TWAP tick computation: truncación hacia cero en vez de hacia -inf
+#   Líneas 451-454
+#   int56 delta = tickCumulatives[0] - tickCumulatives[1]
+#   int24 tick = SafeCast.toInt24(int256(delta) / twapSecondsInt)
+#   if (delta < 0 && int256(delta) % twapSecondsInt != 0) tick--;
+#   Esta es la corrección estándar de Uniswap para floor division.
+#   El problema: twapSecondsInt = int256(uint256(twapSeconds))
+#   Si twapSeconds es max uint32 (4294967295 ≈ 136 años), delta / twapSecondsInt puede
+#   perder precisión en los bits bajos. Pero esto es precisión normal de TWAP.
+#   La corrección del floor es CORRECTA (equivalente al patrón Uniswap PositionValue).
+#   No hay bug aquí — es implementación correcta de floor division.
+#
+# [VO-M-07] _getUncollectedFees: feeGrowth0 / feeGrowth1 puede ser MAX_UINT256 post-wrap
+#   Líneas 584-590
+#   feeGrowth0 = feeGrowthInside0LastX128 - position.feeGrowthInside0LastX128 (unchecked)
+#   Si la posición NUNCA se actualizó, position.feeGrowthInside0LastX128 es el valor al
+#   momento de mint. Si feeGrowthInside0LastX128 (actual) < el valor guardado,
+#   wrap ocurre: feeGrowth0 = (2^256 - savedValue) + actualValue ≈ 2^256 — very large.
+#   Luego: FullMath.mulDiv(feeGrowth0, liquidity, Q128)
+#   Si feeGrowth0 ≈ 2^256-1 y liquidity > 0:
+#     mulDiv computa (2^256-1) * liquidity / Q128 — puede ser gigantesco.
+#     Si liquidity = 1: result = (2^256-1) / Q128 = 2^128 - 1 → SafeCast.toUint128 reverts!
+#   IMPACTO: revert en fees → getValue() falla → posición no liquidable.
+#   PERO: el overflow wrap de feeGrowth es INTENCIONAL por diseño de Uniswap.
+#   El invariante es que feeGrowthInside NUNCA puede decrecer más de 2^255 en una sesión.
+#   Esto requiere que el pool esté operando durante ~2^128 operaciones.
+#   En práctica este valor nunca baja; el wrap wraps forward.
+#   El comentario en línea 581 dice "allow overflow - this is as designed by uniswap".
+#   TIER 2 — by design, imposible en práctica.
+#
+# [VO-M-08] _sumMulDiv: redondeo hacia abajo favorece al BORROWER
+#   Líneas 540-545
+#   FullMath.mulDiv redondea hacia abajo (floor).
+#   q1 + q2 = floor(a*b/denom) + floor(c*d/denom) ≤ (a*b + c*d)/denom
+#   (r1 + r2)/denominator = floor((r1+r2)/denom) — también floor
+#   Total puede ser menor que la suma exacta por hasta 2 unidades del denominador.
+#   En contexto: valor de posición podría subestimarse por hasta 2 wei en unidades de
+#   priceTokenX96, que equivale a ~2/Q96 tokens ≈ dust. Prácticamente irrelevante.
+#   PERO: el rounding beneficia al borrower (posición vale MENOS), podría permitir
+#   que posiciones marginalmente sobre-colateralizadas sean consideradas sub-colateralizadas.
+#   Severidad: QA/Gas — rounding drift de 2 wei, no exploitable.
+#
+# [VO-M-09] _requireMaxDifference: bypass cuando maxDifferenceX10000 == type(uint16).max
+#   Línea 172: `&& maxDifferenceX10000 < type(uint16).max`
+#   Si maxDifference == 65535 (type(uint16).max), la verificación de precio es DESACTIVADA.
+#   Esto es intencional como "disable check" flag, pero si owner configura token con
+#   maxDifference=65535, el oráculo acepta CUALQUIER diferencia de precio sin revert.
+#   Un atacante que manipule el TWAP o Chainlink no tendría resistencia del check.
+#   PERO: esto requiere que el owner configure maxDifference=65535 — acción admin.
+#   TIER 2 — admin-dependent, but worth documenting.
+#
+# [VO-M-10] getValue: price0X96/price1X96 calculados con floor, pero amount0/amount1 también
+#   Líneas 133-134: price0X96 = FullMath.mulDiv(state.price0X96, Q96, priceTokenX96)
+#   Ambos mulDiv redondean hacia abajo. En el contexto de colateralización, subestimar
+#   price0X96 y price1X96 hace que el valor de colateral sea MENOR → más conservador.
+#   Esto es safe desde perspectiva del protocolo (evita sobrevaluar colateral).
+#   No es un bug — es conservador por diseño.
+#
+# ============================================================
+# FINDING MÁS CRÍTICO: VO-M-02
+# SafeCast.toUint160 en derivedSqrtPriceX96 puede revert con tokens de precio extremo,
+# bloqueando liquidaciones. Este es TIER 2 (DoS) no TIER 1 (fund loss directo).
+#
+# FINDING SECUNDARIO: VO-M-01
+# r1 + r2 en _sumMulDiv tiene overflow teórico cuando denominator > 2^255,
+# lo cual es imposible en práctica pero no está protegido.
+# ============================================================
+
+hypotheses:
+  - id: VO-M-01
+    tier: 2
+    type: property
+    description: >
+      _sumMulDiv (línea 545): la expresión `(r1 + r2) / denominator` suma dos resultados
+      de mulmod sin protección contra overflow. r1 = mulmod(a, b, denominator) produce
+      valores en [0, denominator-1], por lo que r1 + r2 ∈ [0, 2*(denominator-1)].
+      Si denominator > 2^255, la suma r1 + r2 puede desbordar uint256 silenciosamente
+      (Solidity ^0.8.0 revierte en overflow checked, pero esta línea NO está en unchecked).
+      En la práctica denominator es priceTokenX96 que típicamente es ≈ Q96 (2^96), por lo
+      que el overflow es imposible con precios reales. Sin embargo, si un token malicioso
+      o extremadamente valioso tuviera priceTokenX96 > 2^255, el resultado de _sumMulDiv
+      sería incorrecto por truncación de overflow, subvalorando la posición. Esto afecta
+      tanto a getValue() (línea 129) como al cálculo de feeValue (línea 131).
+    attack_scenario: >
+      1. Un token configurado en el oráculo tiene un precio extremadamente alto tal que
+         su priceTokenX96 > 2^255 (improbable con tokens reales pero teóricamente posible).
+      2. Un borrower crea una posición en ese token y llama a getValue().
+      3. r1 + r2 overflows uint256, wrap ocurre, el resultado de (r1+r2)/denominator es
+         un valor incorrecto (cercano a 0 o desbordado).
+      4. El valor de la posición se subestima, el borrower parece sub-colateralizado.
+      5. Alternativamente, si wrap produce un valor enorme, el borrower parece
+         hiper-colateralizado y puede pedir prestado más de lo que debería.
+      Precondición requerida: token con priceTokenX96 > 2^255 — no realista con precios de
+      mercado actuales pero no hay validación en el código que lo prevenga.
+    solidity: |
+      // Invariant VO-M-01: r1 + r2 en _sumMulDiv no debe overflow uint256
+      // En la práctica testear con valores extremos de denominator
+      function invariant_sumMulDiv_noOverflow(
+          uint256 a, uint256 b, uint256 c, uint256 d, uint256 denominator
+      ) internal pure {
+          if (denominator == 0) return;
+          uint256 r1 = mulmod(a, b, denominator);
+          uint256 r2 = mulmod(c, d, denominator);
+          // Si r1 + r2 overflows, la suma wraps: (r1 + r2) < r1
+          // t() es el helper de Chimera: t(condition) reverts si false
+          t(r1 + r2 >= r1, "VO-M-01: r1+r2 overflow in _sumMulDiv");
+      }
+
+  - id: VO-M-02
+    tier: 2
+    type: property
+    description: >
+      _populatePrices (línea 532): `state.derivedSqrtPriceX96 = SafeCast.toUint160(Math.sqrt(derivedPoolPriceX96) * (2**48))`.
+      derivedPoolPriceX96 = FullMath.mulDiv(price0X96, Q96, price1X96).
+      Cuando price0X96 es mucho mayor que price1X96 (token0 extremadamente más valioso),
+      derivedPoolPriceX96 puede ser muy grande. Math.sqrt(derivedPoolPriceX96) ≈ sqrt(price0/price1) * sqrt(Q96).
+      Multiplicar por 2^48 da: sqrt(price0/price1) * sqrt(Q96) * 2^48 = sqrt(price0/price1) * 2^96.
+      Para que SafeCast.toUint160 no reverta, se necesita que el resultado ≤ 2^160 - 1,
+      es decir: sqrt(price0/price1) ≤ 2^64. Esto significa price0/price1 ≤ 2^128.
+      Si price0 > price1 * 2^128, SafeCast.toUint160 reverts con "SafeCast: value doesn't fit".
+      Como resultado, getValue(), getPositionBreakdown() y cualquier función que llame
+      _populatePrices reverts, bloqueando liquidaciones de esas posiciones.
+    attack_scenario: >
+      1. El protocolo acepta dos tokens con ratio de precio > 2^128 (ej: token de precio
+         $10^38 vs stablecoin $1). El owner configura el oráculo para ambos.
+      2. Un borrower abre posición en el pool token0/token1 con ticket de precio extremo.
+      3. Cuando el precio de token0 sube dramáticamente (o token1 colapsa), el ratio
+         excede 2^128.
+      4. Todas las llamadas a getValue() para esa posición empiezan a revertir.
+      5. La posición no puede ser liquidada aunque esté underwater — el liquidador no puede
+         calcular el valor de colateral porque la llamada reverts.
+      6. El borrower se beneficia: su deuda crece con interés pero la posición es inmune
+         a liquidación mientras el ratio de precio permanezca extremo.
+      Precondición: requiere precio ratio > 2^128 entre los dos tokens del pool de colateral.
+    solidity: |
+      // Invariant VO-M-02: derivedSqrtPriceX96 nunca debe causar SafeCast.toUint160 revert
+      // Verificar que el resultado de sqrt(derivedPoolPriceX96) * 2^48 cabe en uint160
+      function invariant_derivedSqrtPrice_fits_uint160(
+          uint256 price0X96, uint256 price1X96
+      ) internal pure {
+          if (price1X96 == 0) return;
+          uint256 derivedPoolPriceX96 = FullMath.mulDiv(price0X96, Q96, price1X96);
+          uint256 sqrtResult = Math.sqrt(derivedPoolPriceX96);
+          uint256 scaled = sqrtResult * (2 ** 48);
+          // Debe caber en uint160
+          t(scaled <= type(uint160).max, "VO-M-02: derivedSqrtPriceX96 overflows uint160");
+      }
+
+  - id: VO-M-03
+    tier: 2
+    type: property
+    description: >
+      _requireMaxDifference (línea 167): `differenceX10000 = |priceX96 - verifyPriceX96| * 10000`.
+      Esta multiplicación puede overflow uint256 si |priceX96 - verifyPriceX96| > type(uint256).max / 10000
+      ≈ 2^256 / 10^4 ≈ 1.16e73. En Solidity ^0.8.0 este overflow causaría revert (checked arithmetic),
+      resultando en que _requireMaxDifference siempre reverts cuando los precios son muy grandes,
+      bloqueando efectivamente todas las operaciones del oráculo para ese token.
+      Adicionalmente, si verifyPriceX96 == 1 (un wei), differenceX10000 / verifyPriceX96
+      puede ser un número enorme aunque las diferencias de precio sean pequeñas en términos
+      relativos pero grandes en absoluto, forzando un revert aunque el precio real sea razonable.
+    attack_scenario: >
+      1. Un token de precio muy alto (e.g., un token de índice de mercado con precio
+         expresado en 18 decimales) tiene priceX96 ≈ 2^200.
+      2. En modo CHAINLINK_TWAP_VERIFY, el precio de Chainlink y el TWAP difieren por
+         cualquier cantidad, incluyendo cantidades pequeñas.
+      3. differenceX10000 = |priceX96 - verifyPriceX96| * 10000
+         Si la diferencia es 2^190, differenceX10000 = 2^190 * 10000 ≈ 2^190 * 2^13 = 2^203.
+         Esto es << 2^256, no hay overflow. Sin embargo:
+      4. Si diferencia es > 2^243 (type(uint256).max / 10000), el checked arithmetic de
+         Solidity 0.8 reverts — todas las operaciones del oráculo para ese token quedan DoS.
+      Caso adicional: verifyPriceX96 = 1 (precio de verificación es 1 wei):
+         differenceX10000 / 1 = diferencia * 10000 que puede exceder maxDifferenceX10000
+         aunque el precio real sea "correcto". El oráculo se vuelve inútilmente estricto.
+    solidity: |
+      // Invariant VO-M-03: diferenceX10000 no debe overflow en _requireMaxDifference
+      function invariant_requireMaxDifference_noOverflow(
+          uint256 priceX96, uint256 verifyPriceX96
+      ) internal pure {
+          uint256 diff = priceX96 >= verifyPriceX96
+              ? priceX96 - verifyPriceX96
+              : verifyPriceX96 - priceX96;
+          // Si diff > type(uint256).max / 10000, la multiplicación overflows
+          // y causa revert en checked arithmetic Solidity 0.8
+          t(
+              diff <= type(uint256).max / 10000,
+              "VO-M-03: differenceX10000 multiplication overflow in _requireMaxDifference"
+          );
+      }
+
+  - id: VO-M-04
+    tier: 2
+    type: property
+    description: >
+      _getChainlinkPriceX96 (línea 424): `SafeCast.toUint256(answer) * Q96 / (10**feedDecimals)`.
+      La multiplicación `answer * Q96` ocurre ANTES de dividir por 10^feedDecimals.
+      answer es int256 (precio de Chainlink). Si answer es extremadamente grande
+      (e.g., un oracle precio de 1e38 con feedDecimals=0), answer * Q96 puede overflow uint256.
+      SafeCast.toUint256(answer) convierte int256 -> uint256 (max 2^255-1 para positivos).
+      Multiplicar por Q96=2^96: si answer > 2^160, el resultado > 2^256 y overflow reverts.
+      Para feedDecimals=0 (sin decimales, price en unidades enteras), un oracle que reporta
+      un precio muy alto puede causar DoS permanente.
+      Para feedDecimals=18 (standard ETH pricing), la división posterior previene overflow
+      en muchos casos, pero la multiplicación PREVIA a la división puede igualmente overflow.
+    attack_scenario: >
+      1. Un token configurado con un Chainlink feed de feedDecimals=0 (o feedDecimals=1).
+      2. Si el precio del activo sube extremadamente (o el feed está mal configurado con
+         un raw price sin escalar), answer puede ser > 2^160.
+      3. SafeCast.toUint256(answer) * Q96 overflows uint256 → revert en checked arithmetic.
+      4. Todas las operaciones del oráculo para ese token fallan → liquidaciones bloqueadas.
+      Más probable durante condiciones de mercado extremas o con un feed mal configurado.
+    solidity: |
+      // Invariant VO-M-04: answer * Q96 no debe overflow en _getChainlinkPriceX96
+      function invariant_chainlink_multiplication_noOverflow(
+          int256 answer, uint8 feedDecimals
+      ) internal pure {
+          if (answer <= 0) return; // feed inválido, revertirá antes
+          uint256 answerUint = SafeCast.toUint256(answer);
+          // Q96 = 2^96. Si answerUint > type(uint256).max / Q96, overflow
+          t(
+              answerUint <= type(uint256).max / Q96,
+              "VO-M-04: answer * Q96 overflow in _getChainlinkPriceX96"
+          );
+      }
+
+  - id: VO-M-05
+    tier: 1
+    type: property
+    description: >
+      _getTWAPPriceX96 (línea 435): `poolTWAPPriceX96 = Q96 * Q96 / priceX96`.
+      Esta es la operación de inversión de precio para cuando isToken0==false.
+      Q96 * Q96 = 2^192, que cabe en uint256 (max 2^256-1). No hay overflow aquí.
+      SIN EMBARGO: si priceX96 == 0 (pool no inicializado), hay división por cero →
+      revert silencioso en EVM (Panic 0x12 en Solidity 0.8).
+      _getReferencePoolPriceX96 retorna FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, Q96).
+      Si sqrtPriceX96 == 0 (pool no inicializado o manipulado), retorna 0.
+      Con Aerodrome Slipstream, un pool recién creado puede tener sqrtPriceX96=0
+      antes de la primera inicialización. Si el owner configura ese pool como referencia
+      TWAP antes de que sea inicializado, todas las llamadas a _getTWAPPriceX96 con
+      isToken0=false revertirán, creando un DoS en getValue() y liquidaciones.
+      IMPACTO TIER 1: Si la inversión de precio (token es token1, no token0) se bloquea,
+      todas las posiciones con ese token como token1 no pueden ser valoradas ni liquidadas.
+    attack_scenario: >
+      1. El owner configura un token T con un pool donde T es token1 (isToken0=false).
+      2. El pool referenciado aún no ha sido inicializado (sqrtPriceX96=0 en slot0).
+         O el pool fue manipulado para tener tick en MIN_TICK con sqrtPriceX96=MIN_SQRT_RATIO.
+         (MIN_SQRT_RATIO = 4295128739, priceX96 = MIN_SQRT_RATIO^2/Q96 = ~2.35e11, nonzero)
+      3. Para el caso de pool sin inicializar: priceX96=0 → división por cero en línea 435.
+      4. Todas las operaciones de valoración/liquidación para posiciones con token T fallan.
+      Nota: para tick en MIN_TICK, priceX96 es minúsculo pero nonzero. La división-por-cero
+      pura solo ocurre con pool sin inicializar (edge case real en Aerodrome Slipstream
+      donde el owner puede configurar tokens antes de que los pools tengan liquidez).
+    solidity: |
+      // Invariant VO-M-05: priceX96 del pool reference nunca debe ser 0 cuando isToken0=false
+      function invariant_twap_price_nonzero_for_inversion(
+          IUniswapV3Pool pool, uint32 twapSeconds, bool isToken0
+      ) internal view {
+          if (!isToken0) {
+              uint256 priceX96 = _getReferencePoolPriceX96(pool, twapSeconds);
+              t(priceX96 > 0, "VO-M-05: priceX96==0 causes division by zero in _getTWAPPriceX96");
+          }
+      }
+
+  - id: VO-M-06
+    tier: 2
+    type: property
+    description: >
+      _getReferenceTokenPriceX96 (línea 356): cuando referenceTokenDecimals > feedConfig.tokenDecimals,
+      el cálculo es: `(10**(referenceTokenDecimals - feedConfig.tokenDecimals)) * chainlinkPriceX96 * Q96 / chainlinkReferencePriceX96`.
+      La multiplicación de tres términos ocurre izquierda a derecha sin intermediate overflow checks.
+      chainlinkPriceX96 (línea 424) = answer * Q96 / 10^feedDecimals.
+      Con answer=1e8 (precio $1 con 8 decimals), chainlinkPriceX96 = 1e8 * 2^96 / 1e8 = Q96 = 2^96.
+      10^(referenceTokenDecimals - feedConfig.tokenDecimals) con diff=12: 10^12.
+      10^12 * 2^96 * 2^96 = 10^12 * 2^192.
+      2^192 ≈ 6.3e57. 10^12 * 6.3e57 ≈ 6.3e69 — within uint256 (max ~1.1e77).
+      Para diff=18: 10^18 * 2^192 ≈ 6.3e75 — still within uint256.
+      Para diff=22: 10^22 * 2^192 ≈ 6.3e79 — OVERFLOW uint256!
+      Aunque diff > 18 es poco común (la mayoría de tokens tienen ≤18 decimals),
+      si el referenceToken tiene 20+ decimals y el feedToken tiene 0-2 decimals,
+      la multiplicación overflows y causa revert permanente en el oráculo.
+    attack_scenario: >
+      1. referenceToken configurado con 20 decimals (inusual pero posible en tokens custom).
+      2. feedConfig.tokenDecimals = 0 (token sin decimals, como algunos NFT-wrapped tokens).
+      3. diff = 20 → 10^20 * chainlinkPriceX96 * Q96 overflows uint256 → revert.
+      4. Todo precio en modo Chainlink para ese token reverts → liquidaciones bloqueadas.
+      Más probable: referenceToken con 18 decimals + token con 0 decimals = diff 18,
+      al límite del umbral de overflow (depende del precio exacto de Chainlink).
+    solidity: |
+      // Invariant VO-M-06: multiplicación en chainlink price scaling no debe overflow
+      function invariant_chainlink_decimal_scaling_noOverflow(
+          uint256 chainlinkPriceX96,
+          uint8 referenceTokenDecimals,
+          uint8 tokenDecimals
+      ) internal pure {
+          if (referenceTokenDecimals <= tokenDecimals) return;
+          uint256 diff = referenceTokenDecimals - tokenDecimals;
+          uint256 scale = 10 ** diff;
+          // scale * chainlinkPriceX96 debe no overflow antes de * Q96
+          t(
+              scale == 0 || chainlinkPriceX96 <= type(uint256).max / scale,
+              "VO-M-06: scale*chainlinkPriceX96 overflow in decimal adjustment"
+          );
+          uint256 intermediate = scale * chainlinkPriceX96;
+          t(
+              intermediate <= type(uint256).max / Q96,
+              "VO-M-06: (scale*chainlinkPriceX96)*Q96 overflow in decimal adjustment"
+          );
+      }
+
+  - id: VO-M-07
+    tier: 1
+    type: property
+    description: >
+      _getPoolSlot0 (línea 635): `sqrtPriceX96 = SafeCast.toUint160(word0)`.
+      word0 es el primer word ABI-decoded de la respuesta de slot0().
+      Para Uniswap V3, slot0 ABI-codifica sqrtPriceX96 como uint160 padded a 32 bytes.
+      SafeCast.toUint160(word0) es correcto si word0 ≤ 2^160-1.
+      PERO: para Aerodrome Slipstream, si el ABI encoding de slot0() difiere y
+      el primer word no es sqrtPriceX96 sino otro campo, word0 podría contener un valor
+      > 2^160, causando revert en SafeCast.
+      Más crítico: el código asume que data.length ≥ 64 (línea 624), pero para Aerodrome
+      Slipstream el slot0() podría retornar más campos. Si el primer field es diferente
+      del sqrtPriceX96 de Uniswap V3, la interpretación es incorrecta.
+      Esto podría devolver un sqrtPriceX96 incorrecto → precio incorrecto → posiciones
+      sobrevaluadas o subvaluadas → borrowers pueden pedir demasiado o ser liquidados injustamente.
+    attack_scenario: >
+      1. El protocolo opera en Aerodrome Slipstream (Base mainnet).
+      2. Si la estructura de slot0() de Slipstream difiere del Uniswap V3 estándar,
+         word0 contiene un campo diferente de sqrtPriceX96.
+      3. El precio derivado es incorrecto → _requireMaxDifference puede pasar (si el precio
+         "derivado" incorrecto es cercano al precio oracle), pero los amounts calculados
+         con el sqrtPrice incorrecto son erróneos.
+      4. Posiciones pueden ser subvaluadas → liquidadas injustamente,
+         o sobrevaluadas → permite borrowing excesivo.
+    solidity: |
+      // Invariant VO-M-07: sqrtPriceX96 derivado de slot0 debe estar en rango válido
+      // TickMath.MIN_SQRT_RATIO = 4295128739, MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342
+      function invariant_sqrtPriceX96_inRange(uint160 sqrtPriceX96) internal pure {
+          uint160 MIN_SQRT_RATIO = 4295128739;
+          uint160 MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+          t(sqrtPriceX96 >= MIN_SQRT_RATIO, "VO-M-07: sqrtPriceX96 below MIN_SQRT_RATIO");
+          t(sqrtPriceX96 <= MAX_SQRT_RATIO, "VO-M-07: sqrtPriceX96 above MAX_SQRT_RATIO");
+      }
+
+  - id: VO-M-08
+    tier: 2
+    type: property
+    description: >
+      _getFeeGrowthOutside / _getFeeGrowthInside: el código maneja correctamente el patrón
+      de overflow intencional de Uniswap V3 para fee growth tracking.
+      Sin embargo, en _getUncollectedFees (líneas 584-590), el unchecked block permite
+      que feeGrowth0 = feeGrowthInside0LastX128 - position.feeGrowthInside0LastX128 sea
+      un valor wrap (2^256 - delta). Luego FullMath.mulDiv(feeGrowth0, liquidity, Q128)
+      opera en este valor envuelto.
+      Si feeGrowth0 es exactamente 2^256 - 1 (max uint256) y liquidity = type(uint128).max:
+      mulDiv computa (2^256-1) * (2^128-1) / 2^128. FullMath usa 512-bit arithmetic
+      internamente para evitar overflow → resultado ≈ 2^256 - 2^129 + 1.
+      SafeCast.toUint128(resultado) REVERTS porque resultado >> 2^128.
+      Esto causaría que getFees() revierta para posiciones con fee growth negativo wrap.
+      Aunque el wrap de fee growth es por diseño, la combinación con SafeCast puede DoS
+      la función de fees para posiciones en pools muy activos con fee growth acumulado.
+    attack_scenario: >
+      1. Una posición larga existente en un pool de alta actividad (muchos fees acumulados).
+      2. feeGrowthGlobal ha dado la vuelta completamente (2^256 overflow wrap) una vez.
+      3. El valor guardado feeGrowthInside0LastX128 es mayor que el actual (post-wrap).
+      4. feeGrowth0 en unchecked = current - saved wraps a un valor cerca de 2^256.
+      5. FullMath.mulDiv con ese valor gigante y liquidity alta produce resultado > 2^128.
+      6. SafeCast.toUint128 reverts → getValue() y getPositionBreakdown() fallan.
+      7. Posición no liquidable temporalmente hasta que el pool acumule más fees
+         y el cálculo resulte en valores dentro de uint128.
+    solidity: |
+      // Invariant VO-M-08: fees calculados deben caber en uint128 (no revert en SafeCast)
+      function invariant_fees_fit_uint128(
+          uint256 feeGrowth0, uint256 feeGrowth1, uint128 liquidity
+      ) internal pure {
+          if (liquidity == 0) return;
+          uint256 fees0 = FullMath.mulDiv(feeGrowth0, liquidity, Q128);
+          uint256 fees1 = FullMath.mulDiv(feeGrowth1, liquidity, Q128);
+          t(fees0 <= type(uint128).max, "VO-M-08: fees0 exceeds uint128 max");
+          t(fees1 <= type(uint128).max, "VO-M-08: fees1 exceeds uint128 max");
+      }
+
+  - id: VO-M-09
+    tier: 2
+    type: property
+    description: >
+      getValue (línea 127): `uint256 amount0WithFees = amount0 + fees0`.
+      amount0 es uint256 (de LiquidityAmounts.getAmountsForLiquidity, no bounded explícitamente).
+      fees0 es uint128 (retornado por _getFees). La suma amount0 + fees0 puede overflow uint256
+      solo si amount0 > type(uint256).max - fees0, lo cual es prácticamente imposible
+      ya que amount0 está bounded por la liquidez del pool.
+      Más relevante: `value = _sumMulDiv(state.price0X96, amount0WithFees, ...)`.
+      Si amount0WithFees es extremadamente grande (posición con liquidez máxima),
+      FullMath.mulDiv(price0X96, amount0WithFees, priceTokenX96) puede overflow si el
+      resultado excede uint256. FullMath.mulDiv usa 512-bit arithmetic intermedia y
+      REVERTS si el resultado no cabe en uint256 (invariant: prod1 < denominator).
+      Para que result > uint256: price0X96 * amount0WithFees > type(uint256).max * priceTokenX96.
+      Si priceTokenX96 < price0X96 * amount0WithFees / 2^256 → revert.
+      Esto ocurre cuando el token de denominación es muy barato y la posición es masiva.
+    attack_scenario: >
+      1. priceTokenX96 es un token de muy bajo precio (cerca de 0, e.g., 1 wei).
+      2. price0X96 y amount0WithFees son muy grandes (pool con mucha liquidez y precio alto).
+      3. FullMath.mulDiv reverts porque prod1 >= denominator (priceTokenX96).
+      4. getValue() reverts → liquidaciones bloqueadas para todas las posiciones en ese pool.
+      Nota: FullMath.mulDiv tiene el invariante interno `require(prod1 < denominator)`
+      que previene overflow del resultado, causando un revert explícito.
+    solidity: |
+      // Invariant VO-M-09: FullMath.mulDiv en getValue no debe revert por overflow de resultado
+      // Verificar que price * amount / priceToken cabe en uint256
+      function invariant_getValue_mulDiv_noRevert(
+          uint256 price0X96, uint256 amount0WithFees, uint256 priceTokenX96
+      ) internal pure {
+          if (priceTokenX96 == 0) return;
+          // FullMath.mulDiv reverts si el resultado > uint256.max
+          // Condición: price0X96 * amount0WithFees / priceTokenX96 <= uint256.max
+          // Equivalente: price0X96 * amount0WithFees <= uint256.max * priceTokenX96
+          // En 512-bit: floor(price0X96 * amount0WithFees / 2^256) < priceTokenX96
+          // No podemos calcular esto en Solidity sin 512-bit, usamos FullMath.mulDiv
+          // y atrapamos el revert implícitamente con el invariant
+          uint256 result = FullMath.mulDiv(price0X96, amount0WithFees, priceTokenX96);
+          // Si llegamos aquí, no hubo revert — invariant satisfecho
+          t(result >= 0, "VO-M-09: unreachable, just verify no revert occurred");
+      }
+
+  - id: VO-M-10
+    tier: 2
+    type: property
+    description: >
+      _requireMaxDifference (línea 171): la condición completa es:
+      `(verifyPriceX96 == 0 || differenceX10000 / verifyPriceX96 > maxDifferenceX10000) && maxDifferenceX10000 < type(uint16).max`
+      Si maxDifferenceX10000 == type(uint16).max (65535), el check se desactiva COMPLETAMENTE,
+      permitiendo cualquier diferencia de precio sin revert. Esto es presumably intencional
+      (flag para "no check"), pero crea un punto de confianza en el owner: si el owner
+      configura maxDifference=65535 para un token, las verificaciones cruzadas entre
+      Chainlink y TWAP se omiten, y cualquier precio de oráculo es aceptado sin validación.
+      Un emergencyAdmin malicioso o comprometido que llame setOracleMode() para poner el
+      token en CHAINLINK_TWAP_VERIFY con maxDifference=65535 (ya configurado) podría
+      no proteger contra manipulación de TWAP/Chainlink porque el check se desactiva.
+      Adicionalmente: el check de diferencia usa división entera `differenceX10000 / verifyPriceX96`,
+      que pierde precisión. Si verifyPriceX96 es grande y diferencia es pequeña,
+      differenceX10000 / verifyPriceX96 puede redondear a 0 cuando en realidad la diferencia
+      relativa es significativa (aunque muy pequeña en términos absolutos).
+    attack_scenario: >
+      1. Token T configurado con maxDifference=65535 (check desactivado).
+      2. Un atacante manipula el TWAP pool del token T.
+      3. En modo CHAINLINK_TWAP_VERIFY, el TWAP manipulado se usa como verifyPrice.
+      4. Sin el check de maxDifference, el precio de Chainlink (correcto) pasa la verificación.
+      5. El oráculo reporta el precio de Chainlink (correcto para el main price) pero
+         la falta de verificación TWAP significa que en modo TWAP_CHAINLINK_VERIFY,
+         el precio TWAP manipulado pasaría la verificación de Chainlink también.
+      6. Posiciones sobrevaluadas → borrower puede pedir más de lo colateralizado.
+    solidity: |
+      // Invariant VO-M-10: maxDifference != 65535 para tokens en modo dual-verify
+      // (Policy invariant, no math bug per se)
+      function invariant_maxDifference_not_disabled_for_verify_modes(
+          Mode mode, uint16 maxDifference
+      ) internal pure {
+          if (mode == Mode.CHAINLINK_TWAP_VERIFY || mode == Mode.TWAP_CHAINLINK_VERIFY) {
+              t(
+                  maxDifference < type(uint16).max,
+                  "VO-M-10: maxDifference==65535 disables price verification in dual-oracle mode"
+              );
+          }
+      }

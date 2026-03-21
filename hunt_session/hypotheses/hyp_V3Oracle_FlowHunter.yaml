@@ -1,0 +1,473 @@
+component: V3Oracle
+hunter: FlowHunter
+timestamp: "2026-03-21"
+focus: "DoS via price deviation, sequential oracle failure, fee growth edge cases, factory fallback priority"
+
+hypotheses:
+
+  - id: VO-F-01
+    tier: 1
+    type: liveness_dos
+    severity: HIGH
+    title: "Liquidation DoS via sustained pool price manipulation above maxPoolPriceDifference"
+    description: >
+      In _populatePrices(), after computing the oracle-derived price ratio (price0X96/price1X96),
+      the code calls _requireMaxDifference(priceX96, derivedPoolPriceX96, maxPoolPriceDifference).
+      If the current pool slot0 price diverges from the oracle-derived price by more than
+      maxPoolPriceDifference (e.g. 200 = 2%), the entire call reverts with PriceDifferenceExceeded.
+      This check is hit unconditionally on EVERY call to getValue(), getPositionBreakdown(),
+      and getLiquidityAndFees(). V3Vault.liquidate() calls _checkLoanIsHealthy() → oracle.getValue()
+      and therefore reverts entirely if the pool price is manipulated. A borrower with a position
+      approaching liquidation threshold can flash-loan a large amount to push the pool price outside
+      the maxPoolPriceDifference band, causing liquidate() to revert. The comment in the code
+      ("when a pool is in this state, liquidations will be disabled — but arbitrageurs will move
+      price back") assumes arbitrageurs act within the same block or very quickly. However, on Base
+      (low activity pools), thin liquidity pools, or during periods of low volatility arbitrage
+      interest, the attacker can maintain the deviation for multiple blocks by rebalancing each
+      block with a fresh flash loan. Cost = flash loan fee per block (Balancer: 0 fee, Uniswap: 0.05%
+      on flash). Benefit = avoiding liquidation on a position that may be deeply underwater.
+    attack_scenario: >
+      1. Borrower has position near liquidation. Debt grows via interest. Pool for token0/WETH is
+         thinly traded (e.g. new token, low cap).
+      2. In the same block the liquidator calls liquidate(), attacker (borrower or accomplice) calls
+         a flash loan that moves the pool spot price > maxPoolPriceDifference away from the TWAP.
+         Since _populatePrices uses the CURRENT slot0 price for the deviation check, the check fires.
+      3. liquidate() reverts. Borrower is not liquidated. Interest continues to accrue on a
+         position that is now a bad debt for the vault.
+      4. Flash loan is repaid in same tx. Net cost: flash loan fee only (possibly 0 on Balancer V2).
+      5. This can be repeated every block as long as the position is not force-liquidated.
+      NOTE: The comment in the code acknowledges this by design but the implicit assumption that
+      arbitrageurs always restore price before the next liquidation attempt is NOT guaranteed for
+      illiquid pools. This is the realistic attack surface.
+    cost_benefit: >
+      Cost per block: ~$0 (Balancer flash) to ~0.05% of moved amount (Uniswap flash).
+      Benefit: delay liquidation on e.g. a $100K position for N blocks while debt grows.
+      The protocol accumulates bad debt proportional to delay length. At 1% daily interest rate,
+      24h delay on $100K = $1K extra bad debt. This shifts risk to lenders, not borrower.
+    impact: >
+      Liveness failure for liquidation engine on illiquid pools. Protocol bad debt accumulation.
+      Classified as High because: (a) it requires deliberate attacker action (not just organic price
+      movement), (b) the design comment acknowledges the risk but only mitigates it for liquid pools,
+      (c) on Base with new token listings, thin pools are common.
+    solidity: |
+      // Property: after pool price deviation > maxPoolPriceDifference, liquidate() must not revert
+      // permanently (liveness guarantee). This invariant WILL break if attacker manipulates pool.
+      function prop_liquidationNotBlockedByPriceManipulation(uint256 tokenId) public {
+          // Setup: position is liquidatable (debt > collateralValue)
+          // Attacker: pushes pool spot price > maxPoolPriceDifference from oracle price
+          // Oracle getValue() call inside _checkLoanIsHealthy should revert → liquidate() reverts
+          // This means the invariant "unhealthy positions can always be liquidated" is violated
+          (bool isHealthy, , , ) = _checkLoanIsHealthy(tokenId, loans[tokenId].debt, false);
+          // If !isHealthy, liquidate() must succeed (no revert)
+          // But with manipulated pool price, getValue() reverts before returning isHealthy=false
+          // so the require below would never execute — the revert happens earlier
+          t(!isHealthy, "position is healthy, liquidation not applicable");
+          // Call oracle.getValue directly — if this reverts, liquidation is blocked
+          (bool success, ) = address(oracle).staticcall(
+              abi.encodeWithSignature("getValue(uint256,address,bool)", tokenId, address(asset), false)
+          );
+          t(success, "VO-F-01: oracle.getValue reverted — liquidation is permanently blocked");
+      }
+    verification_notes: >
+      Confirm on Base mainnet: check maxPoolPriceDifference value (likely 200 = 2%).
+      Find pools with low TVL (<$100K) where a $10K-$50K flash push exceeds 2% deviation.
+      Calculate flash loan cost vs. position underwater value to confirm attack is profitable.
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+  - id: VO-F-02
+    tier: 1
+    type: liveness_dos
+    severity: MEDIUM
+    title: "All-or-nothing oracle failure: single stale Chainlink feed blocks all vault operations for a position"
+    description: >
+      _populatePrices() calls _getReferenceTokenPriceX96() for BOTH token0 and token1 sequentially.
+      If either token uses a mode that includes Chainlink (CHAINLINK, CHAINLINK_TWAP_VERIFY,
+      TWAP_CHAINLINK_VERIFY) and its Chainlink feed becomes stale (updatedAt + maxFeedAge < now),
+      _getChainlinkPriceX96() reverts with ChainlinkPriceError. This propagates up through
+      _populatePrices() → getValue() → _checkLoanIsHealthy(), causing ALL of the following to revert:
+        - V3Vault.loanInfo() — UI cannot query position status
+        - V3Vault.borrow() — new borrows impossible
+        - V3Vault.liquidate() — liquidation impossible
+      The critical case: token0 Chainlink feed is stale but token1 feed is fine. There is no
+      fallback to TWAP-only mode at runtime. The oracle does NOT try TWAP if Chainlink fails —
+      it immediately reverts. The emergencyAdmin can call setOracleMode() to change the mode to
+      TWAP, but this requires a manual transaction, likely delayed by hours if the issue happens
+      at an unusual time. During the gap, all positions with that token are frozen.
+    attack_scenario: >
+      Scenario A (organic): Chainlink feed for a non-major token (e.g., an altcoin listed on
+      Revert Lend) misses its heartbeat update window. All positions containing that token as
+      token0 or token1 are frozen for the duration of the outage.
+      Scenario B (adversarial): Attacker monitors Chainlink feeds. When feed update is due but
+      not yet submitted (within maxFeedAge window near expiry), they watch for positions that
+      become liquidatable. If the feed goes stale just before the liquidator acts, liquidation
+      is blocked for up to maxFeedAge seconds (typically 1 hour for volatile, 24h for stable).
+    impact: >
+      Liveness failure. Positions cannot be liquidated during feed outage. This is a known
+      DeFi risk but the severity depends on how long feeds can be stale. With maxFeedAge of
+      24h (for stablecoins like USDC), a 24h oracle outage would freeze the vault for a full day.
+      The emergency admin mechanism is the intended mitigation but requires timely human action.
+    solidity: |
+      // Property: if one token's chainlink feed is stale, getValue() should NOT revert
+      // (it should fall back to TWAP for that token). Currently it DOES revert — this is
+      // the bug if "oracle resilience" is a protocol invariant.
+      function prop_oracleResilientToSingleFeedFailure(uint256 tokenId) public {
+          // Simulate stale chainlink for token0 by warping time past maxFeedAge
+          // Then call oracle.getValue() — if it reverts, the invariant is broken
+          (bool success, ) = address(oracle).staticcall(
+              abi.encodeWithSignature("getValue(uint256,address,bool)", tokenId, address(asset), false)
+          );
+          // With stale feed, success=false is the bug condition
+          // Note: in TWAP mode this would succeed — bug only in CHAINLINK/CHAINLINK_TWAP_VERIFY modes
+          t(success, "VO-F-02: single stale chainlink feed blocks entire oracle, no fallback");
+      }
+    verification_notes: >
+      This is partially by design (conservative oracle behavior). However, the missing fallback
+      makes it a liveness risk under organic conditions. The key question for bounty eligibility
+      is whether the protocol claims oracle resilience or explicitly documents the "freeze on
+      stale feed" behavior. Check audit reports and documentation.
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+  - id: VO-F-03
+    tier: 2
+    type: logic_edge_case
+    severity: LOW
+    title: "Degenerate position tickLower == tickUpper: _getFeeGrowthInside returns incorrect values"
+    description: >
+      In _getFeeGrowthInside(), the three branches are:
+        (1) tickCurrent < tickLower
+        (2) tickLower <= tickCurrent < tickUpper
+        (3) tickCurrent >= tickUpper
+      When tickLower == tickUpper (a degenerate position with zero-width range), both
+      condition (2) and condition (3) match when tickCurrent == tickLower == tickUpper.
+      The code takes branch (2): feeGrowthInside = feeGrowthGlobal - lower - upper.
+      But since lower and upper are the SAME tick, this computes:
+        feeGrowthGlobal - feeGrowthOutside(tick) - feeGrowthOutside(tick)
+        = feeGrowthGlobal - 2 * feeGrowthOutside(tick)
+      This is wrong. For a zero-width range, feeGrowthInside should be 0 (no range to earn fees in).
+      Result: fees0/fees1 calculations for such positions will be incorrect (likely inflated or
+      underflowed due to the unchecked subtraction). The unchecked block means uint256 underflow
+      wraps to a huge number, which then gets passed to FullMath.mulDiv → SafeCast.toUint128,
+      which would overflow/revert on the SafeCast, or produce a massively wrong fee value.
+    attack_scenario: >
+      A user (or attacker) creates a Uniswap V3 position with tickLower == tickUpper (this is
+      technically possible in the NFT manager though the position has zero liquidity and is useless).
+      They deposit this position as collateral in V3Vault. When the vault calls oracle.getValue()
+      or getLiquidityAndFees(), _getFees() → _getUncollectedFees() → _getFeeGrowthInside() runs
+      with tickLower == tickUpper. The SafeCast.toUint128() on the resulting huge wrapped uint256
+      will revert, causing getValue() to revert, which blocks loanInfo() and liquidate() for this
+      tokenId. An attacker could use this to create an unliquidatable "zombie" loan.
+    impact: >
+      DoS for a specific tokenId. If the vault accepts such degenerate positions (no check on
+      tickLower < tickUpper at deposit time), this is a liveness bug for those positions.
+      Severity is LOW-MEDIUM: requires depositing a zero-liquidity position, which the vault
+      should likely reject anyway (collateral value = 0), but the DoS on loanInfo/liquidate
+      is the issue.
+    solidity: |
+      function prop_degeneratePositionFeesDoNotRevert(uint256 tokenId) public {
+          // Load position — if tickLower == tickUpper, fees calculation is degenerate
+          PositionState memory state = _loadPositionState(tokenId);
+          if (state.tickLower == state.tickUpper) {
+              // This should either return (0, 0) or handle gracefully, NOT revert
+              (bool success, ) = address(oracle).staticcall(
+                  abi.encodeWithSignature("getLiquidityAndFees(uint256)", tokenId)
+              );
+              t(success, "VO-F-03: degenerate position (tickLower==tickUpper) causes getLiquidityAndFees revert");
+          }
+      }
+    verification_notes: >
+      Check if V3Vault.create() validates tickLower < tickUpper at deposit. If yes, this path
+      may be unreachable in practice. If no validation exists at deposit, this is exploitable.
+      Also check: does Uniswap NFT manager allow minting with tickLower == tickUpper?
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+  - id: VO-F-04
+    tier: 2
+    type: economic_manipulation
+    severity: MEDIUM
+    title: "Fee snapshot manipulation: collecting fees immediately before borrow understates uncollected fee collateral"
+    description: >
+      getLiquidityAndFees() and getValue() compute uncollected fees by reading the CURRENT pool
+      fee growth accumulators and subtracting the position's stored feeGrowthInside*LastX128.
+      The stored snapshot is only updated when fees are collected (NonfungiblePositionManager.collect()
+      or decreaseLiquidity() with collect). The attack flow:
+        1. Borrower has a position that earns $X in fees per day. These fees count as collateral.
+        2. Before calling V3Vault.borrow(), attacker calls NonfungiblePositionManager.collect() to
+           sweep all accumulated fees INTO tokensOwed0/tokensOwed1 (which updates the snapshot).
+        3. Now the position's feeGrowthInside*LastX128 matches the current pool accumulator.
+        4. The oracle sees uncollected fees ≈ 0. The tokensOwed0/tokensOwed1 from the collect call
+           ARE included in fees0/fees1 (line 562-563: fees0 += state.tokensOwed0), BUT the attacker
+           can also withdraw those by calling collect() again to actually extract the tokens before
+           the oracle is called.
+        5. Wait: tokensOwed is updated in NonfungiblePositionManager.collect(), which sets it to 0
+           after transfer. So if attacker: (a) collect() → gets fees, tokensOwed becomes 0,
+           feeGrowthInsideLast updated, (b) now oracle sees fees ≈ 0, (c) calls borrow().
+           The position's fee contribution to collateral is near-zero at the time of the borrow,
+           even though it will resume earning fees immediately after.
+      This is NOT a direct loss of funds but affects the maximum borrow amount. The position's
+      collateral value is understated at the time of borrow, so the borrower can borrow LESS than
+      they would otherwise. This is actually disadvantageous to the borrower, not the vault.
+      RE-EVALUATION: This is more likely a vault-side issue if getValue(ignoreFees=false) is used
+      for health checks and fees were recently swept. The borrowed amount is based on VALUE at
+      borrow time; if fees are swept then position value drops momentarily, but the borrow already
+      happened. The vault is NOT harmed by this — the borrower just had less collateral when
+      they borrowed. This is probably low/informational.
+    attack_scenario: >
+      More interesting direction: INFLATE fees to borrow MORE.
+      Can an attacker donate fee growth to a pool tick range to inflate feeGrowthInside for a
+      position they control? No — feeGrowthGlobal only increases when actual swaps happen and
+      fees are collected. It cannot be donated externally. So fee inflation requires generating
+      swap volume, which costs swap fees. The cost likely exceeds the borrow benefit.
+    impact: >
+      LOW. The fee manipulation vector doesn't give a clear profit path for the attacker.
+      The design of using oracle fees as collateral is inherently subject to fee volatility.
+    solidity: |
+      // Ghost: track fee value seen by oracle vs. actual fees earned
+      // If fees are swept in same block as borrow, fee collateral = 0 momentarily
+      // But this is by design — fees are not locked collateral
+      function prop_feeCollateralAccountingConsistency(uint256 tokenId) public {
+          (, uint128 fees0Before, uint128 fees1Before) = oracle.getLiquidityAndFees(tokenId);
+          // After collect() by owner, fees should be 0 or reflect new state
+          (, uint128 fees0After, uint128 fees1After) = oracle.getLiquidityAndFees(tokenId);
+          // No strict assertion — this is tracking behavior, not a hard invariant
+          // fees0After should equal tokensOwed0 + new feeGrowthInside * liquidity / Q128
+          _ = fees0Before; _ = fees1Before; _ = fees0After; _ = fees1After;
+      }
+    verification_notes: >
+      This finding is probably LOW/INFORMATIONAL. The protocol is aware fees are transient collateral.
+      The real question is whether the fee floor (minLoanSize) protects against positions that
+      only have fee value and no liquidity value.
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+  - id: VO-F-05
+    tier: 1
+    type: wrong_pool_used
+    severity: MEDIUM
+    title: "Aerodrome factory takes priority over Uniswap V3: wrong pool used if tick spacing collision exists"
+    description: >
+      In _getPool(), the code queries the Aerodrome factory first using _toTickSpacing(fee) which
+      is a bitcast of uint24 fee → int24 tickSpacing. If the Aerodrome factory returns a non-zero
+      address for those parameters, that pool is used WITHOUT further validation. The Uniswap V3
+      factory is only tried if Aerodrome returns address(0).
+      The collision risk: Aerodrome's getPool(tokenA, tokenB, tickSpacing) uses int24 tickSpacing.
+      Uniswap V3's getPool(tokenA, tokenB, fee) uses uint24 fee. For the most common Uniswap fee
+      tiers (500, 3000, 10000), these map to tickSpacing values of 500, 3000, 10000. Aerodrome
+      also has pools with these exact tickSpacings. So for a WETH/USDC pair:
+        - Uniswap V3 WETH/USDC 0.3% fee → fee=3000
+        - Aerodrome WETH/USDC tickSpacing=3000 (if one exists or is deployed by attacker)
+      If an attacker can deploy an Aerodrome pool with the same token pair and a tickSpacing
+      matching a Uniswap fee tier, _getPool() will return the Aerodrome pool instead of the
+      Uniswap one. This could be exploited if:
+        (a) The Aerodrome pool is low-liquidity and easily manipulated
+        (b) The oracle config sets a Uniswap pool as the reference but _getPool() returns
+            the Aerodrome pool at runtime
+      The result: the TWAP oracle reads from a pool that may have different liquidity, different
+      price history, and is more easily manipulated.
+    attack_scenario: >
+      1. Protocol configures token X with TWAP reference pool = Uniswap WETH/X at fee=3000.
+      2. Attacker deploys an Aerodrome WETH/X pool with tickSpacing=3000 (which == fee value 3000).
+      3. The Aerodrome factory registers this at getPool(WETH, X, 3000) → returns attacker's pool.
+      4. When V3Oracle calls _getPool(WETH, X, 3000), it gets the Aerodrome pool (thin/no liquidity).
+      5. The pool observe() call for TWAP returns manipulated tick cumulative data from the empty
+         Aerodrome pool. Oracle price is now attacker-controlled.
+      IMPORTANT: This requires the Aerodrome factory address to be the same as the NonfungiblePositionManager.factory(). On Base, Aerodrome's factory and Uniswap V3's factory are DIFFERENT addresses. The `factory` field is set in constructor from nonfungiblePositionManager.factory() — so it's the Uniswap/Aerodrome NonfungiblePositionManager factory, not both. Need to verify deployment context to confirm if both factory types are actually queried against the same address.
+    impact: >
+      If the factory address is Uniswap V3 factory, the Aerodrome static call for getPool with
+      tickSpacing selector will likely fail or return address(0) (different ABI). In that case
+      the Aerodrome branch is a no-op and the bug doesn't manifest.
+      If the factory IS Aerodrome's factory (configured with Aerodrome's NFT manager), then the
+      Uniswap V3 branch is used as fallback but won't find a matching pool by fee.
+      The actual risk: the oracle is deployed in a context where BOTH Aerodrome AND Uniswap pools
+      exist and the factory responds to BOTH selectors. This needs on-chain verification.
+    solidity: |
+      function prop_correctPoolUsed(uint256 tokenId) public {
+          // Load position and get pool via oracle
+          // Verify: pool returned is the configured reference pool, not an alternative
+          PositionState memory state = _loadPositionState(tokenId);
+          // The pool in state.pool should match the configured feedConfig[token0/token1].pool
+          TokenConfig memory config0 = feedConfigs[state.token0];
+          if (address(config0.pool) != address(0)) {
+              // If configured pool != actual pool used, oracle uses wrong reference
+              // This can happen if factory responds differently to Aerodrome vs Uniswap selector
+              // Hard to test without knowing factory behavior — note for manual review
+          }
+          t(true, "VO-F-05: factory fallback order may cause wrong pool to be used");
+      }
+    verification_notes: >
+      MANUAL CHECK REQUIRED: On Base mainnet, determine what address is set as `factory` in the
+      deployed V3Oracle. Check if this factory address responds to BOTH Aerodrome's getPool
+      (with tickSpacing) AND Uniswap's getPool (with fee). If the factory only supports one
+      interface, the other branch is dead code and the collision is impossible.
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+  - id: VO-F-06
+    tier: 2
+    type: out_of_range_fees
+    severity: LOW
+    title: "getLiquidityAndFees uses live pool tick for out-of-range positions, which may diverge from oracle tick"
+    description: >
+      _getFees() calls _getUncollectedFees(state, state.tick) where state.tick comes from
+      _loadPositionState() → _getPoolSlot0(state.pool), which reads the CURRENT live slot0 tick.
+      Meanwhile, getValue() calls _populatePrices() which then sets state.derivedSqrtPriceX96
+      from the oracle-derived price (not the pool price). However, _getFees() is called AFTER
+      _populatePrices() but uses the live tick, not the oracle-derived tick, to compute
+      feeGrowthInside. This creates an inconsistency:
+        - Liquidity amounts are computed using derivedSqrtPriceX96 (oracle price)
+        - Fee amounts are computed using the live pool tick (spot price)
+      For out-of-range positions, the live tick determines which branch of _getFeeGrowthInside
+      executes. If the oracle says the price is in range but the pool says it's out of range
+      (or vice versa), the fee calculation uses a different branch than the position's actual
+      economic state as seen by the oracle.
+      This is a minor inconsistency — in most cases, oracle price ≈ pool price (within
+      maxPoolPriceDifference), so the branch selection is the same. But at the boundary
+      (tick exactly at tickLower or tickUpper), the two prices could disagree on in-range status.
+    attack_scenario: >
+      Position has tickLower=100, tickUpper=200. Oracle says tick=150 (in range).
+      Pool spot says tick=201 (just above tickUpper, out of range). Since maxPoolPriceDifference
+      allows a 2% divergence, both could be valid simultaneously at boundary conditions.
+      _getFees() uses the pool tick (201), so it takes the "tickCurrent >= tickUpper" branch.
+      _getAmounts() uses the oracle-derived price (tick=150), so it computes both token0 and
+      token1 amounts as if the position is in range. The fee accounting and liquidity accounting
+      use different assumptions about whether the position is in range — a minor inconsistency
+      that could affect collateral value calculations.
+    impact: >
+      LOW. The inconsistency is small (bounded by maxPoolPriceDifference) and the fee values
+      are a small fraction of total position value. Not exploitable for significant fund theft.
+      Edge case that could cause minor valuation errors at tick boundaries.
+    solidity: |
+      function prop_feeAndAmountOracleConsistency(uint256 tokenId) public {
+          PositionState memory state = _loadPositionState(tokenId);
+          _populatePrices(state);
+          // Oracle-derived tick vs live pool tick
+          int24 oracleTick = TickMath.getTickAtSqrtRatio(state.derivedSqrtPriceX96);
+          int24 poolTick = state.tick;
+          // If one is in range and other is out: fee/amount inconsistency
+          bool oracleInRange = oracleTick >= state.tickLower && oracleTick < state.tickUpper;
+          bool poolInRange = poolTick >= state.tickLower && poolTick < state.tickUpper;
+          // Inconsistency: fee calculation uses pool tick, amount calculation uses oracle tick
+          // This is the invariant we're testing — they SHOULD agree on in-range status
+          t(oracleInRange == poolInRange, "VO-F-06: oracle and pool disagree on in-range status, fee/amount inconsistency");
+      }
+    verification_notes: >
+      The maxPoolPriceDifference check in _populatePrices() bounds the divergence but does not
+      prevent tick-boundary inconsistencies. Test with positions exactly at tick boundaries.
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+  - id: VO-F-07
+    tier: 1
+    type: griefing_dos
+    severity: MEDIUM
+    title: "_getPool returns address(0) silently when pool not found, causing invalid pool operations later"
+    description: >
+      In _getPool(), if BOTH factory lookups fail (Aerodrome returns address(0) AND Uniswap V3
+      lookup also returns address(0) or fails), the function returns IUniswapV3Pool(address(0)).
+      This return value is stored in state.pool and then immediately used in:
+        _getPoolSlot0(state.pool) → does a staticcall to address(0)
+      address(0).staticcall() in Solidity/EVM: staticcall to address(0) is a precompile call
+      that succeeds but returns empty data. The _getPoolSlot0 check is:
+        "if (!success || data.length < 64) revert InvalidPool()"
+      Since the precompile at address(0) returns empty data (length 0), data.length < 64 is true
+      and InvalidPool() is reverted. So the error is caught. However, this means: any position
+      where the underlying pool cannot be found via the factory causes getValue() to revert with
+      InvalidPool, which has the same effect as VO-F-01/VO-F-02 — DoS on liquidation.
+      This can happen if: (a) the pool was removed from the factory registry (not possible in
+      Uniswap V3 — pools are immutable), (b) the position uses a fee tier not recognized by either
+      factory, (c) the _toTickSpacing cast produces a negative int24 that the Aerodrome factory
+      rejects silently.
+    attack_scenario: >
+      Edge case: a position is minted with an unusual fee tier (e.g., fee=1000 which is a valid
+      Uniswap V3 fee tier added later). The oracle was deployed when only fee tiers 500/3000/10000
+      existed, and the Aerodrome factory doesn't recognize tickSpacing=1000. If the Uniswap V3
+      factory call also fails (wrong selector on the Aerodrome factory address), _getPool returns
+      address(0). All oracle operations for such a position revert, blocking liquidation.
+    impact: >
+      Low-Medium. Requires an unusual pool configuration. But demonstrates that the oracle has
+      no graceful degradation path when pool resolution fails.
+    solidity: |
+      function prop_poolResolutionNeverReturnsZeroAddress(uint256 tokenId) public {
+          PositionState memory state = _loadPositionState(tokenId);
+          t(address(state.pool) != address(0), "VO-F-07: _getPool returned address(0), oracle operations will revert");
+      }
+    verification_notes: >
+      Check on-chain: what fee tiers are used by positions currently deposited in V3Vault?
+      Verify that _toTickSpacing(fee) produces valid positive int24 for all used fee tiers.
+    finding_pipeline_status:
+      code_read: true
+      invariant_generated: true
+      foundry_fuzz: false
+      tolerance_tuning: false
+      poc_runnable: false
+      medusa_stateful: false
+      echidna_optimization: false
+      redteam: false
+      verify_code: false
+
+summary:
+  high_priority: [VO-F-01, VO-F-02]
+  medium_priority: [VO-F-05, VO-F-07]
+  low_priority: [VO-F-03, VO-F-04, VO-F-06]
+  key_finding: >
+    VO-F-01 is the most actionable finding: the maxPoolPriceDifference check creates a
+    deliberate but incomplete DoS protection. It protects AGAINST oracle manipulation by
+    reverting, but the side effect is that it ENABLES liquidation DoS by a motivated borrower
+    who can cheaply maintain pool price deviation on illiquid pools. The cost-benefit analysis
+    favors the attacker on thin pools. This is worth PoC verification on Base mainnet with
+    actual pools to confirm feasibility.
+  next_steps:
+    - "Fork Base mainnet and test VO-F-01 on a real low-liquidity pool pair used as collateral"
+    - "Verify deployed oracle factory address on Base to confirm VO-F-05 is applicable"
+    - "Check V3Vault.create() for tickLower < tickUpper validation to assess VO-F-03 reachability"
+    - "Calculate flash loan cost for a 2% pool price move on the smallest pool accepted as collateral"

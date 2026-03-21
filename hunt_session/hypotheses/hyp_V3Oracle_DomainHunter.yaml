@@ -1,0 +1,623 @@
+component: V3Oracle
+hunter: DomainHunter
+timestamp: "2026-03-21"
+focus: >
+  Oracle-Vault interaction surface: fee double-counting in staked/unstaked transitions,
+  derivedSqrtPriceX96 overvaluation of out-of-range positions, getLiquidityAndFees vs
+  getValue inconsistency during liquidation, oracle mode race conditions, and uninitialized
+  tick fee growth handling.
+
+# ─────────────────────────────────────────────────────────────────
+# DEEP ANALYSIS NOTES
+#
+# _checkLoanIsHealthy (V3Vault line 1423-1434):
+#   ignoreFees = _isStaked(tokenId)           ← staked → ignoreFees=true
+#   (fullValue, feeValue,,) = oracle.getValue(tokenId, asset, ignoreFees)
+#   collateralValue = fullValue * collateralFactorX32 / Q32
+#
+# getValue (V3Oracle line 101-135):
+#   When ignoreFees=true: fees0=fees1=0, feeValue=0
+#   value = price(amount0 + 0) + price(amount1 + 0)   ← fees excluded from value too
+#   CRITICAL: fullValue itself is LOWER when ignoreFees=true
+#
+# _getAmounts (V3Oracle line 549-557):
+#   Uses derivedSqrtPriceX96 (oracle-derived, NOT pool sqrtPrice)
+#   LiquidityAmounts.getAmountsForLiquidity(derivedSqrtPriceX96, sqrtLower, sqrtUpper, liq)
+#
+# _getFees (V3Oracle line 560-564):
+#   fees = _getUncollectedFees(state, state.tick) + tokensOwed0/1
+#   Uses actual pool TICK (not oracle-derived tick) for fee growth computation
+#
+# _sendPositionValue (V3Vault line 1102-1144):
+#   (liquidity, fees0, fees1) = oracle.getLiquidityAndFees(tokenId)   ← line 1120
+#   getLiquidityAndFees also calls _getFees → uses actual pool tick
+#   liquidationValue split between fees and liquidity is based on feeValue
+#   from _checkLoanIsHealthy, which used getValue(ignoreFees=false) for NON-staked.
+#
+# liquidate() flow (V3Vault line 726-792):
+#   1. _checkLoanIsHealthy(tokenId, debt, false)   → fullValue, feeValue
+#      - If staked: ignoreFees=true → feeValue=0, fullValue excludes fees
+#   2. _unstakeIfNeeded(tokenId)                   → position unstaked HERE
+#   3. _calculateLiquidation(debt, fullValue, collateralValue)
+#   4. _sendPositionValue(tokenId, liquidationValue, fullValue, feeValue, ...)
+#      - calls oracle.getLiquidityAndFees → NOW fees are accessible (unstaked)
+#      - feeValue passed is STILL 0 (from step 1, staked valuation)
+# ─────────────────────────────────────────────────────────────────
+
+hypotheses:
+  - id: VO-D-01
+    tier: 1
+    type: logic_bug
+    title: "Liquidation of staked position: fees counted in position value after unstake but feeValue=0 causes wrong collateral split"
+    severity_estimate: medium
+    description: >
+      In liquidate() (V3Vault line 742-770), the health check at line 742 calls
+      _checkLoanIsHealthy with the position STILL STAKED, so ignoreFees=true and
+      oracle.getValue returns fullValue WITHOUT fees (feeValue=0, fees excluded from
+      fullValue too — V3Oracle line 112-114 and 127-128 show fees0=fees1=0 when
+      ignoreFees=true, so amount0WithFees=amount0, value excludes fee component entirely).
+
+      Then at line 748 _unstakeIfNeeded() is called, making the position return to the
+      NonfungiblePositionManager. At line 770, _sendPositionValue is called with
+      feeValue=0 (the value computed pre-unstake). Inside _sendPositionValue line 1120,
+      oracle.getLiquidityAndFees(tokenId) now returns the REAL fees (position is unstaked,
+      the underlying Aerodrome pool has accumulated fee growth). The branch at line 1127-1132
+      computes:
+        liquidity = (liquidationValue - feeValue) * liquidity / (fullValue - feeValue)
+      With feeValue=0, the numerator is liquidationValue and denominator is fullValue.
+      But fullValue was computed WITHOUT fees — it understates the true position value.
+
+      The result: the liquidator receives a disproportionate fraction of liquidity because
+      the liquidationValue/fullValue ratio is computed on a fee-excluding basis, while the
+      ACTUAL position also contains real fees that the liquidator collects via the
+      collect() call in _sendPositionValue. The liquidator collects fees0/fees1 =
+      type(uint128).max (all fees) if liquidationValue > feeValue (=0), while only paying
+      liquidatorCost computed on the fee-excluding fullValue.
+
+      Concretely: if a staked position has real value 100 USDC (80 liquidity + 20 fees),
+      but health check sees fullValue=80 (ignoreFees=true), the liquidation penalty is
+      applied to 80, yet the liquidator extracts 80-worth of liquidity PLUS all 20 fees,
+      receiving up to 100 USDC worth of collateral while the debt covered is ~80 USDC.
+      The extra 20 USDC comes effectively from the borrower's equity (or from reserves).
+
+    attack_scenario: >
+      1. Attacker opens a large LP position in an Aerodrome Slipstream gauge, deposits it
+         into V3Vault as collateral, borrows near the maximum (position just barely healthy
+         when fees are included).
+      2. Attacker (or anyone) stakes the position via stakePosition(). Health is re-checked
+         post-stake on ignoreFees=true basis (line 1390-1393), so the position is now
+         "healthier" by the fee exclusion — staking is accepted.
+      3. Time passes. Significant uncollected fees accumulate in the gauge.
+      4. An external price move (or natural interest accrual) makes the loan unhealthy under
+         the staked valuation (fullValue_without_fees < debt / collateralFactor). Note: fees
+         might have been the margin that kept it healthy.
+      5. Liquidator calls liquidate(). Health check at step 742 uses ignoreFees=true →
+         fullValue=80, feeValue=0. _unstakeIfNeeded() releases the position with fees.
+      6. _sendPositionValue receives feeValue=0, so liquidationValue - feeValue =
+         liquidationValue, fullValue - feeValue = fullValue (both without fees).
+         The liquidity fraction taken = liquidationValue / fullValue, applied to full
+         liquidity. THEN fees0/fees1 = type(uint128).max → all fees also collected.
+      7. Liquidator gains: (liquidationValue/fullValue * liquidity_tokens) + ALL fees.
+         This exceeds what the debt+penalty formula intended them to receive, harming the
+         borrower's residual equity.
+
+    affected_lines:
+      - "V3Vault.sol:742 — _checkLoanIsHealthy with staked=true → ignoreFees=true"
+      - "V3Vault.sol:748 — _unstakeIfNeeded changes position state BEFORE _sendPositionValue"
+      - "V3Vault.sol:770-771 — _sendPositionValue called with feeValue=0 from pre-unstake"
+      - "V3Vault.sol:1127-1131 — liquidity split uses feeValue=0, misses real fees"
+      - "V3Vault.sol:1129-1130 — fees0/fees1 = type(uint128).max → all real fees collected"
+      - "V3Oracle.sol:112-114 — ignoreFees=true zeroes fees0/fees1"
+      - "V3Oracle.sol:127-129 — fullValue = price*(amount0+0) + price*(amount1+0), fees excluded from value"
+
+    poc_sketch: |
+      // Foundry fork test (Base mainnet, Aerodrome Slipstream)
+      // 1. Mint Slipstream LP position (in-range WETH/USDC pool)
+      // 2. deposit() into V3Vault
+      // 3. borrow() near collateral limit (health factor ~1.0 with fees included)
+      // 4. stakePosition() — health re-checked on ignoreFees basis, accepted
+      // 5. vm.warp(30 days) → fees accumulate on-gauge
+      // 6. vm.mockCall oracle to push WETH price down 5% (just unhealthy without fees)
+      // 7. liquidate() → assert amount0+amount1 value > debt + MAX_LIQUIDATION_PENALTY
+      // 8. Assert borrower residual collateral = 0 (should be > 0)
+
+    solidity: |
+      // Property: after liquidating a staked position,
+      // the value extracted by liquidator ≤ liquidationValue computed by _calculateLiquidation
+      function invariant_staked_liquidation_no_fee_windfall() external {
+          // ghost: track pre-liquidation position value including fees (unstaked valuation)
+          (uint256 fullValueWithFees,,,) = oracle.getValue(tokenId, asset, false);
+          // ghost: liquidator received amount0, amount1 (valued at oracle prices)
+          uint256 liquidatorGained = _valueAt(amount0, amount1);
+          // ghost: liquidationValue from _calculateLiquidation
+          // invariant: liquidatorGained should not exceed liquidationValue computed on fullValueWithFees
+          t(liquidatorGained <= expectedLiquidationValue, "fee windfall in staked liquidation");
+      }
+
+    confidence: medium
+    needs_fork_confirmation: true
+    notes: >
+      The key question is whether the fee overpayment is intentional (borrower forfeits
+      fees on liquidation) or a bug. Given that non-staked positions DO pass ignoreFees=false
+      (fees included in fullValue and feeValue), the asymmetry seems unintentional.
+      The staked path was added later (comment at line 1428: "Staked Slipstream positions
+      pass ignoreFees=true"). The _sendPositionValue function was not updated to recompute
+      feeValue post-unstake.
+
+  - id: VO-D-02
+    tier: 1
+    type: property
+    title: "derivedSqrtPriceX96 overstates out-of-range position value vs actual liquidatable value"
+    severity_estimate: high
+    description: >
+      _getAmounts (V3Oracle line 549-557) calls LiquidityAmounts.getAmountsForLiquidity
+      with derivedSqrtPriceX96 — the price derived from the oracle (Chainlink/TWAP), NOT
+      the actual pool sqrtPriceX96.
+
+      When a position is OUT OF RANGE (pool price is outside [tickLower, tickUpper]),
+      getAmountsForLiquidity returns amount0 or amount1 = 0 (fully in one token). But if
+      derivedSqrtPriceX96 is INSIDE the range while the actual pool sqrtPriceX96 is
+      outside, the oracle will compute a "theoretical in-range" amount split and show
+      HIGHER value than the position actually delivers.
+
+      Example: position range is tick [-1000, 1000]. Actual pool tick = 1200 (above range,
+      fully in token0). Oracle-derived price corresponds to tick 800 (inside range due to
+      TWAP lag or Chainlink feed latency). Oracle computes amounts as if tick=800 → shows
+      both amount0 AND amount1 (mixed), which sums to MORE than just amount0 at tick=1200.
+      This happens because in-range liquidity has higher total value than fully-concentrated
+      one-sided liquidity at the oracle price.
+
+      Wait — actually this needs careful math. In-range at derivedPrice tick=800:
+        amount0 = L * (sqrtUpper - derivedSqrt) / (derivedSqrt * sqrtUpper)
+        amount1 = L * (derivedSqrt - sqrtLower)
+      Fully in token0 at actual tick=1200:
+        amount0 = L * (sqrtUpper - sqrtLower) / (sqrtLower * sqrtUpper)  [approx]
+      The sum valued at oracle prices: when oracle says price is at tick=800 inside the
+      range, the two-sided amount IS the correct economic value at that oracle price. The
+      discrepancy is not about sum-at-oracle-price being higher, but about whether the
+      oracle price accurately reflects what you'd receive if you closed the position NOW
+      at current pool conditions.
+
+      The real risk: if pool price diverges significantly from oracle price AND the position
+      is near a range boundary, the oracle valuation can SIGNIFICANTLY exceed the value
+      a liquidator would actually collect from the position. The liquidator receives tokens
+      at the POOL price (via decreaseLiquidity which uses pool sqrtPrice), not at the
+      oracle price. So collateralValue can exceed realizable collateral value.
+
+      This is fundamentally a design tension (oracle protects against manipulation, but
+      creates oracle-pool divergence risk), but maxPoolPriceDifference check (line 529)
+      bounds this to maxPoolPriceDifference bps. At 2% max difference, the overstatement
+      is bounded. However, the CHECK uses slot0 (current pool tick), not a TWAP of the pool,
+      so a manipulated slot0 close to derivedPoolPrice can pass the check while the
+      position's true liquidatable value differs.
+
+    attack_scenario: >
+      1. Borrower creates position in a low-liquidity pool with range [tickLower, tickUpper].
+      2. Actual pool price is at tickUpper + ε (just outside range, fully in token0).
+      3. Oracle TWAP (30-min average) is at tickUpper - ε (just inside range, mixed amounts).
+      4. Oracle sees position as IN-RANGE → computes high collateral value.
+      5. Borrower borrows near full collateral value.
+      6. Position becomes truly worth less (one-sided, at pool price).
+      7. Loan is unhealthy at real value but oracle still shows "healthy" due to TWAP lag.
+      8. No one can liquidate until TWAP catches up. During this window, borrower's
+         under-collateralized debt accrues interest, increasing bad debt risk.
+      Note: maxPoolPriceDifference bounds the DIVERGENCE but does NOT catch TWAP lag at
+      range boundaries where small price moves cause large amount composition changes.
+
+    affected_lines:
+      - "V3Oracle.sol:525-532 — derivedPoolPrice from oracle prices, not pool price"
+      - "V3Oracle.sol:549-557 — _getAmounts uses derivedSqrtPriceX96"
+      - "V3Oracle.sol:527-529 — _requireMaxDifference checks pool vs derived, allows maxPoolPriceDifference"
+
+    solidity: |
+      // Invariant: oracle fullValue should not exceed actual position value
+      // (amounts if closed at pool price) by more than maxPoolPriceDifference tolerance
+      function invariant_oracle_value_vs_realizable_value(uint256 tokenId) external view {
+          (uint256 oracleValue,,,) = oracle.getValue(tokenId, asset, false);
+          // compute value at actual pool sqrtPrice
+          PositionState memory s = _loadPositionState(tokenId);
+          (uint256 a0, uint256 a1) = LiquidityAmounts.getAmountsForLiquidity(
+              s.sqrtPriceX96, s.sqrtPriceX96Lower, s.sqrtPriceX96Upper, s.liquidity
+          );
+          (uint128 f0, uint128 f1) = _getFees(s);
+          uint256 poolValue = _sumMulDiv(s.price0X96, a0+f0, s.price1X96, a1+f1, priceTokenX96);
+          // allow maxPoolPriceDifference tolerance
+          t(
+              oracleValue <= poolValue * (10000 + maxPoolPriceDifference) / 10000,
+              "oracle overstates realizable collateral value"
+          );
+      }
+
+    confidence: medium
+    needs_fork_confirmation: true
+    notes: >
+      This is a DESIGN TENSION partially mitigated by maxPoolPriceDifference. The real
+      finding strength depends on whether maxPoolPriceDifference is set conservatively
+      enough. If set to 200 (2%), at range boundaries the divergence can be amplified
+      significantly (price moves 2% but amount0/amount1 composition changes dramatically
+      due to nonlinear liquidity math). Worth testing with positions near tick boundaries.
+
+  - id: VO-D-03
+    tier: 1
+    type: logic_bug
+    title: "_getFees uses actual pool tick but getValue amounts use derivedSqrtPriceX96: feeValue vs liquidation split inconsistency"
+    severity_estimate: low
+    description: >
+      getValue (V3Oracle line 109-131) computes amounts using derivedSqrtPriceX96
+      (oracle-derived, line 554) but computes fees using _getFees (line 113) which calls
+      _getUncollectedFees with state.tick — the ACTUAL pool tick (loaded in
+      _loadPositionState line 511 via _getPoolSlot0).
+
+      This inconsistency means:
+      - amounts (amount0, amount1) are computed at ORACLE tick
+      - fees (fees0, fees1) are computed at ACTUAL pool tick
+
+      When pool tick ≠ oracle tick (which is always the case by design, oracle uses TWAP),
+      the fee growth inside calculation in _getFeeGrowthInside uses the actual tick to
+      determine which bracket applies (tickCurrent < tickLower, in-range, or above tickUpper,
+      lines 609-618). This means if actual tick is ABOVE tickUpper but oracle tick is
+      in-range (or vice versa), the fee accumulation formula switches branches:
+      - Actual tick above range: feeGrowthInside = upperOutside - lowerOutside
+      - Oracle in-range: would use global - lower - upper
+      The fees computation is correct (it uses actual tick, which is what Uniswap uses),
+      but the AMOUNTS are computed at a different tick. The combined value = amounts_at_oracle
+      + fees_at_actual is a hybrid that doesn't correspond to any single consistent state.
+
+      In _sendPositionValue (line 1120-1131), the feeValue is used to split the
+      liquidationValue between fees and liquidity. The fees and liquidity amounts come from
+      getLiquidityAndFees which also uses actual tick for fees. This is CONSISTENT within
+      _sendPositionValue. The INCONSISTENCY is between fullValue (hybrid oracle+actual) and
+      the actual collectable amounts (all at actual pool price).
+
+      Net practical impact: the ratio feeValue/fullValue can be distorted when oracle and
+      actual ticks disagree, causing the wrong proportion of liquidity to be taken vs fees.
+
+    attack_scenario: >
+      1. Position range [tickLower, tickUpper]. Large fees accumulated (position in-range
+         for long time). Actual pool tick is slightly above tickUpper (just out of range).
+      2. Oracle TWAP tick is inside range (TWAP lag).
+      3. oracle.getValue: amounts computed at oracle tick (in-range, gives both token0+token1).
+         fees computed at actual tick (above range: feeGrowthInside = upperOutside-lowerOutside).
+      4. fullValue = large (in-range amounts + fees). feeValue = some amount.
+      5. Liquidation: _sendPositionValue uses this feeValue ratio.
+         getLiquidityAndFees also returns actual fees (same branch). But fullValue was
+         computed at oracle tick while actual liquidity amounts (from decreaseLiquidity)
+         will be at actual pool tick (out-of-range = one token only).
+      6. Liquidator receives fewer tokens than feeValue + liquidity_value_oracle suggested.
+         If liquidatorCost was set based on oracle value, liquidator may get less than paid.
+
+    affected_lines:
+      - "V3Oracle.sol:109 — _getAmounts uses derivedSqrtPriceX96 (oracle tick)"
+      - "V3Oracle.sol:113 — _getFees uses state.tick (actual pool tick)"
+      - "V3Oracle.sol:560-564 — _getFees calls _getUncollectedFees(state, state.tick)"
+      - "V3Oracle.sol:567 — _getUncollectedFees receives actual tick parameter"
+
+    solidity: |
+      // Invariant: feeValue / fullValue ratio should be consistent with
+      // what getLiquidityAndFees returns relative to full position
+      function invariant_fee_ratio_consistency(uint256 tokenId) external view {
+          (uint256 fullValue, uint256 feeValue,,) = oracle.getValue(tokenId, asset, false);
+          (uint128 liq, uint128 f0, uint128 f1) = oracle.getLiquidityAndFees(tokenId);
+          // If feeValue > 0, then fees must be > 0 from getLiquidityAndFees
+          if (feeValue > 0) {
+              t(f0 > 0 || f1 > 0, "feeValue > 0 but getLiquidityAndFees returns no fees");
+          }
+          // feeValue should be <= fullValue
+          t(feeValue <= fullValue, "feeValue exceeds fullValue");
+      }
+
+    confidence: low
+    notes: >
+      The fees branch selection (above/below/in-range) depends on actual tick, which IS
+      correct for fee accounting. The issue is more subtle: the mixed oracle/actual tick
+      valuation doesn't map to a realizable state. This is likely a design choice rather
+      than a bug — fees ARE at actual tick, amounts ARE at oracle price. Low severity.
+
+  - id: VO-D-04
+    tier: 2
+    type: access_control
+    title: "Oracle mode race: setTokenConfig or setOracleMode between borrow and health check"
+    severity_estimate: low
+    description: >
+      setTokenConfig (V3Oracle line 242) and setOracleMode (line 292) can be called by owner
+      or emergencyAdmin at any time without timelock. If the mode changes between when
+      a borrower's transaction is submitted and when it executes, the price calculation
+      changes. More relevantly: if owner changes a token from CHAINLINK_TWAP_VERIFY to
+      TWAP mode (no Chainlink verify), a borrower could exploit a manipulated TWAP pool
+      in a window where only TWAP is used.
+
+      Similarly, setTokenConfig can change twapSeconds (e.g., from 1800 to 60 seconds),
+      making the TWAP much more manipulable. In the same block, an attacker who controls
+      the pool could have moved the price and then borrowed against inflated collateral.
+
+      The check at _requireMaxDifference (line 529) compares pool price vs derived price,
+      but if twapSeconds is 60, the "derived price" can be the current slot0 price which
+      an attacker just manipulated.
+
+    attack_scenario: >
+      1. Attacker monitors mempool for owner setTokenConfig transactions reducing twapSeconds.
+      2. Front-runs or same-block: manipulates TWAP reference pool price upward.
+      3. setTokenConfig executes with short twapSeconds.
+      4. Attacker calls borrow() with inflated collateral value based on manipulated TWAP.
+      5. This requires either owner cooperation (trust issue) or owner being front-run
+         (very difficult to exploit reliably — admin-dependent).
+
+    affected_lines:
+      - "V3Oracle.sol:242-287 — setTokenConfig, no timelock"
+      - "V3Oracle.sol:292-304 — setOracleMode, callable by emergencyAdmin too"
+      - "V3Oracle.sol:372-383 — mode determines price source"
+
+    solidity: |
+      // Not a fuzzable invariant — requires sequenced admin action.
+      // Manual review finding only.
+
+    confidence: low
+    notes: >
+      Requires privileged role (owner/emergencyAdmin). Likely classified as "trusted role"
+      by the protocol and excluded from bounty scope. Worth noting but probably not reportable.
+
+  - id: VO-D-05
+    tier: 2
+    type: property
+    title: "_getFeeGrowthOutside for uninitialized ticks returns 0 correctly per Uniswap convention"
+    severity_estimate: info
+    description: >
+      _getFeeGrowthOutside (V3Oracle line 642-667) calls pool.ticks(tick) via staticcall.
+      For uninitialized ticks, Uniswap V3 returns all zeros (default mapping value).
+      The convention in Uniswap V3 (PoolManager and TickBitmap) is that feeGrowthOutside
+      for an uninitialized tick is treated as 0, which effectively means "all fee growth
+      occurred on the other side". The _getFeeGrowthInside calculation (line 594-620)
+      uses unchecked arithmetic (allowed to overflow, matching Uniswap's design).
+
+      If tickLower or tickUpper is uninitialized (liquidity was fully removed from that
+      tick by another position), feeGrowthOutside returns 0. This can cause the fee
+      growth inside to be calculated incorrectly — but only if the tick was previously
+      initialized and then became uninitialized. In practice, the position's own liquidity
+      keeps the ticks initialized while liquidity > 0. When liquidity = 0, _getAmounts
+      returns 0 (line 550 checks state.liquidity != 0), so fees on a zero-liquidity
+      position should also be 0.
+
+      However: tokensOwed0/tokensOwed1 (state.tokensOwed0/1, line 562-563) are added
+      even when liquidity = 0. These represent fees already collected from the position
+      but not yet transferred. If a position has liquidity=0 but tokensOwed > 0, the
+      fee calculation via _getUncollectedFees might behave unexpectedly if the ticks
+      are uninitialized. But feeGrowth0 = feeGrowthInside - position.feeGrowthInside0Last
+      would be 0 (both 0) or incorrectly computed. tokensOwed is added separately and
+      is correct regardless.
+
+      Net: this appears correctly handled. The unchecked overflow follows Uniswap's
+      design. No exploitable vector found.
+
+    attack_scenario: >
+      N/A — analyzed but no exploitable path identified. Ticks stay initialized while
+      the position has liquidity, and when liquidity=0 the amounts are 0. tokensOwed
+      is separately tracked and unaffected by tick initialization.
+
+    affected_lines:
+      - "V3Oracle.sol:560-564 — _getFees adds tokensOwed regardless of tick state"
+      - "V3Oracle.sol:581-590 — unchecked overflow in fee growth delta (by design)"
+      - "V3Oracle.sol:642-667 — _getFeeGrowthOutside returns 0 for uninitialized ticks"
+
+    solidity: |
+      // Informational only — no invariant needed.
+
+    confidence: high
+    notes: >
+      This is correctly handled. The Uniswap V3 convention of treating uninitialized tick
+      feeGrowthOutside as 0 is replicated correctly. tokensOwed is a separate accumulator
+      that is immune to tick initialization. DISCARDED as finding.
+
+  - id: VO-D-06
+    tier: 1
+    type: logic_bug
+    title: "stakePosition health check uses ignoreFees=false BEFORE stake but _checkLoanIsHealthy uses ignoreFees=true AFTER: window allows borrowing more than post-stake health allows"
+    severity_estimate: medium
+    description: >
+      stakePosition (V3Vault line 1381-1394) stakes the position and then health-checks
+      at line 1390-1393:
+        if (loans[tokenId].debtShares != 0) {
+            (uint256 debt,,,,) = loanInfo(tokenId);
+            _requireLoanIsHealthy(tokenId, debt);   ← ignoreFees=true (now staked)
+        }
+      The health check AFTER staking correctly uses ignoreFees=true. But consider the
+      sequence BEFORE staking:
+        - borrow() calls _requireLoanIsHealthy (ignoreFees = _isStaked → false at that time)
+        - So borrow() allows borrowing up to collateralValue INCLUDING fees
+        - stakePosition() is then called — health is re-checked with ignoreFees=true
+
+      This means a user can only stake if the position is healthy WITHOUT fees.
+      stakePosition DOES correctly re-check health post-stake. So this is NOT exploitable
+      in a single-path sense.
+
+      BUT: consider the reverse. A user is staked, position is healthy (ignoreFees=true).
+      User calls unstakePosition(). After unstaking, _isStaked returns false. Now future
+      health checks include fees. The user's collateral effectively INCREASED (fees now
+      counted). The user can immediately borrow() against the new higher collateral.
+
+      Then: user re-stakes. The stakePosition() health check (ignoreFees=true) now applies.
+      If the extra borrow (collateralized by fees) made the position unhealthy without fees,
+      stakePosition WILL REVERT. But the user already has the borrowed funds.
+
+      Result: this is correct behavior — stake rejects if unhealthy without fees. The
+      user just can't re-stake after borrowing against fees. No direct loss to protocol.
+
+      ACTUAL ISSUE: The user can borrow against fees, then the position can become
+      liquidatable in staked mode (ignoreFees=true drops fullValue) even though it was
+      healthy when borrowed (ignoreFees=false). This is the INTENDED design (staking
+      accepts health risk of fee exclusion). The real question: are there situations where
+      the fee collateral borrowed against disappears simultaneously with staking?
+
+      Answer: fees are realized upon staking — _stake() calls gaugeManager.stakePosition()
+      which collects/resets fees. So the fees that backed the borrow disappear at stake time.
+      stakePosition DOES check health post-stake (line 1390-1393). If fees were the margin
+      keeping the loan healthy, stakePosition will REVERT, protecting the protocol.
+
+      FINDING DOWNGRADED: Correctly handled. No exploitable path.
+
+    attack_scenario: >
+      No exploitable attack path. stakePosition correctly re-checks health post-stake
+      with ignoreFees=true. If borrowed against fee collateral, stakePosition reverts.
+      DISCARDED.
+
+    affected_lines:
+      - "V3Vault.sol:1381-1394 — stakePosition with post-stake health check"
+      - "V3Vault.sol:1423-1434 — _checkLoanIsHealthy with ignoreFees=_isStaked"
+
+    solidity: |
+      // No invariant — finding discarded after analysis.
+
+    confidence: high
+    notes: >
+      Analyzed fully. The design is: staked positions exclude fee collateral, and
+      stakePosition re-validates health without fees. The mechanism is sound. DISCARDED.
+
+  - id: VO-D-07
+    tier: 1
+    type: logic_bug
+    title: "Liquidation value computation uses pre-unstake fullValue but _sendPositionValue collects post-unstake fees: borrower equity stolen"
+    severity_estimate: high
+    description: >
+      This is the precise, quantified version of VO-D-01 with full tracing.
+
+      liquidate() flow for a STAKED position:
+        Line 742: (isHealthy, fullValue, collateralValue, feeValue) = _checkLoanIsHealthy(tokenId, debt, false)
+          → ignoreFees=true because _isStaked(tokenId)=true
+          → fullValue = oracle.getValue(tokenId, asset, true).value
+             = price0 * amount0 + price1 * amount1   [NO fees in value]
+          → feeValue = 0   [explicitly 0 when ignoreFees=true, line 130-132]
+
+        Line 748: _unstakeIfNeeded(tokenId) → NFT returned to NonfungiblePositionManager
+          → tokensOwed0, tokensOwed1 are now claimable
+          → fee growth inside is non-zero (time passed while staked in gauge)
+
+        Line 750: (liquidationValue, liquidatorCost, reserveCost) =
+            _calculateLiquidation(debt, fullValue, collateralValue)
+          → liquidationValue computed on fullValue WITHOUT fees
+          → This determines how much of position goes to liquidator
+
+        Line 770: _sendPositionValue(tokenId, liquidationValue, fullValue, feeValue=0, ...)
+          Line 1120: (liquidity, fees0, fees1) = oracle.getLiquidityAndFees(tokenId)
+            → NOW position is unstaked, fees are real and non-zero
+          Line 1123: if (liquidationValue <= feeValue)  ← feeValue=0 → ALWAYS FALSE
+          Line 1127-1131: [else branch always taken]
+            fees0 = type(uint128).max   ← ALL fees taken
+            fees1 = type(uint128).max   ← ALL fees taken
+            liquidity = (liquidationValue - 0) * liquidity / (fullValue - 0)
+                      = liquidationValue * liquidity / fullValue
+
+        Line 1141: nonfungiblePositionManager.collect(tokenId, recipient, fees0=MAX, fees1=MAX)
+          → Liquidator receives ALL accumulated fees (which were not included in fullValue)
+          → Liquidator receives liquidationValue/fullValue fraction of liquidity
+
+      TOTAL value liquidator receives:
+        = (liquidationValue/fullValue) * liquidity_value + fees_value
+
+      But _calculateLiquidation computed liquidationValue expecting:
+        total_payout = debt * (1 + penalty)
+      where penalty ∈ [MIN_LIQUIDATION_PENALTY, MAX_LIQUIDATION_PENALTY] (2%-10%)
+
+      If fees_value > 0, liquidator receives MORE than debt*(1+penalty).
+      The EXCESS (fees_value) comes from the borrower's equity in the position.
+      The borrower loses fees they earned while staked.
+
+      Quantification example:
+        debt = 90 USDC
+        fullValue (without fees) = 100 USDC  → collateralValue = 90 USDC (at 90% CF)
+        fees_value = 20 USDC (accumulated while staked 30 days)
+        True total position value = 120 USDC
+
+        _calculateLiquidation: fullValue=100, debt=90 → maxPenaltyValue = 90*1.10=99
+        Since fullValue(100) >= maxPenaltyValue(99):
+          startLiquidationValue = 90 * 100/90 = 100
+          liquidationValue = 90 * (1 + penalty%) ≈ 99 USDC (near max penalty)
+          liquidatorCost = 90 USDC (pays full debt)
+
+        _sendPositionValue: liquidationValue=99, fullValue=100, feeValue=0
+          liquidity fraction = 99/100 of liquidity → liquidator gets 99 USDC of liquidity
+          fees: ALL 20 USDC of fees
+          TOTAL TO LIQUIDATOR: 99 + 20 = 119 USDC
+          LIQUIDATOR PROFIT: 119 - 90 (cost) = 29 USDC
+
+        Intended liquidator profit: 99 - 90 = 9 USDC (the penalty)
+        EXCESS PROFIT: 20 USDC (the fee windfall) at borrower's expense
+
+        Borrower residual: 120 - 119 = 1 USDC (should be ~21 USDC = 120 - 99)
+
+    attack_scenario: >
+      No attacker needed — this is triggered by ANY liquidation of a staked position
+      that has accumulated fees. The liquidator is the beneficiary, borrower is harmed.
+
+      To maximize harm:
+      1. Wait for staked positions with large accumulated fees to become liquidatable.
+      2. Call liquidate() immediately — the entire fee balance goes to the liquidator
+         even though it was not priced into the liquidation cost.
+      3. Borrower loses their earned fees on top of the liquidation penalty.
+
+      This is a SILENT value extraction from borrowers that happens every time a staked
+      position with fees is liquidated. At scale (many staked positions, continuous fee
+      accumulation), this represents a systematic overpayment to liquidators.
+
+    affected_lines:
+      - "V3Vault.sol:742-743 — health check with ignoreFees=true while staked"
+      - "V3Vault.sol:748 — unstake BEFORE feeValue is recomputed"
+      - "V3Vault.sol:770-771 — _sendPositionValue called with stale feeValue=0"
+      - "V3Vault.sol:1120 — getLiquidityAndFees post-unstake returns real fees"
+      - "V3Vault.sol:1123 — feeValue=0 → else branch always → ALL fees taken by liquidator"
+      - "V3Vault.sol:1129-1130 — fees0/1 = type(uint128).max always for staked liquidation"
+      - "V3Oracle.sol:112-114 — ignoreFees=true → fees0=fees1=0"
+      - "V3Oracle.sol:130-132 — feeValue=0 when ignoreFees=true"
+
+    poc_sketch: |
+      // FOUNDRY FORK TEST — Base mainnet
+      // Setup: real Aerodrome Slipstream pool WETH/USDC
+      // 1. mint position, deposit to vault, borrow 90% collateral, stakePosition()
+      // 2. vm.warp(30 days) — fees accumulate in gauge
+      // 3. manipulate/wait for position to become unhealthy (WETH price drop 5%)
+      // 4. liquidate() as attacker
+      // 5. assert: attacker_received_value > debt * (1 + MAX_LIQUIDATION_PENALTY)
+      // 6. assert: borrower_residual < (true_position_value - liquidation_value_cap)
+
+      function test_staked_liquidation_fee_windfall() public {
+          // [fork setup]
+          uint256 tokenId = _mintAndDepositStakedPosition();
+          uint256 debtBefore = _borrow(tokenId, 90e6); // 90 USDC
+
+          vm.warp(block.timestamp + 30 days);
+
+          _dropWETHPrice(5); // make loan unhealthy without fees
+
+          uint256 attackerUSDCBefore = usdc.balanceOf(attacker);
+          vm.prank(attacker);
+          usdc.approve(address(vault), type(uint256).max);
+          (uint256 a0, uint256 a1) = vault.liquidate(LiquidateParams(tokenId, attacker, 0, 0, block.timestamp));
+
+          uint256 attackerGained = _valueInUSDC(a0, a1);
+          uint256 attackerNet = attackerGained - (attackerUSDCBefore - usdc.balanceOf(attacker));
+
+          // attackerNet should equal ~10% penalty (MAX_LIQUIDATION_PENALTY)
+          // but will equal penalty + all accumulated fees
+          uint256 expectedMaxProfit = debtBefore * MAX_LIQUIDATION_PENALTY_X32 / Q32;
+          assertGt(attackerNet, expectedMaxProfit, "liquidator profit exceeds intended penalty");
+      }
+
+    solidity: |
+      // Invariant for fuzzer (mock version):
+      function invariant_liquidation_value_cap() external {
+          // After liquidating a staked position:
+          // value_received_by_liquidator <= debt * (1 + MAX_LIQUIDATION_PENALTY_X32/Q32)
+          // (allow small tolerance for oracle rounding)
+          uint256 maxAllowed = ghost_debt * (Q32 + MAX_LIQUIDATION_PENALTY_X32) / Q32;
+          uint256 liquidatorReceivedValue = ghost_liquidatorAmount0Value + ghost_liquidatorAmount1Value;
+          lte(liquidatorReceivedValue, maxAllowed + 1e4, "liquidator exceeds max penalty cap");
+      }
+
+    confidence: high
+    needs_fork_confirmation: true
+    notes: >
+      This is the same root cause as VO-D-01 but with precise quantification and a
+      concrete PoC sketch. The critical path is: ignoreFees=true in health check +
+      _unstakeIfNeeded BEFORE _sendPositionValue + feeValue=0 passed to _sendPositionValue.
+      The fix would be to re-call oracle.getValue(tokenId, asset, false) AFTER unstaking
+      to get the real feeValue before computing the position split.
+      Classification: HIGH severity — direct fund loss to borrowers, always triggered
+      on any staked liquidation with accumulated fees.
