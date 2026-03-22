@@ -321,13 +321,18 @@ def find_report(finding_id: str, state_entry: dict | None) -> tuple[str | None, 
 
     content = report_path.read_text()
 
-    # Extraer título del H1
+    # Extraer título: primero H1, si no hay H1 tomar el primer H2
     title = None
+    first_h2 = None
     for line in content.splitlines():
-        line = line.strip()
-        if line.startswith("# ") and not line.startswith("## "):
-            title = line[2:].strip()
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            title = stripped[2:].strip()
             break
+        if first_h2 is None and stripped.startswith("## "):
+            first_h2 = stripped[3:].strip()
+    if not title:
+        title = first_h2
 
     return content, title
 
@@ -395,7 +400,11 @@ def main():
             print(f"  ⚠ {e} — usando current_hunt.json como fallback")
             hyp = {
                 "id": finding_id,
-                "description": state_entry.get("description", ""),
+                # title > description > root_cause como fallback en cascada
+                "description": (state_entry.get("description")
+                                or state_entry.get("title")
+                                or state_entry.get("root_cause")
+                                or ""),
                 "tier": 1,
                 "confidence": state_entry.get("confidence", 80),
                 "solidity": "",
