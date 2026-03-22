@@ -2,7 +2,7 @@
 """
 run_hunt.py — Coordinador autónomo del pipeline de hunting
 
-Prepara el contexto para los 6 hunters, orquesta el análisis, y actualiza el estado.
+Prepara el contexto para los 7 hunters, orquesta el análisis, y actualiza el estado.
 Este script es el punto de entrada para un hunt autónomo de un componente.
 
 Uso:
@@ -43,6 +43,7 @@ HUNTER_DOMAINS = {
     "OracleHunter":  ("oracle",  "Price manipulation, TWAP staleness, spot price vs TWAP, oracle dependencies"),
     "DomainHunter":  ("domain",  "Protocol-specific invariants, cross-component interactions, economic attacks"),
     "WildcardHunter":("wildcard","Novel bugs, unconventional vectors, assumption violations, composability risks"),
+    "TrustBoundaryHunter":("trust","Trust boundary analysis: token quirks (ERC777, fee-on-transfer, rebasing, pausable), external call trust (reverts, unexpected returns, delegatecall), proxy/upgrade patterns (uninitialized, storage collision), compiler/EVM assumptions, cross-contract trust assumptions"),
 }
 
 DOMAIN_BRIEFING = {
@@ -58,6 +59,8 @@ DOMAIN_BRIEFING = {
     "access":     "knowledge/access-control.md",
     "signature":  "knowledge/signature-replay.md",
     "proxy":      "knowledge/proxy-upgrade.md",
+    # Trust boundaries
+    "trust":      "knowledge/trust-boundaries.md",
     # Bridges & L2
     "bridge":     "knowledge/bridge.md",
     "opstack":    "knowledge/bridge-opstack.md",
@@ -67,6 +70,9 @@ DOMAIN_BRIEFING = {
     "governance": "knowledge/governance.md",
     "nft":        "knowledge/nft-erc721.md",
     "yield":      "knowledge/yield-aggregator.md",
+    "liquid":     "knowledge/liquid-staking.md",
+    "perps":      "knowledge/perps-derivatives.md",
+    "crosschain": "knowledge/cross-chain-intents.md",
 }
 
 # Keywords para auto-detectar dominios del código fuente del contrato.
@@ -102,6 +108,10 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
                   "elastic", "shares", "_gonsPerFragment"],
     "zk":        ["Groth16", "PlonK", "verifyProof", "IVerifier",
                   "zkProof", "circuit", "snark", "constraint"],
+    "trust":      ["safeTransfer", "safeApprove", "forceApprove", "delegatecall",
+                   "call{value", "fallback", "receive", "ERC777", "tokensReceived",
+                   "feeOnTransfer", "rebase", "permit", "callback", "hook",
+                   "implementation", "proxy", "upgradeTo", "selfdestruct"],
     "governance": ["Governor", "TimelockController", "propose", "castVote",
                    "proposalThreshold", "quorum", "vetoer", "timelock",
                    "GovernorBravo", "getPastVotes", "proposalsPassed"],
@@ -112,6 +122,21 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
                    "prepareReturn", "liquidatePosition", "_deployFunds", "_freeFunds",
                    "strategyDebt", "maxDebt", "pricePerShare", "totalDebt",
                    "yieldToken", "aToken", "harvestFees", "migrate"],
+    "liquid":     ["stETH", "wstETH", "cbETH", "rETH", "LidoOracle",
+                   "getPooledEthByShares", "getSharesByPooledEth", "exchangeRate",
+                   "liquidStaking", "LST", "withdrawalQueue", "requestWithdrawal",
+                   "unstakeEth", "submitEth", "deposit", "IStaking"],
+    "perps":      ["openPosition", "closePosition", "increasePosition", "decreasePosition",
+                   "fundingRate", "markPrice", "indexPrice", "liquidatePosition",
+                   "IMX", "IPerp", "IPerpetual", "unrealizedPnl", "realizedPnl",
+                   "maxLeverage", "maintenanceMargin", "positionSize", "entryPrice",
+                   "GMX", "GLP", "clearinghouse", "openInterest", "skewScale"],
+    "crosschain": ["lzReceive", "ccipReceive", "xCall", "relayMessage",
+                   "executeMessage", "validateMessage", "bridgeToken",
+                   "lockAndMint", "burnAndRelease", "intent", "fillOrder",
+                   "solver", "destinationChain", "srcChainId", "dstChainId",
+                   "trustedRemote", "setTrustedRemote", "ILayerZeroEndpoint",
+                   "IRouterClient", "IWormhole", "nonce", "messageHash"],
 }
 
 
