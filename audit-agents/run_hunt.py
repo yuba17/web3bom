@@ -73,6 +73,8 @@ DOMAIN_BRIEFING = {
     "liquid":     "knowledge/liquid-staking.md",
     "perps":      "knowledge/perps-derivatives.md",
     "crosschain": "knowledge/cross-chain-intents.md",
+    "vesting":    "knowledge/vesting-tokenomics.md",
+    "options":    "knowledge/options-structured-products.md",
 }
 
 # Keywords para auto-detectar dominios del código fuente del contrato.
@@ -137,6 +139,16 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
                    "solver", "destinationChain", "srcChainId", "dstChainId",
                    "trustedRemote", "setTrustedRemote", "ILayerZeroEndpoint",
                    "IRouterClient", "IWormhole", "nonce", "messageHash"],
+    "vesting":    ["vesting", "vestingSchedule", "cliff", "release",
+                   "vestedAmount", "claimable", "startTime", "vestingPeriod",
+                   "revoke", "accelerate", "allocate", "linearVesting",
+                   "ERC20Votes", "getPastVotes", "delegate", "checkpoint",
+                   "totalSupply", "mint", "emissionRate", "MAX_SUPPLY"],
+    "options":    ["strike", "expiry", "premium", "optionType", "exerciseOption",
+                   "settleOption", "putOption", "callOption", "writeOption",
+                   "underlyingAsset", "settlementPrice", "impliedVolatility",
+                   "DOV", "tranches", "senior", "junior", "leveragedToken",
+                   "IVault", "structuredProduct"],
 }
 
 
