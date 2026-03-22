@@ -66,6 +66,7 @@ DOMAIN_BRIEFING = {
     "zk":         "knowledge/zk-circuits.md",
     "governance": "knowledge/governance.md",
     "nft":        "knowledge/nft-erc721.md",
+    "yield":      "knowledge/yield-aggregator.md",
 }
 
 # Keywords para auto-detectar dominios del código fuente del contrato.
@@ -107,6 +108,10 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "nft":        ["ERC721", "onERC721Received", "safeTransferFrom", "tokenId",
                    "ownerOf", "getApproved", "setApprovalForAll", "_safeMint",
                    "IERC721", "ERC721Enumerable", "NonfungiblePositionManager"],
+    "yield":      ["BaseStrategy", "TokenizedStrategy", "harvest", "tend",
+                   "prepareReturn", "liquidatePosition", "_deployFunds", "_freeFunds",
+                   "strategyDebt", "maxDebt", "pricePerShare", "totalDebt",
+                   "yieldToken", "aToken", "harvestFees", "migrate"],
 }
 
 
