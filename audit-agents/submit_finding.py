@@ -386,6 +386,63 @@ def reset_finding(finding_id: str, target_status: str, sess: requests.Session):
     print(f"\n  URL: {BASE_URL}/findings/{new_radar_id}")
 
 
+def patch_fields(finding_id: str, sess: requests.Session,
+                 impact: str | None, likelihood: str | None, severity: str | None):
+    """
+    PATCH campos de metadata (impact, likelihood, severity) sin cambiar el status.
+    Útil para corregir valores mal enviados en el registro inicial.
+    """
+    state   = load_state()
+    finding = find_in_state(state, finding_id)
+    if not finding:
+        print(f"✗ '{finding_id}' no encontrado en current_hunt.json")
+        sys.exit(1)
+    radar_id = finding.get("radar_id")
+    if not radar_id:
+        print(f"✗ '{finding_id}' no tiene radar_id")
+        sys.exit(1)
+
+    _VALID_IMPACT     = {"Critical", "High", "Medium", "Low"}
+    _VALID_LIKELIHOOD = {"High", "Medium", "Low"}
+    _VALID_SEVERITY   = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+
+    payload: dict = {}
+    if impact:
+        v = impact.capitalize()
+        if v not in _VALID_IMPACT:
+            print(f"✗ impact inválido '{impact}'. Válidos: {sorted(_VALID_IMPACT)}")
+            sys.exit(1)
+        payload["impact"] = v
+        finding["impact_rating"] = v
+    if likelihood:
+        v = likelihood.capitalize()
+        if v not in _VALID_LIKELIHOOD:
+            print(f"✗ likelihood inválido '{likelihood}'. Válidos: {sorted(_VALID_LIKELIHOOD)}")
+            sys.exit(1)
+        payload["likelihood"] = v
+        finding["likelihood"] = v
+    if severity:
+        v = severity.upper()
+        if v not in _VALID_SEVERITY:
+            print(f"✗ severity inválido '{severity}'. Válidos: {sorted(_VALID_SEVERITY)}")
+            sys.exit(1)
+        payload["severity"] = v
+        finding["severity_final"] = v.lower()
+
+    if not payload:
+        print("✗ Nada que patchear — usa --impact, --likelihood y/o --severity")
+        sys.exit(1)
+
+    result = api_patch(f"/api/findings/{radar_id}", payload, sess)
+    print(f"\n✓ {finding_id} actualizado:")
+    for k in ("severity", "impact", "likelihood"):
+        if k in payload:
+            print(f"  {k}: {result.get(k)}")
+
+    save_state(state)
+    print(f"  ✓ current_hunt.json actualizado")
+
+
 def sync_all(sess: requests.Session):
     """Pull Bounty Radar → actualiza radar_status en current_hunt.json."""
     state = load_state()
@@ -432,15 +489,18 @@ def sync_all(sess: requests.Session):
 def main():
     parser = argparse.ArgumentParser(description="Integración con Bounty Radar")
     parser.add_argument("--list-programs", action="store_true")
-    parser.add_argument("--show",   metavar="FINDING_ID", help="Muestra estado local + radar del finding")
-    parser.add_argument("--update", metavar="FINDING_ID", help="Actualiza status via PATCH")
-    parser.add_argument("--reset",  metavar="FINDING_ID", help="Delete+recreate para transiciones hacia atrás")
-    parser.add_argument("--to-status", help="Status objetivo (para --reset)")
-    parser.add_argument("--status", help="Nuevo status (para --update)")
-    parser.add_argument("--payout", type=int)
-    parser.add_argument("--note",   help="Nota de rechazo o contexto")
+    parser.add_argument("--show",        metavar="FINDING_ID", help="Muestra estado local + radar del finding")
+    parser.add_argument("--update",      metavar="FINDING_ID", help="Actualiza status via PATCH")
+    parser.add_argument("--patch",       metavar="FINDING_ID", help="Patchea campos de metadata (impact, likelihood, severity)")
+    parser.add_argument("--reset",       metavar="FINDING_ID", help="Delete+recreate para transiciones hacia atrás")
+    parser.add_argument("--to-status",   help="Status objetivo (para --reset)")
+    parser.add_argument("--status",      help="Nuevo status (para --update)")
+    parser.add_argument("--impact",      help="Impact rating: Critical|High|Medium|Low (para --patch)")
+    parser.add_argument("--likelihood",  help="Likelihood: High|Medium|Low (para --patch)")
+    parser.add_argument("--payout",      type=int)
+    parser.add_argument("--note",        help="Nota de rechazo o contexto")
     parser.add_argument("--submission-url", help="URL de la submission en la plataforma")
-    parser.add_argument("--sync",  action="store_true", help="Pull Bounty Radar → sincroniza local")
+    parser.add_argument("--sync",        action="store_true", help="Pull Bounty Radar → sincroniza local")
     parser.add_argument("--password")
     args = parser.parse_args()
 
@@ -464,6 +524,10 @@ def main():
             sys.exit(1)
         update_finding(args.update, args.status.upper(), sess,
                        args.payout, args.note, args.submission_url)
+
+    elif args.patch:
+        patch_fields(args.patch, sess, args.impact, args.likelihood,
+                     args.status)  # --status se reutiliza para severity aquí
 
     elif args.reset:
         if not args.to_status:
