@@ -64,6 +64,7 @@ DOMAIN_BRIEFING = {
     # Emerging
     "erc4337":    "knowledge/erc4337-account-abstraction.md",
     "zk":         "knowledge/zk-circuits.md",
+    "governance": "knowledge/governance.md",
 }
 
 # Keywords para auto-detectar dominios del código fuente del contrato.
@@ -99,6 +100,9 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
                   "elastic", "shares", "_gonsPerFragment"],
     "zk":        ["Groth16", "PlonK", "verifyProof", "IVerifier",
                   "zkProof", "circuit", "snark", "constraint"],
+    "governance": ["Governor", "TimelockController", "propose", "castVote",
+                   "proposalThreshold", "quorum", "vetoer", "timelock",
+                   "GovernorBravo", "getPastVotes", "proposalsPassed"],
 }
 
 
