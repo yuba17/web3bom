@@ -76,6 +76,7 @@ DOMAIN_BRIEFING = {
     "vesting":    "knowledge/vesting-tokenomics.md",
     "options":    "knowledge/options-structured-products.md",
     "mev":        "knowledge/mev-sandwich.md",
+    "reentrancy": "knowledge/reentrancy-patterns.md",
 }
 
 # Keywords para auto-detectar dominios del código fuente del contrato.
@@ -145,6 +146,10 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
                    "revoke", "accelerate", "allocate", "linearVesting",
                    "ERC20Votes", "getPastVotes", "delegate", "checkpoint",
                    "totalSupply", "mint", "emissionRate", "MAX_SUPPLY"],
+    "reentrancy": ["nonReentrant", "ReentrancyGuard", ".call{", "receive()",
+                   "fallback()", "onERC721Received", "onERC1155Received",
+                   "tokensReceived", "uniswapV3SwapCallback", "flashLoan",
+                   "executeOperation", "locked", "_status", "CEI"],
     "mev":        ["slippage", "minAmountOut", "amountOutMinimum", "deadline",
                    "sqrtPriceLimitX96", "slot0", "sqrtPriceX96", "priceImpact",
                    "sandwich", "frontrun", "backrun", "TWAP", "observe",
