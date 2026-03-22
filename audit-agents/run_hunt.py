@@ -46,14 +46,59 @@ HUNTER_DOMAINS = {
 }
 
 DOMAIN_BRIEFING = {
-    "staking":   "knowledge/staking.md",
-    "lending":   "knowledge/lending.md",
-    "vault":     "knowledge/vault-erc4626.md",
-    "oracle":    "knowledge/oracle.md",
-    "dex":       "knowledge/dex-amm.md",
-    "access":    "knowledge/access-control.md",
-    "flash":     "knowledge/flash-loan.md",
-    "token":     "knowledge/token-erc20.md",
+    # Core DeFi
+    "staking":    "knowledge/staking.md",
+    "lending":    "knowledge/lending.md",
+    "vault":      "knowledge/vault-erc4626.md",
+    "oracle":     "knowledge/oracle.md",
+    "dex":        "knowledge/dex-amm.md",
+    "flash":      "knowledge/flash-loan.md",
+    "token":      "knowledge/token-erc20.md",
+    # Security primitives
+    "access":     "knowledge/access-control.md",
+    "signature":  "knowledge/signature-replay.md",
+    "proxy":      "knowledge/proxy-upgrade.md",
+    # Bridges & L2
+    "bridge":     "knowledge/bridge.md",
+    "opstack":    "knowledge/bridge-opstack.md",
+    # Emerging
+    "erc4337":    "knowledge/erc4337-account-abstraction.md",
+    "zk":         "knowledge/zk-circuits.md",
+}
+
+# Keywords para auto-detectar dominios del código fuente del contrato.
+# Orden importa: más keywords específicas = mejor señal.
+DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    "opstack":   ["OptimismPortal", "CrossDomainMessenger", "L2OutputOracle",
+                  "FaultDisputeGame", "PreimageOracle", "finalizeWithdrawal",
+                  "proveWithdrawal", "respectedGameType", "SuperchainConfig"],
+    "erc4337":   ["UserOperation", "EntryPoint", "IPaymaster", "validateUserOp",
+                  "handleOps", "IAccount", "PackedUserOperation", "SpendPermission"],
+    "staking":   ["gauge", "emission", "bribe", "veToken", "GaugeManager",
+                  "notifyRewardAmount", "rewardPerToken", "earned", "getReward",
+                  "stake", "unstake", "checkpoint", "votingPower"],
+    "lending":   ["borrow", "repay", "liquidat", "collateral", "debtShares",
+                  "lendingPool", "healthFactor", "maxWithdraw", "utilizationRate"],
+    "vault":     ["totalAssets", "convertToShares", "convertToAssets",
+                  "maxDeposit", "ERC4626", "previewDeposit", "previewMint"],
+    "oracle":    ["twap", "getPrice", "latestRoundData", "IUniswapV3Pool",
+                  "observe", "slot0", "sqrtPriceX96", "getPriceX96", "TWAP"],
+    "dex":       ["swap", "addLiquidity", "removeLiquidity", "tick",
+                  "IUniswapV3", "getAmountOut", "reserve0", "reserve1", "k ="],
+    "flash":     ["flashLoan", "executeFlashLoan", "onFlashLoan",
+                  "flashCallback", "IERC3156", "maxFlashLoan"],
+    "bridge":    ["LayerZero", "CCIP", "lzReceive", "ccipReceive",
+                  "xCall", "relayMessage", "sendMessage", "IBC"],
+    "proxy":     ["upgradeable", "implementation", "StorageSlot",
+                  "UUPSUpgradeable", "TransparentUpgradeableProxy", "_upgradeToAndCall"],
+    "signature": ["ecrecover", "ECDSA", "EIP712", "permit",
+                  "SignatureChecker", "nonces", "DOMAIN_SEPARATOR"],
+    "access":    ["onlyOwner", "AccessControl", "Ownable", "onlyRole",
+                  "hasRole", "grantRole", "revokeRole"],
+    "token":     ["feeOnTransfer", "rebase", "deflation", "taxed",
+                  "elastic", "shares", "_gonsPerFragment"],
+    "zk":        ["Groth16", "PlonK", "verifyProof", "IVerifier",
+                  "zkProof", "circuit", "snark", "constraint"],
 }
 
 
@@ -61,14 +106,40 @@ def load_hunt_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except:
-            pass
+        except json.JSONDecodeError as e:
+            print(f"✗ CRÍTICO: current_hunt.json corrupto: {e}")
+            backup = STATE_FILE.with_suffix('.backup.json')
+            if backup.exists():
+                print(f"  Recuperando desde backup: {backup}")
+                try:
+                    return json.loads(backup.read_text())
+                except Exception:
+                    pass
+            print(f"  Sin recuperación posible. Revisa {STATE_FILE}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"✗ Error leyendo current_hunt.json: {e}")
+            sys.exit(1)
     return {}
 
 
 def save_hunt_state(state: dict):
+    """Escritura atómica: escribe a .tmp, luego rename. Mantiene .backup.json."""
+    import tempfile, shutil as _shutil
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    # Guardar backup antes de sobreescribir
+    if STATE_FILE.exists():
+        _shutil.copy2(STATE_FILE, STATE_FILE.with_suffix('.backup.json'))
+    # Escritura atómica via rename
+    tmp = STATE_FILE.with_suffix('.tmp.json')
+    try:
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(STATE_FILE)
+    except Exception as e:
+        print(f"✗ Error guardando estado: {e}")
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 def find_contract(component: str, repo_path: str) -> Path | None:
@@ -104,29 +175,78 @@ def count_locs(file_path: Path) -> int:
         return 0
 
 
-def get_solodit_context(domain: str, keywords: list) -> str:
-    """Obtiene contexto de Solodit para el dominio."""
+def get_solodit_context(domain: str, keywords: list, component: str = "") -> str:
+    """
+    Obtiene contexto de Solodit con múltiples queries específicas.
+    3 búsquedas: (1) componente+dominio, (2) solo dominio HIGH/CRITICAL, (3) sin dominio
+    para maximizar señal relevante para el hunter.
+    """
     if not SOLODIT_SEARCH.exists():
         return ""
-    try:
-        result = subprocess.run(
-            [sys.executable, str(SOLODIT_SEARCH),
-             "--domain", domain, "--limit", "5", "--hunter-context",
-             "--component", keywords[0] if keywords else domain,
-             *keywords[1:3]],
-            capture_output=True, text=True, timeout=30
-        )
-        return result.stdout[:2000] if result.stdout else ""
-    except:
-        return ""
+
+    def run_search(extra_args: list, q: str) -> str:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(SOLODIT_SEARCH), *extra_args, q],
+                capture_output=True, text=True, timeout=20
+            )
+            return result.stdout or ""
+        except Exception:
+            return ""
+
+    parts = []
+    seen_titles: set = set()
+
+    # Query 1: componente específico (sin filtro de dominio — mayor recall)
+    if component:
+        out = run_search(["--limit", "5", "--hunter-context", "--component", component], component)
+        if out.strip():
+            parts.append(f"### Findings sobre {component}\n{out}")
+            for line in out.splitlines():
+                if line.startswith(" ") and "]" in line:
+                    seen_titles.add(line.strip()[:60])
+
+    # Query 2: dominio + keywords del contrato, solo HIGH/CRITICAL
+    kw = " ".join(k for k in keywords if k.lower() != domain)[:80]
+    if kw:
+        out = run_search(["--domain", domain, "--severity", "high",
+                          "--limit", "6", "--hunter-context"], kw)
+        if out.strip():
+            # Dedup: omitir líneas ya vistas
+            filtered = [l for l in out.splitlines()
+                        if not any(l.strip()[:60] in t for t in seen_titles)]
+            if filtered:
+                parts.append(f"### HIGH findings en dominio {domain}\n" + "\n".join(filtered))
+
+    # Query 3: query genérica sin dominio para patrones cross-domain
+    generic_kw = (kw or domain)[:60]
+    out = run_search(["--severity", "high", "--limit", "4", "--hunter-context"], generic_kw)
+    if out.strip():
+        filtered = [l for l in out.splitlines()
+                    if not any(l.strip()[:60] in t for t in seen_titles)]
+        if filtered:
+            parts.append(f"### Cross-domain HIGH relevantes\n" + "\n".join(filtered))
+
+    combined = "\n\n".join(parts)
+    return combined[:4000]  # aumentado de 2000 a 4000
 
 
-def load_briefing(domain: str) -> str:
+def detect_domains(contract_src: str, max_domains: int = 3) -> list:
     """
-    Carga un resumen comprimido del briefing — optimizado para intuición del hunter.
-    En vez de los primeros N chars (que cortan en medio de un bug),
-    extrae las secciones más accionables: trampas, que_mirar, checklist, y grep targets.
+    Auto-detecta los dominios más relevantes del código fuente del contrato.
+    Devuelve hasta max_domains dominios ordenados por número de keywords encontradas.
     """
+    src_lower = contract_src.lower()
+    scores: dict[str, int] = {}
+    for domain, keywords in DOMAIN_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw.lower() in src_lower)
+        if score > 0:
+            scores[domain] = score
+    return [d for d, _ in sorted(scores.items(), key=lambda x: -x[1])][:max_domains]
+
+
+def load_briefing_single(domain: str) -> str:
+    """Carga y comprime un único briefing."""
     rel_path = DOMAIN_BRIEFING.get(domain, "")
     if not rel_path:
         return ""
@@ -221,6 +341,66 @@ def load_briefing(domain: str) -> str:
     return result
 
 
+def load_grep_targets_only(domain: str) -> str:
+    """Carga solo la sección Quick Grep Targets de un briefing — versión compacta para dominios secundarios."""
+    rel_path = DOMAIN_BRIEFING.get(domain, "")
+    if not rel_path:
+        return ""
+    full_path = WEB3_DIR / rel_path
+    if not full_path.exists():
+        return ""
+    try:
+        text = full_path.read_text()
+    except:
+        return ""
+
+    lines = text.split("\n")
+    in_grep = False
+    grep_lines = []
+    for line in lines:
+        if "Grep Targets" in line or "Quick Grep" in line or "## 4." in line:
+            in_grep = True
+            continue
+        if in_grep:
+            if line.startswith("## ") and grep_lines:
+                break
+            if line.strip():
+                grep_lines.append(line)
+            if len(grep_lines) >= 12:
+                break
+
+    return "\n".join(grep_lines)
+
+
+def load_briefings(domains: list) -> str:
+    """
+    Carga briefings para múltiples dominios con estrategia de peso diferenciado:
+    - Dominio primario (index 0): extracto completo (~1500 chars) — patrones, trampas, grep
+    - Dominio secundario (index 1): solo grep targets (~300 chars) — señal sin ruido
+    - Dominio terciario (index 2+): omitido — el Solodit context cubre cross-domain
+
+    Rationale: más de un briefing completo satura el contexto del hunter con patrones
+    irrelevantes y baja la calidad de los invariantes generados. Solo la sección
+    de grep targets es suficientemente señal/ruido para dominios secundarios.
+    """
+    if not domains:
+        return ""
+
+    parts = []
+    primary = domains[0]
+    primary_text = load_briefing_single(primary)
+    if primary_text:
+        parts.append(f"### Briefing principal: {primary}\n{primary_text}")
+
+    if len(domains) > 1:
+        secondary = domains[1]
+        grep_text = load_grep_targets_only(secondary)
+        if grep_text:
+            parts.append(f"\n### Grep targets adicionales ({secondary})\n{grep_text}")
+
+    return "\n\n".join(parts)
+
+
 def generate_hunter_prompt(
     hunter_name: str,
     component: str,
@@ -237,8 +417,15 @@ def generate_hunter_prompt(
         abbreviation = component[:3].upper()
 
     contract_preview = ""
+    contract_truncated = False
+    CONTRACT_CHAR_LIMIT = 60_000
     if contract_path and contract_path.exists():
-        contract_preview = contract_path.read_text()[:8000]
+        full_src = contract_path.read_text()
+        if len(full_src) > CONTRACT_CHAR_LIMIT:
+            contract_preview = full_src[:CONTRACT_CHAR_LIMIT]
+            contract_truncated = True
+        else:
+            contract_preview = full_src
 
     hyp_output = str(WEB3_DIR / f"hunt_session/hypotheses/hyp_{component}_{hunter_name}.yaml")
 
@@ -255,6 +442,7 @@ No busques bugs genéricos. Busca bugs que nazcan de la lógica ESPECÍFICA de e
 ## Contrato a Analizar
 **Archivo**: `{contract_path}`
 **Dominio**: {domain}
+{"⚠ CONTRATO TRUNCADO: se muestran los primeros 60,000 chars. Usa el Read tool en " + str(contract_path) + " para leer el resto." if contract_truncated else ""}
 
 ```solidity
 {contract_preview}
@@ -474,8 +662,31 @@ def main():
             state["components_remaining"].remove(comp)
         if comp not in state.get("components_done", []):
             state.setdefault("components_done", []).append(comp)
+        # Avanzar current_component al siguiente pendiente
+        remaining = state.get("components_remaining", [])
+        state["current_component"] = remaining[0] if remaining else None
+        state["last_session"] = datetime.utcnow().isoformat() + "Z"
         save_hunt_state(state)
         print(f"✓ {comp} marcado como completado")
+        if remaining:
+            print(f"→ Siguiente componente: {remaining[0]}")
+        # Auto-aplicar feedback de hipótesis al briefing
+        print(f"\nAplicando feedback de hipótesis a briefings...")
+        try:
+            result = subprocess.run(
+                [sys.executable, str(AUDIT_AGENTS_DIR / "apply_feedback.py"), "--hypotheses"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                # Mostrar solo el total final
+                for line in reversed(result.stdout.splitlines()):
+                    if "Total updates" in line:
+                        print(f"  ✓ {line.strip()}")
+                        break
+            else:
+                print(f"  ⚠ apply_feedback error: {result.stderr[:200]}")
+        except Exception as e:
+            print(f"  ⚠ apply_feedback no ejecutado: {e}")
         return 0
 
     if not args.component:
@@ -485,36 +696,70 @@ def main():
     component = args.component
     protocol = state.get("protocol", "unknown")
     repo_path = state.get("repo_path", "")
-    # Busca dominio: arg > component_domains map > campo domain genérico > default staking
+
+    # Auto-detectar dominios del contrato si no se especifica --domain
     component_domains = state.get("component_domains", {})
-    domain = args.domain or component_domains.get(component) or state.get("domain", "staking")
+    forced_domain = args.domain or component_domains.get(component)
+
+    # Localizar contrato temprano para poder hacer auto-detección
+    contract_path_early = find_contract(component, repo_path) if repo_path else None
+    detected_domains: list = []
+    if not forced_domain and contract_path_early and contract_path_early.exists():
+        src = contract_path_early.read_text()
+        detected_domains = detect_domains(src, max_domains=2)
+        if detected_domains:
+            print(f"  Auto-detectado dominios: {detected_domains}")
+
+    # Prioridad: --domain > component_domains > auto-detect > state.domain > staking
+    if forced_domain:
+        domains = [forced_domain]
+    elif detected_domains:
+        domains = detected_domains
+    else:
+        domains = [state.get("domain", "staking")]
+
+    domain = domains[0]  # dominio primario (para Solodit y retrocompat)
 
     print(f"\n{'='*60}")
     print(f"  PREPARANDO HUNT: {component}")
     print(f"{'='*60}")
 
-    # Localizar contrato
-    contract_path = find_contract(component, repo_path) if repo_path else None
+    # Localizar contrato (puede que ya lo tengamos de la auto-detección)
+    contract_path = contract_path_early or (find_contract(component, repo_path) if repo_path else None)
     if not contract_path:
         print(f"  ⚠ Contrato no encontrado. Especifica --domain o comprueba repo_path")
     else:
         locs = count_locs(contract_path)
         print(f"  Contrato: {contract_path} ({locs} LOC)")
 
-    # Solodit context
+    # Solodit context — keywords extraídos del contrato si existe
     solodit_ctx = ""
     if not args.no_solodit:
-        print(f"  Buscando contexto en Solodit...")
-        solodit_ctx = get_solodit_context(domain, [component, domain])
+        print(f"  Buscando contexto en Solodit (3 queries)...")
+        # Extraer keywords específicos del contrato para queries más precisas
+        contract_keywords = [component]
+        if contract_path and contract_path.exists():
+            src = contract_path.read_text()
+            # Extraer nombres de funciones públicas/externas relevantes
+            fn_names = re.findall(r'function\s+(\w+)\s*\(', src)
+            # Quedarse con las más específicas (no getters genéricos)
+            specific_fns = [f for f in fn_names
+                           if len(f) > 6 and f not in
+                           ('initialize', 'constructor', 'receive', 'fallback',
+                            'transfer', 'approve', 'allowance', 'balanceOf')][:4]
+            contract_keywords.extend(specific_fns)
+        contract_keywords.append(domain)
+        solodit_ctx = get_solodit_context(domain, contract_keywords, component=component)
         if solodit_ctx:
-            print(f"  ✓ Contexto Solodit obtenido ({len(solodit_ctx)} chars)")
+            print(f"  ✓ Contexto Solodit obtenido ({len(solodit_ctx)} chars, keywords: {contract_keywords[:4]})")
         else:
             print(f"  ⚠ Sin contexto Solodit")
 
-    # Briefing
-    briefing_excerpt = load_briefing(domain)
+    # Briefings (primario completo + secundario solo grep)
+    briefing_excerpt = load_briefings(domains)
     if briefing_excerpt:
-        print(f"  ✓ Briefing {domain} cargado")
+        label = " + ".join(domains)
+        print(f"  ✓ Briefings cargados: {label}")
 
     # Crear context file
     ctx_file = create_context_file(component, contract_path, domain, solodit_ctx, briefing_excerpt, protocol)
@@ -573,10 +818,17 @@ def main():
     print(f"\n  Cada hunter escribe su resultado en:")
     for h in selected_hunters:
         print(f"    hunt_session/hypotheses/hyp_{component}_{h}.yaml")
-    print(f"\n  Cuando todos terminen:")
-    print(f"    python3 audit-agents/merge_invariants.py")
-    print(f"    FOUNDRY_PROFILE=chimera forge build --build-info")
-    print(f"    FOUNDRY_PROFILE=chimera forge test --fuzz-runs 5000")
+    print(f"\n  Cuando todos terminen (pipeline completo):")
+    print(f"    python3 audit-agents/merge_invariants.py              # YAML → Properties.sol")
+    print(f"    FOUNDRY_PROFILE=chimera forge build --build-info      # compilar")
+    print(f"    FOUNDRY_PROFILE=chimera forge test --fuzz-runs 5000   # Phase 1: mock quick")
+    print(f"    forge test --match-contract ForkTester --fuzz-runs 10000  # Phase 3: fork")
+    print(f"    medusa fuzz --config test/chimera/medusa.json --timeout 600  # Phase 4")
+    print(f"    python3 audit-agents/apply_feedback.py --hypotheses   # actualizar briefings")
+    print(f"\n  Si hay findings confirmados con fork PoC:")
+    print(f"    python3 audit-agents/report_finding.py --finding <ID>  # crea en Bounty Radar + Telegram")
+    print(f"    python3 audit-agents/submit_finding.py --update <ID> --status REPORTED --submission-url <URL>")
+    print(f"\n  ⚠  OBLIGATORIO: ejecutar merge_invariants.py ANTES del fuzzing")
 
     return 0
 
