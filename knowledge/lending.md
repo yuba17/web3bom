@@ -36,6 +36,7 @@
   trampas:
     - "Rounding dust (1 wei per operation) is normal in integer math -- allow tolerance of max(numPayments, numLoans) + 1"
     - "Mock oracles produce unrealistic AUM values -- always confirm on fork"
+  solodit_ids: []
   incidentes:
     - "ZeroLend One — _burnCollateralTokens fee omission causes pool insolvency (high)"
     - "Blueberry — totalLend not updated on liquidation, permanently inflated (medium)"
@@ -81,6 +82,7 @@
   trampas:
     - "Some protocols batch-accrue via 'touch()' -- verify it covers all paths"
     - "Open-term vs fixed-term loans have different accrual mechanics"
+  solodit_ids: []
   incidentes:
     - "ZeroLend One — Interest rate updated BEFORE debt updated when repaying (high)"
     - "Roots — Stale totalActiveDebt cached before _accrueActiveInterests in openTrove (high)"
@@ -139,6 +141,11 @@
   trampas:
     - "Interest accrual over long periods can legitimately make positions unhealthy -- not a bug"
     - "Oracle price updates between check and execution create edge cases"
+  solodit_ids:
+    - users-can-become-immediately-liquidatable-after-executing-an-action-trailofbits-none-aave-v4-pdf
+    - h-04-shrines-recovery-mode-can-be-weaponized-as-leverage-to-liquidate-healthy-troves-code4rena-opus-opus-git
+    - liquidation-cannot-be-closed-even-with-healthy-position-due-to-strict-debt-check-codehawks-regnum-aurum-acquisition-corp-core-contracts-git
+    - m-1-attackerpartial-liquidator-can-extend-liquidation-action-by-resetting-liquidationstart_agent-to-0-sherlock-cap-git
   incidentes:
     - nombre: "WiseLending"
       fecha: "Jan 2024"
@@ -229,6 +236,12 @@
   trampas:
     - "Rounding can make unrealizedLosses slightly exceed AUM -- allow tolerance of numLoans + 1"
     - "Mock liquidation tests often miss the real oracle impact"
+  solodit_ids:
+    - m-12-some-bad-debt-will-not-be-cleared-when-it-should-which-will-cause-accrual-of-bad-debt-decreasing-the-protocols-solvency-sherlock-exactly-protocol-update-stacking-contract-git
+    - m-1-bad-debt-isnt-cleared-when-earningsaccumulator-is-lower-than-a-fixed-pool-bad-debt-sherlock-exactly-protocol-git
+    - bad-debt-accumulation-index-is-reset-on-partial-liquidation-and-is-not-reset-on-cdp-increase-allowing-for-phantom-bad-debt-creation-cantina-none-badgerdao-pdf
+    - m-5-bad-debt-is-not-accounted-for-during-partial-liquidation-of-an-insolvent-position-sherlock-lend-git
+    - protocol-lacks-bad-debt-management-mechanisms-risking-permanent-insolvency-trailofbits-none-cap-labs-covered-agent-protocol-pdf
   incidentes:
     - "BendDAO — Bad debt never handled, insolvency risk (high)"
     - "Perennial V2 — Bad debt liquidation leaves negative collateral causing bank run (medium)"
@@ -275,6 +288,7 @@
   trampas:
     - "Partial liquidity scenarios are complex but not bugs -- check the partialLiquidity flag logic"
     - "Queue processing in batches may leave dust -- tolerance needed"
+  solodit_ids: []
   incidentes:
     - "Sublime — SavingsAccount withdrawAll freezes user funds ignoring strategy liquidity (high)"
     - "Notional Update #5 — Rebalance delayed due to revert, excess liquidity lent out (medium)"
@@ -312,6 +326,7 @@
   trampas:
     - "Rounding tolerance needed: max(numPayments, numLoans) + 1 for interest aggregates"
     - "Open-term and fixed-term have different aggregate tracking -- check both"
+  solodit_ids: []
   incidentes:
     - "Blueberry — totalLend not updated on liquidation, permanently inflated value (medium)"
     - "DODO V3 — Borrow amount precision loss for small-decimal tokens like WBTC (medium)"
@@ -349,6 +364,11 @@
   trampas:
     - "Standard ERC20 tokens without fees will never trigger this -- focus on weird tokens"
     - "Rebasing token balances change without transfers"
+  solodit_ids:
+    - h-03-critical-oracle-manipulation-risk-by-lender-code4rena-abracadabra-money-abranft-contest-git
+    - h-04-oracle-periodsize-is-very-low-allowing-the-twap-price-to-be-easily-manipulated-code4rena-canto-canto-git
+    - m-19-v3oracle-susceptible-to-price-manipulation-code4rena-revert-lend-revert-lend-git
+    - h-5-wrong-calculation-of-amount-of-ltokens-to-seize-in-liquidatecrosschain-function-sherlock-lend-git
   incidentes:
     - nombre: "MidasCapital"
       fecha: "Jan 2023"
@@ -422,6 +442,11 @@
   trampas:
     - "Self-liquidation is sometimes intended behavior (user wants to exit quickly)"
     - "The profitability depends on liquidation bonus vs oracle manipulation cost"
+  solodit_ids:
+    - self-liquidations-of-leveraged-positions-can-be-profitable-spearbit-none-euler-labs-evk-pdf
+    - self-liquidations-are-profitable-under-certain-collateralization-ratios-spearbit-none-size-v1-pdf
+    - h-02-liquidation-doesnt-account-for-penalty-when-calculating-collateral-to-give-allowing-users-to-profit-by-borrowing-and-self-liquidating-code4rena-loopfi-loopfi-git
+    - proxy-based-self-liquidation-creates-bad-debt-for-lenders-cyfrin-none-licredity-markdown
   incidentes:
     - nombre: "EulerFinance"
       fecha: "Mar 2023"
@@ -496,6 +521,7 @@
   trampas:
     - "Deferred liquidity check patterns (EVC) intentionally allow same-tx borrow/repay -- check if fees still apply"
     - "This is a design choice, not always a bug"
+  solodit_ids: []
   incidentes:
     - nombre: "PolterFinance"
       fecha: "Nov 2024"
@@ -555,6 +581,12 @@
     - "Some protocols intentionally use balanceOf for totalAssets -- check if donation is possible"
     - "Virtual offset solves this but introduces small imprecision"
     - "Revert Lend V3Vault uses exchange-rate-based ERC4626 -- NOT balance-based totalAssets for share pricing. First depositor inflation attack does NOT apply because donations go to reserves (not share price). Share price only changes via _calculateGlobalInterest. Wasted hunting time: rule this out immediately on protocols with explicit exchange-rate-based share math."
+  solodit_ids:
+    - m-1-vault-inflation-attack-sherlock-smilee-finance-git
+    - first-depositor-inflation-attack-in-stakedtoken-contract-spearbit-none-infinifi-contracts-pdf
+    - first-depositor-can-break-minting-of-shares-zokyo-none-narwhal-finance-markdown
+    - first-depositor-inflation-attack-in-sheepdog-contract-cantina-none-ceazor-snack-sandwich-pdf
+    - l-18-vault-is-susceptible-to-inflation-attack-by-first-depositor-pashov-audit-group-none-hyperstable_2025-02-26-markdown
   incidentes:
     - nombre: "Sonne Finance"
       fecha: "May 2024"
@@ -614,6 +646,7 @@
   trampas:
     - "Some protocols intentionally allow small positions for UX -- verify there is SOME floor"
     - "Gas costs vary by chain -- L2s may make this less critical"
+  solodit_ids: []
   incidentes:
     - "Euler EVK -- Lack of incentives to liquidate small positions (medium)"
     - "DYAD -- No incentive to liquidate small positions, protocol goes underwater (medium)"
@@ -664,6 +697,7 @@
   trampas:
     - "Liquidation bonus vs liquidation fee are different -- check both"
     - "Protocol fee on liquidation may go to treasury, not liquidator"
+  solodit_ids: []
   incidentes:
     - "ZeroLend One -- _burnCollateralTokens does not account for liquidation fees (high)"
     - "Backed Protocol -- purchaseLiquidationAuctionNFT takes extra liquidation penalty on last collateral (medium)"
@@ -709,6 +743,7 @@
   trampas:
     - "Some protocols use aTokens/cTokens as collateral which are always redeemable -- not affected"
     - "Frontrunning mitigation depends on chain -- L2s with sequencers are different"
+  solodit_ids: []
   incidentes:
     - "ZeroLend One -- Liquidation DoS due to lack of liquidity on collateral reserve (high)"
     - "Taurus -- User prevents liquidation by frontrunning and slightly increasing collateral (medium)"
@@ -752,6 +787,12 @@
   trampas:
     - "Taylor approximation for compounding is intentionally imprecise -- verify against full exp"
     - "Different protocols use different precision bases (1e4, 1e18, 1e27)"
+  solodit_ids:
+    - m-2-fixed-interest-rates-can-be-manipulated-by-a-whale-borrower-sherlock-exactly-protocol-git
+    - trst-h-2-pool-initialization-can-be-front-ran-to-manipulate-the-interest-rate-trust-security-none-timeswap-markdown
+    - potential-manipulation-of-stable-interest-rates-using-flash-loans-consensys-aave-protocol-v2-markdown
+    - adversaries-can-manipulate-victims-stable-rate-to-remain-excessively-high-via-flashloan-immunefi-folks-finance-git
+    - m-14-interest-rates-can-be-raised-above-the-market-as-a-griefing-disabling-the-pool-sherlock-ajna-ajna-git
   incidentes:
     - "Flayer -- calculateCompoundedFactor has calculation error, users overpay 10x interest (high)"
     - "Surge -- Precision differences in userCollateralRatioMantissa (high, found twice)"
@@ -802,6 +843,7 @@
   trampas:
     - "Some protocols intentionally calculate rate before update for gas optimization -- verify impact"
     - "The bug may only manifest after many operations accumulate drift"
+  solodit_ids: []
   incidentes:
     - "ZeroLend One -- Interest rate updated before debt updated when repaying (high)"
     - "Roots -- Stale totalActiveDebt used in openTrove after accrueInterest (high)"
@@ -846,6 +888,7 @@
   trampas:
     - "Yield position tokens may have different addresses than underlying -- check both"
     - "Some yield positions are non-transferable by design"
+  solodit_ids: []
   incidentes:
     - "The Standard Smart Vault -- Collateral in Gamma vaults not considered during liquidation (high)"
     - "Zaros -- User withdraws all collateral when position has profit, nothing to deduct on liquidation (medium)"
@@ -886,6 +929,7 @@
   trampas:
     - "Some protocols pause by asset, not globally -- check per-market granularity"
     - "Emergency pause may legitimately need to freeze everything including repay"
+  solodit_ids: []
   incidentes:
     - "Blueberry -- Liquidations enabled when repayments disabled, borrowers lose funds (medium)"
     - "Isomorph -- Outstanding loans cannot be closed or liquidated if collateral paused (high)"
@@ -931,6 +975,7 @@
   trampas:
     - "Risk premiums that update post-borrow can also close the gap -- check deferred updates"
     - "Different assets may have different gaps needed"
+  solodit_ids: []
   incidentes:
     - "Backed Protocol -- Users liquidated right after taking maximal debt (high)"
     - "Sentiment -- originationFee makes borrower liquidatable immediately (medium)"
@@ -974,6 +1019,7 @@
   trampas:
     - "Bad debt can be legitimate in extreme market conditions -- focus on whether it is HANDLED, not prevented"
     - "Some protocols use insurance funds instead of socialization"
+  solodit_ids: []
   incidentes:
     - "BendDAO -- Bad debt never handled, insolvency risk (high)"
     - "Perennial V2 -- Bad debt liquidation leaves negative collateral causing bank run (medium)"
@@ -1015,6 +1061,11 @@
   trampas:
     - "Flash loans that borrow and repay atomically may not affect rates if rates are calculated pre-tx"
     - "Some IRM models are intentionally responsive -- high sensitivity is a feature"
+  solodit_ids:
+    - h-03-high-erc721-utilization-rate-can-be-exploited-to-steal-funds-zachobront-none-fungify-markdown
+    - m-4-utilisation-can-be-manipulated-far-above-100-sherlock-arcadia-git
+    - utilizationrate-should-be-upper-capped-by-1e18-halborn-gloop-finance-gmi-and-lending-markdown
+    - m-6-vaultadaptermultiplier-not-initialized-can-lead-first-borrows-to-have-utilizationrate-0-sherlock-cap-git
   incidentes:
     - "Olympusdao -- SiloAMO forced to fund reduced rates by manipulating utilization (high)"
     - "Surge -- Attackers skip collateral ratio recovery to inflate ratios and steal funds (medium)"
@@ -1064,6 +1115,7 @@
   trampas:
     - "ERC721 and ERC1155 have different transfer semantics -- check both"
     - "Seaport/marketplace integration adds external state machine complexity"
+  solodit_ids: []
   incidentes:
     - "Astaria -- Anyone can take loan on behalf of any collateral holder (high)"
     - "Astaria -- Borrower lists collateral on Seaport, receives price without repaying liens (high)"
@@ -1110,6 +1162,7 @@
   trampas:
     - "Most standard ERC20s work fine -- this only matters for non-standard tokens"
     - "Fee-on-transfer is rare but USDT-on-some-chains has been known to enable it"
+  solodit_ids: []
   incidentes:
     - "Hyperlend -- Deprecated safeApprove blocks collateral approval to pool (high)"
     - "Morpho -- ERC20 with transfer fee not handled by PositionManager (medium)"
@@ -1157,6 +1210,7 @@
   trampas:
     - "Small deltas are normal due to rounding -- only large divergence is a bug"
     - "Morpho-specific pattern but applies to any P2P optimization layer"
+  solodit_ids: []
   incidentes:
     - "Morpho -- Liquidating Morpho's Aave position leads to state desync (high, found twice)"
     - "Morpho -- P2P rate manipulated as lazy-updated snapshot (high)"
@@ -1202,6 +1256,7 @@
   trampas:
     - "Partial liquidation restoring health may be legitimate -- only the TIMER RESET is the bug"
     - "Dutch auction parameters are highly protocol-specific"
+  solodit_ids: []
   incidentes:
     - "Ajna -- Auction timers fall through floor price causing pool insolvency (medium)"
     - "Ajna -- scaledQuoteTokenAmount not updated in take calculation (high)"
@@ -1248,6 +1303,7 @@
   trampas:
     - "Read-only reentrancy does not modify state but reads stale state -- separate pattern from write reentrancy"
     - "Cross-contract reentrancy bypasses single-contract reentrancy guards"
+  solodit_ids: []
   incidentes:
     - "Arcadia -- Reentrancy in flashAction drains liquidity pools via ERC777 (high)"
     - "Blueberry Update -- BalancerPairOracle manipulated via read-only reentrancy (high)"
@@ -1298,6 +1354,7 @@
     - "Message ordering is not guaranteed across chains -- race conditions are inherent"
     - "Failed cross-chain messages can leave state permanently desynchronized"
     - "Different token addresses on different chains may represent the same asset"
+  solodit_ids: []
   incidentes:
     - "LEND -- Cross-chain borrow ignores existing debt in collateral validation (high, 20+ finders)"
     - "LEND -- Cross-chain liquidation uses seize amount instead of repay amount (high, 15 finders)"
@@ -1347,6 +1404,7 @@
     - "Many protocols intentionally assume peg as a design choice -- check if there is explicit depeg handling"
     - "The bug only manifests during depeg events which may be rare but catastrophic"
     - "Some stablecoins have secondary oracles (Chainlink USDC/USD) that can be used"
+  solodit_ids: []
   incidentes:
     - "USG-Tangent -- USG peg assumption in on-chain safety checks causes incorrect liquidation (medium, 8 finders)"
     - "The Standard Smart Vault -- USD stablecoins incorrectly assumed to always be at peg (high)"
@@ -1392,6 +1450,12 @@
     - "1 wei of dust per operation is normal -- only large accumulated truncation is a bug"
     - "Rate change functions may be admin-only, reducing exploitability"
     - "Some protocols use ray math (1e27) which has much less truncation"
+  solodit_ids:
+    - m-11-debt-calculation-should-be-rounded-up-during-repayment-pashov-audit-group-none-sharwafinance-markdown
+    - m-05-borrowers-can-be-left-with-debt-shares-after-full-repayment-pashov-audit-group-none-sharwafinance-markdown
+    - c-03-users-can-borrow-tokens-without-generating-debt-shares-pashov-audit-group-none-sharwafinance-markdown
+    - liquidation-repaidshares-computation-rounding-issue-cantina-none-morpho-pdf
+    - m-36-sgl-and-bb-repay-do-not-round-up-both-on-allowance-spending-and-elastic-amount-sherlock-tapioca-git
   incidentes:
     - "Bold -- Batch shares math can be rebased to forgive entire Trove debt via rounding + rate changes (high)"
     - "Sharwafinance -- Borrowers left with debt shares after full repayment (medium)"
@@ -1438,6 +1502,7 @@
     - "This can take time to manifest -- index grows slowly with normal supply but explodes with dust"
     - "May be triggered by first-depositor attack (lending-010) as a secondary effect"
     - "Reward distributors and interest accumulators have separate indices -- check both"
+  solodit_ids: []
   incidentes:
     - "Astera/Cod3x Lend -- Index reaches type(uint104).max when totalSupply is dust, DoS aToken transfers (high)"
     - "Astera/Cod3x Lend -- RewardsController inconsistent scaling in handleAction causes transfer DoS (high)"
@@ -1485,6 +1550,7 @@
     - "Leveraged vaults are complex multi-step operations -- trace the full flow carefully"
     - "Slippage during deleverage swaps is expected -- only accounting bugs are real findings"
     - "Some leftover tokens may be by design (dust tolerance)"
+  solodit_ids: []
   incidentes:
     - "Peapods -- _removeLeverage() provides incorrect amounts when swapping (high)"
     - "Peapods -- removeLeverage sends wrong token to user (high)"
@@ -1534,6 +1600,7 @@
   trampas:
     - "E-Mode removal is a rare admin action, but the impact on existing positions is immediate"
     - "Some protocols cache E-Mode parameters at borrow time, making changes even harder to propagate"
+  solodit_ids: []
   incidentes:
     - "NUTS Finance/Cod3x Lend -- E-Mode misconfiguration causing inaccurate collateral accounting (medium)"
     - "Resolv -- No mechanism to exit isolation mode once entered (medium)"
@@ -1577,6 +1644,7 @@
   trampas:
     - "Minipools may have different risk parameters by design -- only RESTRICTION BYPASS is a bug"
     - "Liquidation of minipool positions requires understanding the hierarchical ownership model"
+  solodit_ids: []
   incidentes:
     - "Astera/Cod3x Lend -- Minipools can borrow from lending pool reserves that are not borrowable (high)"
     - "Astera/Cod3x Lend -- Minipool owner can create unliquidatable loan, imposing bad debt on main pool (medium)"
@@ -1620,6 +1688,7 @@
     - "In practice, closing and reopening has gas costs that may make this uneconomical for small amounts"
     - "Some protocols use StabilityPool instead of redistribution, partially mitigating this"
     - "Block-level atomicity makes this easy on L2s with cheap gas"
+  solodit_ids: []
   incidentes:
     - "Bima -- Users can prevent getting bad debt by withdrawing just before liquidation (medium)"
     - "Bima -- Bad debt redistribution not happening between liquidations in batch mode (high)"
@@ -1800,6 +1869,7 @@
     - "Some protocols enforce caps per-asset and globally — check both"
     - "If totalBorrows tracks shares not assets, cap in assets can be bypassed via rounding"
     - "Flash loans that borrow and repay in one tx may bypass a supply cap check that reads pre-tx state"
+  solodit_ids: []
   incidentes:
     - "Synthetix (Sigma Prime) — openLoan() checks supply cap before issuance, not after; cap can be exceeded by exact overshot (HIGH)"
     - "Aave Protocol (OpenZeppelin) — Fixed-rate loan max size bypass via pre-check on available liquidity (HIGH)"
@@ -1846,6 +1916,7 @@
     - "Aave's LTV=0 assets are related but different: LTV=0 means no NEW borrows, but existing borrows are valid"
     - "The isolation debt ceiling is global across ALL users borrowing against that asset — a single large position can block all others"
     - "Some isolation assets have LTV>0 for the isolated asset itself but 0 for cross-collateral use"
+  solodit_ids: []
   incidentes:
     - "Morpho on Aave V3 (Spearbit) — Isolated assets treated as valid cross-collateral, bypassing isolation mode restrictions (CRITICAL)"
     - "Multiple Aave V3 forks — Integration layers that read aToken balances but ignore isolation-mode bit in reserveConfig (HIGH)"
@@ -1895,6 +1966,7 @@
     - "Different collateral types may have different decimals — normalize BEFORE applying collateralFactor"
     - "A precision error that only allows liquidating 0.01% of positions may still be high severity if repeated"
     - "Inherited protocols (Compound fork, Aave fork) may change decimal convention in one place but not all callers"
+  solodit_ids: []
   incidentes:
     - "Stader Labs (Sigma Prime) — healthFactor precision issue causes all healthy positions to be liquidatable (HIGH)"
     - "Navi Protocol (OtterSec) — Erroneous max_liquidable_collateral calculation leads to unfair liquidation (HIGH)"
@@ -1953,6 +2025,7 @@
     - "El riesgo real es si el check pre-stake usa la metrica incorrecta (con fees) y luego el post-stake la cambia"
     - "decreaseLiquidityAndCollect() puede reducir liquidez sin check staked/unstaked — verificar flujo"
     - "transformWithRewardCompound() re-stakea si wasStaked=true — mismo riesgo al re-entrar"
+  solodit_ids: []
   incidentes:
     - "Patron especifico de Revert Lend GaugeManager — no hay incidentes previos documentados (NEW)"
   severidad: high
@@ -2011,6 +2084,7 @@
     - "_requireLoanIsHealthy post-transform ES llamado (linea 579) — pero la deuda ya fue enviada en borrow()"
     - "Si borrow() ocurre DENTRO del transform (via transformer -> vault.borrow()), el health check es al final del transform"
     - "La ventana real: create() con tokensOwed -> borrow() directamente (no via transform) -> position value cero despues"
+  solodit_ids: []
   incidentes:
     - "Patron derivado de analisis de V3Oracle.sol/V3Vault.sol Revert Lend — no hay incidente previo exacto (NEW)"
     - "ParaSpace (Code4rena) — V3 position collateral manipulation via pool price (HIGH, relacionado)"
@@ -2072,6 +2146,7 @@
     - "Para que sea explotable el HF inicial debe ser bajo (posición ya apalancada)"
     - "Revert Lend C4 H-03 parchado: transform() ya no permite llamadas arbitrarias — el exploit path está limitado"
     - "El llamador de transform() debe ser el owner del tokenId en V3Vault — no cualquier actor"
+  solodit_ids: []
   incidentes:
     - "Revert Lend C4 (2024-03) H-03: transform() no valida data input — permite explotar posiciones ajenas (HIGH)"
     - "LoopFi C4 M-05: PositionAction4626.increaseLever siempre reverts por manejo incorrecto de leverage (MEDIUM, relacionado)"
@@ -2135,6 +2210,7 @@
     - "If the protocol charges a deposit/withdrawal fee, the round-trip cost may exceed the interest savings"
     - "The reserve factor reduces attacker incentive (some interest goes to protocol reserves regardless)"
     - "The V3Vault has a per-day borrow limit — a single day's manipulation is bounded, but repeated daily attacks compound"
+  solodit_ids: []
   incidentes:
     - "Teller Finance (Sherlock, H-8) — Interest rate in LenderCommitmentGroup manipulatable by depositing, borrowing, withdrawing (HIGH)"
     - "Exactly Protocol (Sherlock, M-2) — Fixed interest rates manipulated by whale borrower cycling borrows (MEDIUM)"
@@ -2202,6 +2278,7 @@
     - "Wild Credit tenia esta vulnerabilidad pero otros protocolos pueden haberla parcheado en el unwind path"
     - "El atacante necesita que el transformer permita bajar a liquidity=0 SIN que el health check falle"
     - "Si el protocolo requiere liquidity > MIN para aceptar la posicion como colateral, el ataque es mas dificil"
+  solodit_ids: []
   incidentes:
     - "Wild Credit (Code4rena) — H-02: Liquidation escaped by depositing Uni V3 position with 0 liquidity; decreaseLiquidity(0) reverts in NonfungiblePositionManager (HIGH, Code4rena)"
     - "Revert Lend (Code4rena) — zero-liquidity-v3-nft-collateral: tokensOwed residuales aceptados como colateral con liquidity=0 (HIGH, relacionado)"
@@ -2260,6 +2337,7 @@
     - "Flash claims son una feature legitima para NFTs de utilidad (airdrops, juegos) — el fix no debe eliminarlos, sino acotarlos"
     - "La ventana de undercollateralizacion es intra-transaccion — no hay liquidacion durante ella, pero el estado persiste si no hay validacion final"
     - "Trail of Bits clasifico esto como HIGH porque la undercollateralizacion persiste post-transaccion (NFT devuelto pero vaciado)"
+  solodit_ids: []
   incidentes:
     - "ParaSpace (Trail of Bits) — Uniswap V3 NFT flash claims may lead to undercollateralization: durante flash claim, borrower extrae todo el valor de la posicion V3 y la devuelve vacia (HIGH, Trail of Bits)"
     - "Astaria (Code4rena) — Security hook not set for non-V3 NFT blocks flash auction flow (LOW, relacionado — flash flow vulnerabilities en NFT lending)"
@@ -2319,6 +2397,7 @@
     - "El verdadero riesgo es si el transformer puede operar sobre tokenIds distintos al recibido"
     - "Algunos transformers usan delegatecall (ejecutan EN el contexto del vault) — esto amplifica el riesgo enormemente"
     - "Un data payload que apunta a otro tokenId (no el que se esta transformando) es el ataque clasico"
+  solodit_ids: []
   incidentes:
     - "Revert Lend (Code4rena) — H-03: V3Vault::transform does not validate the data input, allows depositing tokens of one position into another position and draining vault funds (HIGH, Code4rena)"
   severidad: high
@@ -2379,6 +2458,7 @@
     - "La reentrancy via onERC721Received es menos obvia que la reentrancy via call() — los auditores la pasan por alto"
     - "El atacante DEBE ser un contrato (para implementar onERC721Received) — wallets normales no pueden hacer esto"
     - "Algunos protocolos mitigan esto con un mapping _depositLock[tokenId] pero olvidan validarlo en borrow()"
+  solodit_ids: []
   incidentes:
     - "Revert Lend (Code4rena) — H-02: Risk of reentrancy in onERC721Received function to manipulate collateral tracking before loan is registered (HIGH, Code4rena)"
     - "Timeswap (Code4rena) — H-04: State updates made after callback in mint() allow reentrancy to mint liquidity without paying (HIGH, Code4rena)"
@@ -2435,6 +2515,7 @@
     - "En Aave V3 el parametro se llama 'initiator' pero en otros pools puede llamarse 'sender' o no existir"
     - "Si el callback no ejecuta acciones privilegiadas (solo valida deuda), el riesgo es menor"
     - "LeverageTransformer en Revert Lend: si el flash loan callback no valida initiator, un atacante puede forzar leverage sobre cualquier posicion"
+  solodit_ids: []
   incidentes:
     - "DODO Margin Trading (PeckShield) — H-1: MarginTrading.sol missing flash loan initiator check allows attacker to open/close positions on behalf of any user (HIGH, PeckShield)"
     - "Stakewise (Sigma Prime) — STAKE-6: Unprotected flash loan callback abused to manipulate and claim other users' positions (HIGH, Sigma Prime)"
@@ -2497,6 +2578,7 @@
     - "Un atacante puede deployar un contrato en la direccion esperada si usa CREATE2 con los parametros correctos — verificar via factory siempre"
     - "Si el contrato no tiene tokens aprobados ni en custodia, el impacto es bajo aunque el callback sea llamable"
     - "V3Utils.sol y LeverageTransformer.sol de Revert Lend tienen callbacks — CRITICO verificar esta validacion"
+  solodit_ids: []
   incidentes:
     - "Barter DAO (Sherlock) — Missing caller verification in uniswapV3SwapCallback() allows any contract to force token transfers (LOW, Sherlock)"
     - "Gamma (Trail of Bits) — Uniswap V3 callbacks access control should be hardened to prevent unauthorized invocation (LOW, Trail of Bits, Fixed)"
@@ -2560,6 +2642,7 @@
     - "Peapods: tokens bloqueados son HIGH; solo slippage es MEDIUM — la severidad depende si hay recovery path"
     - "El sandwich attack requiere mempool visible — en L2s con sequencer centralizado el riesgo es menor"
     - "TWAP oracles no funcionan bien para tokens con liquidez baja — el fix del oracle puede crear otro problema"
+  solodit_ids: []
   incidentes:
     - "Peapods Finance (Code4rena, Nov 2024) — H-06: No slippage checks when removing leverage leads to stuck tokens if slippage exceeds _podAmountOutMin (HIGH, Code4rena)"
     - "Peapods Finance — H-6: LeverageManager remove leverage will lead to stuck tokens if slippage _podAmountOutMin is too strict (HIGH)"
@@ -2759,3 +2842,25 @@ When you open a new lending protocol's code, check these in order:
 - **[MEDIUM] Liquidation cannot be closed even with healthy position (Solodit lending-36)** -- closeLiquidation requires debt below dust threshold instead of checking health factor; user with healthy position but remaining dust debt stays in permanent liquidation state. New pattern: liquidation exit criteria mismatch.
 - **[MEDIUM] Unclaimable reserve assets accrue in pool (Solodit lending-24)** -- Borrow interest compounds but supply interest is linear (fixed); the difference accumulates as unclaimable reserves, slowly reducing capital efficiency. New pattern: compound vs simple interest mismatch.
 - **[MEDIUM] Liquidity pool interest accrual manipulation via frequent borrows (Solodit lending-9)** -- Each borrow call resets totalBorrowsSnapshotTimestamp; frequent small borrows reduce effective accrual window, lowering total interest collected. New pattern: timestamp reset via high-frequency operations.
+
+---
+
+## TRAMPAS VERIFICADAS — Lecciones de revert-lend (V3Vault)
+
+> Fuente: Hunt real de V3Vault.sol — false positives confirmados por análisis profundo.
+> Añadir a checklist antes de reportar cualquier finding en protocolos tipo Compound fork con NFT collateral.
+
+- **Exchange rate time-based ≠ vulnerable a first-depositor inflation**: V3Vault y protocolos similares
+  usan `lastLendExchangeRateX96` actualizado via IRM en función del tiempo, NO del ratio balance/supply.
+  Las donaciones directas al contrato van a reservas, NO inflan el exchange rate.
+  Comprueba siempre: ¿el exchange rate se calcula de `totalAssets/totalSupply` o de un acumulador temporal?
+
+- **Rounding correcto en borrow/repay no es explotable**: Si borrow redondea shares UP (más deuda)
+  y repay-by-assets redondea shares DOWN (menos quemados = el borrower paga más), las direcciones
+  de rounding favorecen al protocolo. No flag como bug. Verifica las dos direcciones antes de reportar.
+
+- **totalSupply==0 durante liquidación con bad debt es unreachable en V3Vault-style**: Para que
+  `totalSupply` llegue a 0, toda la deuda debe repagarse primero. Con deuda cero no hay posiciones
+  liquidables. El path de socialización de pérdidas (`_handleReserveLiquidation`) con `totalLent==0`
+  no es alcanzable. No reportar como DoS en lending.
+

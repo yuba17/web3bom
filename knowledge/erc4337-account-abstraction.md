@@ -61,6 +61,10 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "El paymaster puede ser legítimamente multi-sender — no confundir con bug"
     - "Si el sender es un proxy con timelock de upgrade, el riesgo es menor"
+  solodit_ids:
+    - h-05-paymaster-eth-can-be-drained-with-malicious-sender-code4rena-biconomy-biconomy-smart-contract-wallet-contest-git
+    - verifyingsigner-has-no-authority-over-paymaster-related-gas-limits-cantina-none-coinbase-pdf
+    - m-05-dos-of-user-operations-and-loss-of-user-transaction-fee-due-to-insufficient-gas-value-submission-by-malicious-bundler-code4rena-biconomy-biconomy-smart-contract-wallet-contest-git
   incidentes:
     - "Solodit #6444: Biconomy VerifyingSingletonPaymaster -- sender upgrades a MaliciousAccount y reutiliza firma del paymaster para drenar depósito ETH (HIGH)"
   severidad: high
@@ -102,6 +106,10 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "En EntryPoint v0.7+ el depósito se lockea automáticamente -- verificar versión"
     - "Si withdraw() tiene un delay de cooldown, el ataque es menos práctico"
+  solodit_ids:
+    - h05-incorrect-gas-price-core-openzeppelin-eip-4337-ethereum-account-abstraction-audit-markdown
+    - bundler-may-drop-userops-if-the-owner-of-lightaccount-violates-erc-4337s-validation-requirements-in-isvalidsignature-quantstamp-alchemy-light-account-markdown
+    - enable-mode-can-be-frontrun-to-add-policies-for-a-different-permissionid-codehawks-biconomy-nexus-git
   incidentes:
     - "Solodit #32023: Coinbase MagicSpend -- balance check en validatePaymasterUserOp no garantiza fondos en postOp() si hay front-run de withdraw (MEDIUM)"
     - "Solodit #32024: Coinbase MagicSpend -- front-run de la firma del paymaster causa DoS y pérdida de fee al usuario (MEDIUM)"
@@ -144,6 +152,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "El finding puede estar fixeado en versiones posteriores de MagicSpend -- verificar commit"
     - "Si postOp es llamado por el EntryPoint, el reentrancy directo no aplica, pero el double-claim sí"
+  solodit_ids: []
   incidentes:
     - "Solodit #40749: Coinbase MagicSpend -- postOp() no resetea _gasMaxCostExcess, doble withdrawal del exceso de ETH (MEDIUM)"
   severidad: medium
@@ -186,6 +195,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "Algunos paymasters sponsorizan intencionalmente (usuario no paga) -- solo es bug si el protocolo asume cobro"
     - "Paymasters con depósito pre-cargado en EntryPoint no tienen este problema"
+  solodit_ids: []
   incidentes:
     - "Solodit #62850: EtherSpot GasTankPaymaster -- _postOp() no cobra gas on-chain, cobro diferido via evento permite escape de pago revocando allowance (HIGH)"
   severidad: high
@@ -232,6 +242,12 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "El nonce del EntryPoint protege contra replay del userOpHash completo -- el bug ocurre cuando el módulo valida datos DENTRO del callData por un path separado"
     - "Si validUntil es en el pasado, el replay falla igualmente -- confirmar ventana de validez"
+  solodit_ids:
+    - h-07-replay-attack-eip712-signed-transaction-code4rena-biconomy-biconomy-smart-contract-wallet-contest-git
+    - missing-nonce-in-_getenablemodedatahash-allows-signature-replay-codehawks-biconomy-nexus-git
+    - m-03-cross-chain-signature-replay-attack-code4rena-biconomy-biconomy-smart-contract-wallet-contest-git
+    - nonce-logic-is-skipped-for-smart-contract-wallets-spearbit-none-fastlane-atlas-pdf
+    - replay-attacks-on-co-signer-signed-invocations-sigmaprime-none-dapper-labs-pdf
   incidentes:
     - "Solodit #61409: EtherSpot ResourceLockValidator -- validateUserOp no consume la firma del ResourceLock, replay posible dentro de la ventana validAfter/validUntil (CRITICAL)"
   severidad: critical
@@ -275,6 +291,11 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "El EntryPoint llama validateUserOp con el hash correcto -- el bug surge cuando el módulo NO confía en esto y necesita re-verificarlo para paths custom"
     - "Si el módulo solo se usa como hook (no como validator primario), el riesgo puede ser menor"
+  solodit_ids:
+    - nativetokenlimitmodule-can-be-bypassed-quantstamp-alchemy-modular-account-v2-markdown
+    - validation-modules-validation-can-be-fully-bypassed-if-signature-validation-is-skipped-quantstamp-alchemy-modular-account-v2-markdown
+    - m-01-balance-check-during-magicspend-validation-cannot-ensure-that-magicspend-has-enough-balance-to-cover-the-requested-fund-code4rena-coinbase-coinbase-git
+    - h01-incorrect-prefund-calculation-core-openzeppelin-eip-4337-ethereum-account-abstraction-audit-markdown
   incidentes:
     - "Solodit #61410: EtherSpot ResourceLockValidator -- validateUserOp sin checks suficientes permite drenar balances del wallet con callData malicioso (CRITICAL)"
     - "Solodit #61396: EtherSpot CredibleAccountModule -- no verifica que userOpHash es el hash real del userOp ni que sessionKey pertenece al sender (HIGH)"
@@ -318,6 +339,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "La función puede parecer solo de lectura pero modificar estado con side effects"
     - "En Solidity, funciones public pueden ser llamadas tanto internamente como externamente -- revisar todos los callers"
+  solodit_ids: []
   incidentes:
     - "Solodit #61407: EtherSpot CredibleAccountModule -- validateSessionKeyParams() es public, atacante marca tokens del usuario como claimed sin ejecutar UserOp (CRITICAL)"
   severidad: critical
@@ -358,6 +380,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "ECDSA.recover() de OZ revierte -- solo es bug con ecrecover nativo o ECDSA.tryRecover()"
     - "Si owners mapping requiere registro explícito, address(0) no puede estar -- verificar el path de inicialización"
+  solodit_ids: []
   incidentes:
     - "Solodit #53328: OmoAgen Smart Wallet -- _validateSignature usa ECDSA.recover sin check address(0), firma inválida puede pasar si signer es address(0) (HIGH)"
     - "Solodit #63399: SignaturePaymaster -- validatePaymasterUserOp usa ECDSA.tryRecover sin revert ni check address(0) (LOW/MEDIUM)"
@@ -398,6 +421,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "El bug puede ser solo DoS si validateUserOp no hace transferencias -- valorar impacto real"
     - "Algunos módulos son llamados internamente por el wallet (no por EntryPoint) por diseño -- verificar el flow"
+  solodit_ids: []
   incidentes:
     - "Solodit #62122: Etherspot JWTRecovery -- validateUserOp sin access control permite a cualquier address incrementar nonce del usuario, causando DoS de UserOps legítimas (MEDIUM)"
   severidad: medium
@@ -442,6 +466,7 @@ Bundler → EntryPoint.handleOps()
     y usar esa dirección como clave, no un parámetro externo.
   trampas:
     - "Si solo hay una sesión activa por wallet, el cross-claim no aplica -- verificar si el protocolo permite múltiples sesiones simultáneas"
+  solodit_ids: []
   incidentes:
     - "Solodit #62848: EtherSpot CredibleAccountModule -- sessionKey owner firma consumiendo sessionKey de otro owner del mismo wallet (HIGH)"
   severidad: high
@@ -484,6 +509,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "El bug solo aplica si live/active es la única guard -- si hay nonce de EntryPoint también, el replay puede estar bloqueado de otra forma"
     - "En Solidity >= 0.8.x el compilador no advierte sobre esto -- requiere revisión manual"
+  solodit_ids: []
   incidentes:
     - "Solodit #61406: EtherSpot CredibleAccountModule -- SessionData memory en validateUserOp, sd.live = false no persiste en storage, sesiones nunca se invalidan (CRITICAL)"
   severidad: critical
@@ -531,6 +557,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "Si el usuario solo usa un método (solo on-chain O solo executeWithoutChainId), los índices son consistentes y el bug no aplica"
     - "La severidad varía: puede ser desde confusión hasta lockout permanente si se elimina el último owner"
+  solodit_ids: []
   incidentes:
     - "Solodit #32022: Coinbase SmartWallet -- removeOwnerAtIndex replay cross-chain elimina owner diferente en cada chain, combined con falta de last-owner guard puede causar lockout (HIGH)"
   severidad: high
@@ -572,6 +599,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "Si el paymaster solo opera en una chain, el replay cross-chain no aplica en la práctica"
     - "Biconomy: el chainId también falta en el SmartAccount, no solo en el paymaster -- revisar ambos"
+  solodit_ids: []
   incidentes:
     - "Solodit #6449: Biconomy VerifyingSingletonPaymaster -- getHash() omite chainId, UserOperation replayable en cualquier chain donde el paymaster esté deployado (MEDIUM)"
   severidad: medium
@@ -619,6 +647,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "ERC-6492 es legítimo para verificar firmas de wallets no deployados -- el bug está en qué side-effects se permiten durante la verificación"
     - "Si SpendPermissionManager NO es owner del wallet, el impacto es menor"
+  solodit_ids: []
   incidentes:
     - "Solodit #41992: Coinbase SpendPermissionManager -- ERC-6492 path con ownerIndex manipulado permite al atacante añadirse como owner del SmartWallet víctima y drenar fondos (CRITICAL/HIGH)"
   severidad: critical
@@ -663,6 +692,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "Si el usuario remueve el manager intencionalmente, podría ser 'by design' -- verificar spec"
     - "El DoS puede requerirse que el atacante controle el wallet -- verificar who can call removeOwner"
+  solodit_ids: []
   incidentes:
     - "Solodit #46544: Coinbase SpendPermissionManager -- isApproved() retorna false cuando manager removido de owners, DoS para DApps que dependen de isApproved como pre-validación (MEDIUM)"
   severidad: medium
@@ -705,6 +735,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "La DApp pierde dinero (servicio gratis), no el usuario -- evaluar si el bug scope incluye pérdida de la DApp"
     - "Requiere que el atacante pueda registrar un spend permission -- verificar quién puede hacer approve"
+  solodit_ids: []
   incidentes:
     - "Solodit #46546: Coinbase SpendPermissionManager -- wallet malicioso con execute() vacío permite a apps ser robadas proveyendo servicios sin cobro (MEDIUM)"
   severidad: medium
@@ -751,6 +782,7 @@ Bundler → EntryPoint.handleOps()
   trampas:
     - "Este ataque requiere bundler malicioso -- en ecosistemas con bundlers permissioned no aplica"
     - "La pérdida de fee puede ser pequeña -- evaluar si el protocolo tiene bundlers propios"
+  solodit_ids: []
   incidentes:
     - "Solodit #6451: Biconomy EntryPoint -- bundler malicioso submitia bundle con gas insuficiente, DoS de UserOps y pérdida de fee del usuario (MEDIUM)"
   severidad: medium

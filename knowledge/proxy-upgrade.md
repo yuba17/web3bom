@@ -27,6 +27,12 @@
     - "Standard OpenZeppelin TransparentUpgradeableProxy and UUPS are safe for proxy-vs-implementation overlap -- focus on CUSTOM proxies"
     - "The real danger is between V1 and V2 of the IMPLEMENTATION, not proxy vs implementation"
     - "Enums and small types packed together can shift unexpectedly"
+  solodit_ids:
+    - h-06-storage-collision-between-proxy-and-implementation-lack-eip-1967-code4rena-joyn-joyn-contest-git
+    - risk-of-storage-collision-in-proxy-contract-openzeppelin-none-anvil-protocol-audit-markdown
+    - m09-contracts-storage-layout-can-be-corrupted-on-upgradeable-contracts-openzeppelin-celo-contracts-audit-markdown
+    - accesscontrolds-uses-accesscontrol-which-has-storage-collision-risks-trailofbits-none-arkis-defi-prime-brokerage-protocol-pdf
+    - standard-reentrancyguard-inheritance-risks-diamond-storage-collision-mixbytes-none-cryptolegacy-markdown
   incidentes:
     - "Brink Protocol -- ProxyStorage._implementation and _owner at slots 0-1 overlap with verifier contract storage; attacker could overwrite implementation address via delegatecall to crafted verifier (HIGH)"
   severidad: critical
@@ -68,6 +74,7 @@
     - "reinitializer(version) is legitimate for V2 migration -- only flag if the version number allows re-calling"
     - "On TransparentProxy, the impact is lower because upgrade logic is in the proxy, not implementation"
     - "Some protocols intentionally leave implementation uninitialized if it has no selfdestruct path"
+  solodit_ids: []
   incidentes:
     - "Zap Protocol (Vesting, TokenSale, Admin) -- Three proxy contracts missing _disableInitializers in constructor; implementation contracts directly initializable (MEDIUM)"
     - "Ethos Network -- All EthosContracts missing _disableInitializers in constructor and inheriting non-upgradeable OZ contracts (MEDIUM)"
@@ -112,6 +119,10 @@
     - "OpenZeppelin v5 UUPSUpgradeable forces you to override _authorizeUpgrade (compile error if you don't) -- but the override can still be empty"
     - "The auth check might be present but bypass-able (e.g., checks a role that was not properly set up)"
     - "Transparent proxies are NOT affected -- upgrade logic is in the proxy admin"
+  solodit_ids:
+    - anyone-is-able-to-upgrade-implementation-of-the-contract-zokyo-none-made-for-gamers-markdown
+    - m-04-pool-designed-to-be-upgradeable-but-does-not-set-owner-making-it-un-upgradeable-code4rena-blur-exchange-blur-exchange-contest-git
+    - m-15-crosscurrencyfcashvault-cannot-be-upgraded-sherlock-notional-notional-git
   incidentes:
     - "MorpheusAI (DistributionV2) -- _authorizeUpgrade() has empty body with no access control; anyone can upgrade implementation and selfdestruct proxy (MEDIUM)"
     - "Ithaca Finance (Registry) -- Registry._authorizeUpgrade() has no access control; any user can upgrade to arbitrary implementation (MEDIUM)"
@@ -148,6 +159,11 @@
     - "On L2s with sequencer-ordered transactions (Optimism, Arbitrum), front-running is harder but not impossible"
     - "Some protocols use a two-phase deploy intentionally with a deployer whitelist -- verify the whitelist is enforced"
     - "This is often reported as Medium, not Critical, because it requires monitoring the mempool at deploy time"
+  solodit_ids:
+    - initializefunctions-not-protected-auditone-none-newwit-markdown
+    - implementation-contracts-can-be-initialized-cantina-none-olas-pdf
+    - trst-l-3-strategy-may-be-initialized-by-attacker-trust-security-none-ninja-yield-farming-v3-markdown_
+    - l-01-add-constructor-initializer-in-implementation-contracts-code4rena-jpyc-jpyc-contest-git
   incidentes:
     - "reNFT (modules) -- Both proxy modules missing atomic initialization; initializers can be front-run during deployment, attacker sets owner to themselves (LOW, Code4rena)"
     - "Soonaverse -- Deployment script deploys proxy then calls initialize in separate tx; attacker front-runs initialize to take ownership and force re-deployment (HIGH, AuditOne)"
@@ -180,6 +196,11 @@
     - "Post-Dencun (Mar 2024), selfdestruct no longer destroys code except in same-tx-as-creation -- but many contracts were deployed pre-Dencun"
     - "Some chains (L2s) may not have adopted EIP-6780"
     - "The selfdestruct may be hidden behind an assembly block or in a library"
+  solodit_ids:
+    - risk-of-killing-upgrades-quantstamp-ssvnetwork-markdown
+    - upgradebranchsol-does-not-use-_disableinitializers-codehawks-zaros-git
+    - upgradeable-contract-initializer-not-disabled-in-constructor-allows-implementation-contract-initialization-cyfrin-none-securitize-vaultv2-rwasegwrap-markdown
+    - l-01-some-contracts-not-following-uups-best-practices-pashov-audit-group-none-kittenswap_2025-07-31-markdown
   incidentes:
     - "Biconomy SmartAccount -- Uninitialized SmartAccount implementation allows attacker to initialize, then delegatecall to Destructor, executing selfdestruct and bricking all wallets pointing to implementation (MEDIUM)"
     - "Brink Protocol (Account.sol) -- Account.sol delegateCall() allows owner to delegatecall arbitrary target; if access control compromised, selfdestruct bricks all user wallets (MEDIUM)"
@@ -219,6 +240,7 @@
     - "OpenZeppelin upgradeable contracts already include __gap -- but custom base contracts often don't"
     - "Constants and immutables do NOT consume storage slots -- no gap needed for them"
     - "Mappings and dynamic arrays each consume exactly 1 slot for the root -- gap math still applies"
+  solodit_ids: []
   incidentes:
     - "Biconomy SmartAccount (ModuleManager) -- ModuleManager has storage but no __gap; future base contract changes shift all derived storage slots (MEDIUM)"
     - "Connext Protocol -- All __GAP arrays set to 49 regardless of contract storage variable count; incorrect gap sizes make future upgrades unsafe (MEDIUM)"
@@ -250,6 +272,11 @@
     - "OpenZeppelin TransparentProxy fully prevents this by design -- focus on custom proxies"
     - "4-byte collision probability is low but not zero, especially with auto-generated getters"
     - "This is more of a DoS/UX issue than a fund-loss issue in most cases"
+  solodit_ids:
+    - custom-selectors-could-facilitate-proxy-selector-clashing-attack-openzeppelin-none-security-review-ink-cargo-contract-markdown
+    - risk-of-function-signature-clash-with-ifadmin-openzeppelin-none-ironblocks-onchain-firewall-audit-markdown
+    - possible-function-selector-clashing-openzeppelin-none-venus-protocol-diamond-comptroller-audit-markdown
+    - potential-function-clashes-openzeppelin-compound-iii-audit-markdown
   incidentes:
     - "Ironblocks Onchain Firewall -- ifAdmin modifier deprecated in OZ v4.9.3 due to function signature clash risk; FirewallTransparentUpgradeableProxy inherits deprecated pattern (LOW, OpenZeppelin)"
     - "ink! / cargo-contract -- Custom hardcoded selectors in ink! contracts can produce 4-byte collisions with proxy admin functions; attacker crafts function name to match proxy selector (HIGH, OpenZeppelin)"
@@ -280,6 +307,7 @@
   trampas:
     - "The blast radius is the key differentiator -- a single beacon compromise affects ALL clones"
     - "Beacon proxies are legitimate and useful (gas-efficient mass upgrades) -- the issue is auth, not the pattern"
+  solodit_ids: []
   incidentes:
     - "Primex Finance -- Factory-deployed beacon proxies owned by deployer EOA (not PrimexProxyAdmin); any deployer can upgrade all factory clones without going through governance (MEDIUM, Quantstamp)"
     - "AriaIPVault -- Contract inherits UUPS AND sits behind BeaconProxy; UUPS _authorizeUpgrade is unreachable because beacon controls upgrades; redundant UUPS adds confusion about actual upgrade path (LOW, Pashov Audit Group)"
@@ -536,6 +564,7 @@
   trampas:
     - "If implementation is immutable (never updated), not exploitable"
     - "If proxies are UUPS (not minimal clones), implementation can be updated in-place"
+  solodit_ids: []
   incidentes:
     - "Strata Tranches UnstakeCooldown — reuses old clone proxies with outdated implementation after setImplementations update (Medium)"
   severidad: medium
@@ -567,6 +596,7 @@
   trampas:
     - "If both roles are controlled by the same multisig, lower practical risk"
     - "If the protocol is intended to be admin-upgradeable by design, may be accepted"
+  solodit_ids: []
   incidentes:
     - "RipIt RoleBasedAccessControl — _authorizeUpgrade allows both SUPER_ADMIN_ROLE and ROLE_MANAGER_ROLE, excessive upgrade privilege (Medium)"
   severidad: medium
@@ -599,6 +629,7 @@
   trampas:
     - "If the platform uses a different upgrade mechanism for subsequent upgrades, may be mitigated"
     - "May only manifest on the second upgrade cycle"
+  solodit_ids: []
   incidentes:
     - "EVAA Finance — submit_upgrade_process generates new_upgrade_config but never saves to storage, version tracking broken (Medium)"
   severidad: medium
@@ -631,6 +662,7 @@
   trampas:
     - "If using Transparent Proxy (not UUPS), attacker cannot upgrade further even if they front-run"
     - "If reinitializer only sets non-critical parameters, impact is low"
+  solodit_ids: []
   incidentes:
     - "Linea RollupRevenueVault — reinitializer(2) available immediately after initialize, front-runnable before admin calls upgradeAndCall (Medium)"
   severidad: high
@@ -662,6 +694,7 @@
   trampas:
     - "If Diamond has only one facet using slot 0, no collision currently"
     - "Future facet additions may introduce the collision"
+  solodit_ids: []
   incidentes:
     - "CryptoLegacy — Diamond plugins inherit standard ReentrancyGuard using slot 0, collision risk across facets (Low)"
   severidad: medium
@@ -695,6 +728,7 @@
   trampas:
     - "Post-EIP-6780 chains: SELFDESTRUCT only works in same-creation-tx, limiting attack"
     - "If contract has payable functions, balance manipulation is expected"
+  solodit_ids: []
   incidentes:
     - "VeChain DPoS Staker — SELFDESTRUCT sends VET to Staker contract, breaks balance == staked invariant, blocks block production (High)"
     - "Camp WrappedCAMP — SELFDESTRUCT inflates totalSupply derived from balance (Low)"
@@ -728,6 +762,7 @@
     - "If diamond is intended to be immutable post-deploy, diamondCut should be removed entirely from facets"
     - "Some diamonds use a governance proposal + timelock flow -- check whether execution step also requires the delay"
     - "LiFi's Diamond uses owner-only diamondCut with no timelock -- owner key compromise is the remaining risk"
+  solodit_ids: []
   incidentes:
     - "Burve Protocol (SimplexDiamond) -- DiamondCutFacet.diamondCut exposed with no access control; any caller can replace all facets, drain all liquidity positions (CRITICAL, Pashov Audit Group)"
     - "LI.FI Diamond -- diamondCut callable by owner with no timelock delay; Connext requires 7-day proposal window for same operation (LOW, Spearbit)"
@@ -764,6 +799,7 @@
     - "Diamond storage with ERC-7201 namespaced structs avoids this if all access control is inside the same namespace"
     - "If the protocol has an off-chain role registry, re-granting may be feasible -- but it requires the grant function to work post-upgrade"
     - "Even immutable roles (DEFAULT_ADMIN_ROLE) stored in a shifted slot are lost"
+  solodit_ids: []
   incidentes:
     - "GainsNetwork GNSMultiCollatDiamond -- Upgrade shifts accessControl mapping from slot 2 to slot 3; all grantee roles lost post-upgrade, all role-gated protocol functions broken (HIGH, Pashov Audit Group)"
     - "Realize TokenManager -- Roles granted in constructor apply only to implementation, not proxy; after upgrade implementation roles are lost and proxy has no DEFAULT_ADMIN_ROLE (INFO, Zokyo)"
@@ -799,6 +835,7 @@
     - "If the wrong role is empty (no holders), result is DoS on upgrades rather than privilege escalation"
     - "Role typos are especially dangerous if the 'wrong' role is held by a less-trusted account"
     - "This pattern appears in both UUPS and Diamond proxies -- anywhere hasRole gates upgrade"
+  solodit_ids: []
   incidentes:
     - "Coinbase AttestationIndexer -- UPGRADER_ROLE value uses 'staticattester' string instead of 'indexer'; role check in _authorizeUpgrade silently gates wrong set of accounts, breaking upgrade access control (MEDIUM, Cantina)"
     - "Coinbase AttestationIndexer -- INDEXER_ROLE similarly incorrect ('cbattestations.staticattester.indexer' vs expected value); pattern shows systemic copy-paste of wrong protocol name in role constants (MEDIUM, Cantina)"
@@ -845,6 +882,7 @@
     - "On chains where SELFDESTRUCT is post-EIP-6780 (same-tx only), implementation destruction is harder but still possible via CREATE2 address reuse"
     - "Foundry mocks often deploy implementation to valid addresses — fork testing is needed to catch this in prod deploys"
     - "The pattern is also triggered if a clone factory points to an implementation that was never deployed (deploy script bug)"
+  solodit_ids: []
   incidentes:
     - "DeGate (Consensys) — delegatecall with no code existence check; if target is zero-code, call silently succeeds, breaking proxy logic (MEDIUM)"
     - "Frax Finance (Trail of Bits) — same delegatecall-no-code-check pattern; HIGH severity due to critical proxy paths affected"
@@ -896,6 +934,7 @@
     - "Cork Protocol finding: contract compiles and deploys fine; the bug only manifests when upgrade is actually needed (emergency scenario)"
     - "If the protocol is 'intended to be non-upgradeable', removing upgrade logic entirely is safer than broken UUPS"
     - "Some audits flag this as Low/Info if the protocol claims upgrades are out-of-scope — but a bricked upgrade path is a real operational risk"
+  solodit_ids: []
   incidentes:
     - "Cork Protocol — UUPS standard implemented incorrectly; admin cannot upgrade smart contracts, breaking core upgrade functionality (MEDIUM, audit 2024)"
     - "Cork Protocol M-3 — Admin will not be able to upgrade, blocking emergency response (MEDIUM)"
@@ -947,6 +986,7 @@
     - "Enso Finance: implementation destruction directly executed (HIGH, $0 loss caught in audit)"
     - "Biconomy SmartAccount: implementation destroyed in prod — all smart accounts bricked"
     - "This is different from proxy-002 (uninitialized proxy) — here the IMPLEMENTATION is taken over, not the proxy"
+  solodit_ids: []
   incidentes:
     - "Enso Finance — EnsoWallet implementation can be destroyed; any proxy pointing to it loses all functionality (HIGH, Consensys)"
     - "Biconomy SmartAccount — implementation contract destroyed via uninitialized takeover; all wallets bricked (HIGH)"
@@ -994,6 +1034,7 @@
     - "Sablier finding is about plugin/target with selfdestruct enabled via proxy — adjacent but different vector"
     - "MIMO finding: the DoS is permanent unless proxy admin can call via a different code path to reset"
     - "Gas reserve DoS is rated HIGH in Sablier audit due to permanent bricking of all user flows"
+  solodit_ids: []
   incidentes:
     - "MIMO DeFi (MIMOProxy) — setMinGasReserve() with no upper bound; attacker sets max value, all proxy calls revert permanently (HIGH, Spearbit)"
     - "MIMO DeFi — MIMOProxy owner destroys their proxy via selfdestruct-enabled plugin; cannot redeploy (MEDIUM, Spearbit)"
@@ -1043,6 +1084,7 @@
     - "OpenZeppelin v5 ProxyAdmin moves admin functions out-of-proxy — this pattern only affects older OZ versions or custom proxies"
     - "If the proxy uses a dedicated ProxyAdmin contract (OZ standard), admin calls the ProxyAdmin, not the proxy directly — routing confusion doesn't apply"
     - "Selector clashes between proxy and impl are rare but 4-byte collisions do exist (proxy-007 documents known clashes)"
+  solodit_ids: []
   incidentes:
     - "Infinigold — Inadequate proxy implementation preventing upgrades; transparent proxy routing misconfigured, admin cannot upgrade (HIGH)"
     - "Various — Selector clash between proxy admin functions and implementation causes silent misdirection (class of bugs, multiple audit findings)"

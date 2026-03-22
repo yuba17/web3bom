@@ -40,6 +40,14 @@
     - "1 wei rounding per operation is generally not exploitable unless repeatable cheaply"
     - "Penalty mechanisms may intentionally reduce effective rewards — not a rounding bug"
     - "Rebasing staking tokens naturally cause accumulator drift"
+  solodit_ids:
+    - rounding-errors-result-in-lost-accrued-rewards-ottersec-none-mysten-labs-sui-pdf
+    - m-01-the-user-who-withdraws-liquidity-from-a-particular-pool-is-able-to-claim-more-rewards-than-they-should-by-carefully-selecting-a-decreaseshareamount-value-such-that-the-virtualrewardstoremove-is-rounded-down-to-zero-code4rena-saltyio-saltyio-git
+    - rounding-to-zero-if-duration-is-greater-than-reward-sigmaprime-none-synthetix-pdf
+    - m-2-integer-overflow-when-calculating-rewards-sherlock-gamma-locked-staking-contract-git
+    - m-16-accumulated-rewards-per-share-can-round-to-zero-code4rena-gte-gte-git
+    - lps-can-lose-fees-if-fee-growth-accumulator-overflows-their-checkpoint-spearbit-none-primitive-pdf
+    - improper-reward-distribution-ottersec-none-goosefx-v2-pdf
   incidentes:
     - "Redacted Cartel/PirexRewards — User with tiny pxGMX balance gets amount=0 from rounding, accrued rewards zeroed permanently (HIGH, C4)"
     - "Gamma Staking — cumulatedReward scaled by 1e36 overflows uint256 when multiplied by staker balance; griefable by staking 1 wei (MEDIUM, Sherlock)"
@@ -88,6 +96,11 @@
     - "Contracts without lock periods are vulnerable by design — confirm this is unintentional"
     - "Linear distribution (Synthetix rewardsDuration) mitigates single-block extraction but not multi-block flash loans"
     - "Private mempool (Flashbots) reduces but does not eliminate risk"
+  solodit_ids:
+    - h-04-nftxlpstaking-is-subject-to-a-flash-loan-attack-that-can-steal-nearly-all-rewardsfees-that-have-accrued-for-a-particular-vault-code4rena-nftx-nftx-git
+    - flash-loan-attack-on-gauge-reward-distribution-via-get_adjustment-manipulation-mixbytes-none-yield-basis-markdown
+    - h-27-attacker-can-inflate-stake-rewards-as-he-wants-sherlock-elfi-git
+    - m-11-the-variable-fshareratio-is-vulnerable-to-manipulation-by-flash-minting-and-burning-code4rena-fairside-fairside-contest-git
   incidentes:
     - "Buffer Finance — LPs game option expiry by staking before OTM expiry and withdrawing after 10-min lock (HIGH, Sherlock)"
     - "Locke — User can stake before stream creator produces funding stream, capturing unearned rewards (MEDIUM)"
@@ -136,6 +149,11 @@
     - "Protocols with same staking and reward token are more vulnerable"
     - "Some protocols intentionally accept donations as extra yield — verify design intent"
     - "Virtual shares offset mitigates share-price inflation but not reward accumulator inflation"
+  solodit_ids:
+    - h-01-stakedtoken-is-vulnerable-to-share-inflation-attack-via-donation-pashov-none-increment-markdown
+    - inflation-attack-on-zero-total-stake-ottersec-none-thala-lsd-deps-pdf
+    - backstop-deposit-inflation-ottersec-none-blend-capital-pdf
+    - vaults-are-vulnerable-to-a-donation-attack-halborn-tagus-labs-v2-markdown
   incidentes:
     - "River Protocol — 1 wei force-sent via selfdestruct before first deposit makes sharesToMint=0 for all future depositors (HIGH, Spearbit)"
     - "Collateral.sol (C4) — First depositor mints 1 share then donates to strategy controller, all subsequent depositors get 0 shares (HIGH)"
@@ -182,6 +200,10 @@
     - "Standard Synthetix pattern is safe IF modifiers are applied correctly"
     - "ERC-20 transfers (no hooks) do not enable reentrancy — only flag for ERC-777 or native ETH"
     - "Leftover rewards from previous epoch rolled into new epoch is expected in some designs"
+  solodit_ids:
+    - malicious-user-can-drain-rewards-through-reentrancy-in-staking-quantstamp-zero-staking-markdown
+    - l-04-the-unstake-function-can-be-re-entered-pashov-audit-group-none-dyad-markdown
+    - missing-reentrancy-protection-in-cllockerincreaseliquidity-mixbytes-none-velodrome-markdown
   incidentes:
     - "AI Arena — Reentrancy on claimRewards() lets player mint extra fighter NFTs via smart contract callback (HIGH, C4)"
     - "Ajna — RewardsManager doesn't delete old bucket snapshot on unstaking, allowing stale state claims (HIGH, Sherlock)"
@@ -231,6 +253,7 @@
     - "Non-transferable tokens may break composability — check if protocol requires it"
     - "Protocols with no lock period have no bypass to find"
     - "Some protocols allow admin to skip cooldown by design (not a bug if documented)"
+  solodit_ids: []
   incidentes:
     - "Telcoin — Withdraw delay bypassed by initiating withdrawal early (MEDIUM, Sherlock)"
     - "Onchainheroes — Uninitialized stakeDuration=0 lets user bypass fishing duration entirely (MEDIUM, Shieldify)"
@@ -278,6 +301,7 @@
     - "Rounding of 1-2 wei per epoch is not exploitable — use tolerance"
     - "Protocols that allow admin to top up rewards mid-period may self-correct"
     - "Fee-on-transfer reward tokens cause natural balance deficit — protocol must account for this"
+  solodit_ids: []
   incidentes:
     - "Olympusdao — Internal reward tokens accrue indefinitely with no end timestamp, over-committing and breaking all claims (MEDIUM, Sherlock)"
     - "Morpho — Setting new rewards manager breaks claiming old rewards (MEDIUM, Spearbit)"
@@ -491,6 +515,7 @@
   trampas:
     - "If boost only applies to future rewards (post-checkpoint), this is not vulnerable"
     - "Multiplier changes by admin that only affect new stakes are safe"
+  solodit_ids: []
   incidentes:
     - "Meta — setLockStatus() retroactively applies boost to 90 days of unclaimed rewards (HIGH)"
     - "FrankenDAO — admin changing monsterMultiplier causes unstake underflow, locking NFTs (HIGH)"
@@ -534,6 +559,7 @@
   trampas:
     - "If protocol never re-adds removed tokens, underflow path is unreachable"
     - "Infinite reward accrual is only a problem if contract balance is insufficient"
+  solodit_ids: []
   incidentes:
     - "Olympusdao — Removed reward tokens permanently lose unclaimed balances (MEDIUM, Sherlock)"
     - "Olympusdao — Re-added reward tokens cause underflow on claim (MEDIUM, Sherlock)"
@@ -575,6 +601,7 @@
   trampas:
     - "If rewards are auto-compounded into stake, withdrawal implicitly includes them"
     - "emergencyWithdraw intentionally forfeits rewards in some designs"
+  solodit_ids: []
   incidentes:
     - "Stakehouse — withdrawETH() burns LP without distributing rewards, orphaning them (HIGH, C4)"
     - "Stakehouse — _onDepositETH sets claimed to max, erasing unclaimed rewards (HIGH, C4)"
@@ -618,6 +645,7 @@
   trampas:
     - "If exchange rate is always 1:1 (no reward accumulation in rate), this doesn't apply"
     - "Cooldown periods between stake and unstake mitigate the loop"
+  solodit_ids: []
   incidentes:
     - "Aria/RWIPStaking — stRWIP minted 1:1 but burned at exchange rate, attacker drains all rewards (HIGH, Cantina)"
     - "wstTAO — Manual updateExchangeRate() enables front-running wrap at favorable rate (HIGH, Quantstamp)"
@@ -660,6 +688,11 @@
   trampas:
     - "Some protocols intentionally allow rewards to accumulate for first staker"
     - "Dust amounts of totalSupply (1 wei) avoid the zero case but create rounding issues"
+  solodit_ids:
+    - h-02-reward-rates-can-be-reset-to-0-and-future-rewards-can-be-stolen-from-voters-pashov-audit-group-none-kittenswap_2025-07-31-markdown
+    - h-01-repeated-distributions-for-killed-gauges-can-block-valid-distributions-pashov-audit-group-none-kittenswap_2025-07-31-markdown
+    - gauge-emissions-revert-when-emissions-are-higher-than-the-leftover-buffer-instead-of-depositing-the-difference-codehawks-regnum-aurum-acquisition-corp-core-contracts-git
+    - alchemix-the-first-epochs-alcx-emissions-of-voter-contract-will-be-stuck-forever-immunefi-alchemix-git
   incidentes:
     - "Wenwin — Rewards sent to staking contract with zero stakers are locked forever (MEDIUM, C4)"
     - "Convergence — totalWeightLocked==0 causes division by zero, locking all CVG permanently (MEDIUM, Sherlock)"
@@ -702,6 +735,7 @@
   trampas:
     - "If slashing is admin-only via timelock, frontrunning is less practical"
     - "Protocols without slashing mechanism are not affected"
+  solodit_ids: []
   incidentes:
     - "Telcoin — stake(1) frontrun blocks slash via checkpointProtection, bypass slashing while withdrawal delay runs (MEDIUM, Sherlock)"
     - "GoGoPool — Node operator avoids slash via recordStakingError while keeping reward eligibility (MEDIUM, C4)"
@@ -745,6 +779,7 @@
   trampas:
     - "If receipt tokens are non-transferable (soulbound), this doesn't apply"
     - "If transfer hook settles AND adjusts claimed, it's safe"
+  solodit_ids: []
   incidentes:
     - "Stakehouse — Transfer of GiantMevAndFeesPool tokens leaves claimed[] too high, causing DoS and orphaned rewards (HIGH, C4)"
     - "Stakehouse — When users transfer GiantLP, some rewards lost (MEDIUM, C4)"
@@ -786,6 +821,7 @@
   trampas:
     - "If interest accrual is atomic for all users, desync doesn't occur"
     - "Small interest rates over short periods may produce negligible drift"
+  solodit_ids: []
   incidentes:
     - "Bima — TroveManager rewardIntegral uses interest-inflated totalDebt but user debt is stale, losing ~10% of rewards (HIGH, Cantina)"
     - "Sway — Imprecise reward distribution using total_stakes without accounting for pending unapplied rewards (MEDIUM, Otter Audits)"
@@ -825,6 +861,7 @@
   como_se_arregla: "Read user's share amount specifically. Deduct user shares from total. Mark orderId as consumed after unstake. Add invariant test: totalShares == sum(userShares)."
   trampas:
     - "If only one user exists, totalShares == userShares and bug is invisible"
+  solodit_ids: []
   incidentes:
     - "Surge — Unstake zeroes ALL pool shares instead of user's shares, destroying rewards for everyone (HIGH, Shieldify)"
     - "Sapien — initiateUnstake/unstake never deduct from StakingInfo, allowing repeated drain (HIGH, Quantstamp)"
@@ -867,6 +904,11 @@
   trampas:
     - "If rate only changes once (at deployment), no retroactive issue"
     - "Linear distribution (Synthetix rewardRate = amount / duration) handles this via lastTimeRewardApplicable"
+  solodit_ids:
+    - future-epoch-cache-manipulation-via-calcandcachestakes-allows-reward-manipulation-cyfrin-none-suzaku-core-markdown
+    - incorrect-reward-epoch-start-date-calculation-fixed-consensys-forta-delegated-staking-markdown
+    - timestamp-boundary-condition-causes-reward-dilution-for-active-operators-cyfrin-none-suzaku-core-markdown
+    - h-07-inconsistent-rounding-of-lock-time-causes-voting-power-errors-pashov-audit-group-none-kittenswap_2025-05-07-markdown
   incidentes:
     - "DIAWhitelistedStaking — Rewards use current rewardRatePerDay for entire duration, ignoring historical changes (HIGH, Hacken)"
     - "Popcorn — Anyone deploys vault to call changeRewardSpeed, drains 99% of reward tokens in 12 seconds (HIGH, C4)"
@@ -911,6 +953,7 @@
   trampas:
     - "If protocol has no validator exit mechanism, stopped is always 0"
     - "Single-operator protocols don't have selection issues"
+  solodit_ids: []
   incidentes:
     - "Liquid Collective — _hasFundableKeys returns true for exhausted operators, DoS staking (CRITICAL, Spearbit)"
     - "Liquid Collective — Selection picks operator with funded==stopped, returns empty, blocking all staking (CRITICAL, Spearbit)"
@@ -958,6 +1001,11 @@
   trampas:
     - "Expired locks with zero power naturally can't vote in some implementations"
     - "If delegation is disabled, trap scenario doesn't apply"
+  solodit_ids:
+    - manipulation-of-ve-voting-mechanism-unlimited-boost-circumvention-of-cooldown-immunefi-alchemix-git
+    - attackers-can-control-the-vote-result-and-amplify-target-gauges-share-immunefi-zerolend-git
+    - manipulation-of-governance-voting-result-by-unlimited-minting-the-flux-token-by-exploiting-the-logic-of-reset-and-merge-tokenid-immunefi-alchemix-git
+    - max-voter-weight-manipulation-ottersec-none-pyth-governance-pdf
   incidentes:
     - "MagicSea/MlumStaking — Vote with expired lock, withdraw, restake, vote again in same epoch (HIGH, Sherlock)"
     - "FrankenDAO — Delegate traps delegatees indefinitely via continuous proposals (MEDIUM, Sherlock)"
@@ -1003,6 +1051,7 @@
   trampas:
     - "If protocol uses same codebase as external reward source, interface matches"
     - "Single-contract systems don't have cross-contract lock issues"
+  solodit_ids: []
   incidentes:
     - "D2 — Wrong getReward interface for Berachain RewardVaults, all BGT rewards locked (HIGH, Cyfrin)"
     - "Hyperstable — nonReentrant on getReward conflicts with notifyRewardAmount callback, breaking distribution (MEDIUM, Pashov)"
@@ -1048,6 +1097,7 @@
   trampas:
     - "If zero-amount transfers are properly no-ops (early return), safe"
     - "If warmup doesn't reset on additional stakes, DoS path is blocked"
+  solodit_ids: []
   incidentes:
     - "SMRewardDistributor — 0-token transfer resets victim's reward multiplier to 1 permanently (HIGH, Cantina)"
     - "Yieldy — stake(1 wei, victim) resets warmup period, permanent DoS on claiming (HIGH)"
@@ -1089,6 +1139,7 @@
   trampas:
     - "If staking uses a separate token (receipt/wrapper), original is free to use"
     - "Composability may intentionally allow receipt token use as collateral"
+  solodit_ids: []
   incidentes:
     - "FluidLocker — Staked tokens withdrawn via provideLiquidity without unstaking, earning rewards on phantom balance (HIGH, Sherlock)"
     - "ZeroLend — OmnichainStaking allows burning voting power to unstake any NFT, swapping cheap lock for expensive one (HIGH, Immunefi)"
@@ -1131,6 +1182,7 @@
   trampas:
     - "If all reward tokens are always distributed in the same epoch, this is not exploitable"
     - "Single-token reward systems are unaffected"
+  solodit_ids: []
   incidentes:
     - "Suzaku Core - lastEpochClaimedStaker/Curator/Operator not keyed by reward token, claiming one token blocks all others (HIGH, Cyfrin)"
     - "Suzaku Core — _calculateOperatorShare fetches current asset classes for historical epoch; new asset class causes division by zero, locking epoch rewards permanently (HIGH, Cyfrin)"
@@ -1174,6 +1226,7 @@
   trampas:
     - "If cache functions are access-controlled to trusted roles, risk is lower"
     - "If cache can be overwritten (no immutable flag), this is mitigated"
+  solodit_ids: []
   incidentes:
     - "Suzaku Core - calcAndCacheStakes allows future epoch caching, locking in manipulable stake values (HIGH, Cyfrin)"
     - "Suzaku Core - forceUpdateNodes compromised by premature cache entries (HIGH, Cyfrin)"
@@ -1221,6 +1274,7 @@
     - "If claimable is transferred to minter (not zeroed), funds are recoverable"
     - "If protocol never kills gauges, this is not reachable"
     - "Some protocols intentionally burn killed gauge rewards"
+  solodit_ids: []
   incidentes:
     - "KittenSwap - killGauge zeros claimable without settling, 100% reward loss (HIGH, Pashov)"
     - "KittenSwap - gauge fees stuck in pair contract after kill because _claimFees unreachable (MEDIUM, Pashov)"
@@ -1268,6 +1322,7 @@
     - "If reward detection is access-controlled (only admin), dust attack is blocked"
     - "If minimum unseen threshold is enforced, dust amounts are filtered"
     - "Standard Synthetix notifyRewardAmount pattern is immune to this"
+  solodit_ids: []
   incidentes:
     - "DefiApp/MFDLogic - Dust reward token donation resets rewardPerSecond, extending vesting for all users (MEDIUM, Cantina)"
     - "Kwenta - USDC 6-decimal precision + frequent updates cause rewardPerToken to round to zero (MEDIUM, Sherlock)"
@@ -1313,6 +1368,7 @@
   trampas:
     - "If stake-on-behalf is restricted to approved callers, attack surface is limited"
     - "If delegation is separate from staking (standalone delegate() function), this specific path may not exist"
+  solodit_ids: []
   incidentes:
     - "Virtuals Protocol - Anyone calls stake(1 wei, victim, attacker) to hijack delegation and voting power (HIGH, C4)"
     - "Virtuals Protocol - Validator score initialized to maxScore, earn full rewards without participation (HIGH, C4)"
@@ -1358,6 +1414,7 @@
   trampas:
     - "If the protocol has no accumulated rewards before first stake, this is harmless"
     - "Synthetix-style contracts with updateReward modifier on stake() are immune if modifier runs unconditionally"
+  solodit_ids: []
   incidentes:
     - "DIA Staking - rewardAccumulator not initialized on stake creation, new stakers claim all historical rewards (CRITICAL, MixBytes)"
     - "NodeOps - lastStakedEpoch not set, _updateRewards skipped for new stakers, claim rewards from epoch 0 (HIGH, Halborn)"
@@ -1407,6 +1464,7 @@
   trampas:
     - "If protocol only has a single unstake path (no fallback), this doesn't apply"
     - "If receipt tokens are not burned until withdrawal completes, tokens are safe"
+  solodit_ids: []
   incidentes:
     - "Mystic Finance - Validator unstake fallback path burns frxETH but doesn't save withdrawalRequests, permanent fund loss (HIGH, Kann)"
     - "Mystic Finance - Multiple concurrent unstake() calls share same currentWithheldETH, later withdrawals fail (MEDIUM, Kann)"
@@ -1454,6 +1512,7 @@
   trampas:
     - "If staking contract doesn't take NFT custody (uses approval instead), ownerOf is correct"
     - "If operator keys are immutable (never reassigned), double-claim is impossible"
+  solodit_ids: []
   incidentes:
     - "KittenSwap - CLGauge._getReward sends KITTEN to nfp.ownerOf() which is the gauge itself, 100% rewards lost (CRITICAL, Pashov)"
     - "Tanssi - ODefaultOperatorRewards tracks claimed by recipient address, key reassignment enables double-claim (MEDIUM, Pashov)"
@@ -1497,6 +1556,7 @@
   trampas:
     - "Pure ERC-20 tokens without hooks cannot trigger this"
     - "Per-function reentrancy guards create a false sense of security"
+  solodit_ids: []
   incidentes:
     - "Stakehouse — _distributeETHRewardsToUserForToken ETH callback enables reentrancy across deposit/withdraw/claim (HIGH, C4)"
     - "Stakehouse — withdrawDETH reentrancy in GiantSavETHVaultPool from no whitelist check (HIGH, C4)"
@@ -1540,6 +1600,7 @@
   trampas:
     - "Redistributing forfeited rewards to remaining stakers may be intentional"
     - "MasterChef emergencyWithdraw by design forfeits rewards — not always a bug"
+  solodit_ids: []
   incidentes:
     - "Ampera/OpenZeppelin — Unit-based accounting with claims reducing total tokens causes units-per-token inflation, eventually locking funds permanently (HIGH)"
     - "Hybra Finance — Users emergency withdrawing lose all past accrued rewards without accounting update (MEDIUM)"
@@ -1601,6 +1662,7 @@
     - "Revert Lend uses `ignoreFees=true` for staked to be CONSERVATIVE (lower collateral value) — this actually protects the protocol from being under-collateralized. The liquidator windfall is a feature, not a bug in their case."
     - "The real risk is the reverse: if a protocol counts staked fee value as collateral but the fees are not claimable during liquidation, collateral is overstated."
     - "During compoundRewards, the position is temporarily unstaked and restaked — if a liquidation is triggered in the same block between these steps, `_isStaked` returns false and fees ARE included in collateral."
+  solodit_ids: []
   incidentes:
     - "No verified incident found for this exact pattern in the Solodit DB (2026-03-21 search)"
     - "Related: NFT cannot be withdrawn after all liquidity removed from CLGauge (Velodrome/Spearbit, MEDIUM) — gauge custody block pattern"
@@ -1661,6 +1723,7 @@
     - "Revert Lend's compoundRewards is permissionless (owner or vault) — this IS the intended design for keeper automation"
     - "The oracle uses TWAP, so a single compound won't immediately reflect at full new value — mitigates but doesn't eliminate"
     - "A vault that calls compoundRewards inside transform() (line 533-537 V3Vault) does so BEFORE unstaking for the transform — this is intentional pre-processing, not a bug"
+  solodit_ids: []
   incidentes:
     - "No verified incident for this exact pattern (2026-03-21 search)"
     - "Conceptually related: Ethereum Credit Guild M-19 — gauge stakers can be unstaked despite full debt allocation (C4, MEDIUM)"
@@ -1862,6 +1925,128 @@ Run Medusa first (stateful sequences), then Echidna optimization (maximize attac
 - **[HIGH] Incorrect reward calculation when reward rate changes** — Rewards calculated using current rewardRatePerDay regardless of historical rate changes; identical stakes get different rewards depending on when unstake is called (DIAWhitelistedStaking, Hacken)
 - **[MEDIUM] Missing timestamp update causes double-claimed rewards** — add_reward/remove_reward call update_reward but don't update farm.timestamp, causing same time_diff rewards to be counted twice on subsequent operations (Aries Market, Otter Audits)
 - **[MEDIUM] Reward pools get less than promised share** — Compounding reduction of `pendingRewards[poolID]` means higher call frequency of performUpkeep() distributes fewer total rewards; 2.5%/day never reaches 100% distribution (Salty, C4)
+
+---
+
+## SECCIÓN ESPECIAL: Aerodrome/Velodrome CLGauge + Autocompounder
+
+> Patrones específicos de gauge con NFT ERC721 y compounding de rewards.
+> Fuente: Spearbit/Velodrome audits, C4/Hybra Finance, C4/KittenSwap — todos VERIFICADOS.
+
+### CLGauge-001: Reward compound sin slippage — sandwichable
+```yaml
+- id: clgauge-001
+  pattern: compound-reward-no-slippage
+  name: "Compound de rewards sin slippage protection — sandwich attack"
+  causa_raiz: >
+    Al hacer compound de AERO/VELO rewards hacia la posición LP, el swap
+    de reward→token0/token1 usa amountOutMin=0 o amountOutMin derivado de
+    precio spot (manipulable). Un atacante puede sandwich el compound,
+    vendiendo justo antes y recomprando después.
+  como_funciona: |
+    1. Atacante monitorea mempool para llamadas a compoundRewards()
+    2. Frontrun: vende token0 en el pool, mueve precio adversamente
+    3. compoundRewards ejecuta swap a precio desfavorable (slippage alto)
+    4. Backrun: atacante compra token0 de vuelta con ganancia
+    5. El protocolo/usuarios pierden valor en cada compound
+  que_mirar:
+    - "¿amount0Min / amount1Min son 0 en increaseLiquidity?"
+    - "¿El swap de reward usa amountOutMin=0?"
+    - "¿Se usa TWAP para calcular el minOut o precio spot (slot0)?"
+    - "¿La función compoundRewards es callable por cualquiera?"
+    - "¿El TWAP_SECONDS es suficientemente largo (≥300s)?"
+  trampas:
+    - "TWAP de 60s puede ser suficiente para pools de alta liquidez — evalúa liquidez del pool"
+    - "Si compound es solo callable por keeper/owner, el riesgo es menor"
+    - "MAX_PRICE_DIFFERENCE_X64 actúa como slippage check — verifica su valor (2% = seguro)"
+  solodit_ids: []
+  incidentes:
+    - "Velodrome AutoCompounder: amountOutMin=0 en swap reward→VELO, sandwichable (MEDIUM, Spearbit)"
+    - "Key Finance STK-1: reward compounds sandwichable, no lockup period (HIGH, Guardian)"
+    - "Redacted Cartel M-03: Anyone can call compound + sandwich, controls amountOutMin (MEDIUM, C4)"
+  severidad: medium
+  fuente: "Spearbit/Velodrome, C4/Key Finance, C4/Redacted Cartel — verificado"
+  verificado: true
+  tags: [slippage, compound, sandwich, MEV, aerodrome, velodrome, gauge]
+```
+
+### CLGauge-002: CLGauge.deposit() no verifica que el NFT pertenece al pool correcto
+```yaml
+- id: clgauge-002
+  pattern: gauge-pool-mismatch
+  name: "Deposit en gauge de NFT de pool diferente — ausencia de validación"
+  causa_raiz: >
+    CLGauge.deposit() acepta cualquier NFT de Slipstream sin verificar
+    que la posición LP es del pool que el gauge integra. Un atacante puede
+    stakear una posición de otro pool (incluso pool vacío/manipulable)
+    y recibir rewards del gauge sin contribuir liquidez real.
+  que_mirar:
+    - "¿Se verifica que position.pool == gauge.pool en deposit()?"
+    - "¿Se usa nonfungiblePositionManager.positions(tokenId) y se compara pool?"
+    - "¿El gauge usa token0/token1/tickSpacing para validar?"
+  solodit_ids: []
+  incidentes:
+    - "Velodrome Finance: CLGauge.deposit() no verifica pool del NFT (HIGH, Spearbit)"
+    - "KittenSwap L-27: Users can deposit NFTs into killed CL gauges (LOW, Cyfrin)"
+  severidad: high
+  fuente: "Spearbit/Velodrome Finance — verificado"
+  tags: [gauge, CLGauge, deposit, validation, NFT, ERC721, velodrome, aerodrome]
+```
+
+### CLGauge-003: claimFees roba rewards de stakers
+```yaml
+- id: clgauge-003
+  pattern: claim-fees-steals-rewards
+  name: "claimFees() en GaugeCL drena rewards de stakers"
+  causa_raiz: >
+    La función _claimFees() recoge fees acumulados del pool subyacente.
+    Pero si los fees se acumulan en el mismo balance que los rewards de staking,
+    o si claimFees transfiere tokens que los stakers esperan recibir como rewards,
+    hay confusión de contabilidad que permite drenar rewards.
+  que_mirar:
+    - "¿claimFees() y getReward() comparten el mismo token?"
+    - "¿El balance usado para calcular rewards incluye fees no reclamados?"
+    - "¿Quién puede llamar claimFees()? ¿Es onlyTeam o pública?"
+    - "¿Los fees van a una dirección diferente de los reward recipients?"
+  trampas:
+    - "Si fees y rewards son tokens diferentes, no hay confusión"
+    - "Curve/Convex gauges normalmente tienen separación limpia de fees vs rewards"
+  solodit_ids: []
+  incidentes:
+    - "Hybra Finance M-06: claimFees steals staking rewards — fees y rewards mismo token (MEDIUM, C4)"
+    - "Hyperstable M-03: Curve gauge rewards griefed via claimFees (MEDIUM, 0x52)"
+  severidad: medium
+  fuente: "C4/Hybra Finance, 0x52/Hyperstable — verificado"
+  tags: [fees, rewards, gauge, claimFees, accounting, velodrome, aerodrome]
+```
+
+### CLGauge-004: Trusted route en autocompounder permite robar rewards
+```yaml
+- id: clgauge-004
+  pattern: autocompounder-fake-route
+  name: "ALLOWED_CALLER usa ruta falsa en AutoCompounder para robar rewards"
+  causa_raiz: >
+    swapTokenToVELOAndCompound() acepta una ruta de swap sin validar
+    que todos los pools en la ruta son legítimos. Un ALLOWED_CALLER malicioso
+    puede usar una factory falsa en la ruta para redirigir el output del swap
+    a su propia dirección en lugar de al vault.
+  que_mirar:
+    - "¿Se valida cada hop de la ruta contra una factory whitelist?"
+    - "¿Quién tiene el rol ALLOWED_CALLER? ¿Es multisig o EOA?"
+    - "¿La ruta es validada on-chain o solo off-chain?"
+    - "¿Hay un slippage check después del swap que detectaría el robo?"
+  trampas:
+    - "Si ALLOWED_CALLER es un multisig de confianza del protocolo → menor severidad"
+    - "Si hay un TWAP check del output → el robo es más difícil pero no imposible"
+  solodit_ids: []
+  incidentes:
+    - "Velodrome AutoCompounder: ALLOWED_CALLER roba rewards con fake factory (MEDIUM, Spearbit)"
+  severidad: medium
+  fuente: "Spearbit/Velodrome Finance — verificado"
+  tags: [autocompounder, route, access_control, swap, velodrome, aerodrome, trusted-role]
+```
+
+---
 
 ### Maps to staking-007 (cross-function reentrancy)
 - **[HIGH] Cross-contract reentrancy allows YIELD_TOKEN theft** — Single WithdrawalRequestManager serving multiple approved vaults enables cross-contract reentrancy; attacker drains YIELD_TOKENs from manager to their strategy, inflating balanceOf delta and minting excess shares (Notional/Exponent, Sherlock)

@@ -38,6 +38,12 @@ Key providers: Aave V3, Balancer, Uniswap V3, dYdX, Maker. Typical available cap
     - "High-liquidity pools (>$10M TVL) are expensive but NOT impossible to manipulate with flash loans"
     - "TWAP with short window (< 30 min) can still be manipulated over multiple blocks"
     - "Chainlink feeds can be stale -- check updatedAt"
+  solodit_ids:
+    - "oracle-manipulation-with-flashloans-can-exploit-funds-via-liquidation-quantstamp-ethereum-reserve-dollar-erd-markdown"
+    - "h-05-flash-loan-price-manipulation-in-purchasepyroflan-code4rena-behodler-behodler-git"
+    - "h-04-oracle-price-can-be-manipulated-code4rena-abracadabra-money-abracadabra-money-git"
+    - "m-08-oracles-are-vulnerable-to-flash-loan-attack-vectors-pashov-audit-group-none-stakedao_2025-07-21-markdown"
+    - "uniswapv2routergetamountsout-based-upon-pool-reserves-allowing-returned-price-to-be-manipulated-via-flash-loan-cyfrin-none-cyfrin-dexe-markdown"
   incidentes:
     - "Behodler/FlanBackstop — purchasePyroFlan reads flan-LP spot reserves; flash loan sandwich profits within acceptableHighestPrice limit (HIGH)"
     - "Spartan Protocol — Synth realise() calculates baseValueLP/baseValueSynth from spot price; flash loan shifts ratio, extracts value (HIGH)"
@@ -106,6 +112,7 @@ incidentes_verificados_oracle_manipulation:
     - "OpenZeppelin Governor + ERC20Votes with proper snapshot delay is safe"
     - "Custom governance that wraps OZ but overrides _getVotes may reintroduce the bug"
     - "Timelock alone does not prevent the vote -- it only delays execution"
+  solodit_ids: []
   incidentes:
     - "PartyDAO — vote multiple times by transferring governance NFT in same block as proposal; any user can pass any proposal unanimously (HIGH)"
     - "DeXe GovPool — flash loan governance tokens, delegate to accomplice who votes, withdraw while Locked; bypasses anti-flash-loan protection (HIGH)"
@@ -154,6 +161,10 @@ incidentes_verificados_oracle_manipulation:
     - "Curve read-only reentrancy (via raw_call) is a separate but related issue"
     - "Fair LP pricing still depends on accurate underlying token prices"
     - "Some protocols intentionally use spot reserves for efficiency -- check if bounded by other mechanisms"
+  solodit_ids:
+    - "h-1-liquidations-are-impossible-for-some-curve-pools-sherlock-notional-notional-update-2-git"
+    - "h-1-h-01-wsteth-eth-curve-lp-token-price-can-be-manipulated-to-cause-unexpected-liquidations-sherlock-sentiment-sentiment-update-2-git"
+    - "balancer-read-only-reentrancy-vulnerability-changes-from-dev-team-added-to-audit-spearbit-cron-finance-pdf"
   incidentes:
     - "PartyDAO BuyCrowdfund — attacker contributes flash-loaned funds to dominate contribution share, purchases own NFT, claims majority voting power/equity for free (MEDIUM)"
   severidad: critical
@@ -195,6 +206,11 @@ incidentes_verificados_oracle_manipulation:
     - "Fee-free flash loans are intentional in some protocols (Aave V3 for same-asset repay) -- check docs"
     - "Zero fee on flash mint may be by design if the protocol has no flash loan fee model"
     - "Rounding to zero on tiny amounts may be acceptable if gas cost exceeds value"
+  solodit_ids:
+    - "receiveflashloan-does-not-account-for-fees-trailofbits-none-lindy-labs-sandclock-pdf"
+    - "m-01-invalid-handling-of-flash-loan-fees-in-positionactiononcreditflashloan-code4rena-loopfi-loopfi-git"
+    - "debttokenflashloan-fees-can-be-bypassed-by-borrowing-in-small-amounts-cyfrin-none-bima-markdown"
+    - "flashloan-functionality-is-blocked-openzeppelin-none-fx-v2-audit-markdown"
   incidentes:
     - "TraderJoe LBPair — flash loan fees paid only to active bin LPs while all bins' liquidity lent; JIT liquidity to active bin captures fees, borrower self-refunds (MEDIUM)"
   severidad: high
@@ -236,6 +252,11 @@ incidentes_verificados_oracle_manipulation:
     - "Read-only reentrancy (Curve) bypasses write-based guards"
     - "Protocol may be safe against reentrancy but vulnerable via a composing protocol that IS vulnerable"
     - "ERC-777 hook reentrancy looks different from classic reentrancy"
+  solodit_ids:
+    - "stake-6-unprotected-flash-loan-callback-can-be-abused-to-manipulateclaim-other-users-positions-hexens-none-stakewise-markdown"
+    - "h-32-reentrancy-in-usdoflashloan-enabling-an-attacker-to-borrow-unlimited-usdo-exceeding-the-max-borrow-limit-code4rena-tapioca-dao-tapioca-dao-git"
+    - "h-15-attacker-can-specify-any-receiver-in-usd0flashloan-to-drain-receiver-balance-code4rena-tapioca-dao-tapioca-dao-git"
+    - "03-reentrancy-could-occur-in-flash-loan-callback-functions-code4rena-badgerdao-badgerdao-git"
   incidentes:
     - "DeFi Saver — attacker triggers random task execution via reentrancy in executeOperation() when taking a flash loan; fixed by adding ReentrancyGuard to executeOperation (High, Consensys)"
     - "Timeswap — borrow() makes external callback to msg.sender before finalizing state; lock modifier guards single-function reentrancy but not cross-function reentrancy (High, Code4rena)"
@@ -279,6 +300,7 @@ incidentes_verificados_oracle_manipulation:
     - "DAI and many stablecoins have legitimate flash mint -- the issue is when OTHER protocols don't account for it"
     - "Flash mint with proper cap and fee may be safe"
     - "The vulnerability is often in the CONSUMER of the token, not the token itself"
+  solodit_ids: []
   incidentes:
     - "FairSide — fShareRatio in purchaseMembership manipulable via flash minting and burning FSD tokens; inflated ratio bypasses capital adequacy check and inflates staking rewards (Medium, Code4rena)"
   severidad: high
@@ -333,6 +355,7 @@ incidentes_verificados_oracle_manipulation:
     - "OpenZeppelin Checkpoints library handles same-block correctly since v4.5 — custom implementations often do not"
     - "Even with correct checkpoint logic, transferring vote-bearing NFTs in same block can multiply votes"
     - "The memory vs storage bug is subtle — both compile and run without revert, just silently lose data"
+  solodit_ids: []
   incidentes:
     - "Vader Protocol — flash loans inflate single voter's weight in DAO.sol via live balanceOf check; attacker can borrow tokens and influence proposal outcome within the same transaction (High, Code4rena)"
     - "Velodrome Finance — balanceOfNFT has flash loan protection (ownershipChange[_tokenId] == block.number → return 0) but balanceOfNFTAt does NOT apply it consistently; inflated voting weight usable via getPriorVotes (Medium, Spearbit)"
@@ -392,6 +415,10 @@ incidentes_verificados_oracle_manipulation:
     - "Aave executeOperation passes initiator as a parameter — but contracts often ignore it"
     - "Even with initiator check, userData can still be malicious if not validated"
     - "PrivatePool variant: previous owner retains approvals set via execute(), enabling post-sale theft via flashLoan"
+  solodit_ids:
+    - "stake-6-unprotected-flash-loan-callback-can-be-abused-to-manipulateclaim-other-users-positions-hexens-none-stakewise-markdown"
+    - "h-15-attacker-can-specify-any-receiver-in-usd0flashloan-to-drain-receiver-balance-code4rena-tapioca-dao-tapioca-dao-git"
+    - "02-missing-flash-loan-return-value-check-in-dooperation-function-code4rena-badgerdao-badgerdao-git"
   incidentes:
     - "Mimo DeFi — attacker sets SuperVault as flash loan receiver; lendingPool calls executeOperation() on SuperVault with attacker-crafted params, draining funds (High, Code4rena H-02)"
     - "Wido Comet Collateral Swap — WidoCollateralSwap_Aave.executeOperation and WidoCollateralSwap_ERC3156.onFlashLoan check msg.sender == pool but not initiator; attacker can impersonate any user (High, OpenZeppelin)"
@@ -500,6 +527,8 @@ incidentes_verificados_oracle_manipulation:
     - "Minimum staking period of 1 block is sufficient defense against single-tx flash loan attacks"
     - "Some protocols intentionally reward active management — distinguish from vulnerable spot-share designs"
     - "Fee manipulation variant (LBPair): JIT liquidity to active bin captures flash loan fees meant for all LPs"
+  solodit_ids:
+    - "m-01-the-buy-functions-mechanism-enables-users-to-acquire-flash-loans-at-a-cheaper-fee-rate-code4rena-caviar-caviar-private-pools-git"
   incidentes:
     - "NFTX NFTXLPStaking — no minimum stake duration; attacker stakes, claims all accrued vault rewards, and unstakes in one tx using flash loan (High, Code4rena H-04)"
     - "Sperax Farms — reward inflation via flash loan: deposit inflates share, withdraw immediately captures disproportionate rewards; fixed by adding depositTs timestamp validation (High, Quantstamp)"
@@ -545,6 +574,7 @@ incidentes_verificados_oracle_manipulation:
   trampas:
     - "If governance token has no flash loan source, attack requires real capital"
     - "If there is a time-weighted voting power, flash loans are ineffective"
+  solodit_ids: []
   incidentes:
     - "Aragon DAO Gov Plugin — MinVotingPowerCondition bypassed via flash loan; with EarlyExecution, create+vote+execute in one tx (High)"
   severidad: high
@@ -587,6 +617,7 @@ incidentes_verificados_oracle_manipulation:
   trampas:
     - "If there is a minimum lock period, flash loan cannot be repaid atomically"
     - "If rewards are negligible during the gap, low practical impact"
+  solodit_ids: []
   incidentes:
     - "Super DCA Liquidity Network — first depositor flash loans to claim inflated token rewards due to skipped timestamp update (Medium)"
   severidad: medium
@@ -626,6 +657,7 @@ incidentes_verificados_oracle_manipulation:
   trampas:
     - "If updatePool is behind a timelock, sandwich timing is harder"
     - "If the function is onlyOwner and owner is a multisig, MEV risk may be lower"
+  solodit_ids: []
   incidentes:
     - "YuzuUSD YuzuILP — updatePool sets poolSize from external input; sandwich attack extracts excess value from other depositors (High)"
   severidad: high
@@ -667,6 +699,7 @@ incidentes_verificados_oracle_manipulation:
   trampas:
     - "If graduation only benefits the token's ecosystem, attacker incentive may be limited"
     - "If flash loan source has insufficient liquidity, attack cost increases"
+  solodit_ids: []
   incidentes:
     - "Virtuals Protocol Bonding — flash loan forces premature token graduation; attacker gains reward emissions without community support (Medium)"
   severidad: medium
@@ -709,6 +742,7 @@ incidentes_verificados_oracle_manipulation:
   trampas:
     - "If the function is unused or behind a flag, no practical impact"
     - "Some implementations wrap this in try/catch, masking the revert"
+  solodit_ids: []
   incidentes:
     - "Astrolab — flashLoanSimple uses safeTransferFrom(address(this),...) requiring self-approval (always reverts) (High)"
     - "Astrolab — balanceBefore recorded pre-transfer, check requires amount+fee as net increase, overcharging users (High)"
@@ -751,6 +785,7 @@ incidentes_verificados_oracle_manipulation:
   trampas:
     - "If flash loans are not a critical feature, lower severity"
     - "If utilization is always well below cap, may never trigger in practice"
+  solodit_ids: []
   incidentes:
     - "Blend — flash loan adds liabilities then immediately checks utilization ratio; blocks flash loans near max utilization (Medium)"
     - "Blend — flash loan reserve d_supply incorrectly updated and stored due to missing cache step (High)"
@@ -797,6 +832,7 @@ incidentes_verificados_oracle_manipulation:
     - "If the callback only reads from params but doesn't make external calls, exploitability is limited"
     - "Aave v3 executeOperation passes initiator as first argument — easy to miss vs checking only msg.sender"
     - "If the contract has no valuable functions callable during the callback, the attack surface is minimal"
+  solodit_ids: []
   incidentes:
     - "DODO Margin Trading — MarginTrading.sol missing initiator check in executeOperation(); attacker opens/closes trades and steals funds using victim contract as flash loan receiver (High, Sherlock H-1)"
     - "Stakewise — LeverageStrategy.receiveFlashLoan validates msg.sender == Balancer vault but not initiator; attacker claims or manipulates other users' positions (Critical, STAKE-6, Hexens)"
@@ -849,6 +885,7 @@ incidentes_verificados_oracle_manipulation:
     - "USDT and other fee-on-transfer tokens make the sender pay more than receiver gets — test explicitly"
     - "f(x) v2 H-01 variant: protocol used `<` instead of `<=` for the check — off-by-one caused a permanent DoS"
     - "Iron Bank variant: USDT non-zero transfer fee broke the balance math on the callback path"
+  solodit_ids: []
   incidentes:
     - "Astrolab — balanceBefore recorded BEFORE flash loan transfer to receiver; balanceAfter check always fails causing every flash loan to revert (High, Pashov H-02)"
     - "f(x) v2 — flashLoan uses `returnedAmount < amount + fee` (strict less-than instead of <=); off-by-one means flash loan is permanently DoS'd when exact repayment is made (High, OpenZeppelin)"
@@ -908,6 +945,7 @@ incidentes_verificados_oracle_manipulation:
     - "Si el liquidation bonus es pequeno (<0.3% flash loan fee), auto-liquidacion no es rentable sin oracle manip"
     - "En un mercado en caida, posicion puede ser genuinamente liquidable sin manipulacion"
     - "El beneficio al atacante depende del spread: MAX_LIQUIDATION_PENALTY_X32=10%, MIN=2% -- 2-10% de colateral"
+  solodit_ids: []
   incidentes:
     - "Euler Labs EVK (Spearbit 2024) -- self-liquidations of leveraged positions profitable via oracle price sandwich; attacker flash-loans collateral, max-borrows, manipulates oracle, self-liquidates (HIGH, Spearbit)"
     - "DYAD (Solodit lending-42) -- flash loan guard bypassed via self-liquidation; protocol has block-based cooldown on borrows but liquidation path lacks same check (HIGH, Sherlock)"
@@ -979,6 +1017,7 @@ incidentes_verificados_oracle_manipulation:
     - "El check `if (tickSpacing <= 0) return false` en _isFactoryPool YA previene tickSpacing negativo"
     - "activeFlashPool guard previene callbacks no solicitados -- la superficie de ataque de pool falso es muy limitada"
     - "El riesgo real es de configuracion incorrecta (usar pool con asset incorrecto), no de exploit directo"
+  solodit_ids: []
   incidentes:
     - "Sandclock scWETHv2/scUSDCv2 (Trail of Bits) -- receiveFlashLoan repays principal only, ignores Balancer fee; directly analogous pattern (HIGH, ToB)"
     - "Astrolab (Pashov H-02) -- flash loan callback does not account for fee in repayment; protocol bleeds on every flash loan (HIGH, Pashov)"
@@ -1032,6 +1071,7 @@ incidentes_verificados_oracle_manipulation:
     - "DODO Margin Trading H-1: missing initiator check allows attacker to open positions on behalf of victims (HIGH)"
     - "Paribus and Primitive: rated Low/Medium because contracts had limited value at risk — impact determines severity"
     - "This is different from flash-017 (which covers balance-check bypass) — here the attack is arbitrary action execution"
+  solodit_ids: []
   incidentes:
     - "Stakewise V3 [STAKE-6] — Unprotected onFlashLoan callback allows attacker to manipulate/claim other users' osToken positions; only pool check, no initiator check (HIGH, Hats Finance)"
     - "DODO Margin Trading H-1 — Missing flash loan initiator check allows attacker to open leveraged positions using victim's collateral (HIGH)"
@@ -1084,6 +1124,7 @@ incidentes_verificados_oracle_manipulation:
     - "In Revert Lend FlashloanLiquidator: attacker still needs to manipulate oracle to make position liquidatable (flash-019)"
     - "Some protocols intentionally allow self-liquidation for tax efficiency / deleveraging — check if excluded"
     - "Euler Labs EVK: self-liquidation of leveraged positions with oracle sandwich is a variant (HIGH, Spearbit)"
+  solodit_ids: []
   incidentes:
     - "DYAD [H-10] — Flash loan guard on borrows not applied to liquidation path; attacker self-liquidates across separate transactions, bypassing guard (HIGH, Sherlock)"
     - "Euler Labs EVK (Spearbit 2024) — Self-liquidation of leveraged positions profitable via oracle price sandwich: flash-loan collateral, max-borrow, manipulate oracle, self-liquidate (HIGH)"
@@ -1135,6 +1176,7 @@ incidentes_verificados_oracle_manipulation:
     - "Mimo DeFi H-02: attacker specifically sets SuperVault as receiver, causing vault to execute attacker params with vault's own funds"
     - "The attack may also DoS the vault if it cannot repay the unexpected flash loan premium from its balance"
     - "Some protocols use a whitelist of valid initiators instead of address(this) — check if whitelist is editable"
+  solodit_ids: []
   incidentes:
     - "Mimo DeFi [H-02] — Fund loss/theft by attacker setting SuperVault as flash loan receiver; executeOperation runs with attacker params, draining vault assets (HIGH, Spearbit)"
     - "Wido Comet Collateral Swap — Unexpected entry point via flash loan callback leads to user impersonation and fund theft (HIGH)"
@@ -1185,6 +1227,7 @@ incidentes_verificados_oracle_manipulation:
     - "Persistent variant (attacker keeps deposit): much more severe but requires actual capital commitment"
     - "If cap is set very high relative to protocol TVL, attack is economically unlikely"
     - "Protocols with dynamic cap adjustments (admin can raise cap) recover faster — but admin latency creates griefing window"
+  solodit_ids: []
   incidentes:
     - "AlchemistV2 (Alchemix) — Well-financed attacker flash-loans to hit global synthetic token minting ceiling, blocking all other users; griefing at cost of flash loan fee only (MEDIUM, audit finding)"
     - "OpenLeverage [M-05] — Anti-flash-loan mechanism blocks legitimate liquidations when TWAP price deviates >5%; indirect griefing via overcorrection (MEDIUM, Code4rena)"

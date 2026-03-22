@@ -38,6 +38,12 @@
     - "OZ ERC4626 v4.9+ with _decimalsOffset() is protected — check the offset value"
     - "Vaults with pre-seeded dead shares in constructor are already mitigated"
     - "Some vaults use internal shares that differ from ERC20 totalSupply"
+  solodit_ids:
+    - m-13-first-erc4626-deposit-can-break-share-calculation-sherlock-astaria-astaria-git
+    - m-1-vault-inflation-attack-sherlock-smilee-finance-git
+    - first-deposit-attack-via-share-price-manipulation-zokyo-none-vaultka-markdown
+    - first-depositor-inflation-attack-in-stakedtoken-contract-spearbit-none-infinifi-contracts-pdf
+    - h-02-erc4626cloned-deposit-and-mint-logic-differ-on-first-deposit-code4rena-astaria-astaria-git
   incidentes:
     - "ChannelsFinance Dec 2023 — $320K (CompoundV2 Inflation)"
     - "bZxProtocol Dec 2023 — $208K (Inflation Attack)"
@@ -125,6 +131,7 @@
     - "Protocols using internal accounting are NOT vulnerable even without virtual shares"
     - "Rebasing tokens legitimately change balanceOf — don't flag as donation"
     - "Some protocols have intentional donate() functions for yield distribution"
+  solodit_ids: []
   incidentes:
     - "HundredFinance Apr 2023 — $7M (Inflation/Rounding via donation)"
     - "Raft_fi Nov 2023 — $3.2M (Inflation/Rounding)"
@@ -187,6 +194,11 @@
     - "1 wei rounding per operation is expected and acceptable — it is NOT a bug"
     - "The bug is when rounding consistently favors the user over the vault"
     - "With virtual shares offset, the rounding error per operation is negligible"
+  solodit_ids:
+    - c-02-users-can-exploit-rounding-to-withdraw-excess-assets-from-the-fund-contract-shieldify-none-harmonixfinance-hyperliquid-markdown
+    - h-01-rounding-issues-in-certain-functions-code4rena-notional-notional-git
+    - connectors-special-withdraw-rounding-amount-direction-should-not-favor-user-cantina-none-balmy-pdf
+    - m-17-malicious-users-can-drain-the-assets-of-vault-due-to-not-being-erc4626-complaint-code4rena-popcorn-popcorn-contest-git
   incidentes:
     - "MahaLend Nov 2023 — $20K (Inflation/Rounding)"
     - "Raft_fi Nov 2023 — $3.2M (Inflation/Rounding)"
@@ -256,6 +268,7 @@
   trampas:
     - "Fee-on-transfer tokens cause apparent profit from vault perspective — use standard ERC20 for testing"
     - "State changes between deposit and redeem (yield accrual) can legitimately change the result — test atomically"
+  solodit_ids: []
   incidentes:
     - "MahaLend Nov 2023 — $20K (Inflation/Rounding)"
     - "Raft_fi Nov 2023 — $3.2M (Inflation/Rounding)"
@@ -307,6 +320,7 @@
   trampas:
     - "Some vaults intentionally revert on zero — that is acceptable per EIP"
     - "The bug is returning nonzero for zero input, not reverting"
+  solodit_ids: []
   incidentes:
     - "HopeLend Oct 2023 — $825K (Precision Loss — zero-amount edge case)"
     - "OnyxProtocol Nov 2023 — $2M (Precision Loss)"
@@ -392,6 +406,10 @@
     - "Fee share minting legitimately decreases share price slightly — whitelist this"
     - "Bad debt socialization legitimately decreases share price — whitelist this"
     - "Rebasing tokens change balanceOf externally — exclude from monotonicity check"
+  solodit_ids:
+    - losses-are-not-taken-into-account-in-the-strategy-mixbytes-none-yearn-finance-markdown__
+    - h-01-incorrect-user-accounting-in-withdraw-method-pashov-none-yield-ninja-markdown_
+    - forcedeallocate-allows-user-to-avoid-incurring-in-losses-and-dump-them-on-other-suppliers-spearbit-none-morpho-vaults-v2-pdf
   incidentes:
     - "Curve LlamaLend Mar 2026 — ~$240K (Share Price Manipulation)"
     - "GMX Jul 2025 (Share Price Manipulation)"
@@ -455,6 +473,10 @@
   trampas:
     - "State changes between preview call and actual call in a multi-step tx are legitimate divergence — always test atomically"
     - "Vaults with fees may legitimately have preview != actual if fees apply on actual but not preview"
+  solodit_ids:
+    - inconsistent-function-override-logic-ottersec-none-plume-network-pdf
+    - m-03-staking-contract-is-not-eip-4626-compliant-pashov-audit-group-none-lucidly-june-markdown
+    - m-42-ulyssespoolsol-does-not-match-eip4626-because-of-the-preview-functions-code4rena-maia-dao-ecosystem-maia-dao-ecosystem-git
   incidentes:
     - "Y2k Finance (Code4rena) — Vault.sol not EIP-4626 compliant, missing mint/redeem, max functions don't account for epoch locking (HIGH)"
     - "Florence Finance (Code4rena) — ERC4626 standard not followed correctly (MEDIUM)"
@@ -499,6 +521,7 @@
   trampas:
     - "Single-layer vaults (no nesting) are NOT affected"
     - "If inner vault uses 1:1 exchange rate permanently, the rounding issue vanishes"
+  solodit_ids: []
   incidentes:
     - "Strata (Cyfrin) — attacker drains sUSDe balance via incorrect pUSDeVault._withdraw accounting (HIGH)"
     - "Strata (Cyfrin) — MetaVault.redeemRequiredBaseAssets only redeems from single vault, not aggregating across vaults (MEDIUM)"
@@ -547,6 +570,7 @@
     - "Vaults with time-locked yield streaming (xERC4626 pattern) are partially protected"
     - "Small rate changes (<0.1%) may not be profitable after gas costs"
     - "This is NOT a vulnerability if the protocol intentionally allows instant rate changes for governance"
+  solodit_ids: []
   incidentes:
     - "LoopVaults (Pashov) — onMorphoSupplyCollateral/onMorphoRepay instantly modify exchange rate, frontrunnable (LOW but documented)"
     - "Union Finance — exchangeRateStored() frontrunning on repayments to mint-then-redeem for profit (MEDIUM)"
@@ -597,6 +621,7 @@
   trampas:
     - "Vaults with 0% withdrawal fee are not affected"
     - "If the fee is taken in shares (not assets), the accounting may be correct"
+  solodit_ids: []
   incidentes:
     - "Blueberry (Sherlock) — BlueBerryBank#withdrawLend causes phantom collateral when soft/hard vault has withdraw fee (HIGH)"
     - "Blueberry (Sherlock) — Interest component of underlying permanently locked because withdrawLend caps at initial deposit (HIGH)"
@@ -648,6 +673,7 @@
   trampas:
     - "Vaults with virtual shares offset have high manipulation cost — may not be economically viable"
     - "If the oracle also checks the underlying asset price via Chainlink, the attack vector is limited to the share ratio"
+  solodit_ids: []
   incidentes:
     - "Sentiment (Sherlock) — ERC4626Oracle vulnerable to price manipulation via deposit/withdraw (MEDIUM)"
     - "Sentiment (Sherlock) — ERC4626Oracle wrong when vault decimals != asset decimals (HIGH)"
@@ -692,6 +718,11 @@
   trampas:
     - "Some vaults intentionally return 0 during pause — this is CORRECT behavior"
     - "Returning a slightly lower value than the true max is acceptable (conservative)"
+  solodit_ids:
+    - m-16-maxwithdraw-and-maxredeem-doesnt-return-correct-value-which-can-make-other-contracts-fail-while-working-with-protocol-code4rena-gogopool-gogopool-git
+    - maxwithdraw-maxredeem-returns-wrong-values-for-fee-recipient-spearbit-none-euler-earn-pdf
+    - l-09-maxwithdraw-and-maxredeem-could-return-the-wrong-value-pashov-audit-group-none-ionprotocol-markdown
+    - maxredeem-and-maxwithdraw-dont-have-_cantransfer-check-cantina-none-centrifuge-pdf
   incidentes:
     - "Maia DAO (Code4rena) — maxWithdraw/maxRedeem return balanceOf during time-locked period instead of 0 (MEDIUM)"
     - "GoGoPool (Code4rena) — maxWithdraw uses totalAssets() including unreleased rewards, causing underflow on beforeWithdraw (MEDIUM)"
@@ -741,6 +772,7 @@
     - "Standard ERC20 tokens without callbacks are NOT vulnerable"
     - "If vault uses WETH wrapper instead of raw ETH, callback risk is eliminated"
     - "Vaults that mint before transferring (not after) are also safe"
+  solodit_ids: []
   incidentes:
     - "JPEG'd (Code4rena) — reentrancy in yVault.deposit via ERC777-like callback (HIGH)"
     - "Real Wagmi #2 (Sherlock) — reenter takeOverDebt() during liquidation swap to duplicate position (HIGH)"
@@ -786,6 +818,7 @@
   trampas:
     - "Vaults using OpenZeppelin's RewardPerToken pattern correctly handle this"
     - "If all deposits happen before any rewards, the issue doesn't manifest"
+  solodit_ids: []
   incidentes:
     - "Fair Funding (Sherlock) — amount_claimable_per_share not initialized on deposit, vault becomes insolvent (HIGH)"
     - "Blueberry Update #3 (Sherlock) — CVX/AURA reward calculation uses current supply across cliff boundaries (HIGH)"
@@ -838,6 +871,7 @@
   trampas:
     - "Single-token vaults are NOT affected"
     - "If all accepted tokens are truly fungible at 1:1 (e.g., same stablecoin on different bridges), risk is lower"
+  solodit_ids: []
   incidentes:
     - "yAxis (Code4rena) — multi-token vault treats all tokens as equal, creating arbitrage (HIGH)"
     - "yAxis (Code4rena) — balance() mixes normalized and non-normalized amounts (HIGH)"
@@ -883,6 +917,10 @@
   trampas:
     - "If the vault has only one strategy, the DoS is inherent to that strategy's availability"
     - "Temporary pauses (< 24h) may be acceptable risk"
+  solodit_ids:
+    - m-18-the-exchange-rate-change-in-the-case-of-lossy-strategy-will-cause-the-vault-to-be-under-collateralized-for-generic-erc4626-yield-vaults-code4rena-pooltogether-pooltogether-git
+    - unaccounted-external-vault-investment-losses-can-create-withdrawal-shortfalls-trailofbits-none-cap-labs-covered-agent-protocol-pdf
+    - h-04-strategy-allocation-tracking-errors-affect-tvl-calculations-pashov-audit-group-none-elytra_2025-07-10-markdown
   incidentes:
     - "Mycelium (Sherlock) — one broken plugin blocks entire vault deposit/withdraw (MEDIUM)"
     - "UXD Protocol (Sherlock) — RageTrade senior vault utilization cap locks deposits (HIGH)"
@@ -934,6 +972,11 @@
   trampas:
     - "Vaults using pure balanceOf for totalAssets have the opposite problem (donation vulnerability)"
     - "Small discrepancies from rounding are expected and acceptable"
+  solodit_ids:
+    - revenue-accounting-ignores-losses-spearbit-none-tenbin-pdf
+    - direct-vault-deposits-incorrectly-counted-as-revenue-leading-to-liquidity-drain-spearbit-none-tenbin-pdf
+    - h-11-pending-withdrawal-tokens-in-redeem-affect-share-price-pashov-audit-group-none-omo_2025-01-25-markdown
+    - m-12-unclaimed-rewards-handling-issue-in-auravault-contract-functions-auravaultdeposit-auravaultmint-auravaultwithdraw-and-auravaultredeem-code4rena-loopfi-loopfi-git
   incidentes:
     - "Astaria (Spearbit) — yIntercept not updated on partial Seaport auction payment (HIGH)"
     - "Astaria (Spearbit) — WithdrawProxy.claim() updates yIntercept incorrectly (HIGH)"
@@ -991,6 +1034,7 @@
   trampas:
     - "If the vault has only one user, this is not exploitable"
     - "Functions that sweep excess tokens to treasury are intentional, not a bug"
+  solodit_ids: []
   incidentes:
     - "Sense (Sherlock) — AutoRoller#eject sends entire target balance including all users' YT yield to single caller (HIGH)"
     - "Cork Protocol (Sherlock) — users steal excess funds from vault due to redeem not decreasing raBalance and withdrawalPool (HIGH)"
@@ -1033,6 +1077,7 @@
   trampas:
     - "If deposits and redeems never happen in the same epoch, the bug doesn't manifest"
     - "Small fee amounts may cause the discrepancy to grow slowly"
+  solodit_ids: []
   incidentes:
     - "Perennial V2 Update #2 (Sherlock) — _withoutSettlementFeeGlobal subtracts fee twice, local only once, systematic share/asset inflation (HIGH)"
     - "Vault.settle coordinator (Code4rena) — Vault.settle(account=coordinator) will lose profitShares (MEDIUM)"
@@ -1072,6 +1117,7 @@
   trampas:
     - "Some functions are intentionally permissionless (e.g., liquidation, public harvest)"
     - "Operator/approved patterns intentionally allow third-party calls"
+  solodit_ids: []
   incidentes:
     - "PoolTogether (Code4rena) — mintYieldFee callable by anyone with arbitrary recipient (HIGH)"
     - "Astaria (Spearbit) — commitToLien doesn't check vault is registered, allows draining via fake vault (CRITICAL)"
@@ -1127,6 +1173,7 @@
   trampas:
     - "If no rewards have been distributed, storedTotalAssets == totalAssets, no issue"
     - "Very short reward cycles (<1 day) minimize the exposure window"
+  solodit_ids: []
   incidentes:
     - "Tribe (Code4rena) — xERC4626.sol storedTotalAssets underflow blocks all withdrawals during reward cycle (MEDIUM)"
     - "GoGoPool (Code4rena) — maxWithdraw/maxRedeem return values exceeding storedTotalAssets (MEDIUM)"
@@ -1166,6 +1213,7 @@
   trampas:
     - "Tokens with 18 decimals (DAI, WETH) don't trigger this bug"
     - "If all tokens in the system share the same decimals, no conversion needed"
+  solodit_ids: []
   incidentes:
     - "UXD Protocol (Sherlock) — deposit/withdraw to vault with wrong decimals in PerpDepository (MEDIUM)"
     - "yAxis (Code4rena) — balance() mixes normalized and non-normalized amounts (HIGH)"
@@ -1216,6 +1264,7 @@
   trampas:
     - "Vaults with only one fulfillment path (queue only) are not affected"
     - "If instant redemption is disabled, the gap does not exist"
+  solodit_ids: []
   incidentes:
     - "Accountable (Cyfrin) — manual fulfillRedeemRequest doesn't reserve liquidity, causing over-commitment (MEDIUM)"
     - "Accountable (Cyfrin) — fulfillRedeemRequest ignores processingMode, uses currentPrice instead of request-time price (HIGH)"
@@ -1264,6 +1313,7 @@
   trampas:
     - "Vaults with instant atomic withdrawals are not affected"
     - "If assets are moved to escrow immediately on request, the issue does not apply"
+  solodit_ids: []
   incidentes:
     - "YuzuUSD (Pashov) — pending withdrawals in YuzuILP not considered in totalAssets (HIGH)"
     - "Nexus (Pashov) — ethWithdrawn/stableWithdrawn and shares not updated on withdrawal, share price includes withdrawn portion (CRITICAL)"
@@ -1310,6 +1360,7 @@
   trampas:
     - "If fees are minted as shares to feeRecipient, the dilution is correct and this is not a bug"
     - "Very small fee rates (<0.1%) make the exploitation economically negligible"
+  solodit_ids: []
   incidentes:
     - "YuzuUSD (Pashov) — fees in YuzuILP._withdraw and StakedYuzuUSD._initiateRedeem remain in poolSize, enabling fee avoidance (HIGH)"
     - "Mellow Flexible Vaults (Sherlock) — redeems through RedeemQueue avoid paying management and performance fee by burning shares before fee accrual (HIGH)"
@@ -1354,6 +1405,7 @@
   trampas:
     - "If the protocol does not support flashloans, this vector does not exist"
     - "If vault deposits are in a separate contract from lending pool, rebalance is isolated"
+  solodit_ids: []
   incidentes:
     - "Astera (Spearbit) — DoSing vault rehypothecation through flashloans on AToken (HIGH)"
     - "Cod3x Lend (Spearbit) — identical AToken rehypothecation DoS via flashloan (HIGH)"
@@ -1395,6 +1447,7 @@
   trampas:
     - "Single-vault agents with no shared accounts are not affected"
     - "If all agents are trusted/permissioned, the DoS variant requires admin compromise"
+  solodit_ids: []
   incidentes:
     - "Omo (Pashov) — cross-vault misattribution in OmoAgent leads to incorrect vault valuation, all agent positions counted by every vault (HIGH)"
     - "Omo (Pashov) — malicious account with invalid oracle permanently disables vault via totalAssets revert (HIGH)"
@@ -1439,6 +1492,7 @@
     - "If no external protocol uses the vault's share price as an oracle, this has no impact"
     - "If state updates happen before the external call, no stale window exists"
     - "Vault-only nonReentrant is NOT sufficient — the vulnerability is cross-protocol"
+  solodit_ids: []
   incidentes:
     - "Balmy (Spearbit) — potential read-only reentrancy pattern in Earn-Vault withdraw, state updated after strategy.withdraw external call (MEDIUM)"
     - "Sentiment V2 (Sherlock) — non-liquidateable positions created by exploiting rebalanceBadDebt to decrease share price, read by lending protocol (MEDIUM)"
@@ -1483,6 +1537,7 @@
   trampas:
     - "If cooldown period is very short (<1 day), yield accrual is negligible"
     - "If share price is fixed (1:1), there is no yield to capture"
+  solodit_ids: []
   incidentes:
     - "Level (Spearbit) — cooldown period bypassed as users gain yield during withdrawal process in StakedlvlUSD (MEDIUM)"
     - "Etherex (Spearbit) — VoteModule unlockTime can be bypassed by depositing before epoch flip and withdrawing before lock is set (LOW)"
@@ -1524,6 +1579,7 @@
   trampas:
     - "If deposit target is always msg.sender or hardcoded, self-deposit is impossible"
     - "If vault shares are ERC20 and the vault never holds its own, no risk"
+  solodit_ids: []
   incidentes:
     - "Aera v3 (Spearbit) — vault can deposit into itself via Provisioner leading to artificial unit inflation (MEDIUM)"
   severidad: medium
@@ -1690,6 +1746,7 @@
     - "Arrakis V2 mitiga esto con un SimpleManager que valida burns/mints — verificar si el vault usa SimpleManager o un gestor custom"
     - "El porcentaje de perdida depende de la profundidad del pool y el TVL del vault — en pools profundos, el ataque es menos rentable"
     - "Vaults con fee de rebalanceo explican cierta caida de share price — distinguir fees legitimas de sandwich loss"
+  solodit_ids: []
   incidentes:
     - "RealWagmi (Sherlock 2023) — H-2: No slippage protection when withdrawing and providing liquidity in rebalanceAll; any caller can trigger rebalance vulnerable to sandwich (HIGH, Sherlock)"
     - "Maia DAO Ecosystem / Talos (Code4rena 2023) — M-18: Lack of slippage protection in all Uniswap V3 interactions (mint, burn, swap) allows MEV extraction from LP (MEDIUM, Code4rena)"

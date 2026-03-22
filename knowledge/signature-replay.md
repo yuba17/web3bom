@@ -25,6 +25,12 @@
   trampas:
     - "The contract may use nonces but allow the same nonce across different batchIds -- check that ALL replay vectors are covered"
     - "Some replay protection exists but only for specific code paths, leaving others open"
+  solodit_ids:
+    - signature-missing-nonce-expiration-deadline-codehawks-sparkn-git
+    - missing-nonce-validation-in-signature-verification-allows-transaction-replay-attacks-cyfrin-none-securitize-onofframp-bridge-markdown
+    - 29-nonce-is-never-used-in-regards-to-the-weighted-signers-allowing-for-proofsignature-replay-code4rena-axelar-network-axelar-network-git
+    - m-31-missing-nonce-reset-during-tss-address-update-allowing-signature-replay-sherlock-zetachain-cross-chain-git
+    - h-05-signatures-can-be-replayed-in-withdraw-to-withdraw-more-tokens-than-the-user-originally-intended-code4rena-taiko-taiko-git
   incidentes:
     - "Solodit #36240: Beanstalk redeemDepositsAndInternalBalances -- no storage of used parameters allows replay (HIGH)"
     - "Solodit #6446: Biconomy SmartAccount -- first user transaction replayable due to batchId nonce bypass (HIGH)"
@@ -56,6 +62,12 @@
   trampas:
     - "OpenZeppelin's EIP712 library handles this correctly since v4.x -- only flag custom implementations"
     - "Some protocols intentionally support cross-chain signatures (verify this is by design)"
+  solodit_ids:
+    - h-01-cross-chain-replay-in-borrowasset-swaptoborrow-kann-audits-none-rwa-markdown
+    - m-01-join-signature-lacks-domain-separation-leading-to-cross-deploymentchain-replay-shieldify-none-soulsclub-revolver-markdown
+    - lack-of-chainid-validation-allows-reuse-of-signatures-across-forks-trailofbits-advanced-blockchain-pdf
+    - risk-of-reuse-of-signatures-across-forks-due-to-lack-of-chain-id-validation-trailofbits-none-maple-labs-pdf
+    - h-01-cross-chain-signature-replay-attack-due-to-user-supplied-domainseparator-and-missing-deadline-check-code4rena-next-generation-next-generation-git
   incidentes:
     - "Solodit #38368: Aligned Layer -- missing chainId in signed data allows cross-chain replay (HIGH)"
     - "Solodit #27801: Bebop DEX -- DOMAIN_SEPARATOR stored as immutable, unsafe after chain fork (HIGH)"
@@ -91,6 +103,10 @@
   trampas:
     - "Some nonce schemes use bitmaps for gas efficiency -- verify the bitmap is properly set"
     - "ERC-2612 permit has built-in nonces -- the issue is in custom signing schemes"
+  solodit_ids:
+    - missing-signature-expiry-enables-perpetual-transaction-validity-codehawks-one-world-project-git
+    - l-01-missing-deadline-and-nonce-in-signature-pashov-audit-group-none-hybux_2025-11-11-markdown
+    - m-01-missing-time-limit-for-signature-kann-audits-none-rwa-markdown
   incidentes:
     - "Solodit #6446: Biconomy SmartAccount -- nonces[batchId] checked but batchId not validated, allowing replay via different batchIds (HIGH)"
     - "Solodit #36240: Beanstalk -- no nonce or hash storage for redeemDepositsAndInternalBalances (HIGH)"
@@ -121,6 +137,7 @@
   trampas:
     - "OpenZeppelin ECDSA.recover() already handles this -- only flag raw ecrecover usage"
     - "The address(0) check alone is insufficient if signature malleability is also present"
+  solodit_ids: []
   incidentes:
     - "Solodit #60156: AccessToken/Signer -- recoverSigner uses raw ecrecover, returns address(0) on invalid sig, allows false approval for ownerless contracts (MEDIUM)"
     - "Solodit #45173: Kakarot -- ecrecover returns valid address for out-of-range s values instead of address(0) (HIGH)"
@@ -152,6 +169,12 @@
   trampas:
     - "Most modern implementations handle this correctly -- focus on custom or older implementations"
     - "Some protocols intentionally cache for gas savings and accept the fork risk"
+  solodit_ids:
+    - the-eip-712-domain-separator-is-missing-the-version-field-spearbit-none-sphinx-pdf
+    - domainseparatorv4-not-updated-after-name-symbol-change-spearbit-connext-pdf
+    - lyswp2-5-immutable-domain_separator-becomes-invalid-after-a-hard-fork-hexens-none-train-protocol-markdown
+    - m-04-verifyingcontract-set-incorrectly-for-eip712-domain-separator-zachobront-none-hook-markdown
+    - domain_separator-in-uniswapv2erc20-will-be-invalid-after-chain-forks-cantina-none-sweep-n-flip-pdf
   incidentes:
     - "Solodit #27801: Bebop -- DOMAIN_SEPARATOR cached as immutable, stale after chain fork (HIGH)"
     - "Solodit #60874: Level Finance -- DOMAIN_SEPARATOR never initialized (HIGH)"
@@ -184,6 +207,12 @@
     - "This is a DoS (griefing) issue, typically Medium severity -- not a fund loss"
     - "Some judges consider this a known limitation of ERC-2612 and may downgrade"
     - "Verify the front-running is actually possible on the target chain (private mempools, L2 sequencers)"
+  solodit_ids:
+    - m-25-same-contract-multi-permits-fundamentally-cannot-be-solved-via-the-chosen-standards-code4rena-tapioca-dao-tapioca-dao-git
+    - permit-call-success-check-enables-front-running-dos-cantina-none-eco-inc-pdf
+    - m-10-erc-2612-permit-front-running-in-routerv2-enables-dos-of-liquidity-operations-code4rena-audit-507-audit-507-git
+    - permit-signatures-can-be-front-run-to-execute-a-temporary-denial-of-service-attack-trailofbits-none-balancer-v3-pdf
+    - permit-front-running-can-dos-requestmintwithpermit-spearbit-none-buck-labs-pdf
   incidentes:
     - "Solodit #58344: RouterV2 -- removeLiquidityWithPermit front-runnable, causes DoS (MEDIUM)"
     - "Solodit #52794: Router.sol -- depositWithPermit2 and repayWithPermit2 front-runnable (MEDIUM)"
@@ -223,6 +252,12 @@
     - "If replay protection uses nonces (not signature hashes), malleability alone is not exploitable"
     - "Many auditors flag this as informational if nonce-based replay protection exists"
     - "In zkEVM contexts, this can be higher severity because it affects consensus-level transaction validation"
+  solodit_ids:
+    - h-01-signature-malleability-of-evms-ecrecover-in-verify-code4rena-larvalabs-meebits-larvalabs-meebits-git
+    - direct-usage-of-ecrecover-allows-for-signature-malleability-halborn-holograph-protocol-markdown
+    - using-ecrecover-directly-vulnerable-to-signature-malleability-cyfrin-none-bima-markdown
+    - ecdsa-signature-malleability-quantstamp-mezo-portal-markdown
+    - l-03-direct-usage-of-ecrecover-allows-signature-malleability-code4rena-reality-cards-reality-cards-contest-git
   incidentes:
     - "Solodit #42171: NFT marketplace verify() -- ecrecover malleability, mitigated by offer cancellation but fragile (HIGH)"
     - "Solodit #3968: putForSale verify() -- same ecrecover malleability pattern (HIGH)"
@@ -259,6 +294,7 @@
   trampas:
     - "If each account has unique owners, cross-account replay is not possible"
     - "Some protocols intentionally allow shared validation (e.g., multi-sig with same signers) -- verify intent"
+  solodit_ids: []
   incidentes:
     - "Solodit #56710: zkSync SSO Clave ERC1271Handler -- insufficient checks in isValidSignature allow replay (HIGH)"
     - "Solodit #40900: Clave isValidSignature -- signature replay across accounts with shared owners (HIGH)"
@@ -290,6 +326,7 @@
   trampas:
     - "Permit2 has a token field in the permit struct -- the issue is when the contract does not set/check it"
     - "This can be Critical if it allows direct fund theft from the vault"
+  solodit_ids: []
   incidentes:
     - "Solodit #32261: Revert Lend V3Vault -- permit2 does not check token is USDC, attacker can steal all USDC (HIGH)"
     - "Solodit #49062: LoopFi PositionAction -- incorrect spender address in permit causes revert or bypass (MEDIUM)"
@@ -320,6 +357,7 @@
     - "This is a real fund-loss vector, not just griefing -- severity is High/Critical"
     - "Permit2's witness mechanism exists specifically to solve this -- check if it is used"
     - "On L2s with private mempools, front-running may not be possible -- verify per chain"
+  solodit_ids: []
   incidentes:
     - "Solodit #53124: FlashSwapRouter -- attacker front-runs ERC-2612 swap with amountOutMin = 0, steals via MEV (HIGH)"
     - "Solodit #49644: BakerFi pullTokensWithPermit -- anyone can call with valid permit to steal tokens (HIGH)"
@@ -348,6 +386,7 @@
   trampas:
     - "This is a DoS issue, not a fund theft -- typically Medium severity"
     - "Some implementations use type(uint256).max as deadline which always works but has other implications"
+  solodit_ids: []
   incidentes:
     - "Solodit #61182: Pledge function -- hardcoded block.timestamp + 300 as deadline breaks structHash (MEDIUM)"
     - "Solodit #63340: flashMintWithPermit -- oracle price change between signing and execution invalidates permit amount (MEDIUM)"
@@ -375,6 +414,7 @@
   trampas:
     - "Contract wallets may have different addresses on L2 -- verify address mapping logic"
     - "Migration windows may be time-limited, adding urgency to fixes"
+  solodit_ids: []
   incidentes:
     - "Solodit #36298: Beanstalk L2ContractMigrationFacet -- cross-chain replay in migration signatures (MEDIUM)"
     - "Solodit #36271: Beanstalk -- contract wallet users stuck on L1, cannot migrate beans (MEDIUM)"
@@ -409,6 +449,7 @@
   trampas:
     - "LOW if the unsigned parameter has a narrow valid range enforced on-chain (e.g., enum with 2 values)"
     - "Some parameters may be intentionally flexible (e.g., gas limit) — verify actual impact"
+  solodit_ids: []
   incidentes:
     - "Solodit #64685: PawnShop — durationDays not in signed quote, borrower swaps 7-day to 30-day term (LOW)"
     - "Solodit #3099: Rigor Community/Project — untyped data signing, keccak256(abi.encode()) without EIP-712 struct allows cross-context replay (HIGH)"
@@ -445,6 +486,7 @@
   trampas:
     - "This is often a DoS (signatures never verify) rather than a bypass — severity depends on whether fallback paths exist"
     - "Some contracts never actually verify signatures on-chain (off-chain only) — no on-chain impact"
+  solodit_ids: []
   incidentes:
     - "Solodit #58347: BlackHole VotingEscrow — DOMAIN_TYPEHASH has 3 fields but abi.encode has 4 (includes version), delegation signatures always fail (MEDIUM)"
     - "Solodit #27569: Brahma TypeHashHelper — incorrect typehash for Validation and Transaction structs, not EIP-712 compliant (MEDIUM)"
@@ -481,6 +523,7 @@
   trampas:
     - "Some protocols intentionally allow admin bypass — verify if msg.sender is checked (safe) vs data field (unsafe)"
     - "address(0) check may already exist via OpenZeppelin ECDSA — only flag raw ecrecover"
+  solodit_ids: []
   incidentes:
     - "Solodit #64745: Order verification — skips signature check when creator is in privileged_addresses, any user can set creator field to privileged address (HIGH)"
     - "Solodit #63978: HarTokenSale — permitSigner set to address(0) disables all access controls, anyone can self-whitelist (MEDIUM)"
@@ -518,6 +561,7 @@
   trampas:
     - "If the signature has a short deadline (e.g., 5 minutes), replay window may be too small to be practical"
     - "Some protocols intentionally allow retry of failed txs — verify if this is by design"
+  solodit_ids: []
   incidentes:
     - "Solodit #1685: Rolla EIP712MetaTransaction — executeMetaTransaction reverts on failed low-level call, nonce unchanged, replay possible (HIGH)"
     - "Solodit #63761: Sequence Calls — session call with BEHAVIOR_REVERT_ON_ERROR fails, nonce not consumed, attacker replays partial call subset (HIGH)"
@@ -551,6 +595,12 @@
   trampas:
     - "If all fields are fixed-size types (uint256, address, bytes32), encodePacked is safe"
     - "The collision may not be exploitable if other constraints (e.g., valid address) narrow the space"
+  solodit_ids:
+    - typed-signatures-implement-insecure-nonstandard-encodings-trailofbits-meson-protocol-pdf
+    - hash-collisions-in-untyped-signatures-trailofbits-meson-protocol-pdf
+    - m-1-abiencodepacked-allows-hash-collision-sherlock-nftport-nftport-git
+    - non-injective-hash-encoding-in-getclaimkeyhash-trailofbits-paraspace-pdf
+    - multichaincompact-and-batchcompact-incompatible-with-erc712-due-to-incorrect-hashing-spearbit-none-uniswap-the-compact-pdf
   incidentes:
     - "Solodit #3546: NFTPort Factory — abi.encodePacked with multiple dynamic types in signedOnly modifier, hash collision bypasses signature check (MEDIUM)"
     - "Solodit #41149: EYWA BaseRouter — _getRawData concatenates operation params without separators, different parameter splits produce same hash (HIGH)"
@@ -586,6 +636,7 @@
     - "EIP-7702 is post-Pectra only — verify target chain supports it before reporting"
     - "If protocol already handles both paths with try/catch, this is a non-issue"
     - "Severity depends on whether EIP-7702 is live on target chain — may be informational pre-Pectra"
+  solodit_ids: []
   incidentes:
     - "Solodit #57707: FactCheckExchange — settleMatchedOrders uses isContract to route sig verification, breaks under EIP-7702 (MEDIUM)"
     - "Solodit #6662: Blueberry onlyEOAEx — tx.origin check to enforce EOA will not hold under EIP-3074 (MEDIUM)"
@@ -620,6 +671,7 @@
   trampas:
     - "If signatures are verified against a fixed signer set with 1:1 mapping, duplicates are not possible"
     - "Some implementations sort off-chain — verify on-chain enforcement exists"
+  solodit_ids: []
   incidentes:
     - "Solodit #65088: Recall SubnetActorCheckpointingFacet — no signature duplication check, single validator can satisfy quorum alone (HIGH)"
   severidad: critical
@@ -655,6 +707,7 @@
   trampas:
     - "If revocation is permanent and cannot be undone, replay may re-grant — check if this is intended"
     - "Merkle proofs with per-wallet mint limits may mitigate replay even without explicit tracking"
+  solodit_ids: []
   incidentes:
     - "Solodit #6415: Ondo KYCRegistry — addKYCAddressViaSignature replayable after KYC revocation, user re-verifies before deadline (MEDIUM)"
     - "Solodit #8860: RabbitHole QuestFactory — mintReceipt signature replay, mitigated only by per-address mint limit (MEDIUM)"
@@ -688,6 +741,7 @@
   trampas:
     - "Short expiry windows (5 minutes) may make replay impractical"
     - "If oracle is centralized and never re-signs, replay risk is limited to the validity window"
+  solodit_ids: []
   incidentes:
     - "Superform v2 Periphery ECDSAPPSOracle — no nonce in signature schema, stale PPS price replay breaks share accounting (High)"
     - "Soulsclub Revolver — joinGame signature lacks chainId, address(this), currentRoundId; cross-chain and cross-round replay (Medium)"
@@ -721,6 +775,7 @@
   trampas:
     - "If the contract is only deployed on one chain, cross-chain replay is not possible"
     - "Some protocols intentionally omit chainId — verify if this is documented"
+  solodit_ids: []
   incidentes:
     - "Uniswap Foundation KEM Hooks — signed swap digest lacks domain separator, cross-chain replay via CREATE3 (Medium)"
     - "Accountable Authorizable — _verify not EIP-712 compliant, mixes chainId in message not domain (Low)"
@@ -754,6 +809,7 @@
   trampas:
     - "If using EIP-712 (not personal_sign), this pattern does not apply"
     - "abi.encode pads everything to 32 bytes; abi.encodePacked uses actual sizes"
+  solodit_ids: []
   incidentes:
     - "SXT — _validateSxtFulfillUnstake declares 36-byte length but actual message is 72 bytes, EIP-191 non-compliant (Low)"
   severidad: medium
@@ -786,6 +842,7 @@
   trampas:
     - "Only affects L1/L2 node implementations with system transactions"
     - "Requires malicious block proposer — not exploitable by regular users"
+  solodit_ids: []
   incidentes:
     - "Monad — static_validate_system_transaction missing EIP-2 malleable signature check, consensus split possible (High)"
   severidad: high
@@ -818,6 +875,7 @@
   trampas:
     - "If deadlines are very short (minutes), practical risk is limited"
     - "If signatures are only held by trusted relayers, lower severity"
+  solodit_ids: []
   incidentes:
     - "Securitize DSToken Rebasing — no function to invalidate nonce in SecuritizeSwap, signed transactions irrevocable until deadline (Low)"
   severidad: medium
@@ -850,6 +908,7 @@
   trampas:
     - "If permit is wrapped in try/catch and falls back to allowance, may be informational"
     - "Stablecoins with fixed price are not affected"
+  solodit_ids: []
   incidentes:
     - "Colbfinance USC Engine — flashMintWithPermit recalculates fullPayout from oracle, mismatches signed permit amount (Medium)"
   severidad: medium
@@ -892,6 +951,7 @@
     - "Si el nonce está ligado al address del owner (no al accountId), un nuevo owner empieza en nonce=0 naturalmente — el fix es ligar el nonce al accountId"
     - "Algunos sistemas intencionalmente resetan nonces para permitir reutilización de firmas post-transfer — verificar el diseño"
     - "Si no hay función de transferencia de cuenta, este bug no aplica"
+  solodit_ids: []
   incidentes:
     - "ReyaNetwork — AccountModule::notifyAccountTransfer resetea nonce a 0; replay de mensajes firmados por owner anterior posible (Medium, Pashov Audit Group; impacto High)"
     - "ZetaChain Cross-Chain — update_tss (Solana) no resetea nonce del TSS anterior, permitiendo replay de firmas TSS previas con el nuevo signatario (Medium, Sherlock)"
@@ -935,6 +995,7 @@
     - "Esta vulnerabilidad es específica de protocolos con era/epoch + slash mechanism — rara en contratos simples"
     - "Si los nonces NO se resetean con el era, el replay no es posible aunque falte el era en el typehash"
     - "Impacto en Reserve Protocol clasificado como Low por el auditor — considerar severidad en contexto del protocolo específico"
+  solodit_ids: []
   incidentes:
     - "Reserve Protocol StRSRVotes — delegateBySig() no verifica que la delegación ocurra en el era en que fue firmada; firma de era anterior re-ejecutable post-seize (Low, Code4rena 2024-07)"
   severidad: medium
@@ -975,6 +1036,7 @@
     - "Delegate en ERC20Votes estándar (OpenZeppelin) sí permite delegar PROPIO balance — es correcto"
     - "Este bug aplica solo a veNFT/lockId-based delegation, no a ERC20.delegate(address)"
     - "Si el protocolo intencionalmente permite que terceros (e.g., un operator aprobado) deleguen, verificar si hay un isApprovedForAll check"
+  solodit_ids: []
   incidentes:
     - "Hyperstable vePeg — delegate() no tiene ownership check; cualquier dirección puede delegar los votos de cualquier lock a un lock arbitrario; attacker monopoliza governance (Critical, Pashov Audit Group 2025)"
     - "EYWA EscrowManager — moveVotes() no verifica hasVoted, permite inflar votos de un delegado transfiriendo NFT que ya votó (High, MixBytes)"

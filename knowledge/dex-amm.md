@@ -39,6 +39,11 @@
     - "Fees intentionally reduce output — k must increase by fee amount, not stay flat"
     - "Virtual reserves in concentrated liquidity mean k is per-range, not global"
     - "Rebasing tokens break the invariant naturally — pool must handle rebase"
+  solodit_ids:
+    - "m-05-the-constant-product-invariant-can-be-broken-code4rena-basin-basin-git"
+    - "h-01-protocol-allows-creating-broken-tri-crypto-cpmm-pools-code4rena-mantra-mantra-git"
+    - "h-11-stableswap-does-disjoint-swaps-breaking-the-underlying-invariant-code4rena-mantra-mantra-git"
+    - "removeliquidity-logic-is-not-correct-for-generalized-well-functions-other-than-constantproduct-cyfrin-beanstalk-wells-markdown_"
   incidentes:
     - "MANTRA DEX -- Stableswap does disjoint swaps per isolated pair instead of full n-dimensional invariant curve, breaks stableswap invariant (HIGH)"
     - "MANTRA DEX -- Stableswap pool can be skewed free of fees via imbalanced deposits, effectively swapping without fee (HIGH)"
@@ -87,6 +92,7 @@
     - "UniV2 MINIMUM_LIQUIDITY (1000 wei) prevents first-depositor attack"
     - "Fee-on-transfer tokens cause natural desync — protocol must use actual received amounts"
     - "Imbalanced deposits in multi-asset pools intentionally cost more (swap fee applies)"
+  solodit_ids: []
   incidentes:
     - "NUTS Finance SelfPeggingAsset -- First depositor inflation attack: 1 wei deposit + donation bypasses minMintAmount, victim gets 0 shares (CRITICAL)"
     - "Caviar -- First depositor breaks minting: donate to inflate share price, subsequent LPs get 0 tokens (HIGH)"
@@ -133,6 +139,11 @@
     - "High liquidity pools (>$10M TVL) are expensive to manipulate for spot reads"
     - "TWAP with short window (< 10 min) is still manipulable across multiple blocks"
     - "Chainlink with proper staleness checks is generally safe"
+  solodit_ids:
+    - "on-chain-slippage-calculation-using-exchange-rate-derived-from-poolslot0-can-be-easily-manipulated-cyfrin-none-cyfrin-thermae-markdown"
+    - "slippage-vulnerability-in-primex-protocol-for-swap-and-spot-trade-positions-quantstamp-primex-finance-markdown"
+    - "m-01-twap-price-manipulation-pashov-audit-group-none-titanx-markdown"
+    - "m-08-twap-can-be-manipulated-pashov-audit-group-none-ulti-november-markdown"
   incidentes:
     - "Connext SponsorVault -- Spot AMM price used for swap, attacker sandwiches to drain all native tokens from sponsor vault (CRITICAL)"
     - "Connext -- getPriceFromDex derives price with balanceOf instead of getReserves, manipulable via donation (HIGH)"
@@ -179,6 +190,11 @@
     - "Private mempools (Flashbots) partially mitigate but do not eliminate risk"
     - "Protocols computing slippage from oracle price internally may be acceptable"
     - "L2s with sequencer ordering have reduced but nonzero sandwich risk"
+  solodit_ids:
+    - "m-1-mev-bots-will-steal-from-users-due-to-an-incorrectly-manipulated-value-sherlock-peapods-git"
+    - "missing-slippage-protection-on-syncswap-swaps-cantina-none-clave-pdf"
+    - "harvesterharvest-swaps-have-no-slippage-parameters-consensys-brahma-fi-markdown"
+    - "no-slippage-protection-on-uniswapv2-interactions-halborn-klimadao-klimadao-autocompounder-markdown"
   incidentes:
     - "Gacha Protocol -- _swap() computes minTokens on-chain from getAmountOut, 5% tolerance is meaningless against sandwich (HIGH)"
     - "Derby Vault -- claimTokens() and withdrawRewards() use IQuoter on-chain for slippage calculation, sandwichable (HIGH)"
@@ -228,6 +244,11 @@
     - "V3 geometric TWAP is much harder to manipulate than V2 arithmetic TWAP"
     - "On L2s with 2-second blocks, 30 minutes = 900 observations (high cardinality needed)"
     - "New pool with few observations may return unreliable TWAP — check initialization"
+  solodit_ids:
+    - "m-01-twap-price-manipulation-pashov-audit-group-none-titanx-markdown"
+    - "m-08-twap-can-be-manipulated-pashov-audit-group-none-ulti-november-markdown"
+    - "h-2-strategy-main-ticks-are-set-according-to-the-tick-in-slot0-leading-to-incorrect-allocation-and-loss-of-funds-sherlock-yieldoor-git"
+    - "h-01-reallocation-depends-on-the-slot0-price-which-can-be-manipulated-code4rena-predy-predy-git"
   incidentes:
     - "Sentiment Update 2 -- Curve LP virtual_price manipulated via read-only reentrancy during remove_liquidity, triggers false liquidations (HIGH)"
     - "Notional -- Attacker flash-loans to bypass BPT threshold, triggers emergency settlement to DOS vault (MEDIUM)"
@@ -273,6 +294,10 @@
     - "Most protocols fork Uniswap V3 exactly — bugs are in the modifications"
     - "Custom tick spacing or fee tiers may introduce new boundary conditions"
     - "Single-tick swaps (no crossing) are generally safe"
+  solodit_ids:
+    - "limit-orders-can-be-incorrectly-filled-openzeppelin-none-openzeppelin-uniswap-hooks-v110-rc-1-audit-markdown"
+    - "accrued-limit-order-fees-can-be-stolen-openzeppelin-none-openzeppelin-uniswap-hooks-v110-rc-1-audit-markdown"
+    - "h-2-strategy-main-ticks-are-set-according-to-the-tick-in-slot0-leading-to-incorrect-allocation-and-loss-of-funds-sherlock-yieldoor-git"
   incidentes:
     - "Yieldoor -- Strategy main ticks set from slot0 tick which is off-by-one at tick boundaries, asymmetric position loses fees (HIGH)"
     - "Ouroboros UniswapV3Staker -- Full-range incentive makes concentrated LPs forfeit 99%+ of swap fees for minimal rewards (HIGH)"
@@ -317,6 +342,7 @@
     - "On L2s with sequencer ordering, deadline risk is reduced (sequencer chooses order)"
     - "Private mempool transactions cannot be held by validators"
     - "Some protocols have their own expiry mechanism separate from DEX deadline"
+  solodit_ids: []
   incidentes:
     - "Hyperhyper -- PositionInteractionFacet sets deadline = block.timestamp + 30 minutes, MEV bots can hold and execute later (MEDIUM)"
     - "Backed Protocol PaprController -- buyAndReduceDebt and startLiquidationAuction have no deadline parameter for UniV3 swaps (MEDIUM)"
@@ -364,6 +390,10 @@
     - "Per-hop slippage in multi-hop swaps is overly restrictive and may cause reverts"
     - "Fee-on-transfer tokens legitimately reduce received amount below expected"
     - "Some aggregators handle slippage at the aggregator level, not the DEX level"
+  solodit_ids:
+    - "on-chain-slippage-calculation-using-exchange-rate-derived-from-poolslot0-can-be-easily-manipulated-cyfrin-none-cyfrin-thermae-markdown"
+    - "h-1-lack-of-slippage-protection-leads-to-loss-of-protocol-funds-sherlock-cork-protocol-git"
+    - "lack-of-slippage-protection-in-liquidity-provision-cantina-none-marginal-pdf"
   incidentes:
     - "Notional Update 2 -- Settlement slippage minPrimary/minSecondary auto-computed and overwritten, caller's values ignored (HIGH)"
     - "Notional Update 2 -- Proportional redemption minExitAmounts set so low they provide no real protection (HIGH)"
@@ -410,6 +440,7 @@
   trampas:
     - "Flash swaps within the AMM itself are normal — the concern is downstream consumers"
     - "High-fee pools make manipulation more expensive but not impossible"
+  solodit_ids: []
   incidentes:
     - "Sentiment Update 2 -- Curve LP virtual_price manipulated via read-only reentrancy during remove_liquidity, triggers false liquidations (HIGH)"
     - "Notional -- Attacker flash-loans to bypass BPT threshold, triggers emergency settlement to DOS vault (MEDIUM)"
@@ -452,6 +483,11 @@
   trampas:
     - "UniV3 feeGrowthGlobal intentionally wraps (overflow by design) — this is not a bug"
     - "Dynamic fees that change per-block are not a mismatch if applied consistently"
+  solodit_ids:
+    - "m-2-rounding-error-when-call-function-dodomultiswap-can-lead-to-revert-of-transaction-or-fund-of-user-sherlock-dodo-dodo-git"
+    - "m-21-incorrect-rounding-in-computeswap-code4rena-bunni-august-bunni-august-git"
+    - "m-1-pairs-with-max_fee-can-revert-due-to-rounding-inconsistencies-sherlock-rubicon-rubicon-finance-git"
+    - "buck-takes-swap-fee-on-lp-operations-spearbit-none-buck-labs-pdf"
   incidentes:
     - "Velodrome Finance -- getAmountIn hardcodes 0.3% fee but pools have factory-set custom fees, math is wrong (MEDIUM)"
     - "Alchemix RevenueHandler -- Curve pool exchange_underlying min_dy misunderstood, precision loss enables sandwich on protocol funds (HIGH)"
@@ -493,6 +529,9 @@
   trampas:
     - "Using an oracle price on-chain to compute minAmountOut is acceptable if the oracle is manipulation-resistant (e.g., Chainlink)"
     - "On-chain TWAP-based slippage is ok if the TWAP window is long enough (30+ min)"
+  solodit_ids:
+    - "on-chain-slippage-calculation-using-exchange-rate-derived-from-poolslot0-can-be-easily-manipulated-cyfrin-none-cyfrin-thermae-markdown"
+    - "h-1-lack-of-slippage-protection-leads-to-loss-of-protocol-funds-sherlock-cork-protocol-git"
   incidentes:
     - "Gacha Protocol -- _swap() calculates minTokens from getAmountOut on-chain, 5% slippage tolerance is meaningless (HIGH)"
     - "Derby -- Vault.claimTokens() and MainVault.withdrawRewards() use IQuoter on-chain for slippage, sandwichable (HIGH)"
@@ -529,6 +568,7 @@
   como_se_arregla: "Always call pair.token0() to determine which reserve corresponds to which token. Sort token addresses before assigning reserves."
   trampas:
     - "On some chains/forks, WETH address may happen to be token0 in test pairs but not in production"
+  solodit_ids: []
   incidentes:
     - "Gacha Protocol -- _swap() assigns (wethReserve, tokenReserve) without checking token0 ordering (CRITICAL)"
   severidad: high
@@ -564,6 +604,7 @@
   trampas:
     - "Standard UniV2 forks with immutable 0.3% fee are not affected"
     - "Velodrome, Solidly, and similar forks commonly have variable fees"
+  solodit_ids: []
   incidentes:
     - "Velodrome Finance -- UniswapV2Library.getAmountIn hardcodes 997 fee but pools have custom fees via factory (MEDIUM)"
   severidad: medium
@@ -601,6 +642,7 @@
   trampas:
     - "MIN_LOCK_DURATION > 1 block mitigates flash loan but not well-funded attackers"
     - "Synthetix-style drip over 7 days is generally safe"
+  solodit_ids: []
   incidentes:
     - "Merit Circle -- front-run distributeRewards() to steal newly added rewards (MEDIUM)"
     - "Backd -- BkdLocker.depositFees() lump-sum distribution frontrunnable (MEDIUM)"
@@ -643,6 +685,7 @@
   trampas:
     - "Composable Balancer pools include BPT in the pool tokens array -- easy to miss"
     - "Protocol tokens that also serve as LP tokens (e.g., Curve LP = pool token)"
+  solodit_ids: []
   incidentes:
     - "Notional Update 4 -- AuraStakingMixin._isInvalidRewardToken does not exclude BPT, can be sold during reinvestment (MEDIUM)"
     - "Gauntlet/Aera Vault -- sweep() allows Treasury to withdraw pool BPTs, bypassing all safeguards (CRITICAL)"
@@ -683,6 +726,10 @@
     - "Only affects pools with native ETH (not WETH) due to .call callback"
     - "Balancer pools with reentrancy guard since Aug 2023 are patched"
     - "Vyper < 0.3.1 had broken reentrancy guards making this worse"
+  solodit_ids:
+    - "h-1-liquidations-are-impossible-for-some-curve-pools-sherlock-notional-notional-update-2-git"
+    - "h-1-h-01-wsteth-eth-curve-lp-token-price-can-be-manipulated-to-cause-unexpected-liquidations-sherlock-sentiment-sentiment-update-2-git"
+    - "balancer-read-only-reentrancy-vulnerability-changes-from-dev-team-added-to-audit-spearbit-cron-finance-pdf"
   incidentes:
     - "Sentiment Update 2 -- wstETH-ETH Curve LP virtual_price suppressed via read-only reentrancy, triggers false liquidations ($potential millions) (HIGH)"
     - "Cron Finance TWAMM -- Balancer read-only reentrancy affects getVirtualReserves, getVirtualPriceOracle (HIGH)"
@@ -721,6 +768,7 @@
   trampas:
     - "Pairs of same-decimal tokens (WETH/DAI both 18) are not affected"
     - "cTokens have 8 decimals regardless of underlying -- easy to miss"
+  solodit_ids: []
   incidentes:
     - "Notional Update 2 -- Curve vault undervalues LP when tokens have different decimals (HIGH)"
     - "Connext -- _slippageTol does not adjust for decimal differences, DoS or no protection (MEDIUM)"
@@ -762,6 +810,7 @@
   trampas:
     - "sqrtPriceLimitX96 is NOT a revert-on-breach parameter -- it is a partial-fill boundary"
     - "ExactOutput swaps return positive for the input side"
+  solodit_ids: []
   incidentes:
     - "Maia DAO -- RootBridgeAgent._gasSwapIn/Out does not negate UniV3 return, DoS via overflow (MEDIUM)"
     - "Blueberry -- IchiSpell uses sqrtPriceLimitX96 as slippage but it causes partial swaps, not reverts (HIGH)"
@@ -799,6 +848,7 @@
   trampas:
     - "Stargate, Amarok, NXTP all have try-catch on destination -- each handles failure differently"
     - "If receiver is an Executor contract with proper access control, tokens may be safe"
+  solodit_ids: []
   incidentes:
     - "LI.FI -- Destination chain swap failure leaves tokens in protocol, attacker drains via sandwich + sweep (HIGH)"
     - "Connext -- Users forced to accept any slippage on destination, no cancel function (HIGH)"
@@ -836,6 +886,7 @@
   trampas:
     - "2-asset pools with standard curves are typically safe"
     - "Generalized AMM frameworks (Beanstalk Wells, Balancer custom pools) are high-risk"
+  solodit_ids: []
   incidentes:
     - "MANTRA DEX -- Factory allows 3-asset CPMM pools but swap math only handles 2-asset pairs (HIGH)"
     - "MANTRA DEX -- Stableswap does disjoint swaps breaking the n-dimensional invariant (HIGH)"
@@ -873,6 +924,7 @@
   trampas:
     - "Balanced deposits (proportional) do not incur this issue"
     - "Small imbalances may be dust-level and not exploitable"
+  solodit_ids: []
   incidentes:
     - "MANTRA DEX -- Stableswap pool can be skewed free of fees via imbalanced deposits (HIGH)"
     - "PlatypusFinance -- Multiple exploits targeting coverage ratio manipulation in stableswap (HIGH, $10.5M total)"
@@ -910,6 +962,7 @@
   trampas:
     - "Functions that don't rely on overflow (pure addition) don't need unchecked"
     - "Already patched in recent @uniswap/v3-core releases"
+  solodit_ids: []
   incidentes:
     - "Astaria -- FullMathUniswap, LiquidityAmounts, TickMath ported to 0.8 without unchecked, reverts on edge cases (MEDIUM)"
   severidad: medium
@@ -946,6 +999,7 @@
   trampas:
     - "Timelocked changes with >24h delay are generally safe due to arbitrage equilibrium"
     - "Curve's rampA already uses gradual change over days"
+  solodit_ids: []
   incidentes:
     - "TermMax Market -- setLsf() causes AMM price shift, sandwichable (HIGH)"
     - "Gauntlet/Aera Vault -- enableTradingWithWeights allows instant weight change while trading is active (MEDIUM)"
@@ -985,6 +1039,7 @@
   trampas:
     - "If caller can only choose among pre-approved DEXes and fee tiers, risk is lower"
     - "Keeper-only functions with trusted EOA are less risky but still exploitable if key is compromised"
+  solodit_ids: []
   incidentes:
     - "Notional -- 0x adaptor does not validate recipient, purchased tokens sent to attacker wallet (HIGH)"
     - "Redacted Cartel -- AutoPxGmx.compound lets caller choose fee tier, routes through illiquid pool (MEDIUM)"
@@ -1023,6 +1078,7 @@
   trampas:
     - "Different chains may deploy same factory with different init code hashes"
     - "Upgradeable pair implementations change the hash"
+  solodit_ids: []
   incidentes:
     - "Numoen -- UniswapV2Library uses SushiSwap init code hash instead of UniswapV2, computed pair addresses are wrong (MEDIUM)"
   severidad: medium
@@ -1066,6 +1122,7 @@
     - "Single-account JIT penalties work; multi-account coordination is the bypass"
     - "Fee donation to pool is standard Uniswap V4 pattern but creates perverse incentives for penalties"
     - "Hooks that track by msg.sender can be bypassed by contract-based proxies"
+  solodit_ids: []
   incidentes:
     - "OpenZeppelin Uniswap Hooks -- AntiSandwichHook bypassed via JIT liquidity that captures donated anti-sandwich fees (HIGH)"
     - "OpenZeppelin Uniswap Hooks -- LiquidityPenaltyHook bypassed using secondary accounts to capture donated penalties (HIGH)"
@@ -1113,6 +1170,7 @@
     - "PDAs on Solana are deterministic from seeds -- anyone can compute them"
     - "CREATE opcode addresses are deterministic from (sender, nonce) -- attacker can predict"
     - "Using == for balance checks is always fragile; selfdestruct/force-send breaks it"
+  solodit_ids: []
   incidentes:
     - "Pump.fun audit -- Bonding Curve DOS through escrow pre-funding, deterministic PDA poisoned (HIGH)"
     - "Pump.fun audit -- Direct SOL transfers to bonding curve escrow break protocol invariant (HIGH)"
@@ -1161,6 +1219,7 @@
     - "ERC-20 LP tokens with no transfer hook are always vulnerable"
     - "ERC-721 LP NFTs can carry metadata but must update on transfer"
     - "Soulbound LP tokens prevent this entirely but reduce composability"
+  solodit_ids: []
   incidentes:
     - "QuantAMM -- Fee evasion via LP Token Transfer resets deposit value, zeroing uplift fee (HIGH)"
     - "Pendulum Backstop Pool -- Cool-off period for deposits bypassed by transferring LP tokens to another address (HIGH)"
@@ -1203,6 +1262,7 @@
     - "Synthetix-style continuous distribution prevents this"
     - "If flash loan fees exceed recaptured fees, attack is unprofitable"
     - "Some protocols intentionally allow this as a feature (buyback)"
+  solodit_ids: []
   incidentes:
     - "Velar Artha -- User sandwiches own position close to reclaim all borrowing fees via flash liquidity (HIGH)"
     - "TermMax Market -- Malicious users steal swap fees from LPs via flash deposit-withdraw around fee event (HIGH)"
@@ -1250,6 +1310,7 @@
     - "Two-step commit-reveal patterns can have logic errors in the commit check"
     - "Slippage on bonding curve side does NOT protect the DEX liquidity addition"
     - "Initial LP from graduation is often permanently locked -- but not always"
+  solodit_ids: []
   incidentes:
     - "GroupcoinFactory -- Tokens launched to Uniswap v3 anytime due to logic error in commit check, ETH drained (HIGH)"
     - "GroupcoinFactory -- Launch enabled without raising enough ETH, underfunded pool (HIGH)"
@@ -1298,6 +1359,7 @@
     - "Protocols without internal balance accounting are not affected"
     - "If all operations use EXTERNAL mode, internal balances are never at risk"
     - "Diamond proxy patterns make it easy to miss that facets share state"
+  solodit_ids: []
   incidentes:
     - "Beanstalk -- Internal balance tokens drained through CurveFacet.exchangeUnderlying, recipient mismatch between INTERNAL/EXTERNAL modes (HIGH)"
   severidad: critical
@@ -1340,6 +1402,7 @@
     - "Only affects positions with significant uncollected fees"
     - "Uniswap V4 periphery had this exact bug (now patched)"
     - "V3 does not combine fees and position cost in the same return value"
+  solodit_ids: []
   incidentes:
     - "Uniswap V4 Periphery -- Slippage checks not enforced when fees accrued exceed tokens required for liquidity deposit (HIGH)"
     - "Uniswap V4 Periphery -- Same finding confirmed independently by two auditors (HIGH)"
@@ -1483,6 +1546,7 @@
     - "The attack is only profitable if the initial liquidity is large enough to arb"
     - "For token launches (no oracle exists), use a price range check derived from expected tokenomics"
     - "Uniswap V4 pools: PoolManager.initialize is permissionless — same attack surface exists"
+  solodit_ids: []
   incidentes:
     - "Serious Protocol (Pashov) — createPoolAndAddLiquidity does not handle pre-existing pool at wrong price, front-runnable initial price setting (HIGH)"
     - "Predy Finance (Code4rena) — reallocate() uses slot0 price which is front-runnable, LP position pushed out of range (HIGH)"
@@ -1533,6 +1597,7 @@
     - "If the function is only callable by admin/keeper, manipulation requires MEV cooperation with keeper"
     - "Uniswap V3 observations array may be uninitialized (cardinality=1) — OracleLibrary.consult reverts"
     - "On L2s with centralized sequencers, sandwich attacks require sequencer cooperation — reduced risk"
+  solodit_ids: []
   incidentes:
     - "Predy Finance (Code4rena H-01) — reallocate() uses slot0 tick to decide reallocation, front-runnable (HIGH)"
     - "Thermae (Cyfrin) — On-chain slippage derived from pool.slot0 allows sandwich of any swap (HIGH)"
@@ -1584,6 +1649,7 @@
     - "If fee is small (0.01-0.05%), the error may be minor unless price ratio is extreme"
     - "In two-sided fee models (maker + taker), track which side each fee applies to separately"
     - "Off-by-one in fee direction becomes critical for high-value limit orders or bulk fill scenarios"
+  solodit_ids: []
   incidentes:
     - "Ellipsis Plasma (OtterSec) — AMM fee incorrectly applied to base asset after quote conversion in get_limit_order_size_in_base_and_quote (HIGH)"
     - "Multiple DEX limit order extensions — fee applied to wrong token causes systematic over/underpayment (MEDIUM)"
@@ -1639,6 +1705,7 @@
     - "El slippage está protegido por TWAP check (maxTWAPTickDifference), así que el peor caso es pérdida de fees + protocol reward, no sandwich total"
     - "El keeper (Revert controlled) es un actor de confianza — el riesgo real es misconfiguration del owner, no keeper malicioso"
     - "Solodit M-02: gas griefing via malicious onERC721Received ya documentado — este es diferente (valor extraído, no DOS)"
+  solodit_ids: []
   incidentes:
     - "Revert Lend C4 (2024-03) M-02: gas griefing en AutoRange via onERC721Received (diferente vector, mismo contrato)"
     - "Revert Lend C4 (2024-03) M-23: AutoRange execution front-run para evitar protocol fee (relacionado)"
@@ -1689,6 +1756,7 @@
     - "En pools de alto volumen, el MEV no puede mantener el precio desplazado — riesgo bajo en mainnet liquidity"
     - "El compound es llamado por Revert keeper (confiable) — el riesgo real es front-run MEV, no keeper malicioso"
     - "Comparar con execute() que SÍ pasa amountOutMin a _routerSwap() — autoCompound es el caso más débil"
+  solodit_ids: []
   incidentes:
     - "No se encontró incidente real equivalente en Solodit para este vector exacto"
   severidad: medium
@@ -1739,6 +1807,7 @@
     - "El caso más realista es un edge case de precio extremo durante el mint — no trivial de triggerear"
     - "La condición requiere: precio se mueve DESPUÉS del swap pero DURANTE el mint → window pequeño"
     - "Si onlyFees=true, este path NO se ejecuta — solo relevante para onlyFees=false"
+  solodit_ids: []
   incidentes:
     - "No se encontró incidente real equivalente confirmado"
   severidad: low
@@ -1992,6 +2061,7 @@
     - "El keeper puede ser confiable hoy pero comprometido/griefed mañana — defensa en profundidad"
     - "Si la pool tiene muy poca liquidez, el TWAP puede manipularse con menos capital"
     - "Sherlock (RealWagmi) consideró HIGH por pérdida directa sin condiciones previas"
+  solodit_ids: []
   incidentes:
     - "RealWagmi (Sherlock 2023-06, H-2): rebalanceAll sin slippage en removeLiquidity/addLiquidity — HIGH, solodit.xyz/issues/h-2-no-slippage-protection-when-withdrawing-and-providing-liquidity-in-rebalanceall-sherlock-none-realwagmi-git"
     - "Maia DAO/Talos (Code4rena 2023, H-10): TalosBaseStrategy.init() sin checkDeviation modifier presente en deposit/rebalance — HIGH, solodit.xyz/issues/h-10-talosbasestrategyinit-lacks-slippage-protection-code4rena-maia-dao-ecosystem-maia-dao-ecosystem-git"
@@ -2048,6 +2118,7 @@
     - "Si el reward token es muy ilíquido, el slippage es alto per-se — el límite debe ser más amplio"
     - "Algunos protocolos usan relayers que calculan amountOutMin off-chain — verificar si eso aplica"
     - "Velodrome clasificó esto como MEDIUM (no HIGH) porque requiere pools activos con liquidez"
+  solodit_ids: []
   incidentes:
     - "Velodrome Finance (Spearbit 2023, MEDIUM): AutoCompounder.sol#L78 y #L91 pasan amountOutMin=0 al swap de VELO rewards — solodit.xyz/issues/lack-of-slippage-control-during-compounding-spearbit-none-velodrome-finance-pdf"
     - "Fuji Protocol (Consensys 2022): FujiVaultFTM.harvestRewards genera swap con minOutput=0 en todos los casos — solodit.xyz/issues/missing-slippage-protection-for-rewards-swap-consensys-fuji-protocol-markdown"
@@ -2121,6 +2192,7 @@
     - "El patrón aparece en cualquier protocolo con rewards multi-vault donde la factory se pasa como argumento"
     - "Buscar también en funciones de `harvest`, `compound`, `collectFees` que acepten address params"
     - "A veces el fix incorrecto valida solo que factory != address(0) en lugar de que sea la factory oficial"
+  solodit_ids: []
   incidentes:
     - "Velodrome Finance — Spearbit 2023: ALLOWED_CALLER can steal all rewards from AutoCompounder using a fake factory (Medium) — solodit.xyz"
     - "Daoslive — Fee Theft via Arbitrary Contract Impersonation in collect() Function (High) — solodit.xyz"
@@ -2173,6 +2245,7 @@
     - "La variante con 're-entry en range re-entry' (Burve H-5) es más compleja: el atacante deposita cuando el pool tick re-entra al rango del vault"
     - "Distinguir de sandwich attack clásico: aquí no hay swap, solo timing de depósito vs colecta"
     - "Vaults con lockup mínimo post-depósito resuelven esto pero añaden UX friction"
+  solodit_ids: []
   incidentes:
     - "Mellow Protocol — [H-03] UniV3Vault.sol#collectEarnings() can be front run (High, Code4rena 2023) — solodit.xyz"
     - "Burve — H-5: Attacker captures unclaimed fees by timing deposit with range re-entry and withdrawal (High) — solodit.xyz"
@@ -2228,6 +2301,7 @@
     - "La pérdida es gradual (Medium) vs inmediata (High) — depende de si setModule() está disponible"
     - "Arrakis H-3 es la variante más severa: executor puede drenar 100% vía setModule con módulo falso"
     - "En Revert Lend, los keepers de AutoRange tienen control sobre el nuevo rango — verificar si pueden elegir rangos sub-óptimos repetidamente"
+  solodit_ids: []
   incidentes:
     - "Arrakis Finance — M-2: Lack of rebalance rate limiting allow operators to drain vaults (Medium, Spearbit 2023) — solodit.xyz"
     - "Arrakis Valantis SOT — H-3: Through rebalance(), an executor can drain 100% of vault reserves by minting (High) — solodit.xyz"
@@ -2281,6 +2355,7 @@
     - "La variante Mimo H-02 (automation para vault no existente) es más severa — permite configurar trampas"
     - "En Revert Lend, los params de AutoExit/AutoRange incluyen maxGasTipCap y rewardX64 — verificar si son front-corredores"
     - "El impacto real depende de si hay competencia entre keepers: si solo hay 1 keeper, el griefing es DoS"
+  solodit_ids: []
   incidentes:
     - "Mimo DeFi — [M-07] vaultOwner Can Front-Run rebalance() With setAutomation() To Lower Incentive (Medium, Code4rena 2023) — solodit.xyz"
     - "Mimo DeFi — [H-02] Automation/management can be set for not yet existing vault (High) — solodit.xyz"
@@ -2335,6 +2410,7 @@
     - "Si la fee es pequeña por llamada pero el protocolo tiene mucho TVL acumulado, el drain es grande"
     - "Buscar funciones en la misma familia: claim, harvest, collect, settle, execute, request"
     - "A veces el fix está en la función caller (KeeperFactory) no en el contrato de fees"
+  solodit_ids: []
   incidentes:
     - "Perennial V2 Update #1 (Sherlock 2023-10, H-4): KeeperFactory.settle() con arrays vacíos paga fee sin trabajo — HIGH, solodit.xyz/issues/h-4-attacker-can-call-keeperfactorysettle-with-empty-arrays-as-input-parameters-to-steal-all-keeper-fees-sherlock-perennial-v2-update-1-git"
   severidad: high

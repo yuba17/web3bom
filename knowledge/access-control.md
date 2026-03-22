@@ -25,6 +25,13 @@
   trampas:
     - "Some functions are intentionally permissionless (liquidation, keeper calls) -- verify it SHOULD be restricted"
     - "Access control may be enforced deeper in the call stack via an internal function"
+  solodit_ids:
+    - h-01-missing-access-control-in-updatefairlaunchproperties-function-naman-none-hyacinth-markdown
+    - missing-access-control-in-collateralliquidityprovidersetexternalcollateralredemption-cyfrin-none-securitize-redemptions-markdown
+    - lack-of-access-control-ottersec-none-comet-pdf
+    - maximillionsetcether-callable-multiple-times-by-anyone-quantstamp-quadrata-lending-markdown
+    - l-03-cvxlockersetapprovals-can-be-called-by-anyone-code4rena-badgerdao-bvecvx-by-badgerdao-contest-git
+    - lpwrapper-s-initialize-can-be-called-by-anyone-to-set-and-fix-most-of-the-relevant-parame-ters-cantina-none-mellow-pdf
   incidentes:
     - "Subsquid (tSQD) -- registerTokenOnL2 had no access control; attacker could front-run and set wrong L2 token address, permanently breaking the bridge (high)"
     - "Burve (SimplexDiamond) -- diamondCut function unrestricted; anyone could add/remove/replace facets and take full control (critical)"
@@ -199,6 +206,14 @@
   trampas:
     - "Not always exploitable by attacker -- more of a governance risk"
     - "Some protocols intentionally use single-step for simplicity (low value contracts)"
+  solodit_ids:
+    - missing-two-step-ownership-transfer-mixbytes-none-cryptolegacy-markdown
+    - missing-two-step-transfer-ownership-pattern-spearbit-porter-finance-pdf
+    - missing-two-step-transfer-ownership-pattern-spearbit-lifi-pdf
+    - missing-two-step-transfer-ownership-pattern-halborn-persistence-stkbnb-markdown
+    - lack-of-two-step-ownership-transfer-zokyo-none-filament-markdown
+    - lack-of-two-step-ownership-transfer-zokyo-none-tren-markdown
+    - lack-of-two-step-ownership-transfer-zokyo-none-symbiosis-markdown
   incidentes:
     - "Velodrome (CLGaugeFactory) -- setEmissionAdmin/setNotifyAdmin transferred roles in single step; mistyped address permanently locks admin (low)"
     - "Clober (MarketFactory) -- handOverHost single-step transfer; typo could disrupt fee collection (medium)"
@@ -226,6 +241,11 @@
   como_se_arregla: "Call _disableInitializers() in the implementation constructor. Use initializer modifier on all init functions."
   trampas:
     - "reinitializer(version) is legitimate for upgrade migrations -- only flag if version is re-callable"
+  solodit_ids:
+    - l-03-front-runnable-initializers-code4rena-prepo-prepo-contest-git
+    - l-01-front-runnable-initializers-code4rena-skale-skale-contest-git
+    - l-03-front-runnable-initializers-code4rena-hubble-hubble-contest-git
+    - missing-_disableinitializers-and-possible-initialization-front-running-zokyo-none-devve-markdown
   incidentes:
     - "Saffron (RestrictedVaultFactory) -- initializeVault not overridden; previous owner could initialize vaults with arbitrary params after ownership transfer (low)"
     - "Covalent (DelegatedStaking) -- used non-upgradeable Ownable in upgradeable proxy; constructor never ran, owner stuck at address(0), all onlyOwner functions bricked (critical)"
@@ -253,6 +273,7 @@
   trampas:
     - "Standard OpenZeppelin TransparentUpgradeableProxy and UUPS are safe by default"
     - "Focus on custom proxy implementations"
+  solodit_ids: []
   incidentes:
     - "LI.FI -- Diamond facets used global variable appStorage on slot 0 instead of getStorage/NAMESPACE pattern; any new facet with a global variable would corrupt access control storage (high)"
   severidad: critical
@@ -280,6 +301,10 @@
   trampas:
     - "Emergency pause mechanisms intentionally skip timelock -- this is expected"
     - "Cap decreases are often instant by design (reducing exposure is safe)"
+  solodit_ids:
+    - m-03-missing-eventstimelocks-for-owneradmin-only-functions-that-change-critical-parameters-code4rena-float-capital-float-capital-git
+    - missing-events-for-admin-only-functions-that-change-critical-parameters-halborn-moonwell-governance-timelock-updates-markdown
+    - n07-missing-event-and-or-timelock-for-critical-parameter-change-code4rena-ens-ens-contest-git
   incidentes:
     - "Connext (RootManager/SpokeConnector) -- setDelayBlocks had no minimum; owner could set delayBlocks to 0, collapsing entire fraud protection mechanism (medium)"
     - "Forgeries (VRFNFTRandomDraw) -- recoverTimelock set at initialize, not updated per draw; admin could claim NFT immediately after initialization period, bypassing intended post-draw delay (high)"
@@ -309,6 +334,12 @@
   trampas:
     - "Centralization concerns are often out of scope for bug bounties unless the bounty explicitly covers governance"
     - "Multi-sig is considered trusted in most bounty programs"
+  solodit_ids:
+    - l-01-the-addblacklistaddress-and-addwhitelistaddress-functions-do-not-check-whether-the-user-has-opposite-role-code4rena-ethena-labs-ethena-labs-git
+    - m-6-freezing-roles-in-erc721nftproduct-and-erc1155nftproduct-is-moot-sherlock-nftport-nftport-git
+    - m-16-maltrepository_revokerole-may-not-work-correctly-code4rena-malt-protocol-malt-protocol-versus-contest-git
+    - insufficient-role-isolation-mixbytes-none-fantium-markdown
+    - m-02-minter-staker-spender-roles-can-never-be-revoked-code4rena-ai-arena-ai-arena-git
   incidentes:
     - "AI Arena (Neuron) -- DEFAULT_ADMIN_ROLE never granted; MINTER/STAKER/SPENDER roles irrevocable once granted (medium)"
     - "Escher -- CREATOR_ROLE bypass: malicious creator could grant DEFAULT_ADMIN_ROLE to non-creators, undermining the creator-only edition system (medium)"
@@ -365,6 +396,7 @@
   trampas:
     - "Standard proxy patterns (TransparentProxy, UUPS) use delegatecall by design -- the issue is when the target is changeable without auth"
     - "Solidity libraries use delegatecall internally -- this is safe"
+  solodit_ids: []
   incidentes:
     - "Sudoswap -- factory owner could whitelist router contracts by first removing them as routers; pair owner could then use call() to invoke pairTransferERC20From and steal approved user funds (high)"
     - "Sudoswap -- clone verification checked only first 54 bytes of bytecode; attacker could deploy malicious clone with valid preamble, pass isPair check, and drain router-approved funds (critical)"
@@ -463,6 +495,7 @@
   como_se_arregla: "Wrap comparison in require(): `require(msg.sender == minterAddress, 'not minter');` or use OZ AccessControl."
   trampas:
     - "Some modifiers delegate the check to an internal function that does revert -- trace the full call"
+  solodit_ids: []
   incidentes:
     - "RabbitHole -- onlyMinter modifier had bare comparison, anyone could mint receipts and steal all quest rewards (critical)"
   severidad: critical
@@ -493,6 +526,11 @@
   trampas:
     - "If the owner has a separate custom revocation mechanism outside AccessControl"
     - "Some protocols intentionally make roles permanent (verify design docs)"
+  solodit_ids:
+    - l-11-grantrole-and-revokerole-in-elyhype-lack-admin-privileges-pashov-audit-group-none-elytra_2025-07-10-markdown
+    - freezer_role-not-revoked-from-previous-vaultrouter-quantstamp-blexio-markdown
+    - renounceable-privileged-role-quantstamp-venus-multichain-support-markdown
+    - deployer-retaining-privileged-roles-is-risky-spearbit-none-infrared-contracts-pdf
   incidentes:
     - "AI Arena -- MINTER/STAKER/SPENDER roles could never be revoked; _setupRole used instead of _grantRole, DEFAULT_ADMIN_ROLE never granted (medium)"
   severidad: high
@@ -522,6 +560,7 @@
   trampas:
     - "Some protocols intentionally want owner renunciation (fully decentralized after launch)"
     - "Check if other roles (admin, guardian) can perform the critical functions"
+  solodit_ids: []
   incidentes:
     - "BOB -- OfframpRegistry inherits Ownable2Step without overriding renounceOwnership; renouncing while paused would permanently brick the contract (medium)"
     - "Connext -- Multiple contracts (WatcherClient, WatchManager, RootManager, ConnextPriceOracle) could have ownership renounced, breaking fraud protection and fee withdrawal permanently (high)"
@@ -552,6 +591,7 @@
   como_se_arregla: "Remove the contradictory inline check. Use only the modifier OR only the inline check, not both."
   trampas:
     - "Sometimes the inline check is for a DIFFERENT condition than the modifier -- read carefully"
+  solodit_ids: []
   incidentes:
     - "Atlendis Labs -- updateRolesManager() had contradictory onlyGovernance modifier and inline isGovernance check; roles manager could never be updated (high)"
   severidad: high
@@ -583,6 +623,7 @@
   trampas:
     - "Many bug bounties exclude admin/centralization risks -- check scope first"
     - "If admin is a timelock/multisig, the risk is lower but still valid if README says RESTRICTED"
+  solodit_ids: []
   incidentes:
     - "Taurus -- admin could update price oracle without timelock, set malicious oracle to liquidate all positions (medium)"
     - "InsureDAO -- Vault owner could setController to malicious contract and drain all funds via utilize() (high)"
@@ -618,6 +659,7 @@
   trampas:
     - "The check might be in a modifier while the update is expected in the function body"
     - "Some functions intentionally allow repeated claims (e.g., streaming rewards)"
+  solodit_ids: []
   incidentes:
     - "Union Finance -- claimTokens() checked claimedTokens mapping but never updated it, allowing anyone to drain entire contract balance (high)"
     - "RabbitHole -- withdrawFee() had no protection against repeated calls, anyone could drain quest funds after end time (high)"
@@ -649,6 +691,7 @@
   trampas:
     - "Some alternate paths are intentionally permissionless (e.g., liquidation)"
     - "The access check might be enforced deeper in the call stack"
+  solodit_ids: []
   incidentes:
     - "Alchemix -- addRewardToken restricted to gauge but notifyRewardAmount bypassed it to add any whitelisted token (medium)"
     - "Lens Protocol -- unfollow restricted via whenNotPaused on LensHub but FollowNFT.removeFollower/burn had no pause check (medium)"
@@ -681,6 +724,7 @@
   trampas:
     - "If deploy function has onlyOwner or requires a signature, frontrunning is not possible"
     - "Some factory patterns intentionally allow anyone to deploy with deterministic addresses"
+  solodit_ids: []
   incidentes:
     - "Biconomy -- deployCounterFactualWallet salt excluded entrypoint; attacker could front-run with malicious entrypoint and control the wallet (critical)"
     - "Term Structure -- VaultFactory createVault salt excluded curator/timelock; attacker could front-run and hijack curator role (medium)"
@@ -712,6 +756,7 @@
   trampas:
     - "If governance is deployed simultaneously with token and tokens are pre-minted in constructor"
     - "Some protocols use off-chain governance for initial setup"
+  solodit_ids: []
   incidentes:
     - "Olympus DAO -- anyone could pass any proposal with 0 votes before first VOTES mint, taking over kernel admin/executor (critical)"
     - "Alchemix -- proposalThreshold was 0 before first veALCX lock, enabling proposal spam/griefing (medium)"
@@ -744,6 +789,7 @@
   como_se_arregla: "Use @openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol. Call __Ownable_init() in initialize()."
   trampas:
     - "If the contract is not actually deployed behind a proxy (just has initializer for other reasons)"
+  solodit_ids: []
   incidentes:
     - "Covalent -- DelegatedStaking used non-upgradeable Ownable with initializer pattern; all onlyOwner functions inaccessible after proxy deployment (critical)"
   severidad: critical
@@ -771,6 +817,7 @@
   como_se_arregla: "Add LibDiamond.enforceIsContractOwner() at the start of diamondCut. Verify all facet functions that modify critical state have proper access control."
   trampas:
     - "Standard Diamond implementations (diamond-3) include the check by default -- focus on custom implementations"
+  solodit_ids: []
   incidentes:
     - "Burve -- SimplexDiamond included diamondCut selector without access restriction; any user could remove/replace facets (critical)"
     - "Connext -- DiamondInit.init() allowed anyone to change acceptanceDelay after first init, enabling DOS or instant governance changes (high)"
@@ -803,6 +850,7 @@
   trampas:
     - "Only exploitable if the system allows external module additions"
     - "Standard OZ AccessControl uses bytes32 roles, not msg.sig -- this is a custom pattern"
+  solodit_ids: []
   incidentes:
     - "Yield -- AccessControl used msg.sig as role ID; function selector collision with ROOT (0x00000000) could grant full system access via innocent-looking module function (high)"
   severidad: high
@@ -830,6 +878,7 @@
   como_se_arregla: "Change `this.functionB()` to internal call `_functionB()` or make functionB public instead of external and call directly."
   trampas:
     - "this.func() is sometimes intentional for reentrancy or ABI encoding purposes"
+  solodit_ids: []
   incidentes:
     - "Golom -- _transferFrom called this.removeDelegation() which changed msg.sender to contract address, breaking all NFT transfers (critical)"
   severidad: high
@@ -859,6 +908,7 @@
   como_se_arregla: "Remove access control from functions that distribute to fixed addresses (anyone can trigger, funds go to predetermined recipients). Or add DAO-level fallback."
   trampas:
     - "Some access control is needed to prevent griefing (e.g., gas costs, timing)"
+  solodit_ids: []
   incidentes:
     - "Clober -- collectFees restricted to host only, but also distributed DAO fees; lost host key would lock DAO fees permanently (medium)"
     - "Morpho -- claimToTreasury could send to address(0) if treasuryVault not set, burning tokens instead of distributing (medium)"
@@ -889,6 +939,7 @@
   como_se_arregla: "Verify full bytecode including all immutable arguments. Or use a registry pattern: only factory-deployed addresses are marked as valid in a mapping."
   trampas:
     - "Standard OZ Clones library verification is complete -- focus on custom clone implementations"
+  solodit_ids: []
   incidentes:
     - "Sudoswap -- isPair only checked first 54 bytes; attacker deployed contract with valid preamble + malicious factory/nft params, could drain all router-approved user funds (critical)"
   severidad: critical
@@ -923,6 +974,7 @@
   trampas:
     - "Admin-only poke functions (pokeTokens) may be intentionally unguarded for keeper automation"
     - "Some protocols intentionally allow poke without epoch limits for UX reasons — verify reward accrual is separated from vote refresh"
+  solodit_ids: []
   incidentes:
     - "Alchemix — Voter.poke() lacked onlyNewEpoch modifier, allowing unlimited FLUX minting per epoch; 20+ duplicate reports on Immunefi (critical)"
     - "Alchemix — VotingEscrow.merge() + Voter.reset() loop allowed cross-token epoch bypass for unlimited FLUX (critical)"
@@ -957,6 +1009,7 @@
   trampas:
     - "Only exploitable if the attacker holds CANCELLER_ROLE"
     - "OZ TimelockController uses mappings, not assembly XOR — this is specific to optimized implementations"
+  solodit_ids: []
   incidentes:
     - "Coinbase/Solady — cancel(bytes32(0)) zeroed out minDelay slot via XOR collision, enabling instant execution and full timelock takeover (critical)"
   severidad: critical
@@ -989,6 +1042,7 @@
   trampas:
     - "Only exploitable when SpendPermissionManager is an owner on the SmartWallet"
     - "Standard EOA signature verification is unaffected"
+  solodit_ids: []
   incidentes:
     - "Coinbase SmartWallet — ERC-6492 path in SpendPermissionManager allowed attacker to deploy arbitrary contract during signature check, drain any wallet with SPM as owner (critical)"
     - "Coinbase SmartWallet — ownerIndex manipulation via ERC-6492 path allowed same drain attack with different vector (critical)"
@@ -1021,6 +1075,7 @@
   trampas:
     - "Some tokens intentionally only block the sender (different design choice)"
     - "If approval was granted before blacklisting, revoking approvals may require a separate admin function"
+  solodit_ids: []
   incidentes:
     - "TerPlayer BeraBTC — transferFrom only checked msg.sender blacklist, allowing blacklisted users to transfer via approved addresses (high)"
   severidad: high
@@ -1054,6 +1109,7 @@
   trampas:
     - "Some session key implementations use the key itself as the signer — verify the authorization model"
     - "ERC-4337 entrypoint handles some validation externally"
+  solodit_ids: []
   incidentes:
     - "Etherspot — SessionKey owner could consume another key's allowance for same wallet; no binding between signer and specific key (critical)"
     - "Etherspot — enableSessionKey allowed overwriting sessionKeyToWallet for active keys from other wallets (critical)"
@@ -1089,6 +1145,7 @@
   trampas:
     - "The bug may only manifest when removing non-last elements (last element removal might work correctly)"
     - "Test with at least 3 members and remove the middle one to detect"
+  solodit_ids: []
   incidentes:
     - "Astrolab — Custom AsSequentialSet.remove() did not reset index mapping; revoked accounts retained DEFAULT_ADMIN_ROLE permanently (high)"
   severidad: high
@@ -1122,6 +1179,7 @@
   trampas:
     - "Some protocols intentionally keep deployer as owner during initial setup phase"
     - "Verify the admin address is correct (not zero, not the deployer)"
+  solodit_ids: []
   incidentes:
     - "HypurrFi — DeployCapAutomator.run() deployed CapAutomator with deployer as owner, never transferred to admin (high)"
     - "HypurrFi — _deployUsdxl() initialized proxy with deployer as owner, never transferred usdxlToken ownership to admin (high)"
@@ -1156,6 +1214,7 @@
   trampas:
     - "OZ Governor.cancel() properly propagates to timelock — this bug affects custom implementations"
     - "Some protocols use separate cancellation mechanisms for governance vs timelock"
+  solodit_ids: []
   incidentes:
     - "RAAC — Governance.cancel() did not propagate to TimelockController; cancelled proposals remained executable via timelock (medium)"
     - "RAAC — Unrestricted proposal cancellation allowed cancelling Succeeded/Queued proposals, disrupting governance (medium)"
@@ -1304,6 +1363,7 @@
     - "Flash loan solo es posible si el token es flash-loaneable O si la plataforma permite préstamos del mismo"
     - "Governance que requiere staking/lockeo previo (con tiempo mínimo) no es vulnerable"
     - "El ataque requiere que la propuesta ya esté creada — el atacante no puede crear y ejecutar en una sola tx si hay voting delay"
+  solodit_ids: []
   incidentes:
     - "Aragon DAO Gov Plugin — propuestas con EarlyExecution vulnerables a flash loan attack si el token del LockManager es flash-loaneable; attacker puede vote y execute en una transacción (High, Spearbit)"
     - "Curve DAO / Frax Finance — veFXS via Aragon: sin mitigación de flash loan en voting, sin snapshot, sin bloqueo de transferencia post-voto (High, Trail of Bits)"
@@ -1347,6 +1407,7 @@
     - "SnapshotERC20Guild de DXdao implementa snapshot pero con un bug distinto (double-vote via transfer dentro del mismo snapshot)"
     - "La mayoría de formas de OZ Governor sí implementan snapshot correctamente — flag solo en custom governance"
     - "veToken (locked) governance suele ser inmune al flash loan pero puede ser vulnerable a double-vote via NFT transfer si no hay check"
+  solodit_ids: []
   incidentes:
     - "Regnum Aurum Core Contracts — castVote() usa balance actual, no snapshot; double-vote y flash loan posibles (High, Codehawks)"
     - "DXdao BaseERC20Guild — doble voto via lockTokens + transfer antes de snapshot; attacker puede votar dos veces con los mismos tokens (High, Sigmaprime)"
@@ -1389,6 +1450,7 @@
     - "Quorum bajo (2-5%) es normal en muchos protocolos reales (AAVE: 3%, COMP: 5%) — verificar la INTENCIÓN del protocolo antes de reportar"
     - "Reducción de quorum que afecta propuestas pasadas puede ser deliberada en emergencias"
     - "El fallo de quorum-reached() en DeFi no siempre es por numerador/denominador — puede ser bug en totalVoteWeight (e.g., Dexe)"
+  solodit_ids: []
   incidentes:
     - "IQ AI TokenGovernor — quorum esperado del 25% pero atacante pasa propuestas con solo 4% debido a miscalculación de numerador/denominador (High, Code4rena 2025)"
     - "Velodrome Finance VeloGovernor — MAX_PROPOSAL_NUMERATOR en 0.5% cuando debía ser 5%; proposal numerator start value también incorrecto (Low, Spearbit)"
@@ -1442,6 +1504,7 @@
     - "En Revert Lend, los keepers de AutoExit reciben un reward — verificar si la función de ejecución está restringida solo a keepers autorizados"
     - "Distinguir de dex-047: aquí el problema es WHO puede ejecutar, no cuánto pagan"
     - "Si el protocolo usa Gelato/Chainlink Automation: la restricción debe ser en el Upkeep contract, no solo en el backend"
+  solodit_ids: []
   incidentes:
     - "The Standard Auto Redemption — Auto redemption logic can be abused by an attacker due to insufficient access control: cualquier dirección puede llamar fulfillRequest() y elegir qué vault redimir (High, Sherlock 2024) — solodit.xyz"
     - "The Standard Auto Redemption — Automation and redemption could be artificially manipulated due to use of instant price (Medium) — solodit.xyz"
@@ -1502,6 +1565,7 @@
     - "El impacto real es que todas las posiciones del protocolo dejan de ejecutarse si el depósito se agota"
     - "En Revert Lend, si los keepers de AutoExit/AutoRange son pagados por un depósito del protocolo, este bug aplica"
     - "Brahma tenía MÚLTIPLES variantes del mismo bug (H-2, H-4, M-1) — buscar en toda la superficie de pago de gas"
+  solodit_ids: []
   incidentes:
     - "Brahma — TRST-H-2: Users can drain Gelato deposit at little cost: strategy creation barata permite drenar depósito de gas del protocolo (High, Trust Security 2023) — solodit.xyz"
     - "Brahma — TRST-H-4: Executors can drain the Gelato deposit while profiting from free gas (High, Trust Security 2023) — solodit.xyz"
@@ -1556,6 +1620,7 @@
     - "Elfi M-9 es similar pero desde el ángulo opuesto: el protocolo SUBESTIMA el costo y el keeper no puede recuperar su gas real"
     - "Distinguir de access-039: aquí el keeper sí hace trabajo real, pero infla el cobro. En access-039 no hace trabajo"
     - "En Revert Lend: verificar la función que paga el reward al keeper en AutoExit/AutoCompound — cómo se calcula exactamente"
+  solodit_ids: []
   incidentes:
     - "GMX Update — M-5: Keepers can steal additional execution fee from users: gasUsed manipulable por el keeper (Medium, 2023) — solodit.xyz"
     - "Elfi — M-9: The implementation of payExecutionFee() didn't take EIP-150 into consideration (Medium, 2024) — solodit.xyz"

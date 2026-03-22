@@ -55,6 +55,15 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
       detalle: "Oracle returned bad price due to stale/incorrect feed data"
       verificado: true
       fuente: "DeFiHackLabs (github.com/SunWeb3Sec/DeFiHackLabs)"
+  solodit_ids:
+    - m-7-latestrounddata-has-no-check-for-round-completeness-sherlock-isomorph-isomorph-git
+    - m-05-chainlinks-latestrounddata-might-return-stale-or-incorrect-results-code4rena-mochi-mochi-contest-git
+    - missing-chainlink-oracle-staleness-check-cyfrin-none-licredity-markdown
+    - chainlink-oracle-data-may-be-stale-quantstamp-stakestone-vault-markdown
+    - should-check-return-data-from-chainlink-aggregator-severity-medium-auditone-none-coinlend-markdown
+    - m-15-lacking-validation-of-chainlink-oracle-queries-code4rena-vader-protocol-vader-protocol-contest-git
+    - m-02-chainlinks-latestrounddata-might-return-stale-or-incorrect-results-code4rena-phuture-finance-phuture-finance-contest-git
+    - l-03-chainlinkadapter-does-not-check-for-round-completeness-which-may-lead-to-stale-data-pashov-none-fyde-markdown
   incidentes:
     - "Licredity — ChainlinkFeedLibrary.getPrice() ignores updatedAt and answeredInRound (MEDIUM)"
     - "API3 — ProductApi3ReaderProxyV1 returns block.timestamp masking stale underlying feeds (MEDIUM)"
@@ -211,6 +220,11 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
       detalle: "Wrong price calculation in oracle logic"
       verificado: true
       fuente: "DeFiHackLabs (github.com/SunWeb3Sec/DeFiHackLabs)"
+  solodit_ids:
+    - m-10-erc4626oracle-vulnerable-to-price-manipulation-sherlock-sentiment-sentiment-git
+    - m-04-fallback-oracle-is-using-spot-price-in-uniswap-liquidity-pool-which-is-very-vulnerable-to-flashloan-price-manipulation-code4rena-paraspace-paraspace-contest-git
+    - spot-price-manipulation-can-lead-to-unfair-liquidations-cyfrin-none-deriverse-dex-markdown
+    - pools-can-be-subject-to-price-manipulation-leading-to-early-liquidations-or-arbitrage-openzeppelin-none-fx-v2-audit-markdown
   incidentes:
     - "Sense — LP pricing uses current pool balances, trivially manipulable via flash loan (HIGH)"
     - "Salty.IO — CoreSaltyFeed spot price manipulable, causes undesired liquidations (HIGH)"
@@ -258,6 +272,12 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
       detalle: "TWAP manipulation on short observation window oracle"
       verificado: true
       fuente: "DeFiHackLabs (github.com/SunWeb3Sec/DeFiHackLabs)"
+  solodit_ids:
+    - m-10-taporacle-twap-duration-for-uniswap-oracle-should-be-at-least-30-mins-pashov-none-tapiocadao-markdown
+    - m-08-twap-can-be-manipulated-pashov-audit-group-none-ulti-november-markdown
+    - h-04-use-of-only-higher-price-in-seer-makes-it-vulnerable-to-price-manipulation-pashov-none-tapiocadao-markdown
+    - m-06-uniswap-oracle-prices-can-be-manipulated-pashov-audit-group-none-ouroboros_2024-12-06-markdown
+    - uniswap-oracle-are-very-easy-to-manipulate-on-l2-cantina-none-euler-pdf
   incidentes:
     - "Ouroboros — Uniswap V3 TWAP windows of 36s and 5min on low-liquidity pools (MEDIUM)"
     - "UXD Protocol — getPositionValue uses 15-second TWAP instead of 15-minute (HIGH)"
@@ -293,6 +313,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Solidity int256 can be negative -- casting to uint256 without check wraps around"
     - "Some feeds return minAnswer/maxAnswer bounds, not zero, on extreme events"
     - "Check Chainlink aggregator minAnswer -- if real price drops below, feed returns minAnswer (stale)"
+  solodit_ids: []
   incidentes:
     - "Perennial V2 — empty orders create oracle version with price=0, corrupts accounting (HIGH)"
     - "Tokemak — Tellor oracle price=0 not checked, passes through to calculations (MEDIUM)"
@@ -337,6 +358,12 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Only relevant for L2 deployments -- not applicable to L1"
     - "Some L2s have different sequencer feed addresses"
     - "Grace period too long (>2h) unnecessarily freezes the protocol"
+  solodit_ids:
+    - missing-checks-for-sequencer-uptime-when-fetching-chainlink-prices-quantstamp-venus-multichain-support-markdown
+    - trst-m-3-no-check-for-active-arbitrum-sequencer-in-chainlink-oracle-trust-security-none-stella-markdown_
+    - unchecked-chainlink-sequencer-uptime-zokyo-none-umami-markdown
+    - missing-l2-sequencer-uptime-check-in-oracleadapter-cyfrin-none-yieldfi-markdown
+    - missing-checks-for-sequencer-uptime-when-fetching-chainlink-prices-quantstamp-open-dollar-smart-contract-audit-markdown
   incidentes:
     - "Sentiment — WSTETH Oracle missing Arbitrum sequencer check (MEDIUM)"
     - "Bond Protocol — _validateAndGetPrice doesn't check Arbitrum sequencer (MEDIUM)"
@@ -376,6 +403,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Most USD feeds are 8 decimals but verify per feed"
     - "ETH-denominated feeds are typically 18 decimals"
     - "Protocol may correctly handle decimals but have a bug in a single edge-case path"
+  solodit_ids: []
   incidentes:
     - "Y2K Finance — pricefeed.decimals() handling only works for 8-decimal feeds (HIGH)"
     - "Sense — LP oracle assumes 18 decimals, undervalues non-18 tokens (HIGH)"
@@ -467,6 +495,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
       detalle: "Read-only reentrancy used to manipulate oracle price during cross-contract callback"
       verificado: true
       fuente: "DeFiHackLabs (github.com/SunWeb3Sec/DeFiHackLabs)"
+  solodit_ids: []
   incidentes:
     - "Aloe — Oracle.consult manipulable by increasing observationCardinality with malicious seed (HIGH)"
     - "Yieldoor — checkPoolActivity() incorrect check, cardinality timestamp=1 not handled (MEDIUM)"
@@ -512,6 +541,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Small deviation thresholds (<0.5%) may not be profitable after gas"
     - "Protocol with time-locked withdrawals is partially protected"
     - "Sandwich requires mempool visibility -- private/encrypted pools reduce risk"
+  solodit_ids: []
   incidentes:
     - "Olympus -- sandwich oracle update to exploit vault wstETH/OHM pricing (HIGH)"
     - "Olympus -- compound oracle deviation across stETH/ETH + ETH/OHM chains (HIGH)"
@@ -567,6 +597,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Formula may look correct for one pool type but fail for another"
     - "Balancer pre-minted BPT inflates totalSupply -- getActualSupply excludes it"
     - "Division by zero can occur when resA < resB in computeFairReserves"
+  solodit_ids: []
   incidentes:
     - "Blueberry -- CurveTricryptoOracle divides by ETH price, returns ETH instead of USD (HIGH)"
     - "Blueberry -- Stable BPT uses minPrice*rate, overvalues by 12%, causes insolvency (HIGH)"
@@ -620,6 +651,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Previous price fill looks correct (nonzero) but semantically wrong"
     - "Empty orders seem harmless but create accounting gaps"
     - "Strict roundId matching can freeze system during Chainlink gaps"
+  solodit_ids: []
   incidentes:
     - "Perennial V2 -- expired oracle version returned as valid with previous price (HIGH)"
     - "Perennial V2 -- empty orders use price=0, corrupting fee accounting (HIGH)"
@@ -670,6 +702,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "WBTC has been stable historically -- depeg is tail risk but catastrophic"
     - "USDC briefly depegged to $0.87 during SVB crisis (March 2023)"
     - "wstETH/stETH has a known exchange rate via Lido contract, not 1:1"
+  solodit_ids: []
   incidentes:
     - "Blueberry -- BTC/USD oracle prices WBTC, ignoring bridge depeg risk (MEDIUM)"
     - "Isomorph -- USDC hardcoded to $1.00 in Velodrome LP pricing (MEDIUM)"
@@ -717,6 +750,11 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "minAnswer/maxAnswer are on the aggregator, not the proxy -- must call aggregator()"
     - "Not all feeds have meaningful bounds -- check specific feed"
     - "After aggregator update, cached min/max become invalid"
+  solodit_ids:
+    - incorrect-prices-will-be-returned-if-the-nodetype-is-price_deviation_circuit_breaker-immunefi-folks-finance-git
+    - lastgoodprice-updates-during-divergence-spearbit-none-buck-labs-pdf
+    - mint-pricing-bypasses-oracle-validation-spearbit-none-buck-labs-pdf
+    - oracle-update-front-running-allows-extraction-of-value-from-vaults-trailofbits-none-cap-labs-covered-agent-protocol-pdf
   incidentes:
     - "Blueberry -- aggregator hits minAnswer, returns wrong price for collapsed asset (MEDIUM)"
     - "Isomorph -- cached minAnswer/maxAnswer from aggregator become stale after update (MEDIUM)"
@@ -767,6 +805,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Chainlink rarely reverts but the impact is catastrophic when it does"
     - "Some protocols intentionally revert to prevent stale price usage -- balance is needed"
     - "Fallback to cached price has its own risks (staleness)"
+  solodit_ids: []
   incidentes:
     - "Blueberry -- oracle down or zero price freezes all liquidations (MEDIUM)"
     - "Inverse Finance -- Chainlink access blocked, protocol usability limited (MEDIUM)"
@@ -814,6 +853,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Storage collisions are hard to detect without formal analysis"
     - "ABI mismatch compiles fine -- only detectable at runtime"
     - "Missing storage gaps only manifest on upgrade, not initial deployment"
+  solodit_ids: []
   incidentes:
     - "Ekubo -- oracle storage key collision corrupts token price data (MEDIUM)"
     - "Buck Labs -- ABI struct mismatch in BandConfig between LiquidityWindow and PolicyManager (HIGH)"
@@ -861,6 +901,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Lender may not realize the oracle is borrower-controlled"
     - "Pyth confidence interval check is often skipped"
     - "Manual oracle may work fine in low-volatility periods"
+  solodit_ids: []
   incidentes:
     - "Abracadabra -- borrower sets malicious oracle to avoid liquidation (HIGH)"
     - "Deriverse DEX -- user provides old price feed, trades at stale price (MEDIUM)"
@@ -909,6 +950,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Small values (< $1000) may legitimately exceed threshold due to dust"
     - "Basis points (1e4) is minimum; 1e18 is preferred for DeFi"
     - "Multi-purpose parameters seem like good design but create coupling bugs"
+  solodit_ids: []
   incidentes:
     - "Notional -- PERCENTAGE_DECIMALS=100 allows 2x intended deviation (MEDIUM)"
     - "Notional -- oraclePriceDeviationLimitPercent reused for ratio check (MEDIUM)"
@@ -959,6 +1001,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Status transition logic is complex -- easy to miss edge cases"
     - "View functions that seem safe can bypass write-path validation"
     - "lastGoodPrice should only update when both oracles agree"
+  solodit_ids: []
   incidentes:
     - "eBTC -- fetchPrice returns different prices in same tx on 50% Chainlink move (MEDIUM)"
     - "Buck Labs -- lastGoodPrice updates during oracle divergence (MEDIUM)"
@@ -1009,6 +1052,12 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "NFT floor price feeds have 24h heartbeats (not 1h)"
     - "stETH/ETH has 24h heartbeat with 2% deviation -- very loose"
     - "heartbeat=0 may be intentional for push-based oracles but dangerous for Chainlink"
+  solodit_ids:
+    - incorrect-staleness-threshold-for-chainlink-price-feeds-zokyo-none-copra-markdown
+    - m-07-oraclemodule-assumes-that-all-chainlink-feeds-have-a-heartbeat-of-24-hours-pashov-none-fyde-markdown
+    - m-1-lack-of-price-freshness-check-in-chainlinkoraclesolgetprice-allows-a-stale-price-to-be-used-sherlock-sentiment-sentiment-git
+    - m-04-omooraclegetusdvalue-price-feed-updates-may-be-incorrectly-marked-stale-pashov-audit-group-none-omo_2025-01-25-markdown
+    - oracle-freshness-threshold-can-lead-to-stale-data-being-provided-zokyo-none-paribus-markdown
   incidentes:
     - "LooksRare -- maxLatency=3600s but floor price feeds have 86400s heartbeat (MEDIUM)"
     - "Olympus -- stETH/ETH has 24h heartbeat and 2% deviation, causes fund loss (MEDIUM)"
@@ -1066,6 +1115,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Array swap deletion is a common Solidity pattern but dangerous for voting"
     - "Quorum reduction seems safe but enables back-running"
     - "1 wei attack is specific to deposit-receipt-based oracle governance"
+  solodit_ids: []
   incidentes:
     - "Liquid Collective -- removeMember allows double voting via array swap (HIGH)"
     - "Liquid Collective -- quorum decrement enables front-running between factions (MEDIUM)"
@@ -1123,6 +1173,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "TWAP works fine for first period then freezes -- easy to miss in testing"
     - "Integer division of reserves looks correct but produces 0"
     - "Token order bug only manifests with certain address orderings"
+  solodit_ids: []
   incidentes:
     - "Morpho -- SwapManager TWAP freezes after first period (HIGH)"
     - "Morpho -- initial cumulative prices wrong due to integer division (MEDIUM)"
@@ -1175,6 +1226,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Constructor sets scaler but update() may not use it"
     - "Works perfectly for all 8-decimal feeds, breaks on first 18-decimal feed"
     - "Cross-oracle rate comparison can silently overflow for certain pairs"
+  solodit_ids: []
   incidentes:
     - "Tracer -- SMAOracle.update() skips scaling, prices off by 1e10 (HIGH)"
     - "Y2K Finance -- pricefeed.decimals() math only works for 8 decimals (HIGH)"
@@ -1226,6 +1278,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Divergence check seems like good security but weaponizable against liquidations"
     - "Dutch auction decay during downtime is especially unfair -- not widely known"
     - "User grace period vs oracle grace period are different concepts"
+  solodit_ids: []
   incidentes:
     - "Panoptic -- spot manipulation triggers StaleOracle, blocks all liquidations (MEDIUM)"
     - "GTE -- liquidation stalls when top-of-book outside divergence band (MEDIUM)"
@@ -1277,6 +1330,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "maxConf semantics differ from Chainlink deviation threshold"
     - "Preview paths are read-only but can mislead external integrators"
     - "Pyth confidence interval is unique -- no equivalent in Chainlink"
+  solodit_ids: []
   incidentes:
     - "Buck Labs -- Pyth maxConf treated as absolute instead of percentage (MEDIUM)"
     - "Covenant -- preview quotes allow 15-min stale prices vs live quotes (LOW->MEDIUM)"
@@ -1327,6 +1381,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Unlike Chainlink sandwich, no mempool visibility needed -- fully atomic"
     - "maxOracleAge alone doesn't prevent this -- attacker pushes fresh update"
     - "Works with any pull-based oracle (Pyth, API3 with OEV, RedStone)"
+  solodit_ids: []
   incidentes:
     - "XPress/LPManager -- Pyth atomic update: addLiquidity at low, removeLiquidity at high in same tx (CRITICAL, MixBytes)"
     - "Hanji/LPManager -- identical pattern to XPress (CRITICAL, MixBytes)"
@@ -1376,6 +1431,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Works fine at current prices but breaks when asset price doubles"
     - "Only manifests with specific feed decimal combinations"
     - "36-decimal intermediate precision is common in composite oracles but dangerous"
+  solodit_ids: []
   incidentes:
     - "NUTS Finance ChainlinkOracleComposite -- getPrice overflows at $100K, freezes all integrated contracts (HIGH, MixBytes)"
   severidad: high
@@ -1427,6 +1483,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Rate is close to 1:1 for new markets but diverges as yield accrues"
     - "Different Pendle markets return getPtToSyRate with different decimals"
     - "ERC4626 donation attack requires only small amount for low-TVL vaults"
+  solodit_ids: []
   incidentes:
     - "USG Tangent OraclePendlePT -- assumes 1 SY = 1 underlying, overstates PT price (MEDIUM, Sherlock)"
     - "USG Tangent OraclePendlePT -- getPtToSyRate assumed 1e18 but some markets return 1e27 (MEDIUM, Sherlock)"
@@ -1477,6 +1534,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Individual report processing looks correct in isolation"
     - "Bug only manifests when multiple non-base reports precede base report"
     - "Fee overcharge compounds: more assets = worse overcharge"
+  solodit_ids: []
   incidentes:
     - "Mellow Flexible Vaults -- Oracle.submitReports double-counts protocol fees for non-base assets (HIGH, Sherlock)"
   severidad: high
@@ -1526,6 +1584,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Works fine in low-volatility conditions when all oracles agree"
     - "Mean-based filtering is academically common but operationally fragile"
     - "Weight threshold seems secure but allows subset selection"
+  solodit_ids: []
   incidentes:
     - "Bucket Protocol V2 -- non-deterministic oracle selection lets user cherry-pick favorable subset (LOW->MEDIUM, Quantstamp)"
     - "Bucket Protocol V2 -- mean-sensitive outlier detection produces non-deterministic aggregated price (LOW, Quantstamp)"
@@ -1578,6 +1637,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Returning 0 on failure seems safer than reverting but silently corrupts"
     - "Zero propagates through multiplication without triggering any check"
     - "Only manifests during actual oracle downtime -- hard to test"
+  solodit_ids: []
   incidentes:
     - "Symbiotic -- ChainlinkPriceFeed.getPriceAt returns 0 on failure, zeroes operator voting power (MEDIUM, Cyfrin)"
     - "NUTS Finance -- zero price cast from negative passes through, halts liquidation (MEDIUM, MixBytes)"
@@ -1629,6 +1689,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Symmetric deposits work fine -- bug only appears with asymmetric liquidity"
     - "Oracle price is correct -- the issue is the pool mechanics, not the oracle"
     - "Standard AMM invariant testing misses this because x*y=k doesn't apply"
+  solodit_ids: []
   incidentes:
     - "Dango DEX -- asymmetric liquidity in geometric pool allows purchase at flat oracle price, unbounded size (HIGH, Sherlock)"
   severidad: high
@@ -1681,6 +1742,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Both oracles return correct prices -- the bug is only in comparison logic"
     - "Works fine when both providers happen to use same decimals"
     - "Manifests as permanent fallback to one oracle, not obvious as a bug"
+  solodit_ids: []
   incidentes:
     - "Malda MixedPriceOracleV4 -- API3 (18 dec) vs eOracle (8 dec) comparison always divergent, permanent fallback (MEDIUM, Sherlock)"
     - "Malda -- getUnderlyingPrice DoS for tokens where oracle decimals differ (MEDIUM, Sherlock)"
@@ -1858,6 +1920,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "La inflacion de fees via swaps circulares tiene costo real (fee del pool) — calcular si es rentable"
     - "En pools de alta liquidez, el costo de inflar fees supera el beneficio — atacar pools de bajo TVL"
     - "ignoreFees se lee de _isStaked() — solo staked positions excluyen fees"
+  solodit_ids: []
   incidentes:
     - "Olympus RBS 2.0 (Sherlock) — BunniToken price uses fees in reserve validation inconsistently (MEDIUM)"
     - "ParaSpace (Code4rena H-05) — Attacker manipulates low TVL UniV3 pool to inflate collateral (HIGH)"
@@ -1920,6 +1983,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Algunos protocolos excluyen fees intencionalmente por simplicidad — verificar si hay documentacion"
     - "En posiciones out-of-range (currentTick fuera del rango), fees siguen acumulandose pero amounts=0"
     - "tokensOwed solo crece, nunca decrece espontaneamente — siempre representan valor real cobrable"
+  solodit_ids: []
   incidentes:
     - "Omo_2025-01-25 (Pashov Audit Group) — H-12: getPositionValue() only retrieves liquidity token amounts, does not account for accumulated fees; positions undervalued as collateral (HIGH, Pashov)"
     - "Revert Lend (Code4rena 2024) — M-19: V3Oracle susceptible to price manipulation via spot sqrtPrice for amounts calculation; fees component correct but amounts manipulable (MEDIUM, Code4rena)"
@@ -1977,6 +2041,7 @@ Verified data sourced from `invariant-registry/universal/exploit_derived.json`.
     - "Mode.CHAINLINK puro no usa maxDifference (la verificacion cruzada no aplica) -- correcto que bypass funcione ahi"
     - "Si el admin es multisig con timelock, configurar maxDifference=65535 requiere governance -- riesgo reducido"
     - "Para el bug ser explotable sin admin compromise, el finding necesita demostrar que el DEFAULT para algun token es 65535"
+  solodit_ids: []
   incidentes:
     - "Revert Lend V3Oracle -- maxDifference=type(uint16).max documentado como bypass de verificacion (linea 172 V3Oracle.sol); no hay incidente externo equivalente directo"
     - "Morpho Blue (Cantina) -- oracle price deviation enables arbitrage in high-LLTV markets; sin bypass explicito pero patron de 'maxDifference demasiado generoso' (MEDIUM, Cantina)"

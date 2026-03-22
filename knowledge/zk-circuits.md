@@ -50,6 +50,12 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "Comments saying 'range limit the remainder' may be aspirational, not enforced"
     - "The gadget may work correctly for honest provers but be exploitable by malicious ones"
     - "Nested gadget composition can hide missing range checks deep in call chains"
+  solodit_ids:
+    - etrp-6-missing-constraints-on-message-padding-in-poseidon-decryption-circuit-hexens-none-avacloud-markdown
+    - missing-constraint-in-the-output-of-passportverificationsha1-circuit-halborn-rarimo-passport-zk-circuits-security-assessment-freedom-tool-markdown
+    - h-01-range-check-fails-to-bind-limbs-to-value-enabling-invalid-witnesses-code4rena-succinct-succinct-git
+    - missing-field-order-constraint-ottersec-none-light-protocol-pdf
+    - m-01-zktrie-maximum-depth-limit-is-not-enforced-in-scroll-code4rena-unruggable-unruggable-git
   incidentes:
     - nombre: "DeGate / Loopring V3 -- MulDivGadget"
       solodit_id: "17854"
@@ -109,6 +115,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "The reduction equation is correct but insufficient -- it does not imply sub-result validity"
     - "unsafe/unchecked constructors in Rust ZK frameworks bypass type-level safety"
     - "Composite lookup tables give a false sense of security -- the decomposition is the weak point"
+  solodit_ids: []
   incidentes:
     - nombre: "zkSync Era -- binop reduction gate"
       solodit_id: "30278"
@@ -162,6 +169,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "Honest provers naturally use small values, so tests may never trigger the overflow"
     - "Multiple embedded curves may have different subgroup orders -- check each one"
     - "The issue affects ALL operations using the embedded curve, not just specific gadgets"
+  solodit_ids: []
   incidentes:
     - nombre: "Encrypted Token (ERC20) -- BabyJubJub scalar overflow"
       solodit_id: "56670"
@@ -218,6 +226,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "gnark hint errors (returning error) only affect honest provers, not malicious ones"
     - "A correct implementation may exist elsewhere in the codebase, masking the broken one"
     - "The bug may be in a low-level helper called thousands of times -- massive blast radius"
+  solodit_ids: []
   incidentes:
     - nombre: "SP1 (Succinct) -- KoalaBearRangeCheck missing recomposition"
       solodit_id: "64925"
@@ -273,6 +282,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "Different verification functions may have different transcript requirements"
     - "Protocol modifications (e.g., squaring inputs, changing step counts) can silently break Fiat-Shamir"
     - "The attack requires a sophisticated prover but is fully exploitable in adversarial settings"
+  solodit_ids: []
   incidentes:
     - nombre: "EigenDA -- BatchVerifyCommitEquivalence"
       solodit_id: "61704"
@@ -341,6 +351,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "Large programs with many operations can naturally approach the field characteristic"
     - "The attack is invisible to honest execution -- only exploitable by malicious provers"
     - "Multiplicity constraints on receives may be loose (unconstrained negative values)"
+  solodit_ids: []
   incidentes:
     - nombre: "OpenVM -- LogUp bus argument overflow"
       solodit_id: "53415"
@@ -404,6 +415,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "Opcode flag constraints give the illusion of completeness but are only half the job"
     - "Adapter AIR and Core AIR share responsibility -- the gap may be between them"
     - "A single broken instruction in the recursive verifier ISA breaks the entire proof stack"
+  solodit_ids: []
   incidentes:
     - nombre: "OpenVM -- LOADW/STOREW missing semantic constraints"
       solodit_id: "53430"
@@ -471,6 +483,10 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "public_values_hash may cover some inputs but not all (vk_root may be outside the hash)"
     - "Off-chain verification 'trust' is not a security property -- any off-chain bug becomes on-chain exploitable"
     - "Deferred accumulator default values (zeroed nonce) silently overwrite real values during shard packing"
+  solodit_ids:
+    - m-01-plonkgroth16-verifiers-accept-proofs-with-untrusted-recursion-vk-root-code4rena-succinct-succinct-git
+    - m-4-malicious-verifier-will-recover-private-witness-values-breaking-zero-knowledge-property-sherlock-brevis-pico-zkvm-git
+    - m-05-sp1-host-verifier-rejects-plonk-and-groth16-proofs-with-blake3-hashed-public-values-code4rena-succinct-succinct-git
   incidentes:
     - nombre: "SP1 (Succinct) -- PLONK/Groth16 accept untrusted recursion vk root"
       solodit_id: "64926"
@@ -548,6 +564,11 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "Honest provers always send well-formed inputs, so these bugs survive normal testing"
     - "On-chain gas waste from non-short-circuiting is a griefing vector, not just inefficiency"
     - "Multiple independent panic sites compound: attacker picks the cheapest one to trigger"
+  solodit_ids:
+    - right-shift-overflow-panic-ottersec-none-solana-zk-token-pdf
+    - memory-access-without-explicit-bounds-checks-openzeppelin-none-zksync-protocol-precompiles-implementation-audit-markdown
+    - batchedrangeproofcontext-tryinto-assumes-all-used-commitments-are-nonzero-trailofbits-none-transfer-blockchain-pdf
+    - vecpoly1eval-can-panic-on-malformed-structs-trailofbits-none-transfer-blockchain-pdf
   incidentes:
     - nombre: "SP1 (Succinct) -- Truncated public_values panic"
       solodit_id: "64927"
@@ -616,6 +637,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "Requires deep understanding of the PCS to verify — easy to miss in review"
     - "May only affect recursive verifier, not the native prover/verifier"
+  solodit_ids: []
   incidentes:
     - "Brevis Pico ZKVM — polynomial evaluations not observed by recursive verifier, soundness completely bypassed (High)"
   severidad: critical
@@ -649,6 +671,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "Only affects verifier implementations that read from proof metadata"
     - "Reference implementations (SP1) correctly derive from trace — diff carefully"
+  solodit_ids: []
   incidentes:
     - "Brevis Pico ZKVM — quotient domain entirely prover-controlled, FRI soundness broken (High)"
   severidad: critical
@@ -681,6 +704,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "Requires understanding of the lookup argument protocol to verify"
     - "The sum is computed correctly — it's just not asserted"
+  solodit_ids: []
   incidentes:
     - "Brevis Pico ZKVM — global_cumulative_sum not enforced zero when combine is complete, lookup argument unsound (High)"
   severidad: critical
@@ -712,6 +736,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "Only relevant to zkVM implementations with configurable chip sets"
     - "If chip set is fixed at compile time, ordering is predetermined"
+  solodit_ids: []
   incidentes:
     - "Brevis Pico ZKVM — chip ordering prover-controlled, allows selective opening of only favorable chips (High)"
   severidad: critical
@@ -744,6 +769,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "Requires understanding the full recursion pipeline to identify"
     - "If VK whitelisting is strict, this path may not exist"
+  solodit_ids: []
   incidentes:
     - "Brevis Pico ZKVM — compress accepts convert output directly, bypassing combine completeness checks (High)"
   severidad: critical
@@ -776,6 +802,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "If all relevant data is included, this pattern does not apply"
     - "Some optimizations intentionally exclude certain inputs — verify with spec"
+  solodit_ids: []
   incidentes:
     - "EigenDA vCISO — UniversalVerify hashes only commitments, not proofs/indices/data; prover can forge batch proofs (High)"
     - "EigenDA vCISO — BatchVerifyCommitEquivalence hashes only commitments; insufficient for Fiat-Shamir security (High)"
@@ -810,6 +837,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
   trampas:
     - "Only affects Groth16 proving system, not PLONK or other backends"
     - "High-entropy witnesses are computationally infeasible to brute-force"
+  solodit_ids: []
   incidentes:
     - "Brevis Pico ZKVM — RangeChecker.Check in BabyBear/KoalaBear chips uses unpatched gnark with CVE-2024-45040, verifier recovers private witnesses (Medium)"
   severidad: high
@@ -866,6 +894,7 @@ Verified data sourced from `solodit_bulk_findings.json` (Solodit/Cyfrin database
     - "NO es lo mismo que missing constraint (zk-001) que acepta pruebas falsas — este patrón PREVIENE pruebas verdaderas"
     - "Puede solo aparecer en edge cases (zero balance withdraw, valores máximos) — difícil de detectar en testnet"
     - "A veces el 'rechazo' no revierte el proof sino que produce un output incorrecto — más difícil de detectar"
+  solodit_ids: []
   incidentes:
     - "Starknet bridge withdrawal path: valor > threshold rechazado por constraint too strict — withdrawals >1000 USDC bloqueados (HIGH, hipotético basado en análisis de constraints)"
     - "SP1 recursive prover: sub-proof format aceptado standalone pero rechazado en aggregated proof (CRITICAL potencial)"

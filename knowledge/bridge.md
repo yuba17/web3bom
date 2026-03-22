@@ -27,6 +27,10 @@
   trampas:
     - "Replay on a different chain pair is not a replay bug -- it is a message forgery bug"
     - "Failed messages that become retryable are not replays"
+  solodit_ids:
+    - invalid-message-replay-design-ottersec-none-olympus-dao-pdf
+    - m-12-non-blocking-layerzero-cross-chain-buy-operations-can-be-blocked-pashov-audit-group-none-stationx-markdown
+    - l-06-uln302-verifiable-conflates-distinct-failure-states-with-verified-breaking-off-chain-relayer-logic-code4rena-layerzero-layerzero-git
   incidentes:
     - "Harpie -- changeRecipientAddress signature lacks chain.id; attacker replays on target chain via Wintermute-style address creation (MEDIUM)"
     - "Stakehouse Protocol -- deployLPToken uses Clones.clone with no chain.id validation; cross-chain replay steals LP funds (MEDIUM)"
@@ -63,6 +67,12 @@
   trampas:
     - "If bridge address is a predeploy (e.g., 0x4200...), collision is infeasible -- not a real finding"
     - "Admin-settable bridge address may be intentional if behind timelock"
+  solodit_ids:
+    - m-02-executor-can-deliver-cross-chain-messages-with-unvalidated-native-value-shieldify-none-onchainheroes-genesisbridge-markdown
+    - usage-of-txorigin-ottersec-none-folks-finance-x-chain-pdf
+    - missing-source-validation-in-ccip-message-handling-cyfrin-none-yieldfi-markdown
+    - m-05-bridge-watcher-can-forge-arbitrary-message-and-drain-bridge-code4rena-taiko-taiko-git
+    - missing-verification-for-total-sum-of-user-withdrawals-openzeppelin-none-sonic-opera-native-token-bridge-audit-markdown
   incidentes:
     - "Derby -- XProvider onlySource checks against trustedRemoteConnext[_origin] but does not verify it != address(0); Connext slow path delivers address(0), allowing attacker to disrupt all vault state (HIGH)"
     - "Connext -- GnosisBase _verifySender checks msg.sender and messageSender but not messageSourceChainId; same mirrorConnector on future chain can spoof roots (MEDIUM)"
@@ -127,6 +137,11 @@
   trampas:
     - "On L2 rollups, L1 deposits are guaranteed by the rollup -- not vulnerable to this"
     - "PoS chains with single-slot finality have minimal window"
+  solodit_ids:
+    - m-26-zeta-token-supply-keeps-growing-on-failed-onreceive-contract-calls-sherlock-zetachain-cross-chain-git
+    - bridging-dstoken-back-and-forth-between-chains-causes-totalissuance-cap-to-be-reached-preventing-further-issuances-and-cross-chain-transfers-cyfrin-none-securitize-bridge-cctp-markdown
+    - m-03-all-reallocate-cross-chain-token-and-rewards-will-be-lost-for-the-users-using-the-account-abstraction-wallet-code4rena-nudgexyz-nudgexyz-git
+    - h-1-pushvaultamounts-can-be-called-multiple-times-if-in-the-right-state-sherlock-derby-derby-git
   incidentes:
     - "Tigris Trade -- GovNFT.crossChain burns NFT on source, LZ endpoint fails on destination with low gas; same tokenId NFT exists on two chains simultaneously (MEDIUM)"
   severidad: critical
@@ -191,6 +206,7 @@
   trampas:
     - "Messages that fail due to target contract reverting are expected behavior"
     - "Dust stuck from gas refund differences is not exploitable"
+  solodit_ids: []
   incidentes:
     - "Toki Bridge -- revertReceive[chainId][sequence] collapses all IBC channels sharing same counterpartyChainId; two channels with same sequence overwrite each other, older user permanently unable to retry (MEDIUM)"
     - "Recall -- IPC bridge sends receipt on Transfer message failure but refund calls performCall on EOA which fails; EOA users' funds permanently trapped in gateway (MEDIUM)"
@@ -257,6 +273,7 @@
     - "Ethereum PoS finalizes every ~13 minutes -- reorg beyond that requires 1/3 stake slashing"
     - "L1->L2 deposits on optimistic rollups are force-included and safe"
     - "Testnet reorgs do not reflect mainnet finality"
+  solodit_ids: []
   incidentes:
     - "Uniswap -- NonlinearDutchDecayLib uses block.number which returns approximate L1 block on Arbitrum (12s blocks) instead of L2 block (0.25s blocks); orders that should decay in seconds take minutes (MEDIUM)"
     - "Renzo -- xRenzoBridge encodes L1 block.timestamp compared against L2 block.timestamp; Arbitrum timestamps up to 24h earlier cause valid price updates to be rejected as future timestamps (MEDIUM)"
@@ -354,6 +371,7 @@
   verificado: true
   tags: [layerzero, channel-blocking, DoS, gas-limit, payload-size, ordered-delivery]
   relacionado_con: [bridge-006, bridge-007]
+  solodit_ids: []
   incidentes:
     - protocol: "Tapioca DAO"
       firm: "Code4rena"
@@ -429,6 +447,10 @@
   verificado: true
   tags: [gas-estimation, fee-calculation, underpayment, OFT, dust-removal, L1-to-L2]
   relacionado_con: [bridge-006, bridge-010]
+  solodit_ids:
+    - h-31-on-ulysses-omnichain-retrievedeposit-might-never-be-able-to-trigger-the-fallback-function-code4rena-maia-dao-ecosystem-maia-dao-ecosystem-git
+    - pause-modifier-in-bridge-receiver-functions-causes-receiver-failures-for-in-flight-messages-cyfrin-none-securitize-onofframp-bridge-markdown
+    - fuel1-2-sent-funds-may-get-stuck-inside-of-the-bridge-hexens-none-fuel-markdown
   incidentes:
     - protocol: "Holograph"
       firm: "Code4rena"
@@ -500,6 +522,7 @@
   verificado: true
   tags: [account-abstraction, multisig, address-symmetry, smart-wallet, ZkSync]
   relacionado_con: [bridge-002, bridge-005]
+  solodit_ids: []
   incidentes:
     - protocol: "Ondo Finance"
       firm: "Code4rena"
@@ -558,6 +581,7 @@
   verificado: true
   tags: [aggregator, router, arbitrary-call, LiFi, Axelar, gateway, approval]
   relacionado_con: [bridge-002, bridge-005]
+  solodit_ids: []
   incidentes:
     - protocol: "LI.FI"
       firm: "Spearbit"
@@ -626,6 +650,7 @@
   verificado: true
   tags: [economic-attack, snapshot, state-sync, LP-manipulation, timing, bridge-timing]
   relacionado_con: [bridge-004, bridge-008]
+  solodit_ids: []
   incidentes:
     - protocol: "Mozaic Archimedes"
       firm: "Trust Security"
@@ -680,6 +705,7 @@
   verificado: true
   tags: [state-root, merkle-proof, frame-decoding, consensus-split, Go, challenger]
   relacionado_con: [bridge-008, bridge-009]
+  solodit_ids: []
   incidentes:
     - protocol: "Initia"
       firm: "Code4rena"
@@ -732,6 +758,7 @@
   verificado: true
   tags: [reentrancy, finalization, relayMessage, withdrawal, griefing]
   relacionado_con: [bridge-001, bridge-006]
+  solodit_ids: []
   incidentes:
     - protocol: "Optimism"
       firm: "Sherlock"
@@ -764,6 +791,7 @@
   trampas:
     - "If destination always succeeds (no validation), not exploitable"
     - "Some bridges have retry mechanisms that may recover — check"
+  solodit_ids: []
   incidentes:
     - "Colbfinance USC Offramp — sendDirect burns tokens then ccipReceive rejects blacklisted user, permanent loss (Low)"
     - "Colbfinance USC Offramp — missing zero address validation before burn, tokens lost when destinationAddress is address(0) (Low)"
@@ -796,6 +824,7 @@
   trampas:
     - "If domain 0 is not a valid destination in the protocol, default reverts naturally"
     - "If admin setup is atomic and tested, operational risk only"
+  solodit_ids: []
   incidentes:
     - "Securitize Bridge CCTP — uninitialized chainIdToCCTPDomain returns 0 (Ethereum), USDC sent to wrong chain (Medium)"
   severidad: medium
@@ -829,6 +858,7 @@
   trampas:
     - "If no native value is expected in cross-chain messages, not applicable"
     - "Official LayerZero executors generally provide correct msg.value"
+  solodit_ids: []
   incidentes:
     - "OnchainHeroes GenesisBridge — _lzReceive does not validate msg.value against intended native value, executor can deliver with zero ETH (Medium)"
   severidad: medium
@@ -860,6 +890,7 @@
   trampas:
     - "If refunded tokens subsidize future fees (by design), may be acceptable"
     - "If contract has a generic rescue function, lower severity"
+  solodit_ids: []
   incidentes:
     - "Camp CampTimelockEscrow — LayerZero refund address set to escrow contract, refunded tokens permanently locked (Low)"
     - "Malda — Across bridge depositor set to Rebalancer, failed transfers refund to Rebalancer with no recovery (Medium)"
@@ -892,6 +923,7 @@
   trampas:
     - "If fee is always 0 (standard finality), hardcoded 0 may be fine"
     - "Some bridge protocols deduct fee from amount, not from additional allowance"
+  solodit_ids: []
   incidentes:
     - "Malda EverclearBridge — approves only transfer amount, feeAdapter pulls amount + fee, reverts (Medium)"
     - "Securitize Bridge CCTP — hardcoded maxFee=0 with fast finality incompatible, minimum fee is 1 (Medium)"
@@ -925,6 +957,7 @@
   trampas:
     - "If bridge has instant finality (no pending messages), not applicable"
     - "Admin responsibility — may be documented as operational procedure"
+  solodit_ids: []
   incidentes:
     - "Securitize Bridge CCTP — pending/re-executable messages from old bridge address become undeliverable after setBridgeAddress (Low)"
     - "Threshold Network — missing Wormhole peer validation, no allowlist for source address (Low)"
@@ -957,6 +990,7 @@
   trampas:
     - "If downstream only checks ERC20 balance (not internal), not applicable"
     - "May be caught in integration testing"
+  solodit_ids: []
   incidentes:
     - "Threshold Network — L1BTCRedeemerWormhole grants allowance but zero Bank balance, all Wormhole redemptions blocked (High)"
   severidad: high
@@ -1006,6 +1040,7 @@
     - "Si nonce es por-source-chain solamente (no por destination), sigue vulnerable aunque chainId esté en el hash"
     - "Message replay en el MISMO chain ya cubierto en bridge-001 — este patrón es específicamente cross-chain (diferente destination)"
     - "Algunos bridges permiten el mismo mensaje en múltiples destinations (multicast) por diseño — verificar"
+  solodit_ids: []
   incidentes:
     - "Connext (riesgo potencial): xMsg relayed Polygon → Arbitrum podría ser replayed Polygon → Optimism si nonce no incluye destination"
     - "Stargate v1 (vector identificado): nonce validation per-source, no per-destination pair — mitigado por whitelist de chains pero no por protocolo"

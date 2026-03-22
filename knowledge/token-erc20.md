@@ -22,6 +22,11 @@
   trampas:
     - "This is a known ERC20 design flaw, not a protocol bug. Only report if the PROTOCOL creates a new attack path."
     - "Most judges mark this as informational unless there is a concrete protocol-specific exploit."
+  solodit_ids:
+    - risk-of-token-theft-due-to-race-condition-in-erc20s-approve-function-trailofbits-none-maple-labs-pdf
+    - race-condition-in-the-erc20-approve-function-may-lead-to-token-thet-trailofbits-golem-pdf
+    - race-condition-in-the-erc20-approve-function-may-lead-to-token-thet-trailofbits-dapphub-pdf
+    - ptoken-double-spend-race-conditions-zokyo-none-paribus-markdown
   incidentes:
     - "Liquid Collective -- approve() front-run race condition allows token theft in SharesManager and WLSETH (Medium)"
     - "Holograph -- isOwner/onlyOwner checks bypassed in ERC721/ERC20 implementations via approval manipulation (Medium)"
@@ -47,6 +52,7 @@
   trampas:
     - "If protocol explicitly documents 'no fee-on-transfer tokens', this is informational."
     - "Some protocols use a whitelist -- check governance token addition flow."
+  solodit_ids: []
   incidentes:
     - "Beedle -- Fee-on-transfer tokens cause insolvency in deposit/withdraw accounting (High)"
     - "Blueberry -- type(uint256).max repayment silently fails for FoT tokens, debt persists (Medium)"
@@ -103,6 +109,12 @@
   trampas:
     - "If SafeERC20 is used everywhere, not a finding."
     - "Solidity interface definition may mask the issue -- check actual call site."
+  solodit_ids:
+    - transfertransferfrom-are-used-instead-of-their-counterparts-from-safeerc20-zokyo-none-tradable-markdown
+    - m-02-erc20-return-values-not-checked-code4rena-yaxis-yaxis-contest-git
+    - m-04-erc20-transfer-not-all-tokens-return-boolean-kann-none-wild-protocol-markdown
+    - unhandled-return-value-of-erc20-transfer-in-transfer-and-withdraw-functions-quantstamp-fdusd-on-eth-blockchain-markdown
+    - lack-of-return-value-validation-in-erc20-transfer-zokyo-none-repl-markdown
   incidentes:
     - "Amun -- ERC20 return values not checked, tokens not actually transferred but state updated (Medium)"
     - "Reality Cards -- Unchecked ERC20 transfers cause permanent fund lockup (High)"
@@ -154,6 +166,12 @@
   trampas:
     - "Protocol may intentionally only support 18-decimal tokens with a whitelist."
     - "Check if there is an addToken/addMarket function that validates decimals."
+  solodit_ids:
+    - decimal-mismatch-for-tokens-on-hyperevm-and-hypercore-cyfrin-none-button-basis-trade-markdown
+    - m-07-trovemanager-does-not-work-with-non-18-decimal-tokens-pashov-audit-group-none-roots_2025-02-09-markdown
+    - m-9-market-rate-never-used-due-to-decimal-discrepancy-sherlock-plaza-finance-git
+    - m-02-price-will-not-always-be-18-decimals-as-expected-and-outlined-in-the-comments-code4rena-caviar-caviar-contest-git
+    - the-stable-swap-pools-used-in-connext-are-incompatible-with-tokens-with-varying-decimals-spearbit-connext-pdf
   incidentes:
     - "Blueberry -- ICHI v1 (9 decimals) to v2 (18 decimals) conversion error, users get 1e9x fewer reward tokens (High)"
     - "Sense -- Untrusted decimals() return value can be mutated intra-transaction (High)"
@@ -184,6 +202,9 @@
   trampas:
     - "Centralized token risk is often marked as 'known/accepted' by protocols."
     - "Only report if there is NO mitigation and concrete fund loss path."
+  solodit_ids:
+    - m-01-kumabondtokenapprove-should-revert-if-the-owner-of-the-tokenid-is-blacklisted-code4rena-kuma-protocol-kuma-protocol-versus-contest-git
+    - reward-distribution-or-refunds-can-be-griefed-if-one-of-the-address-gets-blacklisted-zokyo-none-xyro-markdown
   incidentes:
     - "NounsDAO -- USDC-blacklisted recipient blocks cancel() for all streams (Medium)"
     - "reNFT -- Blocklisted ERC20 payment recipient causes rented NFT stuck in Safe (Medium)"
@@ -211,6 +232,7 @@
   trampas:
     - "Infinite approval to canonical Uniswap V2/V3 Router is standard and accepted."
     - "Focus on upgradeable contracts and custom routers."
+  solodit_ids: []
   incidentes:
     - "LI.FI -- Facets approve arbitrary user-supplied addresses for ERC20 tokens (Medium)"
   severidad: critical
@@ -365,6 +387,7 @@
     - "If protocol has ReentrancyGuard on all entry points, not exploitable."
     - "If protocol uses a strict token whitelist excluding ERC777, not a finding."
     - "ERC777 is rare in production -- judges may downgrade if no concrete ERC777 token is in scope."
+  solodit_ids: []
   incidentes:
     - "PolygonZkEVM Bridge -- ERC777 tokensToSend hook reentrancy drains bridge via duplicate deposit leaves (Critical)"
     - "Caviar -- ERC777 reentrancy in buy() allows purchasing at considerable discount (High)"
@@ -409,6 +432,7 @@
     - "This is a well-documented pattern (Trust Security Jan 2024). Judges may mark as informational if impact is just gas griefing."
     - "If the protocol already wraps permit in try/catch, not a finding."
     - "Front-running only works on chains with public mempools (not on L2s with private sequencers)."
+  solodit_ids: []
   incidentes:
     - "Audit 507 (RouterV2) -- removeLiquidityWithPermit DoS via permit front-running (Medium)"
     - "EYWA (RouterV2) -- permit front-running blocks start() function (Medium)"
@@ -443,6 +467,7 @@
   trampas:
     - "If protocol has a token whitelist controlled by admin, not exploitable by attacker."
     - "If payouts are per-token (not iterating a list), this pattern does not apply."
+  solodit_ids: []
   incidentes:
     - "OpenQ -- Malicious ERC20 with blacklist bricks bounty payouts (High)"
     - "OpenQ -- Zero-transfer-reverting token permanently breaks percentage tier bounties (High)"
@@ -478,6 +503,7 @@
     - "Only applies to Solmate SafeTransferLib, NOT OpenZeppelin SafeERC20."
     - "If all token addresses are admin-set and verified, impact is limited."
     - "On some chains, CREATE2 makes address predictable but deployment timing matters."
+  solodit_ids: []
   incidentes:
     - "SIZE -- Solmate SafeTransferLib no code check enables honeypot attack (Medium)"
     - "Bond Protocol -- Solmate safetransfer/safetransferfrom no code size check leads to funding loss (Medium)"
@@ -511,6 +537,7 @@
     - "safeTransferFrom introduces a callback which can be a reentrancy vector -- evaluate tradeoff."
     - "If recipient is always an EOA (user wallet), transferFrom is safe."
     - "Some protocols intentionally use transferFrom to avoid reentrancy from onERC721Received."
+  solodit_ids: []
   incidentes:
     - "DODO -- transferFrom instead of safeTransferFrom for ERC721 (Medium)"
     - "FrankenDAO -- ERC721 transferFrom freezes NFT in non-receiver contract (Medium)"
@@ -549,6 +576,7 @@
   trampas:
     - "If protocol has an admin-curated token whitelist, not exploitable."
     - "Some tokens support both ERC721 and ERC1155 (The Sandbox) -- check for dual-standard tokens."
+  solodit_ids: []
   incidentes:
     - "OpenQ -- ERC721 deposited via fundBountyToken bricks all payouts (High)"
     - "Linea TokenBridge -- ERC721 bridged one-way, permanently stuck (High)"
@@ -586,6 +614,7 @@
     - "If protocol only supports well-known tokens (USDC, WETH), risk is low."
     - "On-chain tokens with fixed decimals (non-upgradeable) cannot mutate."
     - "Connext finding: incorrect decimals in initializeSwap cannot be corrected -- design flaw, not attack."
+  solodit_ids: []
   incidentes:
     - "Sense -- Untrusted ERC-20 decimals() return values mutated intra-transaction (High)"
     - "Connext -- Incorrect decimal in initializeSwap cannot be corrected, permanently wrong calculations (Medium)"
@@ -620,6 +649,7 @@
     - "This extends token-007 (pausable/blacklistable) but is about SPECIFIC address blacklisting, not global pause."
     - "Many judges accept this as a known centralization risk and mark informational."
     - "Only report if there is a concrete flow where one blacklisted address blocks OTHER users."
+  solodit_ids: []
   incidentes:
     - "NounsDAO -- USDC blacklisted recipient blocks cancel() for everyone (Medium)"
     - "reNFT -- Blocklisted payment ERC20 recipient causes rented NFT to be stuck in Safe (Medium)"
@@ -654,6 +684,7 @@
   trampas:
     - "If protocol explicitly requires different tokens, not a finding."
     - "Admin-only token setting may reduce severity."
+  solodit_ids: []
   incidentes:
     - "Streaming (C4) -- recoverTokens() double-counts when depositToken == rewardToken, draining funds (High)"
     - "Amun -- Unused ERC20 tokens not refunded; same-token overlap allows theft (High)"
@@ -685,6 +716,7 @@
   trampas:
     - "Solidity 0.8+ may warn but does not error on missing return."
     - "If return value is discarded by caller, the missing return is harmless."
+  solodit_ids: []
   incidentes:
     - "Sense WstETHAdapter -- wrapUnderlying() missing return value zeros out deposit (High)"
     - "BadgerDAO -- WrappedIbbtcEth stale pricePerShare used for mint/burn, wrong conversion (High)"
@@ -716,6 +748,7 @@
   trampas:
     - "If nonReentrant is present on all ERC1155-interacting functions, not exploitable."
     - "Unlike ERC777, ERC1155 callbacks are expected and well-known -- judges may expect protocols to handle them."
+  solodit_ids: []
   incidentes:
     - "Bridge Mutual -- ERC1155 safeTransferFrom callback reentrancy blocks all rewards (High)"
     - "Sudoswap LSSVM2 -- ERC1155 onERC1155BatchReceived reentrancy via two pairs (Medium)"
@@ -750,6 +783,7 @@
   trampas:
     - "This is rare but catastrophic when it occurs."
     - "Only applies to custom ERC20 implementations, not standard OpenZeppelin usage."
+  solodit_ids: []
   incidentes:
     - "BadgerDAO -- approve uses internal _shares not rebalanced amount, spender spends more than intended (High)"
   severidad: high
@@ -778,6 +812,7 @@
   trampas:
     - "If receiving contract is upgradeable, admin can add rescue function later -- lower severity."
     - "If amounts are small (dust), may be informational."
+  solodit_ids: []
   incidentes:
     - "EYWA -- ERC20 transferred to s_emissionManager which cannot handle them (High)"
     - "Backed Protocol -- safeTransferFrom traps fees in Papr Controller with no recovery (Medium)"
@@ -813,6 +848,7 @@
   trampas:
     - "If getRewardFor is onlyOwner or restricted, not exploitable"
     - "18-decimal reward tokens are generally safe from this truncation"
+  solodit_ids: []
   incidentes:
     - "Summer.fi Governance V2 — getRewardFor callable by anyone, attacker repeatedly claims zero rewards for victim, denying USDC/WBTC accrual (Medium)"
   severidad: medium
@@ -844,6 +880,7 @@
   trampas:
     - "If protocol only uses custom tracking for balanceOf (not ERC1155 standard), the desync may not matter"
     - "If tokens are non-transferable, impact is limited"
+  solodit_ids: []
   incidentes:
     - "Radius Technology EVMAuth — _pruneGroups removes expired groups but ERC1155 balance unchanged, expired auth tokens transferable (High)"
   severidad: high
@@ -879,6 +916,7 @@
     - "If protocol uses token whitelist excluding fee-on-transfer tokens, not a finding"
     - "USDT fee is currently 0% but can be activated — consider future risk"
     - "Most judges require the protocol to explicitly claim fee-on-transfer support for this to be valid"
+  solodit_ids: []
   incidentes:
     - "Ammplify — RFT library strict balance check causes revert for all fee-on-transfer tokens, DoS (Medium)"
     - "Superform v2 — assumes standard ERC20, loss of funds with fee-on-transfer (Low)"
@@ -913,6 +951,7 @@
   trampas:
     - "If token does not have pause functionality, not applicable"
     - "If permit is not supported (no ERC2612), not applicable"
+  solodit_ids: []
   incidentes:
     - "ManifestFinance USHToken — approve() gated by whenNotPaused but permit() inherited from Solmate without override, allowances settable while paused (Low)"
   severidad: medium
@@ -945,6 +984,7 @@
   trampas:
     - "If deposit does not accept a receiver parameter (always msg.sender), partial mitigation"
     - "If there is only one blacklist role, verify it covers all cases"
+  solodit_ids: []
   incidentes:
     - "Neutrl Protocol sNUSD — _deposit() checks SOFT_RESTRICTED but not FULL_RESTRICTED, blacklisted users deposit to other addresses (Medium)"
   severidad: medium
@@ -977,6 +1017,7 @@
   trampas:
     - "If protocol only supports non-rebasing tokens, not applicable"
     - "If underlying asset is guaranteed to only appreciate (e.g., stETH), low risk but still possible during slashing"
+  solodit_ids: []
   incidentes:
     - "STBL Protocol — negative rebase on USDY/oUSG causes withdrawERC20 underflow, all withdrawals blocked (Medium)"
     - "Securitize DSToken Rebasing — token value locks restrict unlocked tokens after negative rebase (Medium)"
@@ -1010,6 +1051,7 @@
   trampas:
     - "If there is no issuance cap, the inflation is cosmetic only"
     - "If bridge uses lock/unlock instead of burn/mint, not affected"
+  solodit_ids: []
   incidentes:
     - "Securitize Bridge CCTP — bridging DSToken back-and-forth inflates totalIssuance on both chains, cap reached, blocking issuance (Medium)"
   severidad: medium
@@ -1051,6 +1093,7 @@
     - "Permit2 has two nonce systems: PermitTransfer (user chooses nonce, must be unique) and PermitAllowance (monotonic counter). The attack applies to the former when protocol chooses the nonce."
     - "If the Permit2 order can only be filled once and nonce is marked used immediately, same-block replay is still possible for atomically frontrunnable orders"
     - "block.prevrandao / RANDAO on post-merge Ethereum is also predictable by validators — still not a good nonce"
+  solodit_ids: []
   incidentes:
     - "Bunni (Pashov Group H-05) — BunniHook uses block.number as Permit2 nonce for Flood.bid orders, enabling same-block replay (HIGH)"
     - "Starbase (Consensys) — StarBaseDCA uses same permit2 signature for multiple claimTokens calls in same block (HIGH)"
@@ -1096,6 +1139,7 @@
     - "If the token is non-upgradeable and the bug is post-deployment, there is no fix — this is a permanent escape hatch"
     - "The reverse: missing `to` check means blacklisted addresses can RECEIVE tokens (separate issue)"
     - "For USDC/USDT clones: the blacklist bypass must happen before the actual blacklist tx confirms — time-sensitive frontrun"
+  solodit_ids: []
   incidentes:
     - "Infinigold (Sigma Prime) — transferFrom() does not check `from` blacklist status; blacklisted users can move funds via allowances (HIGH)"
     - "Anzen Finance Protocol V2 (Halborn) — USDz and sUSDz _update() override missing `from` blacklist check, blocked users can still send tokens (HIGH)"
@@ -1147,6 +1191,7 @@
     - "Some tokens have optional fees (off by default, can be enabled by governance) — document the assumption"
     - "For rebasing tokens (stETH): the accounting error is the opposite — tokens increase in value, shares become undervalued over time (beneficial to holders, not an attack)"
     - "ERC4626 canonical implementation does NOT handle FoT — any fork that doesn't add balance snapshots inherits this"
+  solodit_ids: []
   incidentes:
     - "PoolTogether (Code4rena M-01) — Vault._deposit() uses requested amount not received amount for FoT underlying tokens (MEDIUM)"
     - "Vaultcraft (Zokyo) — ERC7540 virtual accounting breaks with FoT tokens: withdrawal/deposit amounts diverge (MEDIUM)"
