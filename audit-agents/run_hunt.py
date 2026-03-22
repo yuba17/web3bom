@@ -65,6 +65,7 @@ DOMAIN_BRIEFING = {
     "erc4337":    "knowledge/erc4337-account-abstraction.md",
     "zk":         "knowledge/zk-circuits.md",
     "governance": "knowledge/governance.md",
+    "nft":        "knowledge/nft-erc721.md",
 }
 
 # Keywords para auto-detectar dominios del código fuente del contrato.
@@ -103,6 +104,9 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "governance": ["Governor", "TimelockController", "propose", "castVote",
                    "proposalThreshold", "quorum", "vetoer", "timelock",
                    "GovernorBravo", "getPastVotes", "proposalsPassed"],
+    "nft":        ["ERC721", "onERC721Received", "safeTransferFrom", "tokenId",
+                   "ownerOf", "getApproved", "setApprovalForAll", "_safeMint",
+                   "IERC721", "ERC721Enumerable", "NonfungiblePositionManager"],
 }
 
 
