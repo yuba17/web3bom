@@ -6,6 +6,28 @@
 
 ---
 
+## REGLA OBLIGATORIA: Presentación Formal de Findings
+
+**CADA VEZ que se identifica un finding (cualquier severidad, cualquier componente):**
+
+1. **Preséntalo al usuario INMEDIATAMENTE** — no lo dejes en el tracker y sigas adelante
+2. **Explícalo con esta estructura exacta:**
+   - **Qué es**: descripción en una frase
+   - **Dónde**: contrato + función + línea exacta
+   - **Cómo funciona el ataque**: paso a paso, concreto
+   - **Impacto**: quién pierde qué y cuánto
+   - **Confianza**: % y por qué
+   - **¿Reportable?**: sí/no y a qué plataforma
+3. **Espera confirmación** del usuario antes de continuar al siguiente componente
+4. **Pipeline obligatorio para TODOS los findings (cualquier severidad)**:
+   - Ejecuta `/redteam` con la severidad propuesta como input (no como decisión fija)
+   - El RedTeam incluye Ronda 0 de calibración de severidad: puede subir, bajar, o confirmar — **siempre, sin excepción, también para Low/Info**
+   - `/escalation-hunter` es opcional — úsalo cuando el finding tenga interacciones complejas entre componentes y quieras un análisis de severidad más profundo antes de RedTeam
+
+**Esta regla NO tiene excepciones.** No vale mencionar el finding de pasada en un tracker y seguir. El usuario DEBE saber qué encontraste, cómo, y qué hacer con ello.
+
+---
+
 ## MINDSET: Realismo Brutal — Sin Filtros
 
 **Sé honesto, duro, y obsesivo con la mejora del sistema. El objetivo es encontrar vulnerabilidades REALES con el máximo nivel de fiabilidad. Nada más importa.**
@@ -25,7 +47,7 @@
 4. **Prioriza implacablemente.**
    - El 80% de los bugs críticos están en: accounting, access control, y oracle manipulation.
    - El 80% del tiempo se pierde en: setup, tooling, y findings que resultan ser "by design".
-   - Ataca el 20% que produce el 80% del valor. Si llevas 2 horas sin progreso concreto en la SELECCIÓN de target, cambia de target. NOTA: esta regla aplica a la decisión de qué protocolo huntar, NO al pipeline intra-componente. Una vez dentro de un componente, RULE #0 prevalece: termina el checklist de 12 items antes de moverte.
+   - Ataca el 20% que produce el 80% del valor. Si llevas 2 horas sin progreso concreto en la SELECCIÓN de target, cambia de target. NOTA: esta regla aplica a la decisión de qué protocolo huntar, NO al pipeline intra-componente. Una vez dentro de un componente, RULE #0 prevalece: termina el checklist de 13 items antes de moverte.
 
 5. **Sé específico o cállate.** "Puede haber un problema de reentrancy" no es un finding. "La función `withdraw()` en línea 142 permite reentrada vía el callback ERC777 `tokensReceived()` porque actualiza el balance después del transfer externo" SÍ lo es. Si no puedes ser así de preciso, no has entendido el código.
 
@@ -53,15 +75,20 @@
 
 ### Cómo operar en cada sesión:
 
-1. **Al iniciar sesión**: lee `~/.claude/MEMORY/STATE/current_hunt.json` (ruta canónica del estado activo). Si hay un `current_component`, **empieza a huntar ese componente inmediatamente** sin esperar instrucción del usuario. Si el archivo no existe, lee `~/.claude/projects/-home-kali-Documents-Web3/memory/project_revert_lend_hunt.md` como fallback.
+1. **Al iniciar sesión**: lee `~/.claude/MEMORY/STATE/current_hunt.json` (ruta canónica del estado activo). Si hay findings con `radar_id`, ejecuta `python3 audit-agents/sync_state.py` para traer cambios de Bounty Radar antes de continuar. Si hay un `current_component`, **empieza a huntar ese componente inmediatamente** sin esperar instrucción del usuario. Si el archivo no existe, lee `~/.claude/projects/-home-kali-Documents-Web3/memory/project_revert_lend_hunt.md` como fallback.
 
 2. **Ejecuta el pipeline completo de forma autónoma**:
    - Corre `python3 ~/Documents/Web3/audit-agents/run_hunt.py --component <X>` para preparar contexto
-   - Usa el **Agent tool** para lanzar los 6 hunters en paralelo — SOLO para análisis de código (Fase 1). El fuzzing es SIEMPRE secuencial (Foundry → Medusa → Echidna comparten solc y RAM).
+   - Usa el **Agent tool** para lanzar los 7 hunters en paralelo — SOLO para análisis de código (Fase 1). El fuzzing es SIEMPRE secuencial (Foundry → Medusa → Echidna comparten solc y RAM).
    - Cada sub-agente lee su prompt de `hunt_session/context/`, analiza el contrato, escribe `hyp_*.yaml`
+   - Tras los 7 hunters, lanza el **DeepDiveHunter** (secuencial) — lee convergencias de los 7 hunters, genera máximo 5 hipótesis profundas en `hyp_{Component}_DeepDiveHunter.yaml`
    - Recoge los resultados, corre `merge_invariants.py`, compila, fuzzea secuencialmente
    - Documenta findings en HUNT_TRACKER.md y fichas YAML
-   - Ejecuta RedTeam (aplica el protocolo de 4 atacantes de `~/.claude/skills/redteam.md`) antes de reportar cualquier finding Medium+
+   - Para findings Medium+: RedTeam (`~/.claude/skills/redteam.md`) con Ronda 0 de calibración de severidad. Si REPORT → dos acciones INDEPENDIENTES (orden no importa, son workflows paralelos):
+     1. **ReportWriter** (`~/.claude/skills/report-writer.md`) → genera el markdown que se pega en Cantina/Immunefi/etc.
+     2. **`report_finding.py --finding <ID>`** → registra en Bounty Radar desde el YAML (contenido distinto al markdown)
+   - EscalationHunter (`~/.claude/skills/escalation-hunter.md`) es OPCIONAL — solo para findings con interacciones complejas entre componentes
+   - Para findings Low/Info: RedTeam igualmente, Ronda 0 incluida (está integrada en el skill — no se puede omitir)
    - Si cualquier script del pipeline falla (exit code != 0), detente y notifica al usuario con el error completo antes de continuar.
 
 3. **El usuario puede interrumpir en cualquier momento** para preguntar, redirigir, o pedir que mires un fichero específico. Responde y luego **vuelve al pipeline donde lo dejaste**.
@@ -70,15 +97,24 @@
 
 5. **Cuando termines un componente**: márcalo como completo en `current_hunt.json`, actualiza HUNT_TRACKER.md, llama a `apply_feedback.py`. **OBLIGATORIO: informa al usuario del resumen del componente (invariantes probados, findings, resultado) y espera confirmación explícita antes de pasar al siguiente componente.** El paso de componente NUNCA es automático.
 
-6. **Si encuentras un finding confirmado en fork**: actualiza `current_hunt.json`, crea el PoC en Foundry, ejecuta RedTeam internamente, y prepara el reporte. Avisa al usuario con un resumen conciso.
+6. **Si encuentras un finding confirmado en fork**: actualiza `current_hunt.json`, crea el PoC en Foundry, ejecuta RedTeam (incluye Ronda 0 de calibración de severidad). Si veredicto es REPORT, en este orden:
+   1. **ReportWriter** → genera y guarda el markdown del reporte (reports/DRAFT-<ID>-<slug>.md)
+   2. **`report_finding.py --finding <ID>`** → registra en Bounty Radar desde el YAML + manda Telegram
+   3. Avisa al usuario con el path del reporte para que lo revise y submitee manualmente en la plataforma.
 
 ### Qué invocar internamente (no esperar que el usuario lo pida):
 - `run_hunt.py` → al inicio de cada componente
-- Agent tool (6 hunters paralelos) → en el paso de análisis
+- Agent tool (7 hunters paralelos, incluyendo TrustBoundaryHunter) → en el paso de análisis
 - `merge_invariants.py` → cuando los hunters terminen
 - `apply_feedback.py` → al finalizar cada componente
-- RedTeam (internamente, sin skill) → antes de reportar cualquier finding Medium+
+- RedTeam (`~/.claude/skills/redteam.md`) → finding Medium+, incluye Ronda 0 de calibración de severidad (puede subir/bajar/confirmar)
+- ReportWriter (`~/.claude/skills/report-writer.md`) → después de RedTeam REPORT. Genera el markdown del reporte (paso 1 — obligatorio antes de report_finding.py).
+- `report_finding.py --finding <ID>` → después de ReportWriter. Registra en Bounty Radar, genera draft en la UI, manda Telegram (paso 2).
+- `sync_state.py` (`/sincronizar_radar`) → al inicio de sesión si hay findings con radar_id. Trae cambios de bugbounty.0mnia.dev a current_hunt.json (ACCEPTED, REJECTED, PAID, payout).
+- EscalationHunter (`~/.claude/skills/escalation-hunter.md`) → OPCIONAL, solo para findings con interacciones complejas entre componentes
 - `run_hunt.py --status` → para actualizar contexto en cualquier momento
+- DeepDiveHunter (secuencial, post-7 hunters) → genera hipótesis profundas basadas en convergencias
+- ChimeraBuilder (sub-agente contexto limpio) → auto-genera setup de fuzzing si no existe `test/chimera/`
 
 ## REGLA: Persistir Contexto Entre Sesiones
 
@@ -151,6 +187,14 @@ For EACH component in scope (ordered by LOC, largest first):
 **CRITICAL: Run tools SEQUENTIALLY, never in parallel. They share solc and RAM.**
 **Foundry is MANDATORY for PoCs — contest platforms require it.**
 
+**REGLA v4 — FUZZING MÍNIMO OBLIGATORIO:**
+- **Phase 1 (Foundry 5K) + Phase 2 (Medusa 15 min) = SIEMPRE, sin excepciones.**
+- Si el repo no tiene `test/chimera/`, lanzar sub-agente **ChimeraBuilder** (contexto limpio) para auto-generar el setup.
+- ChimeraBuilder recibe: código fuente + invariantes merged + 7 invariantes universales + template Chimera.
+- Compile-fix loop: max 3 intentos. Si falla → fallback a solo invariantes universales (1 intento más). Si aún falla → BLOQUEAR hunt, notificar usuario.
+- Phase 3 (Fork): obligatorio si bounty >= $50K (se lee de `current_hunt.json` campo `payout`) O si Phase 1/2 rompe invariante.
+- Phase 4-5: solo post-finding confirmado.
+
 #### Pipeline order (v3 — Medusa promovida a Phase 2):
 
 **Principio: feedback rápido → secuencias → contratos reales → maximización.**
@@ -173,7 +217,12 @@ For EACH component in scope (ordered by LOC, largest first):
 5. **Phase 4 — Echidna Optimization (10 min)**: `echidna . --contract CryticTester --config test/chimera/echidna.yaml`
    - Modo optimización: maximizar profit del atacante (`optimize_*` functions)
    - Solo después de invariantes tuneados y confirmados en fork
-6. **Phase 5 — Halmos Proof (5 min)**: Symbolic execution en funciones math puras (opcional)
+6. **Phase 5 — Halmos Proof (5 min)**: `~/.local/bin/halmos --function check_ --loop 10 --solver-timeout-assertion 10000`
+   - Symbolic execution: prueba propiedades para TODOS los inputs posibles (bounded)
+   - Ideal para funciones math puras: share price calculation, fee computation, exchange rates
+   - Escribir funciones `check_*` que llaman la función math + assert el invariante
+   - Si Halmos encuentra counterexample → PoC inmediato (input exacto que rompe la propiedad)
+   - NO usar para funciones con dependencias externas (oracles, callbacks) — solo math pura
 
 **Rationale del orden**:
 - Foundry primero: 10x mejor error reporting, detecta invariantes rotos en segundos
@@ -219,10 +268,14 @@ For each pair (A, B) of completed components:
 Each EdgeHunter gets: full source of BOTH components + specific interaction edge to analyze.
 Ask: "What breaks if component B behaves unexpectedly at this call site?"
 
-**Step 3 — Multi-component fuzzing setup** (when warranted):
+**Step 3 — Multi-component fuzzing setup** (warranted cuando: al menos un EdgeHunter encuentra una hipótesis Tier 1, o cuando la superficie de interacción implica transferencia de fondos o cambio de estado crítico entre contratos):
 Build a `MultiComponentSetup.sol` that deploys BOTH real contracts (not mocks) together.
 Add interaction handlers: sequences that span both components.
 Run 5000+ fuzz runs on cross-component invariants.
+
+**Step 5 — Si se encuentra un finding**: entra en el FINDING PIPELINE COMPLETO desde el paso 1.
+El cross-component hunt es un mecanismo de descubrimiento — el finding resultante es un finding nuevo y requiere el pipeline completo (Mock→Medusa→Fork→PoC→Echidna→EscalationHunter→RedTeam→VerifyCode→Report).
+EscalationHunter es especialmente relevante aquí porque el finding ES cross-component por definición.
 
 **Step 4 — Interaction invariants** (add to Properties.sol):
 ```
@@ -255,6 +308,7 @@ A component is DONE only when ALL of these are checked off:
 COMPONENT COMPLETION CHECKLIST (mandatory for each file):
 [ ] 1. FULL CODE READ — every line read and understood
 [ ] 2. PROTOCOL MODEL — what it does, money flows, trust boundaries documented
+[ ] 2.5. DEEPDIVE HUNTER — ejecutado secuencialmente tras los 7 hunters, máximo 5 hipótesis profundas
 [ ] 3. AI INVARIANTS GENERATED — 10-20 specific invariants in Chimera format
 [ ] 4. INVARIANTS ADDED TO Properties.sol — Solidity code, compiles
 [ ] 5. HANDLERS ADDED TO TargetFunctions.sol — all public functions covered
@@ -267,7 +321,7 @@ COMPONENT COMPLETION CHECKLIST (mandatory for each file):
 [ ] 12. TOLERANCE TUNED — dust-level findings have explicit tolerance, not blocking deeper exploration
 ```
 
-**DO NOT start reading the next component until all 12 boxes are checked.**
+**DO NOT start reading the next component until all 13 boxes are checked.**
 **DO NOT skip any step. DO NOT say "we'll come back to it".**
 **If a step fails, FIX IT before moving on.**
 
@@ -303,8 +357,8 @@ vm.selectFork(forkId);
 **Mocks are ONLY acceptable for:**
 - Protocol not yet deployed on any chain (pre-launch audit)
 - Testing pure math logic that doesn't depend on external state
-- Initial 5-minute iteration on invariant structure before switching to fork
-- **ALWAYS migrate to fork before running final fuzzing passes**
+- **Phase 1 del pipeline (Foundry Mock Quick, 5 min)** — es el paso inicial de validación de invariantes antes de Medusa. Es la excepción explícita y permitida.
+- **ALWAYS migrate to fork before running final fuzzing passes (Phase 3)**
 
 ### TOLERANCE TUNING (mandatory 2-pass approach)
 
@@ -367,23 +421,41 @@ Hacerlo es ILEGAL — equivale a robar fondos de usuarios reales aunque sea "par
 ```
 FINDING PIPELINE — [NOMBRE DEL FINDING]
 ════════════════════════════════════════
-[ ] 1. CÓDIGO LEÍDO — Cada línea relevante, entendida en contexto
-[ ] 2. INVARIANTE GENERADO — Solidity assertion en Properties.sol, compila
-[ ] 3. FOUNDRY FUZZ — min 5,000 runs, invariante roto o bounds verificados
-[ ] 4. TOLERANCE TUNING — artefactos de mock vs bug real clasificados
-[ ] 5. POC FOUNDRY RUNNABLE — test que demuestra el bug con assertions duras (PASS)
-        └─ Opción A: mocks controlables (siempre válido para bugs de lógica)
-        └─ Opción B: fork local vm.createFork() (añade confianza, nunca toca fondos reales)
+[ ] 1.  CÓDIGO LEÍDO — Cada línea relevante, entendida en contexto
+[ ] 2.  INVARIANTE GENERADO — Solidity assertion en Properties.sol, compila
+
+        ── FUZZING (orden obligatorio: Phase 1 → 2 → 3 → 4) ──────────────
+[ ] 3.  FOUNDRY MOCK QUICK (Phase 1) — min 5,000 runs con mocks
+        └─ Valida que el invariante compila y tiene sentido. Feedback inmediato.
+[ ] 4.  TOLERANCE TUNING — clasifica cada fallo: real bug / rounding dust / mock artifact
+[ ] 5.  MEDUSA STATEFUL (Phase 2) — min 10 min, corpus guardado
+        └─ Fuerza: secuencias multi-step que Foundry random-walk no alcanza
+[ ] 6.  FOUNDRY FORK + POC (Phase 3) — fork local vm.createFork(), contratos reales
+        └─ Confirma findings de Phase 1+2. PoC con assertions duras (PASS obligatorio)
         └─ NUNCA: transacciones reales en mainnet — ILEGAL
-[ ] 6. MEDUSA STATEFUL — min 10 min, corpus guardado
-[ ] 7. ECHIDNA OPTIMIZATION — optimize_ functions, min 10 min
-[ ] 8. REDTEAM — 4 atacantes (JUDGE/DEVIL/GUARD/ECONOMIST), 3 rondas, veredito emitido
+[ ] 7.  ECHIDNA OPTIMIZATION (Phase 4) — optimize_* functions, min 10 min
+        └─ Maximiza profit del atacante. Solo útil con invariantes ya tuneados.
+[ ] 7.1 HALMOS PROOF (Phase 5) — check_* functions en math pura, 5 min
+        └─ Symbolic execution: prueba TODOS los inputs. Solo para funciones math puras.
+        └─ Comando: ~/.local/bin/halmos --function check_ --loop 10
+        └─ Si encuentra counterexample → PoC con input exacto
+        ────────────────────────────────────────────────────────────────────
+
+[ ] 7.5 ESCALATION HUNTER (opcional) — ejecutar si el finding tiene interacciones
+        cross-component. Criterio: ¿afecta a más de un contrato? → ejecutar.
+        Siempre ejecutar si el finding viene de un cross-component hunt (RULE #0.5).
+[ ] 8.  REDTEAM — 4 atacantes (JUDGE/DEVIL/GUARD/ECONOMIST), Ronda 0 siempre incluida
+        └─ Ronda 0 es obligatoria para TODA severidad (también Low/Info) — calibra antes de atacar
         └─ Resultado debe ser REPORT o REPORT_DOWNGRADED (no DO_NOT_REPORT)
-[ ] 9. VERIFY CODE — verificación estática del código deployed (SIN ejecutar nada):
+[ ] 9.  VERIFY CODE — verificación estática del código deployed (SIN ejecutar nada):
         └─ Buscar contrato en Etherscan/Basescan y confirmar que está verified
         └─ Comparar que las funciones afectadas existen en la versión deployed
         └─ Verificar que no hay un fix reciente en el repo que mitigue el bug
         └─ Comprobar que el feature (e.g., gaugeManager) está activado on-chain
+[ ] 10. REPORT WRITER — solo si RedTeam dice REPORT o REPORT_DOWNGRADED
+        └─ Genera reports/DRAFT-<ID>-<slug>.md — obligatorio ANTES de report_finding.py
+[ ] 11. report_finding.py --finding <ID> — registra en Bounty Radar + manda Telegram
+        └─ Solo después de ReportWriter. Nunca antes.
 
 RESULTADO: [ ] APTO PARA REPORTE  /  [ ] BLOQUEADO — faltan etapas: [lista]
 ```
@@ -392,18 +464,18 @@ RESULTADO: [ ] APTO PARA REPORTE  /  [ ] BLOQUEADO — faltan etapas: [lista]
 > "⛔ [Finding X] NO puede reportarse. Falta(n): [etapa(s)]. Ejecutar antes de continuar."
 
 **Secuencialidad del pipeline — IMPORTANTE:**
-- Las etapas 3, 4, 6, 7 (fuzzing) pueden ejecutarse EN PARALELO entre sí — no dependen unas de otras.
-- Lo que SÍ es estrictamente secuencial: el gate de REPORTE. No se reporta hasta que TODAS las etapas estén ✅.
-- La regla "no pasar de etapa hasta finalizar la anterior" aplica a: (a) transiciones de componente (RULE #0 — 12 checkboxes), y (b) el gate de reporte (9 etapas del pipeline). NO aplica a ejecutar etapas de fuzzing en paralelo.
-- Secuencia obligatoria: Etapa 5 (PoC) debe existir ANTES de ejecutar RedTeam (8). Etapa 8 debe estar ANTES de Verify Code (9). Verify Code (9) debe estar ANTES de reportar.
+- El orden de fuzzing es ESTRICTO: Phase 1 (mock) → Phase 2 (Medusa) → Phase 3 (fork+PoC) → Phase 4 (Echidna). No invertir fases.
+- Las etapas 3, 4, 5, 6, 7 (fuzzing completo) pueden considerarse un bloque — pero dentro del bloque el orden es fijo.
+- Secuencia obligatoria de gates: PoC (paso 6) → RedTeam (8) → Verify Code (9) → ReportWriter (10) → report_finding.py (11).
 
-**Etapas que pueden omitirse SOLO con justificación explícita:**
-- Etapa 3/4/6/7 (fuzzing): si el finding es de lógica pura ya demostrada por PoC estático
+**Etapas que pueden omitirse SOLO con justificación explícita declarada al usuario:**
+- Etapas 3/4/5/6/7 (fuzzing): si el finding es de lógica pura ya demostrada por PoC estático — declarar explícitamente y esperar confirmación del usuario
 - Etapa 7 (Echidna): si Medusa ya encontró el bug (no añade valor incremental)
 - Etapa 9 (verify code): si el protocolo NO está deployado (pre-launch) — documentar
+- Etapa 7.5 (EscalationHunter): si el finding es single-component sin interacciones externas
 
 **Etapas NUNCA omisibles para findings Medium+:**
-- Etapa 5 (PoC runnable) — sin PoC no hay finding
+- Etapa 6 (PoC fork runnable) — sin PoC no hay finding
 - Etapa 8 (RedTeam) — sin esto el reporte puede tener errores graves
 - Etapa 9 (verify code) — para no reportar bugs ya fixeados en el deployed
 
