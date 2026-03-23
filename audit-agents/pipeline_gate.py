@@ -623,8 +623,12 @@ def _save_gate_status(data: dict):
     data["updated_at"] = datetime.now().isoformat()
     GATE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = GATE_STATUS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-    tmp.rename(GATE_STATUS_FILE)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.rename(GATE_STATUS_FILE)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def export_gate_status(component: str, repo: str = ""):
@@ -635,6 +639,10 @@ def export_gate_status(component: str, repo: str = ""):
     passed_count = 0
 
     for g in DISPLAY_GATES:
+        if first_fail is not None:
+            # Gates after first failure are not yet reached
+            comp_data[g] = {"state": "pending", "detail": "Not yet reached"}
+            continue
         if g not in GATE_CHECKS:
             comp_data[g] = {"state": "pending", "detail": "Not yet reached"}
             continue
@@ -790,6 +798,26 @@ def _find_hyp_with_finding(finding_id: str) -> dict | None:
     return None
 
 
+def _check_poc_uses_fork(solidity_text: str) -> bool:
+    """Check if Solidity test code uses mainnet fork (not just mocks)."""
+    import re
+    # Remove single-line comments
+    no_comments = re.sub(r'//.*$', '', solidity_text, flags=re.MULTILINE)
+    # Remove multi-line comments
+    no_comments = re.sub(r'/\*.*?\*/', '', no_comments, flags=re.DOTALL)
+    # Check for fork-related calls (strict — only vm.* fork functions)
+    fork_patterns = [
+        r'vm\.createFork',
+        r'vm\.selectFork',
+        r'vm\.createSelectFork',
+        r'vm\.activeFork',
+    ]
+    for pattern in fork_patterns:
+        if re.search(pattern, no_comments):
+            return True
+    return False
+
+
 def check_finding_poc(finding_id: str) -> tuple[bool, list[str], list[str]]:
     """Check that a PoC exists for this finding."""
     hyp = _find_hyp_with_finding(finding_id)
@@ -819,6 +847,25 @@ def check_finding_poc(finding_id: str) -> tuple[bool, list[str], list[str]]:
         passed.append(f"OK: PoC files found — {[f.name for f in poc_files[:3]]}")
     elif not poc:
         failed.append(f"NO_POC_FILE: No Solidity PoC file found matching {finding_id}")
+
+    # Check that PoC uses fork (not just mocks)
+    state = load_state()
+    is_pre_launch = state.get("pre_launch", False)
+
+    if not is_pre_launch:
+        fork_found = False
+        for f in poc_files:
+            text = f.read_text()
+            if _check_poc_uses_fork(text):
+                fork_found = True
+                passed.append(f"OK: PoC uses mainnet fork — {f.name}")
+                break
+        if not fork_found and poc_files:
+            failed.append(
+                "NO_FORK_IN_POC: PoC exists but does not use vm.createFork/vm.selectFork\n"
+                "  PoCs must run against mainnet fork, not mocks (CLAUDE.md rule)\n"
+                '  Add: uint256 forkId = vm.createFork(vm.envString("RPC_URL"), blockNumber);'
+            )
 
     # Check report file for PoC section
     for report in REPORTS_DIR.glob(f"*{finding_id}*"):
@@ -1009,6 +1056,9 @@ def export_finding_gate_status(finding_id: str):
     if hyp:
         f_data["title"] = str(hyp.get("title", hyp.get("description", "")))[:60]
         f_data["severity"] = hyp.get("severity", "unknown")
+    else:
+        f_data["title"] = finding_id
+        f_data["severity"] = "unknown"
 
     first_fail = None
     passed_count = 0

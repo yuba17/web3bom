@@ -46,3 +46,36 @@ def test_gate_states_are_4_state():
     states_used = {comp[g]["state"] for g in comp if isinstance(comp.get(g), dict) and "state" in comp[g]}
     # At minimum should have some pass and some fail/pending
     assert len(states_used) >= 2, f"Only states found: {states_used}"
+
+
+def test_poc_gate_requires_fork():
+    """PoC gate must verify vm.createFork or vm.selectFork usage."""
+    from pipeline_gate import _check_poc_uses_fork
+
+    # Mock PoC with fork
+    poc_with_fork = """
+    function test_exploit() public {
+        uint256 forkId = vm.createFork(vm.envString("BASE_RPC_URL"), 12345);
+        vm.selectFork(forkId);
+        // ... exploit ...
+    }
+    """
+    assert _check_poc_uses_fork(poc_with_fork) is True
+
+    # Mock PoC without fork
+    poc_no_fork = """
+    function test_exploit() public {
+        token.transfer(attacker, 1000);
+        assertEq(token.balanceOf(attacker), 1000);
+    }
+    """
+    assert _check_poc_uses_fork(poc_no_fork) is False
+
+    # Edge case: fork in comment doesn't count
+    poc_comment_fork = """
+    function test_exploit() public {
+        // vm.createFork would be nice but we use mocks
+        token.transfer(attacker, 1000);
+    }
+    """
+    assert _check_poc_uses_fork(poc_comment_fork) is False
