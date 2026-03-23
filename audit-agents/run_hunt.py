@@ -1216,6 +1216,47 @@ ID prefix: `{abbreviation}-DD` (ej: {abbreviation}-DD-01)
 """
 
 
+def check_chimera_exists(repo_path: Path) -> bool:
+    """Check if the repo already has a Chimera fuzzing setup."""
+    chimera_dir = repo_path / "test" / "chimera"
+    if not chimera_dir.exists():
+        return False
+    # Must have at least Properties.sol and TargetFunctions.sol
+    has_properties = (chimera_dir / "Properties.sol").exists()
+    has_targets = (chimera_dir / "TargetFunctions.sol").exists()
+    return has_properties and has_targets
+
+
+def parse_bounty_value(payout_str: str) -> int:
+    """Extract max numeric bounty value from payout string.
+
+    Examples:
+        "Critical up to $1M, High $20K" → 1_000_000
+        "$50,000" → 50_000
+        "Up to $500K" → 500_000
+        "" or unparseable → 100_000 (default high — safer)
+    """
+    if not payout_str:
+        return 100_000  # default: assume high value (safer)
+
+    # Find all dollar amounts
+    amounts = []
+    for match in re.finditer(r'\$\s*([\d,.]+)\s*([KkMm])?', payout_str):
+        num_str = match.group(1).replace(",", "")
+        try:
+            value = float(num_str)
+        except ValueError:
+            continue
+        suffix = (match.group(2) or "").upper()
+        if suffix == "K":
+            value *= 1_000
+        elif suffix == "M":
+            value *= 1_000_000
+        amounts.append(int(value))
+
+    return max(amounts) if amounts else 100_000
+
+
 def create_context_file(
     component: str,
     contract_path: Path,
@@ -1306,6 +1347,9 @@ def init_ficha(component: str, domain: str, protocol: str, repo_path: str) -> Pa
             "findings_logged": False,
             "tier1_separated": False,
             "tolerance_tuned": False,
+            "deepdive_hunter": False,
+            "fuzzing_phase1_executed": False,
+            "fuzzing_phase2_executed": False,
         },
         "notes": "",
         "feedback_applied": None,
