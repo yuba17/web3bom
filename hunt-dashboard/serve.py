@@ -294,6 +294,17 @@ def build_activity_log(hunt_dir: str, hypotheses: dict) -> list:
     return events[:50]
 
 
+def load_gate_status(hunt_dir: str) -> dict:
+    """Load gate_status.json from hunt_session directory."""
+    gate_file = Path(hunt_dir) / "gate_status.json"
+    if not gate_file.exists():
+        return {}
+    try:
+        return json.loads(gate_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def derive_confirmed_count(findings: list) -> int:
     """Count findings with status != PARKED."""
     return sum(1 for f in findings if f.get("status", "").upper() != "PARKED")
@@ -316,6 +327,7 @@ def build_dashboard(state_path: str, hunt_dir: str) -> dict:
     hypotheses = load_hypotheses(str(Path(hunt_dir) / "hypotheses"))
     convergence = compute_convergence(hypotheses)
     activity_log = build_activity_log(hunt_dir, hypotheses)
+    gate_status = load_gate_status(hunt_dir)
 
     components_done = state.get("components_done", [])
     component_map = state.get("component_map", [])
@@ -347,6 +359,11 @@ def build_dashboard(state_path: str, hunt_dir: str) -> dict:
         "activity_log": activity_log,
         "checklist_labels": {k: {"label": v[0], "desc": v[1]} for k, v in CHECKLIST_LABELS.items()},
         "hunter_domains": HUNTER_DOMAINS_ES,
+        "gates": gate_status.get("component_gates", {}),
+        "finding_gates": gate_status.get("finding_gates", {}),
+        "finding_queue": state.get("finding_queue", []),
+        "finding_queue_summary": gate_status.get("finding_queue_summary", {"total": 0, "pending": 0, "in_pipeline": 0}),
+        "gates_updated_at": gate_status.get("updated_at", ""),
         "timestamp": datetime.now().isoformat(),
     }
 
