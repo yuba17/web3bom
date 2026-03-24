@@ -75,19 +75,20 @@
 
 ### Cómo operar en cada sesión:
 
-1. **Al iniciar sesión**: lee `~/.claude/MEMORY/STATE/current_hunt.json` (ruta canónica del estado activo). Si hay findings con `radar_id`, ejecuta `python3 audit-agents/sync_state.py` para traer cambios de Bounty Radar antes de continuar. Si hay un `current_component`, **empieza a huntar ese componente inmediatamente** sin esperar instrucción del usuario. Si el archivo no existe, lee `~/.claude/projects/-home-kali-Documents-Web3/memory/project_revert_lend_hunt.md` como fallback.
+1. **Al iniciar sesión**: lee `~/.claude/MEMORY/STATE/current_hunt.json` (ruta canónica del estado activo). Si hay findings con `radar_id`, ejecuta `python3 audit-agents/sync_state.py` para traer cambios de Bounty Radar antes de continuar. Si hay un `current_component`, **empieza a huntar ese componente inmediatamente** sin esperar instrucción del usuario. Si el archivo no existe, lee `~/.claude/projects/-home-kali-Documents-Web3/memory/project_revert_lend_hunt.md` como fallback. **Para hunts NUEVOS** (sin `current_hunt.json`): el punto de entrada es `python3 audit-agents/scope_intake.py --repo <path> --platform <platform> --scope-text "..."` — esto crea el estado inicial y arranca el pipeline automáticamente.
 
 2. **Ejecuta el pipeline completo de forma autónoma**:
    - Corre `python3 ~/Documents/Web3/audit-agents/run_hunt.py --component <X>` para preparar contexto
-   - Usa el **Agent tool** para lanzar los 7 hunters en paralelo — SOLO para análisis de código (Fase 1). El fuzzing es SIEMPRE secuencial (Foundry → Medusa → Echidna comparten solc y RAM).
+   - Usa el **Agent tool** para lanzar los 9 hunters en paralelo — SOLO para análisis de código (Fase 1). El fuzzing es SIEMPRE secuencial (Foundry → Medusa → Echidna comparten solc y RAM).
+     - Hunters paralelos (9): AccessHunter, DomainHunter, FlowHunter, MathHunter, OracleHunter, TrustBoundaryHunter, WildcardHunter, SignatureHunter, **DoSHunter**
    - Cada sub-agente lee su prompt de `hunt_session/context/`, analiza el contrato, escribe `hyp_*.yaml`
-   - Tras los 7 hunters, lanza el **DeepDiveHunter** (secuencial) — lee convergencias de los 7 hunters, genera máximo 5 hipótesis profundas en `hyp_{Component}_DeepDiveHunter.yaml`
+   - Tras los 9 hunters, lanza el **DeepDiveHunter** (secuencial) — lee convergencias de los 9 hunters, genera máximo 5 hipótesis profundas en `hyp_{Component}_DeepDiveHunter.yaml`
    - Recoge los resultados, corre `merge_invariants.py`, compila, fuzzea secuencialmente
    - Documenta findings en HUNT_TRACKER.md y fichas YAML
    - Para findings Medium+: RedTeam (`~/.claude/skills/redteam.md`) con Ronda 0 de calibración de severidad. Si REPORT → dos acciones INDEPENDIENTES (orden no importa, son workflows paralelos):
      1. **ReportWriter** (`~/.claude/skills/report-writer.md`) → genera el markdown que se pega en Cantina/Immunefi/etc.
      2. **`report_finding.py --finding <ID>`** → registra en Bounty Radar desde el YAML (contenido distinto al markdown)
-   - EscalationHunter (`~/.claude/skills/escalation-hunter.md`) es OPCIONAL — solo para findings con interacciones complejas entre componentes
+   - EscalationHunter (`~/.claude/skills/escalation-hunter.md`) → OBLIGATORIO para todo finding Medium+ — analiza escalación de severidad vía composability
    - Para findings Low/Info: RedTeam igualmente, Ronda 0 incluida (está integrada en el skill — no se puede omitir)
    - Si cualquier script del pipeline falla (exit code != 0), detente y notifica al usuario con el error completo antes de continuar.
 
@@ -104,17 +105,34 @@
 
 ### Qué invocar internamente (no esperar que el usuario lo pida):
 - `run_hunt.py` → al inicio de cada componente
-- Agent tool (7 hunters paralelos, incluyendo TrustBoundaryHunter) → en el paso de análisis
+- Agent tool (9 hunters paralelos: Access, Domain, Flow, Math, Oracle, TrustBoundary, Wildcard, Signature, DoS) → en el paso de análisis
+- `halmos_property_generator.py <contract.sol>` → antes de Phase 5 Halmos, auto-genera `check_*` functions
+- State Machine Model → OBLIGATORIO tras leer el código, antes de DeepDiveHunter. Modelar estados, transiciones, stuck states.
 - `merge_invariants.py` → cuando los hunters terminen
+- **`pipeline_gate.py --component X --gate <gate>`** → OBLIGATORIO entre cada fase. Si el gate falla, NO avanzar.
+  - `--gate scope` → antes de lanzar hunters (verifica current_hunt.json, context, prompts, ficha)
+  - `--gate hunters` → después de los 9 hunters (verifica que todos generaron YAML con solidity)
+  - `--gate deepdive` → después de DeepDiveHunter (verifica hyp_*_DeepDiveHunter.yaml)
+  - `--gate merge` → después de merge_invariants.py (verifica Properties.sol existe)
+  - `--gate compile` → después de forge build (verifica artifacts en out/)
+  - `--gate phase1` → después de Foundry 5K (verifica evidencia de fuzzing)
+  - `--gate phase2` → después de Medusa 15 min (verifica corpus existe)
+  - `--gate phase3` → después de Fork test (obligatorio si bounty >= $2K)
+  - `--gate phase4` → después de Echidna optimization (obligatorio si optimize_* functions existen)
+  - `--gate phase5` → después de Halmos proof (recomendado si funciones math puras existen)
+  - `--status` → muestra dashboard completo del componente
+  - `--mark <gate>` → marca gate manualmente cuando evidencia no es auto-detectable
 - `apply_feedback.py` → al finalizar cada componente
+- `/variant-hunt` → OBLIGATORIO después de cada finding confirmado. Buscar mismo root cause en todo el scope. NUNCA omitir.
 - RedTeam (`~/.claude/skills/redteam.md`) → finding Medium+, incluye Ronda 0 de calibración de severidad (puede subir/bajar/confirmar)
 - ReportWriter (`~/.claude/skills/report-writer.md`) → después de RedTeam REPORT. Genera el markdown del reporte (paso 1 — obligatorio antes de report_finding.py).
 - `report_finding.py --finding <ID>` → después de ReportWriter. Registra en Bounty Radar, genera draft en la UI, manda Telegram (paso 2).
 - `sync_state.py` (`/sincronizar_radar`) → al inicio de sesión si hay findings con radar_id. Trae cambios de bugbounty.0mnia.dev a current_hunt.json (ACCEPTED, REJECTED, PAID, payout).
-- EscalationHunter (`~/.claude/skills/escalation-hunter.md`) → OPCIONAL, solo para findings con interacciones complejas entre componentes
+- EscalationHunter (`~/.claude/skills/escalation-hunter.md`) → OBLIGATORIO para todo finding Medium+ — analiza escalación de severidad vía composability
 - `run_hunt.py --status` → para actualizar contexto en cualquier momento
-- DeepDiveHunter (secuencial, post-7 hunters) → genera hipótesis profundas basadas en convergencias
+- DeepDiveHunter (secuencial, post-9 hunters) → genera hipótesis profundas basadas en convergencias
 - ChimeraBuilder (sub-agente contexto limpio) → auto-genera setup de fuzzing si no existe `test/chimera/`
+- `scope_intake.py --repo <path> --platform <platform> --scope-text "..." [--dry-run]` → al INICIAR un hunt nuevo. Genera `current_hunt.json` + fichas desde el repo + texto del bounty. Ordena componentes por LOC descendente. Auto-ejecuta `run_hunt.py` + `pipeline_gate --gate scope` para el primer componente.
 
 ## REGLA: Persistir Contexto Entre Sesiones
 
@@ -166,7 +184,7 @@ For EACH component in scope (ordered by LOC, largest first):
    - What tokens does it handle?
    - What external calls does it make?
    - What roles/trust boundaries exist?
-3. **Generate SPECIFIC invariants** (10-20 per component):
+3. **Generate SPECIFIC invariants** (MINIMUM 10 per component, no upper limit — more is better):
    - Each invariant must have: natural language description + Solidity assertion code
    - Each invariant must answer: "If this breaks, what's the attack scenario?"
    - Use Chimera assertion helpers: `t()`, `eq()`, `gte()`, `lte()`
@@ -178,7 +196,7 @@ For EACH component in scope (ordered by LOC, largest first):
 ### LAYER 2: COMBINE INVARIANTS
 
 1. **Registry match**: `python audit-agents/matcher.py <source_dir>` → top 20 generic invariants
-2. **AI-generated**: 10-20 specific invariants from Layer 1
+2. **AI-generated**: 10+ specific invariants from Layer 1 (minimum 10, sin techo)
 3. **Merge into Properties.sol** (Chimera format, deduplicated, max 25 total)
 4. **Tag tiers**: Tier 1 (hard fail = confirmed bug) vs Tier 2 (needs review, dust tolerance)
 
@@ -191,8 +209,8 @@ For EACH component in scope (ordered by LOC, largest first):
 - **Phase 1 (Foundry 5K) + Phase 2 (Medusa 15 min) = SIEMPRE, sin excepciones.**
 - Si el repo no tiene `test/chimera/`, lanzar sub-agente **ChimeraBuilder** (contexto limpio) para auto-generar el setup.
 - ChimeraBuilder recibe: código fuente + invariantes merged + 7 invariantes universales + template Chimera.
-- Compile-fix loop: max 3 intentos. Si falla → fallback a solo invariantes universales (1 intento más). Si aún falla → BLOQUEAR hunt, notificar usuario.
-- Phase 3 (Fork): obligatorio si bounty >= $50K (se lee de `current_hunt.json` campo `payout`) O si Phase 1/2 rompe invariante.
+- Compile-fix loop: max 9 intentos (PropertyGPT: 87% con 9 vs 63% con 3). Si falla → fallback a solo invariantes universales (3 intentos más). Si aún falla → BLOQUEAR hunt, notificar usuario.
+- Phase 3 (Fork): obligatorio si bounty >= $2K (se lee de `current_hunt.json` campo `payout`) O si Phase 1/2 rompe invariante.
 - Phase 4-5: solo post-finding confirmado.
 
 #### Pipeline order (v3 — Medusa promovida a Phase 2):
@@ -220,6 +238,9 @@ For EACH component in scope (ordered by LOC, largest first):
 6. **Phase 5 — Halmos Proof (5 min)**: `~/.local/bin/halmos --function check_ --loop 10 --solver-timeout-assertion 10000`
    - Symbolic execution: prueba propiedades para TODOS los inputs posibles (bounded)
    - Ideal para funciones math puras: share price calculation, fee computation, exchange rates
+   - **Auto-generar con**: `python3 audit-agents/halmos_property_generator.py <contract.sol> --output test/halmos/HalmosCheck_<Component>.sol`
+     - Detecta funciones pure/view con aritmética y genera: no-revert, monotonicity, zero-safety, round-trip, precision-bound
+     - Detecta pares bidireccionales (convertToShares↔convertToAssets, wMulDown↔wDivDown) → round-trip automático
    - Escribir funciones `check_*` que llaman la función math + assert el invariante
    - Si Halmos encuentra counterexample → PoC inmediato (input exacto que rompe la propiedad)
    - NO usar para funciones con dependencias externas (oracles, callbacks) — solo math pura
@@ -298,6 +319,36 @@ EscalationHunter es especialmente relevante aquí porque el finding ES cross-com
 
 ---
 
+### Finding Queue — Gestión Automática de Findings Descubiertos
+
+**Variant Hunt, Cross-Component, y Hunter Spillover generan findings nuevos que entran en una cola para no interrumpir el componente actual:**
+
+```bash
+# Añadir variant finding
+python3 audit-agents/pipeline_gate.py --queue-finding --source variant --parent PL-M-01 --title "Same pattern in X" -c ComponentName --severity medium
+
+# Añadir cross-component finding
+python3 audit-agents/pipeline_gate.py --queue-finding --source cross-component --components "Vault,Gauge" --title "Interaction bug" --severity high
+
+# Ver la cola
+python3 audit-agents/pipeline_gate.py --list-queue
+
+# Actualizar estado de un item
+python3 audit-agents/pipeline_gate.py --queue-update PL-M-01-V1 --qstatus in_pipeline
+
+# Promover a findings activos (solo si status=completed)
+python3 audit-agents/pipeline_gate.py --queue-promote PL-M-01-V1
+```
+
+**Reglas de la cola:**
+- La cola se procesa ENTRE componentes, no interrumpiendo el componente actual
+- Cada item en la cola pasa por el FINDING PIPELINE COMPLETO antes de reportarse
+- Status lifecycle: `pending_pipeline` → `in_pipeline` → `completed` → `moved_to_findings` (o `dismissed`)
+- IDs auto-generados según origen: variants → `PL-M-01-V1`, cross-component → `XC-Gauge-Vault-01`, spillover → `MATH-Factory-01`
+- **PoC Fork Gate**: todas las PoCs deben usar `vm.createFork`/`vm.selectFork`. PoCs solo con mocks son rechazadas por el gate `poc`. Excepción: campo `pre_launch: true` en `current_hunt.json` (protocolo no deployado).
+
+---
+
 ### RULE #0: ONE COMPONENT AT A TIME — FINISH COMPLETELY BEFORE MOVING ON
 
 **This is the most important rule. NEVER skip to another component until the current one is 100% done.**
@@ -308,8 +359,13 @@ A component is DONE only when ALL of these are checked off:
 COMPONENT COMPLETION CHECKLIST (mandatory for each file):
 [ ] 1. FULL CODE READ — every line read and understood
 [ ] 2. PROTOCOL MODEL — what it does, money flows, trust boundaries documented
-[ ] 2.5. DEEPDIVE HUNTER — ejecutado secuencialmente tras los 7 hunters, máximo 5 hipótesis profundas
-[ ] 3. AI INVARIANTS GENERATED — 10-20 specific invariants in Chimera format
+[ ] 2.3. STATE MACHINE MODEL — generado por FlowHunter automáticamente:
+       └─ FlowHunter produce FSM en su hyp_*.yaml (estados, transiciones, anomalías)
+       └─ DeepDiveHunter lo consume en Sección 4 para buscar attack paths
+       └─ VERIFICAR que el FSM está en el output de FlowHunter antes de lanzar DeepDive
+       └─ Si FlowHunter no lo incluyó → DeepDiveHunter lo construye como fallback
+[ ] 2.5. DEEPDIVE HUNTER — ejecutado secuencialmente tras los 9 hunters, máximo 5 hipótesis profundas
+[ ] 3. AI INVARIANTS GENERATED — MINIMUM 10 specific invariants in Chimera format (no upper limit)
 [ ] 4. INVARIANTS ADDED TO Properties.sol — Solidity code, compiles
 [ ] 5. HANDLERS ADDED TO TargetFunctions.sol — all public functions covered
 [ ] 6. HANDLERS USE BOUNDARY VALUES — _clampAmount with 0, 1, max, edge cases
@@ -324,6 +380,40 @@ COMPONENT COMPLETION CHECKLIST (mandatory for each file):
 **DO NOT start reading the next component until all 13 boxes are checked.**
 **DO NOT skip any step. DO NOT say "we'll come back to it".**
 **If a step fails, FIX IT before moving on.**
+
+### ENFORCEMENT DETERMINISTA — pipeline_gate.py (OBLIGATORIO)
+
+**Ejecutar `pipeline_gate.py` en estos puntos exactos del pipeline:**
+
+```
+COMPONENT PIPELINE (10 gates):
+Antes de lanzar hunters:  python3 audit-agents/pipeline_gate.py -c <Component> --gate scope
+Después de 9 hunters:     python3 audit-agents/pipeline_gate.py -c <Component> --gate hunters
+Después de DeepDive:      python3 audit-agents/pipeline_gate.py -c <Component> --gate deepdive
+Después de merge:         python3 audit-agents/pipeline_gate.py -c <Component> --gate merge
+Después de forge build:   python3 audit-agents/pipeline_gate.py -c <Component> --gate compile
+Después de Foundry 5K:    python3 audit-agents/pipeline_gate.py -c <Component> --gate phase1
+Después de Medusa 15min:  python3 audit-agents/pipeline_gate.py -c <Component> --gate phase2
+Después de Fork test:     python3 audit-agents/pipeline_gate.py -c <Component> --gate phase3
+Después de Echidna:       python3 audit-agents/pipeline_gate.py -c <Component> --gate phase4
+Después de Halmos:        python3 audit-agents/pipeline_gate.py -c <Component> --gate phase5
+Antes de next component:  python3 audit-agents/pipeline_gate.py -c <Component> --status
+
+FINDING PIPELINE (6 gates):
+Después de PoC:           python3 audit-agents/pipeline_gate.py --finding <ID> --fgate poc
+Después de Escalation:    python3 audit-agents/pipeline_gate.py --finding <ID> --fgate escalation
+Después de Variant Hunt:  python3 audit-agents/pipeline_gate.py --finding <ID> --fgate variant
+Después de RedTeam:       python3 audit-agents/pipeline_gate.py --finding <ID> --fgate redteam
+Después de Verify Code:   python3 audit-agents/pipeline_gate.py --finding <ID> --fgate verify
+Después de ReportWriter:  python3 audit-agents/pipeline_gate.py --finding <ID> --fgate report
+Antes de enviar:          python3 audit-agents/pipeline_gate.py --finding <ID> --fgate reportable
+```
+
+**Si un gate falla → NO avanzar. Arreglar primero.** El gate es acumulativo: cada gate verifica todos los anteriores.
+**Si un gate no puede detectar evidencia automáticamente** (ej: Foundry se ejecutó pero no queda cache):
+```
+python3 audit-agents/pipeline_gate.py -c <Component> --mark phase1
+```
 
 Update HUNT_TRACKER.md with the component status after completing the checklist.
 
@@ -389,7 +479,7 @@ Tolerance guidelines:
 - **Corpus persistent** — save between sessions, seed with known attack patterns
 - **3 actors**: honest user, attacker (high balance), keeper/liquidator
 - **Every invariant must have an attack scenario** — if you can't describe how violating it causes fund loss, it's noise
-- **Compile-fix loop**: generate → compile → fix errors → recompile (max 3 retries)
+- **Compile-fix loop**: generate → compile → fix errors → recompile (max 9 retries — PropertyGPT demostró +24% compilabilidad con 9 vs 3)
 
 ---
 
@@ -441,9 +531,16 @@ FINDING PIPELINE — [NOMBRE DEL FINDING]
         └─ Si encuentra counterexample → PoC con input exacto
         ────────────────────────────────────────────────────────────────────
 
-[ ] 7.5 ESCALATION HUNTER (opcional) — ejecutar si el finding tiene interacciones
-        cross-component. Criterio: ¿afecta a más de un contrato? → ejecutar.
-        Siempre ejecutar si el finding viene de un cross-component hunt (RULE #0.5).
+[ ] 7.5 ESCALATION HUNTER (OBLIGATORIO) — ejecutar SIEMPRE para todo finding Medium+
+        └─ Analiza si el finding escala a mayor severidad por interacciones cross-component
+        └─ Incluso findings single-component pueden tener impacto amplificado vía composability
+        └─ Output: escalation_analysis en el hyp YAML (campo escalation_verdict)
+[ ] 7.6 VARIANT HUNT (OBLIGATORIO) — `/variant-hunt` después de cada finding confirmado
+        └─ Busca el MISMO root cause en todo el scope (todos los contratos, no solo el actual)
+        └─ Trail of Bits: 1 finding → 3-5 variantes en promedio
+        └─ Buscar: mismo patrón de missing validation, misma asimetría, mismo math error
+        └─ Cada variante encontrada entra como finding NUEVO en el pipeline desde paso 1
+        └─ NUNCA omitir — es la forma más eficiente de multiplicar findings
 [ ] 8.  REDTEAM — 4 atacantes (JUDGE/DEVIL/GUARD/ECONOMIST), Ronda 0 siempre incluida
         └─ Ronda 0 es obligatoria para TODA severidad (también Low/Info) — calibra antes de atacar
         └─ Resultado debe ser REPORT o REPORT_DOWNGRADED (no DO_NOT_REPORT)
@@ -463,19 +560,41 @@ RESULTADO: [ ] APTO PARA REPORTE  /  [ ] BLOQUEADO — faltan etapas: [lista]
 **Si cualquier etapa tiene ❌, Claude debe decir:**
 > "⛔ [Finding X] NO puede reportarse. Falta(n): [etapa(s)]. Ejecutar antes de continuar."
 
+### ENFORCEMENT DETERMINISTA — pipeline_gate.py para findings (OBLIGATORIO)
+
+**ANTES de escribir un reporte, ejecutar:**
+```
+python3 audit-agents/pipeline_gate.py --finding <ID> --status
+```
+
+**Después de cada etapa del finding pipeline:**
+```
+Después de PoC:           pipeline_gate.py --finding <ID> --fgate poc
+Después de Escalation:    pipeline_gate.py --finding <ID> --fgate escalation
+Después de Variant Hunt:  pipeline_gate.py --finding <ID> --fgate variant
+Después de RedTeam:       pipeline_gate.py --finding <ID> --fgate redteam
+Después de Verify Code:   pipeline_gate.py --finding <ID> --fgate verify
+Después de ReportWriter:  pipeline_gate.py --finding <ID> --fgate report
+Después de report_finding: pipeline_gate.py --finding <ID> --fgate submit
+Antes de enviar a plataforma: pipeline_gate.py --finding <ID> --fgate reportable
+```
+
+**Si `--fgate reportable` falla → NO enviar a la plataforma.** Sin excepciones.
+
 **Secuencialidad del pipeline — IMPORTANTE:**
 - El orden de fuzzing es ESTRICTO: Phase 1 (mock) → Phase 2 (Medusa) → Phase 3 (fork+PoC) → Phase 4 (Echidna). No invertir fases.
 - Las etapas 3, 4, 5, 6, 7 (fuzzing completo) pueden considerarse un bloque — pero dentro del bloque el orden es fijo.
-- Secuencia obligatoria de gates: PoC (paso 6) → RedTeam (8) → Verify Code (9) → ReportWriter (10) → report_finding.py (11).
+- Secuencia obligatoria de gates: PoC (paso 6) → EscalationHunter (7.5) → Variant Hunt (7.6) → RedTeam (8) → Verify Code (9) → ReportWriter (10) → report_finding.py (11).
 
 **Etapas que pueden omitirse SOLO con justificación explícita declarada al usuario:**
 - Etapas 3/4/5/6/7 (fuzzing): si el finding es de lógica pura ya demostrada por PoC estático — declarar explícitamente y esperar confirmación del usuario
 - Etapa 7 (Echidna): si Medusa ya encontró el bug (no añade valor incremental)
 - Etapa 9 (verify code): si el protocolo NO está deployado (pre-launch) — documentar
-- Etapa 7.5 (EscalationHunter): si el finding es single-component sin interacciones externas
 
 **Etapas NUNCA omisibles para findings Medium+:**
 - Etapa 6 (PoC fork runnable) — sin PoC no hay finding
+- Etapa 7.5 (EscalationHunter) — SIEMPRE. Incluso single-component puede escalar vía composability
+- Etapa 7.6 (Variant Hunt) — NUNCA omitir. 1 finding → 3-5 variantes. Es el mayor multiplicador de ROI
 - Etapa 8 (RedTeam) — sin esto el reporte puede tener errores graves
 - Etapa 9 (verify code) — para no reportar bugs ya fixeados en el deployed
 
@@ -527,6 +646,20 @@ RESULTADO: [ ] APTO PARA REPORTE  /  [ ] BLOQUEADO — faltan etapas: [lista]
 - Reference similar real-world incidents
 - Propose simple fix
 - Only submit at >50% confidence
+
+## REGLA: Reportar Siempre que el Bug Sea Válido (Duplicados = Puntos)
+
+**En plataformas con leaderboard (Immunefi, Code4rena, Cantina):**
+
+1. **Un duplicado válido NO es un desperdicio** — da puntos de leaderboard, builds reputación, y abre puertas a programas invite-only y Whitehat Hall of Fame.
+2. **El cálculo de ROI incluye reputación, no solo dinero.** Peor caso de un report válido duplicado = $0 + puntos + señal de competencia.
+3. **Reporta TODO finding verificado con PoC sólido**, incluso si sospechas alta probabilidad de duplicado. La única razón para NO reportar es si el bug no es real o el PoC no funciona.
+4. **No autocensures por miedo a duplicados.** Especialmente en:
+   - Programas recién lanzados (<30 días) — el backlog de reports es pequeño
+   - Findings Critical/High — los puntos de leaderboard valen más
+   - Programas con KYC — menos hunters compiten, menos duplicados
+5. **El único costo real es el tiempo de preparar el PoC + report.** Si el bug es real y el PoC ya existe del pipeline de fuzzing, el costo marginal de reportar es bajo.
+6. **Prioriza por severidad, no por probabilidad de originalidad.** Un Critical duplicado da más puntos que un Medium original.
 
 ## What NOT to Do (Lessons from Day 1)
 
