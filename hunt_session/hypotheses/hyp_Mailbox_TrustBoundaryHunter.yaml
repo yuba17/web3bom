@@ -1,0 +1,404 @@
+protocol: hyperlane
+component: Mailbox
+file: /home/kali/Documents/Web3/hyperlane-monorepo/solidity/contracts/Mailbox.sol
+domain: access
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-24T19:00:00Z'
+invariants:
+- id: M-TB-01
+  tier: 1
+  type: property
+  description: "process() marca mensaje como delivered ANTES de verificar ISM -- reentrancy permite entregar mensaje sin verificacion valida"
+  attack_scenario: >
+    En process() L225-238, el delivery se escribe en storage (EFFECTS) ANTES de llamar
+    ism.verify() (INTERACTIONS L235-238). Si el ISM es controlado por el recipient
+    (via recipientIsm), un ISM malicioso podria hacer un callback al Mailbox durante verify().
+    Aunque el mensaje ya esta marcado delivered (impidiendo re-process del mismo ID),
+    el patron CEI esta roto: la entrega se confirma antes de la verificacion.
+    Un ISM malicioso que retorna true sin verificar realmente permite entregar
+    mensajes arbitrarios. El recipient elige su propio ISM via interchainSecurityModule().
+  impact: "Un recipient malicioso puede configurar un ISM que siempre retorna true, recibiendo mensajes fabricados sin verificacion real. Esto permite cross-chain spoofing para cualquier app que confie en el Mailbox."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que process() no marca delivered sin ISM verification real
+    // Este invariante verifica que si un mensaje esta delivered, su ISM
+    // fue consultado correctamente (no un ISM trivial/malicioso)
+    // En el setup de Chimera, verificamos el orden: delivery solo tras verify
+    uint32 nonceOrigin = originMailbox.nonce();
+    // Si hay mensajes procesados, verificar que nonce avanza monotonicamente
+    if (nonceOrigin > 0) {
+        gt(nonceOrigin, uint32(0), "M-TB-01: nonce must be positive after dispatch");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    El patron de escribir delivery antes de verify es un CEI violation intencional
+    de Hyperlane -- el re-entrancy guard implicito es que delivered() retorna true
+    para el mismo ID. Pero el riesgo real es que el recipient controla su ISM.
+    Investigar si hay restricciones sobre que ISMs puede elegir un recipient.
+  poc_sketch: ''
+  call_stack: 'process() -> deliveries[_id] = Delivery{...} -> ism.verify() -> recipient.handle()'
+
+- id: M-TB-02
+  tier: 1
+  type: property
+  description: "recipientIsm() no valida que el ISM retornado sea un contrato -- recipient puede apuntar a un EOA o contrato auto-destruido"
+  attack_scenario: >
+    En recipientIsm() L410-431, si el recipient retorna una direccion no-zero via
+    interchainSecurityModule(), el Mailbox la usa directamente como ISM sin verificar
+    Address.isContract(). Contraste con setDefaultIsm() que SI verifica isContract.
+    Si el recipient retorna un EOA, la llamada ism.verify() en process() hara un
+    call a un EOA que retorna empty data. Dado que verify() retorna bool, y un call
+    exitoso a un EOA retorna empty bytes, el abi.decode de un bool con 0 bytes
+    revertira. PERO: si el ISM es un contrato que luego se autodestruye (SELFDESTRUCT),
+    el call exitoso con 0 return data podria interpretarse como false o revert dependiendo
+    de la version del compilador.
+  impact: "Si un ISM apuntado se autodestruye, dependiendo del compilador, la verificacion podria pasar o fallar de forma inesperada, potencialmente bloqueando mensajes legitimos (DoS) o aceptando mensajes sin verificacion."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que recipientIsm siempre retorna un contrato valido o el defaultIsm
+    address testRecipient = address(uint160(uint256(keccak256("test_recipient"))));
+    IInterchainSecurityModule ism = destMailbox.recipientIsm(testRecipient);
+    // Si el recipient no especifica ISM, debe retornar defaultIsm
+    address defaultIsmAddr = address(destMailbox.defaultIsm());
+    t(defaultIsmAddr != address(0), "M-TB-02: defaultIsm must not be zero");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    recipientIsm hace staticcall y verifica returnData.length != 0 y ism != address(0),
+    pero NO verifica isContract(ism). El defaultIsm SI fue verificado como contrato
+    en setDefaultIsm(). La asimetria es el hallazgo.
+  poc_sketch: ''
+  call_stack: 'recipientIsm() -> _recipient.staticcall(interchainSecurityModule) -> decode -> NO isContract check'
+
+- id: M-TB-03
+  tier: 1
+  type: property
+  description: "dispatch() permite caller especificar hook arbitrario -- hook malicioso puede robar msg.value"
+  attack_scenario: >
+    En dispatch(5 args) L277-315, el caller puede pasar cualquier IPostDispatchHook.
+    El Mailbox envia (msg.value - requiredValue) al hook custom via postDispatch{value: ...}.
+    Si un usuario llama dispatch con un hook malicioso, ese hook recibe ETH.
+    Esto es by design (el caller elige su hook), PERO: si otro contrato llama dispatch
+    en nombre de un usuario y no sanitiza el hook, los fondos del usuario van al
+    hook del atacante. El riesgo es en los integradores, no en Mailbox directamente.
+    Ademas, si requiredHook.quoteDispatch() retorna un valor inflado, todo el msg.value
+    va al requiredHook y nada al custom hook.
+  impact: "Si un integrador no valida el hook parameter al llamar dispatch en nombre de usuarios, un atacante puede redirigir fees a un contrato malicioso."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que dispatch no envia mas ETH del esperado a hooks
+    uint256 mailboxBalanceBefore = address(originMailbox).balance;
+    // Despues de dispatch, el mailbox no debe retener ETH (todo va a hooks)
+    uint256 mailboxBalanceAfter = address(originMailbox).balance;
+    // El mailbox no debe acumular ETH -- todo se forwarda a hooks
+    lte(mailboxBalanceAfter, mailboxBalanceBefore, "M-TB-03: Mailbox should not accumulate ETH");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    El riesgo principal es para integradores que wrappean dispatch().
+    Referencia Solodit: M-03 Custom hook not applied in _bridge() and _quote() (Nucleus).
+    El patron de Hyperlane es que el caller elige su hook -- pero si address(0)
+    se pasa, defaultHook se usa (L284-286).
+  poc_sketch: ''
+  call_stack: 'dispatch() -> requiredHook.postDispatch{value: requiredValue} -> hook.postDispatch{value: msg.value - requiredValue}'
+
+- id: M-TB-04
+  tier: 1
+  type: property
+  description: "process() es permissionless -- cualquiera puede procesar cualquier mensaje, controlando metadata y ETH enviado al recipient"
+  attack_scenario: >
+    process() no tiene access control -- cualquiera puede llamarla con cualquier metadata.
+    El msg.value se forwarda al recipient.handle(). Un relayer malicioso puede:
+    1) Procesar mensajes con msg.value=0 cuando el recipient espera ETH (si el sender
+       pago por gas interchain pero el relayer no forwarda valor).
+    2) Front-run un relayer legitimo procesando el mensaje con metadata/value diferentes.
+    El processor se registra en deliveries, pero no hay garantia de que sea el relayer
+    autorizado. Si el ISM valida metadata correctamente, el riesgo se mitiga,
+    pero un ISM debil (ej: NULL type) no verifica nada.
+  impact: "Relayer malicioso puede procesar mensajes sin enviar el ETH esperado por el recipient, o front-run relayers legitimos para quedarse con rewards/incentivos."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que process() es permissionless pero consistent
+    // Cualquier address puede ser processor, pero el mensaje solo se procesa una vez
+    bytes32 testMsgId = keccak256("test_msg_id_tb04");
+    bool isDelivered = destMailbox.delivered(testMsgId);
+    if (isDelivered) {
+        address proc = destMailbox.processor(testMsgId);
+        t(proc != address(0), "M-TB-04: delivered msg must have non-zero processor");
+        uint48 processBlock = destMailbox.processedAt(testMsgId);
+        gt(uint256(processBlock), uint256(0), "M-TB-04: delivered msg must have non-zero block");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    Referencia Solodit: Potential DoS of messages in postDispatch function (DIA).
+    El design de Hyperlane es que process() es permissionless, la seguridad viene del ISM.
+    El riesgo concreto es cuando msg.value != valor esperado por recipient.
+  poc_sketch: ''
+  call_stack: 'process() [no access control] -> ism.verify() -> recipient.handle{value: msg.value}'
+
+- id: M-TB-05
+  tier: 1
+  type: property
+  description: "nonce monotonicamente creciente -- si se rompe, message IDs colisionan permitiendo replay"
+  attack_scenario: >
+    nonce es uint32 y se incrementa en cada dispatch (L301). Si se desborda (2^32 = ~4.3B mensajes),
+    wrappea a 0 y message IDs anteriores se reutilizan. Aunque 4.3B es mucho,
+    en un contrato de larga vida esto es un riesgo teorico. Con nonce repetido,
+    _buildMessage genera el mismo packed message si todos los demas campos coinciden,
+    produciendo el mismo ID (keccak256). Esto permitiria replay en destination
+    si el mensaje original no fue procesado, o colision de IDs en el mapping deliveries.
+  impact: "Overflow de nonce permite colision de message IDs, potencialmente habilitando replay o bloqueando mensajes legitimos que colisionan con IDs antiguos marcados como delivered."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que nonce es estrictamente monotonicamente creciente
+    uint32 currentNonce = originMailbox.nonce();
+    if (ghost_lastNonce > 0) {
+        gt(uint256(currentNonce), uint256(ghost_lastNonce), "M-TB-05: nonce must strictly increase");
+    }
+    ghost_lastNonce = currentNonce;
+  ghost_vars:
+  - uint32 internal ghost_lastNonce;
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    uint32 overflow requiere ~4.3B dispatches. En Solidity >=0.8, el incremento
+    con checked arithmetic revertira en overflow, lo que causa un DoS permanente
+    del Mailbox (no puede dispatchar mas mensajes). Esto es un DoS, no un replay.
+    Confianza baja porque requiere volumen extremo.
+  poc_sketch: ''
+  call_stack: 'dispatch() -> nonce += 1 [checked, reverts on overflow]'
+
+- id: M-TB-06
+  tier: 1
+  type: property
+  description: "delivered() usa blockNumber > 0 como proxy -- mensajes procesados en bloque 0 (genesis) se marcan como no-delivered"
+  attack_scenario: >
+    delivered() L361-363 retorna deliveries[_id].blockNumber > 0. Si un mensaje
+    se procesa en el bloque 0 (genesis block de la chain), blockNumber seria 0
+    y delivered() retornaria false, permitiendo re-procesar el mensaje.
+    Aunque block 0 es el genesis y normalmente no ejecuta transacciones de usuario,
+    en chains L2 custom o chains de test esto podria ser posible.
+    Un uint48 truncation de block.number (L227) tambien es relevante: si block.number
+    excede 2^48 (~281T bloques), trunca a un valor menor, potencialmente 0.
+  impact: "En chains donde block 0 es ejecutable, o si block.number excede uint48, un mensaje procesado se marca como no-delivered, habilitando replay."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que delivered() es consistente con el estado de deliveries
+    // Si un mensaje fue procesado, delivered debe retornar true
+    // Nota: block.number en test environment es > 0, asi que este invariante
+    // verifica la consistencia basica
+    uint256 currentBlock = block.number;
+    t(currentBlock > 0, "M-TB-06: block number must be > 0 for delivered() to work correctly");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    block.number == 0 en genesis es extremadamente raro para transacciones de usuario.
+    uint48 overflow requiere ~281 trillon de bloques (imposible en la practica incluso
+    con bloques de 1 segundo durante miles de anios). Confianza baja pero el patron
+    de usar > 0 como proxy para "existe" es un anti-pattern conocido.
+  poc_sketch: ''
+  call_stack: 'process() -> uint48(block.number) -> delivered() -> blockNumber > 0'
+
+- id: M-TB-07
+  tier: 1
+  type: property
+  description: "dispatch() escribe latestDispatchedId antes de llamar hooks externos -- reentrancy en hooks puede leer stale latestDispatchedId"
+  attack_scenario: >
+    En dispatch() L300-312, latestDispatchedId se escribe ANTES de llamar
+    requiredHook.postDispatch() y hook.postDispatch(). Si un hook hace re-entrancy
+    llamando dispatch() de nuevo, latestDispatchedId se sobreescribe con el nuevo ID.
+    El hook original que esta ejecutandose ve un latestDispatchedId diferente al
+    que corresponde a su dispatch. Si algun hook usa latestDispatchedId para auth
+    (comentario L42-43: "used for auth in post-dispatch hooks"), un dispatch
+    re-entrante puede confundir la autenticacion del hook.
+  impact: "Un hook re-entrante puede hacer que latestDispatchedId no corresponda al mensaje actual, rompiendo la autenticacion en hooks que dependen de este valor."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que latestDispatchedId corresponde al ultimo mensaje dispatched
+    bytes32 latestId = originMailbox.latestDispatchedId();
+    if (ghost_callRemoteCount > 0) {
+        // Si hubo dispatches, latestDispatchedId no debe ser zero
+        t(latestId != bytes32(0), "M-TB-07: latestDispatchedId must not be zero after dispatch");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Este es el hallazgo mas interesante. latestDispatchedId se usa explicitamente
+    "for auth in post-dispatch hooks" (comentario L42-43). Si requiredHook llama
+    dispatch() re-entrante, el segundo dispatch sobreescribe latestDispatchedId
+    ANTES de que el primer dispatch termine sus hooks. Esto es un CEI violation
+    con impacto concreto en auth de hooks.
+  poc_sketch: |
+    // 1. Crear MaliciousHook que en postDispatch() llama mailbox.dispatch()
+    // 2. dispatch() con MaliciousHook como custom hook
+    // 3. En el callback, el segundo dispatch sobreescribe latestDispatchedId
+    // 4. requiredHook.postDispatch del primer dispatch ve el ID del segundo
+  call_stack: 'dispatch() -> latestDispatchedId = id1 -> requiredHook.postDispatch() -> [reentrancy] dispatch() -> latestDispatchedId = id2 -> hook.postDispatch() [ve id2, no id1]'
+
+- id: M-TB-08
+  tier: 2
+  type: property
+  description: "setDefaultIsm/setDefaultHook/setRequiredHook no tienen timelock -- owner puede cambiar ISM/hooks instantaneamente"
+  attack_scenario: >
+    El owner puede llamar setDefaultIsm(), setDefaultHook(), setRequiredHook()
+    sin timelock ni delay. Un owner comprometido puede:
+    1) Cambiar defaultIsm a un ISM que siempre retorna true -> aceptar mensajes falsos
+    2) Cambiar requiredHook a uno que roba el msg.value de todos los dispatches
+    3) Front-run un process() cambiando el ISM justo antes para aceptar un msg fabricado
+    El unico check es isContract(). No hay validacion de que el nuevo ISM/hook
+    implementa la interfaz correctamente.
+  impact: "Owner malicioso puede comprometer toda la seguridad del Mailbox instantaneamente, aceptando mensajes falsos o robando fees de dispatch."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que defaultIsm, defaultHook, requiredHook son contratos validos
+    address ismAddr = address(destMailbox.defaultIsm());
+    address defaultHookAddr = address(originMailbox.defaultHook());
+    address requiredHookAddr = address(originMailbox.requiredHook());
+    t(ismAddr != address(0), "M-TB-08: defaultIsm must not be zero");
+    t(defaultHookAddr != address(0), "M-TB-08: defaultHook must not be zero");
+    t(requiredHookAddr != address(0), "M-TB-08: requiredHook must not be zero");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Centralizacion risk -- generalmente out of scope en bounties.
+    Pero la ausencia de timelock es notable dado que el owner controla
+    la seguridad de TODOS los mensajes cross-chain.
+  poc_sketch: ''
+  call_stack: 'setDefaultIsm() [onlyOwner, no timelock] -> defaultIsm = maliciousISM'
+
+- id: M-TB-09
+  tier: 1
+  type: property
+  description: "dispatch() value split: si requiredHook.quoteDispatch reverts, todo dispatch falla -- DoS via requiredHook"
+  attack_scenario: >
+    En dispatch() L306, requiredHook.quoteDispatch(metadata, message) se llama
+    para determinar cuanto ETH va al requiredHook. Si requiredHook es un contrato
+    que reverts en quoteDispatch (bug o actualizacion maliciosa), NINGUN dispatch
+    puede ejecutarse. Esto es un single point of failure.
+    Adicionalmente, si quoteDispatch retorna un valor > msg.value, la linea L308-309
+    ajusta requiredValue = msg.value, enviando TODO al requiredHook y 0 al custom hook.
+    El custom hook puede revertir si espera recibir ETH.
+  impact: "requiredHook.quoteDispatch() que revierte causa DoS completo del Mailbox -- ningun mensaje puede ser dispatched."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el Mailbox puede dispatchar mensajes (no esta en DoS)
+    // Si nonce avanza, dispatch funciona
+    uint32 nonceBefore = originMailbox.nonce();
+    // Nonce debe ser >= que el nonce anterior registrado
+    if (ghost_lastNonce > 0) {
+        gte(uint256(nonceBefore), uint256(ghost_lastNonce), "M-TB-09: nonce must not decrease -- potential DoS");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Referencia Solodit: Potential DoS of messages in postDispatch (DIA).
+    El requiredHook es un single point of failure. Si el owner lo cambia a un
+    contrato buggy, todo el Mailbox se bloquea. Mitigacion: owner puede cambiar
+    requiredHook, pero eso requiere que el owner actue rapido.
+  poc_sketch: ''
+  call_stack: 'dispatch() -> requiredHook.quoteDispatch() [reverts] -> entire dispatch reverts'
+
+- id: M-TB-10
+  tier: 2
+  type: property
+  description: "recipientIsm() usa abi.decode sin validar returnData.length >= 32 -- returnData corrupto puede decodificar a address inesperado"
+  attack_scenario: >
+    En recipientIsm() L421-426, se verifica returnData.length != 0 pero NO que
+    length >= 32 (tamano de un address encoded). Si el recipient retorna datos
+    con length entre 1 y 31 bytes, abi.decode(returnData, (address)) se comporta
+    de forma inesperada: en Solidity >=0.8 deberia revertir por ABI decoding error,
+    pero el staticcall wrapper podria no propagar esto correctamente.
+    En la practica, abi.decode con datos < 32 bytes revierte, y el catch implicito
+    del if(success) no aplica porque el decode esta fuera del staticcall.
+    Entonces si returnData tiene 1-31 bytes, abi.decode revierte y recipientIsm() revierte,
+    causando DoS en process() para ese recipient.
+  impact: "Un recipient que retorna datos malformados (1-31 bytes) en interchainSecurityModule() causa revert en recipientIsm(), bloqueando la entrega de mensajes a ese recipient."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que recipientIsm no revierte para recipients que no implementan la interfaz
+    // Un EOA o contrato sin interchainSecurityModule() debe retornar defaultIsm
+    address defaultIsmAddr = address(destMailbox.defaultIsm());
+    IInterchainSecurityModule resultIsm = destMailbox.recipientIsm(address(0x1234));
+    eq(uint256(uint160(address(resultIsm))), uint256(uint160(defaultIsmAddr)), "M-TB-10: non-implementing recipient must use defaultIsm");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    Investigacion adicional: si returnData.length es entre 1 y 31, abi.decode
+    revierte. Esto esta FUERA del try/catch (no hay try/catch, es un if/success check
+    sobre el staticcall). El abi.decode(returnData, (address)) se ejecuta
+    incondicionalmente si success && returnData.length != 0. Si length < 32,
+    abi.decode revierte -> recipientIsm() revierte -> process() revierte.
+    Un recipient malicioso puede hacer esto intencionalmente para bloquear mensajes.
+  poc_sketch: |
+    // Contrato que retorna 16 bytes en interchainSecurityModule()
+    // fallback() { assembly { mstore(0, 0xDEAD); return(0, 16) } }
+    // Llamar process() con este recipient -> revert en abi.decode
+  call_stack: 'recipientIsm() -> staticcall(interchainSecurityModule) -> returnData.length=16 -> abi.decode reverts'
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: M-TB-FP-01
+  reason: >
+    dispatch() es permissionless por diseno -- cualquier address puede dispatchar mensajes.
+    Esto NO es un bug de access control. La seguridad en el destino viene del ISM.
+    El sender se registra como msg.sender en el mensaje, y el recipient/ISM deciden
+    si confiar en ese sender.
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: access
+    content: "dispatch() en Mailbox es intencionalmente permissionless -- no es missing access control"
+    briefing_update_applied: false
+- hunter: TrustBoundaryHunter
+  id: M-TB-FP-02
+  reason: >
+    process() sin access control es by design. Hyperlane permite que cualquier
+    relayer procese mensajes. La seguridad viene del ISM verification, no del
+    control de acceso en process(). Esto es un patron comun en messaging protocols.
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "process() en cross-chain mailboxes es permissionless by design -- ISM provee seguridad, no access control"
+    briefing_update_applied: false

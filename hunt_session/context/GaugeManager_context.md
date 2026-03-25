@@ -1,100 +1,110 @@
 # Contexto de Hunt — GaugeManager
 
-**Protocolo**: revert-lend
-**Dominio**: staking
-**LOC**: 447
-**Archivo**: /home/kali/Documents/Web3/revert-lend/src/GaugeManager.sol
-**Generado**: 2026-03-21T03:09:09.897352Z
+**Protocolo**: chainlink-pa-v2
+**Dominio**: dex
+**LOC**: 0
+**Archivo**: None
+**Generado**: 2026-03-22T05:05:51.078124Z
 
 ## Solodit Context
-Buscando 'staking' [SQLite FTS5] (dominio: staking)...
+### Findings sobre GaugeManager
+Buscando 'GaugeManager' [SQLite FTS5] (dominio: general)...
 
-Top 5 findings relevantes: (16ms)
+Top 5 findings relevantes: (4ms)
 
- 1. [LOW] StakedSui Object Merge — Volo
- 2. [LOW] Limit Bypass via stake_coins — Tortuga
- 3. [LOW] Limit Bypass Through Stake Coins Invocation — Tortugal TIP
- 4. [LOW] Incorrect Removal Of Pending Deposit Stake — Hubble Farms
- 5. [LOW] Validator deactivation / reactivation does not consider next_delta_stake during  — Monad
+ 1. [MEDIUM] [M-09] CL gauge accepts unverified pools, allowing malicious pool to brick distr — Hybra Finance
+ 2. [LOW] [11] Governance/centralization Risks (21 contracts covered) — Audit 507
+ 3. [LOW] [07] `distributeAll()` function at risk of repeated failure due to unbounded loo — Audit 507
+ 4. [GAS] [G-17] A modifier used only once and not being inherited should be inlined to sa — Maia DAO Ecosystem
+ 5. [MEDIUM] [M-18] Status does not update inside the `BlackGovernor` leading to complete dis — Audit 507
 
 ============================================================
 
 ## Findings Similares de Solodit (contexto para hunters)
-Componente: GaugeManager | Dominio: staking
+Componente: GaugeManager | Dominio: general
 Los siguientes 5 findings de protocolos similares son relevantes:
 
-1. [LOW] StakedSui Object Merge (Volo)
-   ## Staking Pool Functionality
+1. [MEDIUM] [M-09] CL gauge accepts unverified pools, allowing malicious pool to brick distribution (Hybra Finance)
+   
 
-## Description
-`staking_pool::join_staked_sui` facilitates the merging of Staked Sui objects when their metadata matche...
+*This issue was also [found](https://code4rena.com/audits/2025-10-hybra-finance/submissions/S-631) by [V12](https://v12.zellic.io).*
 
-2. [LOW] Limit Bypass via stake_coins (Tortuga)
-   ## Stake Router Overview
+* `GaugeManage...
 
-The `stake_router` provides two entrypoints to stake coins:
+2. [LOW] [11] Governance/centralization Risks (21 contracts covered) (Audit 507)
+   
+### Roles/Actors in the system
 
-- **`stake_router::stake_coins`**: A permissionless staking end...
+|  | Contract | Roles/Actors |
+| --- | --- | --- |
+| 1. | Black.sol | Minter |
+| 2. | BlackClaims.sol | Owner/Second ...
 
-3. [LOW] Limit Bypass Through Stake Coins Invocation (Tortugal TIP)
-   ## Stake Router Overview
+3. [LOW] [07] `distributeAll()` function at risk of repeated failure due to unbounded loop over gauges (Audit 507)
+   
+<https://github.com/code-423n4/2025-05-blackhole/blob/92fff849d3b266e609e6d63478c4164d9f608e91/contracts/GaugeManager.sol# L341>
 
-The `stake_router` provides two entry points to stake coins:
+### Finding descrip...
 
-- **`stake_router::stake_coins`**  
-  A permissionless staking...
+4. [GAS] [G-17] A modifier used only once and not being inherited should be inlined to save gas (Maia DAO Ecosystem)
+   
+When a modifier is used only once and is not inherited by any other contracts, inlining it can reduce gas costs. Inlining means that the modifier's c...
 
-4. [LOW] Incorrect Removal Of Pending Deposit Stake (Hubble Farms)
-   ## Stake Operations Overview
+5. [MEDIUM] [M-18] Status does not update inside the `BlackGovernor` leading to complete distribution of nudge functionality (Audit 507)
+   
 
-In `stake_operations`, `convert_stake_to_amount` converts a stake (represented as a decimal) into an equivalent amount o...
+<https://github.com/code-423n4/2025-05-blackhole/blob/main/contracts/governance/Governor.sol# L308-L330>
 
-5. [LOW] Validator deactivation / reactivation does not consider next_delta_stake during the boundary pe- (Monad)
-   ## Risk Assessment
+### Finding description and impact
 
-**Severity:** Low Risk
-
-**Context:** No context files were provided by the reviewer.
-
-## Description
-
-Issue found in commit hash `...
+`Minte...
 
 INSTRUCCIÓN: Estos patrones han sido explotados en protocolos similares.
 Verifica si el componente actual tiene las mismas vulnerabilidades.
 
 
+### HIGH findings en dominio dex
+Buscando 'GaugeManager' [SQLite FTS5] (dominio: dex)...
+Sin resultados para los criterios dados. (1ms)
+
+### Cross-domain HIGH relevantes
+Buscando 'GaugeManager' [SQLite FTS5] (dominio: general)...
+Sin resultados para los criterios dados. (1ms)
+
 ## Briefing del Dominio
+### Briefing principal: dex
 ## PATRONES CONOCIDOS (busca primero estos)
-### 1.1 Reward-Per-Share Rounding Exploitation
-### 1.2 Stake Just Before Distribution (Timing Attack)
-### 1.3 Reward Donation Inflation
-### 1.4 Double-Claim Prevention Failure
-### 1.5 Cooldown / Unstake Bypass
-### 1.6 Reward Token Exhaustion / Insolvency
-### 1.9 ERC721 Position Staking (Gauge Style)
-### 2.1 Cross-Function Reentrancy in Staking
-### 2.2 Emergency Withdraw Accounting Break
+### 1.1 Constant Product Invariant Violation
+### 1.2 LP Token Mint/Burn Ratio Desync
+### 1.3 Price Impact Manipulation (Thin Liquidity)
+### 1.4 Sandwich Attack Amplification
+### 1.5 TWAP Oracle Manipulation
+### 1.6 Concentrated Liquidity Tick Boundary Errors
+### 1.7 Swap Deadline Missing
+### 1.8 Slippage Protection Bypass
+### 2.1 Flash Loan + AMM State Manipulation
+### 2.2 Fee Accounting Mismatch
 
 ## TRAMPAS — NO pierdas tiempo en esto
-  ⚠ 1 wei rounding per operation is generally not exploitable unless repeatable cheaply
-  ⚠ Penalty mechanisms may intentionally reduce effective rewards — not a rounding bug
-  ⚠ Rebasing staking tokens naturally cause accumulator drift
-  ⚠ Contracts without lock periods are vulnerable by design — confirm this is unintentional
-  ⚠ Linear distribution (Synthetix rewardsDuration) mitigates single-block extraction but not multi-block flash loans
-  ⚠ Private mempool (Flashbots) reduces but does not eliminate risk
-  ⚠ Protocols with same staking and reward token are more vulnerable
-  ⚠ Some protocols intentionally accept donations as extra yield — verify design intent
-  ⚠ Virtual shares offset mitigates share-price inflation but not reward accumulator inflation
-  ⚠ Standard Synthetix pattern is safe IF modifiers are applied correctly
-  ⚠ ERC-20 transfers (no hooks) do not enable reentrancy — only flag for ERC-777 or native ETH
-  ⚠ Leftover rewards from previous epoch rolled into new epoch is expected in some designs
+  ⚠ Fees intentionally reduce output — k must increase by fee amount, not stay flat
+  ⚠ Virtual reserves in concentrated liquidity mean k is per-range, not global
+  ⚠ Rebasing tokens break the invariant naturally — pool must handle rebase
+  ⚠ UniV2 MINIMUM_LIQUIDITY (1000 wei) prevents first-depositor attack
+  ⚠ Fee-on-transfer tokens cause natural desync — protocol must use actual received amounts
+  ⚠ Imbalanced deposits in multi-asset pools intentionally cost more (swap fee applies)
+  ⚠ High liquidity pools (>$10M TVL) are expensive to manipulate for spot reads
+  ⚠ TWAP with short window (< 10 min) is still manipulable across multiple blocks
+  ⚠ Chainlink with proper staleness checks is generally safe
+  ⚠ Private mempools (Flashbots) partially mitigate but do not eliminate risk
+  ⚠ Protocols computing slippage from oracle price internally may be acceptable
+  ⚠ L2s with sequencer ordering have reduced but nonzero sandwich risk
 
 ## CHECKLIST DE INVARIANTES
 | ID | Invariant | Tier | Source |
 |----|-----------|------|--------|
-| INV-STAKE-001 | totalStaked == sum(balanceOf(all_stakers)) | 1 | reward_distribution.json |
-| INV-STAKE-002 | rewardPerToken monotonically increases | 1 | reward_distribution.json |
-| INV-STAKE-003 | claimed <= earned(user) at call time | 1 | reward_distribution.json |
-| INV-STAKE-004 | unstake(amount) reduces balance by exactly amount | 2 | reward_distribution.json |
-| INV-STAKE-005 | unstake r
+| DEX-INV-001 | k_after >= k_before for every swap | 1 | constant product |
+| DEX-INV-002 | LP mint-then-burn returns <= deposited | 1 | share math |
+| DEX-INV-003 | reserve0 * reserve1 monotonically non-decreasing | 1 | core AMM |
+| DEX-INV-004 | sum(LP balances) == LP totalSupply | 1 | token accounting |
+| DEX-INV-005 | actual token balances >= internal reserves | 1 | INV-EXPLOIT-012 |
+| DEX-INV-006 | amountOut >= amountOutMin (when set > 0)

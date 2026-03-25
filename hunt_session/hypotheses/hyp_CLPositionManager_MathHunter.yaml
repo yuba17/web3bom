@@ -1,0 +1,262 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: MathHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: CLPM-01
+  tier: 1
+  type: property
+  description: "Burn de posición con liquidity=0 pierde fees acumuladas: _burn() solo llama modifyLiquidity si liquidity > 0, pero fees pueden acumularse en el pool manager para posiciones con 0 liquidity (por actividad de otros LPs en el mismo tick range). Esos fees se pierden para siempre."
+  attack_scenario: "Un LP hace _decrease() para sacar toda su liquidez (liquidity→0). Luego, mientras su posición sigue existiendo (NFT no quemado), se acumulan fees en el pool manager por swaps en su tick range. Cuando llama _burn(), el path liquidity==0 salta modifyLiquidity completamente (línea 378), los fees quedan atrapados en el pool manager sin beneficiario. Pérdida directa de fondos para el LP."
+  impact: "Pérdida de fees acumuladas para cualquier LP que haga decrease-to-zero y luego burn. En pools activos con tick ranges estrechos, las fees pueden ser significativas."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Setup: position con liquidity > 0, acumula fees, decrease a 0, espera más fees, burn
+    // Si las fees reportadas en el burn son 0 cuando debían ser > 0, el invariante falla
+    // Ghost: track fees accrued pre-decrease vs fees returned on burn
+    uint256 tokenId = ghost_zeroLiquidityTokenId;
+    if (tokenId != 0) {
+        (PoolKey memory poolKey, CLPositionInfo info) = clPositionManager.getPoolAndPositionInfo(tokenId);
+        uint128 liq = clPositionManager.getPositionLiquidity(tokenId);
+        // Si liquidity es 0 y hay fees pendientes en el pool, burn las pierde
+        if (liq == 0) {
+            // modifyLiquidity con delta=0 debería recoger fees
+            // pero _burn() no lo llama cuando liq==0
+            t(false, "CLPM-01: position with 0 liq will lose pending fees on burn");
+        }
+    }
+  ghost_vars:
+  - "uint256 internal ghost_zeroLiquidityTokenId;"
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "Línea 378 del contrato: if (liquidity > 0). Cuando liquidity==0, no se llama modifyLiquidity y feesAccrued queda en su valor default (0). Las fees reales en el pool manager no se reclaman. Esto es un diseño intencional en Uniswap V4 (se espera que el usuario haga increase(0) para recoger fees antes de burn), pero es una trampa sutil para integradores y usuarios. Verificar si hay documentación que lo advierta."
+
+- id: CLPM-02
+  tier: 1
+  type: property
+  description: "Truncamiento uint160 en _pay() puede causar transferencia parcial: permit2.transferFrom usa uint160(amount), si amount > type(uint160).max se trunca silenciosamente y se transfiere menos de lo esperado."
+  attack_scenario: "Si por alguna combinación de operaciones batched el amount a pagar supera 2^160-1 (1.46e48), la llamada a permit2.transferFrom trunca el valor y se transfiere un monto menor. El vault recibe menos tokens de los que espera, pero marca la deuda como saldada. Esto requiere amounts astronómicos, pero en tokens con 18 decimales y supplies muy grandes (rebasing tokens, etc.) podría ser alcanzable teóricamente."
+  impact: "Pérdida de fondos del vault — recibe menos tokens de los pagados según la contabilidad interna."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que amount nunca excede uint160 max en _pay
+    uint256 amount = ghost_lastPayAmount;
+    if (amount > type(uint160).max) {
+        t(false, "CLPM-02: _pay amount exceeds uint160, truncation risk");
+    }
+  ghost_vars:
+  - "uint256 internal ghost_lastPayAmount;"
+  validated: false
+  priority: low
+  confidence: 30
+  notes: "Línea 472: uint160(amount). En la práctica, ningún token ERC20 tiene supply > 2^160. Permit2 usa uint160 por diseño. Es un edge case teórico pero no práctico. Probablemente by-design dado que Permit2 limita amounts a uint160."
+
+- id: CLPM-03
+  tier: 1
+  type: property
+  description: "Round-trip rounding loss en _increaseFromDeltas / _mintFromDeltas: getLiquidityForAmounts() redondea DOWN al calcular liquidity desde amounts creditados, dejando residuo de tokens sin usar que quedan como crédito pendiente en el vault."
+  attack_scenario: "Un usuario deposita tokens via SETTLE, luego llama INCREASE_LIQUIDITY_FROM_DELTAS. getLiquidityForAmounts calcula liquidity redondeando hacia abajo. La diferencia entre los tokens creditados y los tokens realmente usados queda como crédito residual en el vault. Si el usuario no hace TAKE/CLOSE después, esos tokens quedan atrapados. En el peor caso, un atacante en un batch complejo podría explotar el residuo acumulado de múltiples operaciones."
+  impact: "Pérdida de dust por rounding en cada operación fromDeltas. Para low-decimal tokens (6 dec) con tick ranges estrechos, la pérdida por operación puede ser no trivial."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Después de _increaseFromDeltas, verificar que el crédito residual es mínimo
+    uint256 credit0 = vault.currencyDelta(address(clPositionManager), currency0) > 0
+        ? uint256(vault.currencyDelta(address(clPositionManager), currency0))
+        : 0;
+    uint256 credit1 = vault.currencyDelta(address(clPositionManager), currency1) > 0
+        ? uint256(vault.currencyDelta(address(clPositionManager), currency1))
+        : 0;
+    // Rounding loss should be at most 1 unit per token
+    lte(credit0, 1, "CLPM-03: excessive rounding residue token0");
+    lte(credit1, 1, "CLPM-03: excessive rounding residue token1");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: "getLiquidityForAmounts usa FullMath.mulDiv que redondea down. El residuo normalmente se maneja con CLOSE_CURRENCY o CLEAR_OR_TAKE después. El riesgo real es que el usuario olvide este paso en su batch. Es más un problema de UX/integración que un bug matemático, pero vale la pena fuzzear con tokens de 6 decimales."
+
+- id: CLPM-04
+  tier: 1
+  type: property
+  description: "Slippage check en _increase() sustrae feesAccrued del liquidityDelta antes de validar. Si feesAccrued es mayor que el delta esperado (fees enormes acumuladas), la sustracción puede producir un delta positivo que bypasea el check de MaxIn."
+  attack_scenario: "Una posición acumula fees enormes (pool muy activo, posición concentrada). Al hacer _increase() con una cantidad pequeña de liquidity, (liquidityDelta - feesAccrued) produce un delta positivo en ambos tokens. validateMaxIn (SlippageCheck.sol línea 43-52) solo verifica si amount < 0, y si es positivo NO revierte — el hook credit path. Esto significa que el usuario no tiene protección de slippage: podría pagar mucho más de amount0Max/amount1Max en la parte de liquidity, pero como los fees compensan el total, el check pasa."
+  impact: "Bypass de slippage protection en _increase cuando hay fees acumuladas grandes. El usuario podría aceptar un precio peor del esperado sin saberlo."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simular _increase con fees grandes: verificar que slippage aún protege
+    // Ghost: capturar liquidityDelta y feesAccrued por separado
+    int256 netAmount0 = ghost_lastLiqDelta0 - ghost_lastFeesAccrued0;
+    int256 netAmount1 = ghost_lastLiqDelta1 - ghost_lastFeesAccrued1;
+    // Si netAmount es positivo, validateMaxIn no protege
+    if (netAmount0 > 0 || netAmount1 > 0) {
+        // El usuario no tiene slippage protection real
+        // Verificar que liquidityDelta por sí solo no excede amountMax
+        int256 rawAmount0 = ghost_lastLiqDelta0;
+        if (rawAmount0 < 0 && uint128(uint256(-rawAmount0)) > ghost_lastAmount0Max) {
+            t(false, "CLPM-04: slippage bypassed due to fee subtraction");
+        }
+    }
+  ghost_vars:
+  - "int256 internal ghost_lastLiqDelta0;"
+  - "int256 internal ghost_lastLiqDelta1;"
+  - "int256 internal ghost_lastFeesAccrued0;"
+  - "int256 internal ghost_lastFeesAccrued1;"
+  - "uint128 internal ghost_lastAmount0Max;"
+  validated: false
+  priority: high
+  confidence: 60
+  notes: "validateMaxIn en SlippageCheck.sol línea 46-47: 'if (amount0 < 0 && amount0Max < ...)' — solo chequea si amount0 es negativo. Si (liquidityDelta - feesAccrued) da positivo, el check no se aplica. Esto es documentado como intencional para hooks que dan crédito, pero puede sorprender a usuarios que esperan protección absoluta de slippage en _increase."
+
+- id: CLPM-05
+  tier: 2
+  type: property
+  description: "poolId collision por truncamiento de bytes32 a bytes25: CLPositionInfoLibrary trunca el PoolId (keccak256 hash) de 256 bits a 200 bits. Dos pools diferentes podrían tener los mismos 200 bits superiores, causando que compartan el mismo PoolKey mapping."
+  attack_scenario: "Un atacante crea un pool con un PoolKey cuidadosamente crafteado tal que bytes25(keccak256(poolKey_malicious)) == bytes25(keccak256(poolKey_legitimate)). Si el pool legítimo se mintea primero, poolKeys[poolId] guarda su PoolKey. Luego el atacante intenta mint con el poolKey malicioso, pero info.poolId() colisiona → poolKeys[poolId] ya tiene datos → no se sobreescribe (línea 325). Pero getPoolAndPositionInfo devuelve el PoolKey del pool LEGÍTIMO para la posición del pool MALICIOSO. Esto confunde toda la lógica de modifyLiquidity."
+  impact: "Confusión total de pools — operaciones en un pool afectan a otro. Probabilísticamente inviable (2^-200 de colisión) pero el diseño es frágil."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que no hay colisión de poolId para pools diferentes
+    bytes25 pid = CLPositionInfoLibrary.initialize(poolKey, tickLower, tickUpper).poolId();
+    PoolKey memory stored = clPositionManager.poolKeys(pid);
+    if (stored.parameters != bytes32(0)) {
+        // Si ya hay un poolKey almacenado, debe ser idéntico
+        eq(keccak256(abi.encode(stored)), keccak256(abi.encode(poolKey)),
+           "CLPM-05: poolId collision detected");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 20
+  notes: "200 bits de hash es extremadamente difícil de colisionar (comparable a birthday attack en ~2^100 operaciones). Esto es by-design como trade-off de gas. No es un bug práctico, pero es un invariante útil para detectar si el truncamiento causa problemas inesperados."
+
+- id: CLPM-06
+  tier: 1
+  type: property
+  description: "nextTokenId overflow unchecked a 0: el incremento usa unchecked{}, si nextTokenId overflow a 0 (después de 2^256 mints), el siguiente mint usa tokenId=0 que puede colisionar con posiciones existentes o tener comportamiento indefinido."
+  attack_scenario: "Teóricamente imposible (requiere 2^256 mints) pero el uso de unchecked{} sin guard es un anti-patrón. Si de alguna forma se manipula nextTokenId (upgrade, storage collision), tokenId=0 podría ser asignado, y la posición info para tokenId=0 podría ya tener datos residuales."
+  impact: "Colisión de tokenId, posición de un usuario sobreescribe otra."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que nextTokenId nunca es 0 después de un mint
+    uint256 nxt = clPositionManager.nextTokenId();
+    t(nxt > 0, "CLPM-06: nextTokenId wrapped to 0");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 15
+  notes: "unchecked{} en línea 313-315. Prácticamente imposible por el costo de gas de 2^256 transacciones. Es más un finding informativo sobre el patrón."
+
+- id: CLPM-07
+  tier: 1
+  type: property
+  description: "getLiquidityForAmounts con price exactamente en tickLower boundary: cuando sqrtRatioX96 == sqrtRatioAX96, solo se usa amount0 (ignora amount1). Si el usuario deposita token1 esperando participar, su token1 queda como crédito no usado sin advertencia."
+  attack_scenario: "El precio actual está exactamente en tickLower. El usuario minta una posición con _mintFromDeltas depositando ambos tokens. getLiquidityForAmounts(sqrtPrice == sqrtRatioA) entra en el branch 'sqrtRatioX96 <= sqrtRatioAX96' y usa solo getLiquidityForAmount0. Todo el token1 depositado queda como crédito no consumido. Si el usuario no incluye CLOSE_CURRENCY para token1 en su batch, esos fondos quedan en el vault sin reclamar (accesibles para sweep por cualquiera con crédito)."
+  impact: "Pérdida de token1 depositado cuando price == tickLower. Para tokens de alto valor, la pérdida puede ser significativa."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que after _mintFromDeltas, no hay crédito residual significativo
+    // Este invariante requiere tracking del crédito antes y después de la operación
+    int256 delta0After = vault.currencyDelta(address(clPositionManager), currency0);
+    int256 delta1After = vault.currencyDelta(address(clPositionManager), currency1);
+    // Después de fromDeltas + settle, los deltas deberían estar cercanos a 0
+    // Un delta positivo grande indica tokens no usados
+    if (delta1After > int256(ghost_dustThreshold)) {
+        t(false, "CLPM-07: significant token1 residue after mintFromDeltas at tick boundary");
+    }
+  ghost_vars:
+  - "uint256 internal ghost_dustThreshold = 1000;"
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "Esto es comportamiento esperado de concentrated liquidity math — fuera del range, solo un token tiene valor. Pero fromDeltas no advierte al usuario. La protección está en amount0Max/amount1Max del _mint interno, pero el usuario ya depositó los tokens. Es más un problema de UX que un exploit directo, pero en batches automatizados por contratos integradores puede causar pérdida real."
+
+- id: CLPM-08
+  tier: 1
+  type: optimize
+  description: "Maximizar precision loss en getLiquidityForAmount0 con tokens de 6 decimales y tick ranges estrechos"
+  attack_scenario: "Con tokens de pocos decimales (USDC, 6 dec) y tick ranges muy estrechos, la conversión amount → liquidity → amount puede perder una fracción significativa del depósito. Un atacante podría explotar esto en un round-trip: mint con X tokens, immediate burn, recibir X-loss tokens. Si loss/X > fee, es un vector de extracción del pool."
+  impact: "Extracción de valor del pool vía rounding arbitrage en tokens de bajo decimal."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Optimizar: maximizar la diferencia entre tokens depositados y recibidos en round-trip
+    // mint(liquidity) → immediate decrease(all_liquidity) → medir loss
+    return int256(ghost_tokensDeposited0 + ghost_tokensDeposited1)
+         - int256(ghost_tokensReceived0 + ghost_tokensReceived1);
+  ghost_vars:
+  - "uint256 internal ghost_tokensDeposited0;"
+  - "uint256 internal ghost_tokensDeposited1;"
+  - "uint256 internal ghost_tokensReceived0;"
+  - "uint256 internal ghost_tokensReceived1;"
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: "getLiquidityForAmount0 usa FullMath.mulDiv (rounds down). getAmount0ForLiquidity también rounds down. Rounding en ambas direcciones favorece al protocolo. En Uniswap V3 esto es well-known y la pérdida es de 1 wei por token por operación. Fuzzear con USDC (6 dec) y tick ranges de 1-tick para verificar si la pérdida es mayor que dust."
+
+- id: CLPM-09
+  tier: 2
+  type: property
+  description: "clearOrTake con amountMax=0 siempre hace clear (dona al pool): si un usuario pasa amountMax=0 sin querer, cualquier crédito positivo se dona al vault en vez de retirarse."
+  attack_scenario: "En un batch de acciones, si un integrador pasa amountMax=0 a CLEAR_OR_TAKE por error de encoding, la condición 'delta <= amountMax' se evalúa como 'delta <= 0'. Como delta es uint256 de _getFullCredit (siempre >= 0), solo pasa si delta==0 (no-op). Esto es realmente seguro. DESCARTADO."
+  impact: "Sin impacto — el check es seguro."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que clearOrTake con amountMax=0 no pierde fondos
+    // delta (uint256) <= 0 solo es true si delta == 0, que es no-op
+    // SAFE
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 10
+  notes: "Analizado y descartado: delta es uint256, amountMax=0 solo matchea cuando delta==0. No hay pérdida."
+
+false_positives:
+- hunter: MathHunter
+  id: CLPM-FP-01
+  reason: "clearOrTake con amountMax=0 es seguro — delta es uint256, la comparación delta <= 0 solo es true cuando delta==0 (no-op). No hay riesgo de donación accidental."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "clearOrTake con amountMax=0 en PancakeSwap Infinity es no-op seguro — delta es uint256 de _getFullCredit, solo matchea 0."
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: CLPM-FP-02
+  reason: "uint160 truncation en _pay() es by-design: Permit2 usa uint160 para amounts, y ningún token ERC20 práctico tiene supply > 2^160. El cast es safe por las constraints del ecosystem."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Permit2 transferFrom usa uint160 amounts — es constraint del protocolo, no bug. No hay tokens con supply > 2^160."
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: CLPM-FP-03
+  reason: "nextTokenId unchecked overflow requiere 2^256 mints — físicamente imposible dado el gas cost. El unchecked{} es una optimización de gas aceptable."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "nextTokenId++ unchecked en position managers es gas optimization estándar — overflow requiere 2^256 mints, imposible."
+    briefing_update_applied: false

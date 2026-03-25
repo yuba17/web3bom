@@ -1,0 +1,240 @@
+protocol: chainlink-pa-v2
+component: GPV2CompatibleAuction
+file: src/GPV2CompatibleAuction.sol + src/BaseAuction.sol
+domain: dex
+hunter: MathHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: GPVCA-M01
+  tier: 1
+  type: property
+  description: "Rounding direction consistency: _getAssetOutAmount must always round UP (favoring protocol). For identical inputs, the assetOutAmount must never be lower than the mathematically exact value."
+  attack_scenario: "If rounding rounds DOWN instead of UP, a bidder or CowSwap solver pays slightly less LINK per token sold. Over many bids across many auctions, the protocol accumulates a deficit in LINK received vs fair value."
+  impact: "Accumulated rounding deficit in LINK received by protocol. Proportional to number of bids."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Compare _getAssetOutAmount output vs manual exact computation
+    // For same amountIn, same prices, same elapsed time:
+    uint256 result = auction.getAssetOutAmount(assetIn, amountIn, block.timestamp);
+    // Exact value = (amountIn * assetInPrice / 10^decimalsIn) * multiplier / 1e18 * 10^decimalsOut / assetOutPrice
+    // result must be >= ceil(exact) — verify with mulDivUp semantics
+    // If result < exact value (computed with higher precision), invariant is broken
+    // Test with dust amounts (1 wei, 2 wei) where rounding matters most
+    uint256 exactNumerator = amountIn * assetInUsdPrice * priceMultiplier * (10 ** assetOutDecimals);
+    uint256 exactDenominator = (10 ** assetInDecimals) * 1e18 * assetOutUsdPrice;
+    uint256 exactCeil = (exactNumerator + exactDenominator - 1) / exactDenominator;
+    gte(result, exactCeil, "GPVCA-M01: rounding went DOWN, should be UP");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 30
+  notes: "Investigated thoroughly. Solady mulDivUp and mulWadUp both round UP. The 3-step computation (mulDivUp -> mulWadUp -> mulDivUp) compounds rounding UP, meaning the protocol ALWAYS gets more than fair value. This invariant is unlikely to break but is the correct safety property to verify."
+
+- id: GPVCA-M02
+  tier: 2
+  type: property
+  description: "Dutch auction price monotonicity: as elapsedTime increases by 1 second, the priceMultiplier must decrease or stay the same (never increase)."
+  attack_scenario: "If priceMultiplier increases with time (even for 1 second), a bidder could time their bid to the local minimum before the jump, getting a cheaper price than intended. Then the price 'recovers' — breaking the Dutch auction guarantee."
+  impact: "Bidder gets tokens at below-intended price. Protocol receives less LINK."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For any two timestamps t1 < t2 within auction duration:
+    // getAssetOutAmount(asset, amount, auctionStart + t1) >= getAssetOutAmount(asset, amount, auctionStart + t2)
+    // (higher assetOutAmount means bidder pays MORE — which corresponds to higher price for the bidder)
+    uint256 outAt_t1 = auction.getAssetOutAmount(assetIn, amountIn, auctionStart + t1);
+    uint256 outAt_t2 = auction.getAssetOutAmount(assetIn, amountIn, auctionStart + t2);
+    if (t1 < t2) {
+        gte(outAt_t1, outAt_t2, "GPVCA-M02: price increased with time — monotonicity broken");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 20
+  notes: "The linear decay formula is: multiplier = starting - (starting - ending) * elapsed / duration. Using Solady mulDiv (rounds DOWN), the subtracted term is smaller → multiplier is larger. As elapsed increases, the subtracted term increases (monotonically, since mulDiv(t, D) is non-decreasing in t for fixed D). So multiplier is non-increasing. Extremely unlikely to break, but essential safety property."
+
+- id: GPVCA-M03
+  tier: 1
+  type: property
+  description: "CowSwap approval desync: after _onAuctionStart, the approval for the vault relayer equals balanceOf(this) at that moment. If tokens are donated to the contract after, isValidSignature can validate orders for amounts the relayer cannot actually transfer."
+  attack_scenario: "1) Auction starts, approval set to 1000 tokens. 2) Attacker donates 500 tokens to the contract. 3) Solver sees balance=1500, creates order for 1500 tokens. 4) isValidSignature passes (checks balance not approval). 5) Settlement fails because relayer only approved for 1000. 6) Solver wastes gas, auction potentially gets stuck if all solvers fail."
+  impact: "Liveness degradation — CowSwap solvers waste gas on orders that will fail. No direct fund loss."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After _onAuctionStart:
+    uint256 approval = IERC20(asset).allowance(address(auction), gpV2VaultRelayer);
+    uint256 balance = IERC20(asset).balanceOf(address(auction));
+    // If someone donates tokens after start:
+    // approval < balance is possible
+    // isValidSignature checks balance, not approval
+    // This means valid orders can be created that will fail on settlement
+    eq(approval, balance, "GPVCA-M03: approval != balance, CowSwap orders may fail");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: "Real issue but Low severity. The desync between what isValidSignature validates (balance check on L160-162) and what the relayer can actually transfer (limited by approval set at L92) creates a griefing vector. However, no fund loss occurs and the bid() path is unaffected. A well-behaved solver would check allowance before creating orders."
+
+- id: GPVCA-M04
+  tier: 2
+  type: property
+  description: "No minBidUsdValue enforcement on CowSwap path: isValidSignature does not check minimum bid value, unlike bid(). Dust orders (1 wei sellAmount) pass validation."
+  attack_scenario: "A malicious or buggy solver creates orders with 1 wei sellAmount. Due to mulDivUp rounding, the minBuyAmount rounds up to 1 wei LINK. For high-value tokens (e.g., WETH at $3000), 1 wei WETH (~$3e-15) is sold for 1 wei LINK (~$1.5e-17). Protocol loses ~$3e-15 per dust order. Not economically viable due to gas costs, but creates noise in settlement."
+  impact: "Negligible fund loss per order. Gas cost of CowSwap settlement far exceeds any value extracted."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // In isValidSignature, there is no equivalent of this check from bid():
+    // if (bidUsdValue < minBidUsdValue) revert BidValueTooLow(...)
+    // Verify: for sellAmount=1, isValidSignature should still return valid selector
+    // This is a design asymmetry between the two paths
+    // Test: call isValidSignature with a valid order where sellAmount = 1 wei
+    // It should pass all checks if buyAmount >= minBuyAmount (which is 1 wei due to rounding up)
+    uint256 minBuyForDust = auction.getAssetOutAmount(assetIn, 1, block.timestamp);
+    gte(minBuyForDust, 1, "GPVCA-M04: dust order produces 0 output — would be free tokens");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: "Confirmed design asymmetry. bid() has minBidUsdValue check (L431-435), isValidSignature does not. However, the rounding UP in _getAssetOutAmount means even 1 wei input produces 1 wei output, so there is no case where sellAmount > 0 produces minBuyAmount == 0 (which would be free tokens). The lack of minimum is likely intentional — CowSwap solvers are expected to batch efficiently."
+
+- id: GPVCA-M05
+  tier: 1
+  type: property
+  description: "Price boundary correctness: at elapsedTime=0, priceMultiplier must equal startingPriceMultiplier. At elapsedTime=auctionDuration, priceMultiplier must equal endingPriceMultiplier. At any time in between, endingPriceMultiplier <= priceMultiplier <= startingPriceMultiplier."
+  attack_scenario: "If the multiplier exceeds startingPriceMultiplier at t=0, the protocol demands more than intended (unfair to bidders, DoS if no one will pay). If it goes below endingPriceMultiplier, protocol gives too large a discount — fund loss."
+  impact: "Protocol could sell tokens at deeper discount than configured maximum, losing value."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // At t=0: multiplier = starting - (starting - ending) * 0 / duration = starting ✓
+    // At t=duration: multiplier = starting - (starting - ending) * duration / duration = ending ✓
+    // For 0 < t < duration: check bounds
+    uint256 outAtStart = auction.getAssetOutAmount(assetIn, amountIn, auctionStart);
+    uint256 outAtEnd = auction.getAssetOutAmount(assetIn, amountIn, auctionStart + auctionDuration);
+    uint256 outAtMid = auction.getAssetOutAmount(assetIn, amountIn, auctionStart + t);
+    gte(outAtStart, outAtMid, "GPVCA-M05: mid-auction price exceeds start price");
+    gte(outAtMid, outAtEnd, "GPVCA-M05: mid-auction price below end price");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 15
+  notes: "Mathematically proven correct by the linear formula. mulDiv(elapsed, duration) is bounded in [0, 1] for 0 <= elapsed <= duration, so the subtracted term is bounded in [0, starting-ending]. The only edge case is when mulDiv rounds DOWN, which makes the subtracted term SMALLER → multiplier HIGHER (within bounds). Important safety property but very unlikely to break."
+
+- id: GPVCA-M06
+  tier: 2
+  type: property
+  description: "Decimal scaling consistency: for tokens with different decimals (6 vs 18 vs 8), the USD value computation and final assetOut amount must be proportionally correct regardless of decimal mismatch."
+  attack_scenario: "If assetIn has 6 decimals (USDC) and assetOut has 18 decimals (LINK), a miscalculation in the decimal scaling could give orders of magnitude more or less assetOut than intended. E.g., 1 USDC (1e6) at $1 should buy ~0.067 LINK at $15, but a decimal error could give 0.067e-12 LINK or 0.067e12 LINK."
+  impact: "Protocol sells tokens at drastically wrong price — either massive overpayment by bidder (DoS) or massive underpayment (fund loss)."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For a 6-decimal token at price $1 (1e18 in 18-decimal price):
+    // auctionUsdValue = amountIn.mulDivUp(1e18, 1e6) = amountIn * 1e12 (correct USD value in 18 dec)
+    // then mulWadUp(multiplier) ≈ same (multiplier ~ 1e18)
+    // then mulDivUp(1e18, linkPrice) = USD_value * 1e18 / linkPrice
+    // if linkPrice = 15e18: result = amountIn * 1e12 * 1e18 / 15e18 = amountIn * 1e12 / 15
+    // For amountIn = 1e6 (1 USDC): result = 1e6 * 1e12 / 15 = 6.67e16 = 0.0667e18 LINK ✓
+    // Test with various decimal combinations: 6, 8, 18, 20
+    uint256 result = auction.getAssetOutAmount(assetIn, amountIn, block.timestamp);
+    uint256 expectedApprox = (amountIn * assetInPrice * (10 ** assetOutDecimals)) / ((10 ** assetInDecimals) * assetOutPrice);
+    // Allow 1% tolerance for rounding
+    uint256 tolerance = expectedApprox / 100;
+    gte(result, expectedApprox, "GPVCA-M06: decimal scaling error — output too low");
+    lte(result, expectedApprox + tolerance + 1, "GPVCA-M06: decimal scaling error — output too high");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 20
+  notes: "The formula handles decimals correctly: divides by 10^assetInDecimals and multiplies by 10^assetOutDecimals. Both values come from stored AssetParams which are validated against IERC20Metadata.decimals() on configuration. Manual trace through 6-dec, 8-dec, 18-dec tokens all produce correct results. Low confidence of FINDING a bug, but high importance to verify."
+
+- id: GPVCA-M07
+  tier: 1
+  type: property
+  description: "bid() solvency: for every bid, the assetOutAmount pulled from bidder must represent at least the fair USD value of the assetIn amount sent, adjusted by the auction's current price multiplier."
+  attack_scenario: "If the assetOutAmount computation has an error that produces a value lower than fair, bidders extract value from the protocol. Each bid drains the protocol of LINK relative to the tokens sold."
+  impact: "Direct fund loss: protocol receives less LINK than the value of tokens sold."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After a bid: the LINK received must be >= (amountIn * assetInPrice * endingMultiplier) / (10^assetInDec * assetOutPrice / 10^assetOutDec)
+    // This is the MINIMUM acceptable — using endingPriceMultiplier as the absolute floor
+    // ghost tracking:
+    ghost_totalAssetInSold += amount;
+    ghost_totalAssetOutReceived += assetOutAmount;
+    // Solvency check: total LINK received >= total value sold at worst multiplier
+    uint256 minExpected = (ghost_totalAssetInSold * assetInPrice * endingMultiplier * (10 ** assetOutDec)) / ((10 ** assetInDec) * 1e18 * assetOutPrice);
+    gte(ghost_totalAssetOutReceived, minExpected, "GPVCA-M07: protocol received less LINK than minimum fair value");
+  ghost_vars:
+  - "uint256 internal ghost_totalAssetInSold;"
+  - "uint256 internal ghost_totalAssetOutReceived;"
+  validated: false
+  priority: high
+  confidence: 25
+  notes: "Core economic invariant. Due to mulDivUp rounding and the multiplier always being >= endingPriceMultiplier, this should always hold. The ghost variables track cumulative values across multiple bids to detect any systematic rounding drift."
+
+- id: GPVCA-M08
+  tier: 3
+  type: optimize
+  description: "Maximize bidder profit: find input parameters (amount, timing) that maximize the difference between fair market value of tokens received and LINK paid."
+  attack_scenario: "If the optimizer finds positive profit, there exists a bid strategy that extracts value from the protocol beyond what the discount curve intends."
+  impact: "Economic extraction — bidder gets tokens worth more than the LINK they pay."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Bidder receives 'amount' of assetIn, pays 'assetOutAmount' of LINK
+    // Fair value of assetIn in LINK = amount * assetInPrice / assetOutPrice (no multiplier)
+    // Profit = fairValueInLink - assetOutAmount
+    // Positive profit = bidder extracting value beyond the auction discount
+    int256 fairValueInLink = int256((amount * assetInPrice * (10 ** assetOutDec)) / ((10 ** assetInDec) * assetOutPrice));
+    int256 paid = int256(assetOutAmount);
+    return fairValueInLink - paid;
+    // Expected: always negative (bidder pays premium or at most the ending discount)
+    // If positive: bug — bidder profits beyond intended discount
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 30
+  notes: "Echidna optimization target. The multiplier starts above 1.0 (premium) and decays to ending (e.g., 0.98 = 2% discount). The bidder should NEVER get more than the endingPriceMultiplier discount. If optimizer finds positive values, it means the rounding or computation gives too favorable a price."
+
+false_positives:
+- hunter: MathHunter
+  id: GPVCA-FP-01
+  reason: "mulDivUp rounding direction is consistently UP across all 3 multiplication steps in _getAssetOutAmount. This means the protocol ALWAYS charges slightly more than exact fair value. There is no path where rounding benefits the bidder. Investigated all 3 operations: amountIn*price/decimals (UP), *multiplier (UP), *outDecimals/outPrice (UP). Each step rounds UP independently."
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Dutch auction with 3-step mulDivUp/mulWadUp: compound rounding UP across steps does NOT create exploitable conditions — it consistently overcharges the buyer. Not a bug."
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: GPVCA-FP-02
+  reason: "isValidSignature missing minBidUsdValue check is by design, not a bug. CowSwap solvers batch orders efficiently, and the partially-fillable order model means small fills are part of normal operation. The rounding UP in _getAssetOutAmount ensures even 1 wei sellAmount produces at least 1 wei buyAmount (never 0), so there is no free-token extraction. Gas costs make dust attacks economically irrational."
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "CowSwap EIP-1271 isValidSignature intentionally omits minBidValue check — partial fills + solver batching make it unnecessary. Not a bug for Dutch auctions using GPv2."
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: GPVCA-FP-03
+  reason: "Approval set at _onAuctionStart (balance at start time) can desync with balance if tokens are donated after. isValidSignature checks balance (not approval), so it can validate orders that will fail on settlement. However, this is a liveness/griefing issue requiring the attacker to donate tokens — no fund loss occurs. The bid() path is completely unaffected. Severity: Info at most."
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "CowSwap approval set at auction start vs balance check in isValidSignature — desync possible with token donations but no fund loss. Info severity."
+    briefing_update_applied: false

@@ -1,0 +1,491 @@
+protocol: variational
+component: Oracle + SettlementPool
+file: src/Oracle.sol, src/SettlementPool.sol, src/SettlementPoolFactory.sol
+domain: settlement
+hunter: FlowHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+# ═══════════════════════════════════════════════════════════════════════
+# H-01: transferFromOLPToPool — poolAddress NOT validated against factory
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-01
+  tier: 1
+  type: property
+  description: >
+    transferFromOLPToPool (Oracle:267-285) accepts a raw `poolAddress` parameter
+    and sends USDC directly to it via `usdc.transfer(poolAddress, amount)` WITHOUT
+    validating that poolAddress == factory.getPool(poolUuid). A malicious/compromised
+    provider can route OLP funds to ANY arbitrary address. This is the ONLY function
+    in Oracle that takes poolAddress as a direct parameter — all other functions
+    resolve poolAddress from poolUuid via getPool() or factory.getPool().
+  attack_scenario: >
+    1. Provider (PROVIDER_ROLE) calls transferFromOLPToPool with a legitimate
+       olpWallet (who has approved Oracle for USDC), a valid poolUuid, but sets
+       poolAddress to the attacker's own wallet.
+    2. Oracle pulls USDC from OLP via transferFrom(olpWallet, oracle, amount).
+    3. Oracle sends USDC to attacker via transfer(poolAddress=attacker, amount).
+    4. Funds are stolen. The poolUuid parameter is only used in the event emission,
+       providing no on-chain validation.
+    KILL SIGNAL CHECK: The function is gated by PROVIDER_ROLE. If provider is a
+    trusted off-chain service with a hot wallet, compromise of that key = full drain
+    of all approved OLP balances. Even if provider is a multisig, the poolAddress
+    parameter should STILL be validated — defense in depth.
+  impact: >
+    Direct theft of all USDC approved by any OLP wallet to the Oracle contract.
+    The amount at risk equals sum of all OLP USDC allowances to Oracle.
+    On Arbitrum with USDC, this could be significant.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariant: poolAddress passed to transferFromOLPToPool MUST match factory.getPool(poolUuid)
+    // This cannot be tested as a fuzz invariant — it's a static code analysis finding.
+    // The fix is to add: require(poolAddress == factory.getPool(poolUuid), "pool mismatch");
+    // OR remove poolAddress param entirely and resolve from poolUuid.
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 85
+  notes: >
+    KILL SIGNALS:
+    - Provider is a trusted role. If it's an EOA hot wallet, risk is HIGH (key compromise).
+    - If provider is a multisig, risk is MEDIUM (social engineering, but poolAddress
+      validation still missing = defense-in-depth violation).
+    - The poolUuid param exists in the function but is ONLY used in the event — zero
+      on-chain validation. This is suspicious design.
+    - Compare with ALL other Oracle functions: depositUSDC (line 350), withdrawUSDC (line 258),
+      atomicDeposit (line 296), processTreasuryManagementDeposits (line 154),
+      processTreasuryManagementWithdrawals (line 203) — ALL resolve poolAddress from
+      factory.getPool(poolUuid) or pools[poolUuid]. transferFromOLPToPool is the ONLY exception.
+    - Immunefi scope: if trusted roles are excluded, this may be out of scope. CHECK RULES.
+    VERDICT: Valid code defect. Reportability depends on Immunefi scope re: trusted roles.
+  poc_sketch: |
+    // Foundry PoC
+    function test_transferFromOLPToPool_arbitrary_recipient() public {
+        // Setup: OLP approves Oracle for 1000 USDC
+        vm.prank(olpWallet);
+        usdc.approve(address(oracle), 1000e6);
+
+        // Attack: provider routes funds to attacker instead of pool
+        address attacker = makeAddr("attacker");
+        vm.prank(provider);
+        oracle.transferFromOLPToPool(
+            olpWallet,
+            attacker,          // <-- NOT a real pool, just attacker address
+            1000e6,
+            poolUuid,
+            rfqUuid,
+            parentQuoteUuid
+        );
+
+        // Verify: attacker got the funds
+        assertEq(usdc.balanceOf(attacker), 1000e6);
+        // Pool got nothing
+        assertEq(usdc.balanceOf(realPoolAddress), 0);
+    }
+  call_stack: >
+    Oracle.transferFromOLPToPool(olpWallet, ATTACKER_ADDR, amount, poolUuid, ...)
+      → usdc.transferFrom(olpWallet, oracle, amount)  // OLP → Oracle
+      → usdc.transfer(ATTACKER_ADDR, amount)           // Oracle → ATTACKER (not pool!)
+      → emit OLPToPoolTransfer(...)                     // event logged but funds gone
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-02: grantRole override — permanently broken for PROVIDER_ROLE
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-02
+  tier: 1
+  type: property
+  description: >
+    Oracle.grantRole() (line 438-446) calls super.grantRole(role, account) BEFORE
+    checking require(!hasRole(PROVIDER_ROLE, account)). Since super.grantRole()
+    already grants the role, hasRole() returns true at the require check, making
+    !hasRole() always false. The require ALWAYS reverts for PROVIDER_ROLE, making
+    the standard OZ grantRole() path permanently broken. The addProvider() function
+    still works as an alternative path.
+  attack_scenario: >
+    1. Admin calls grantRole(PROVIDER_ROLE, newProvider) — the standard OZ interface.
+    2. super.grantRole grants the role on line 439.
+    3. Line 442: require(!hasRole(PROVIDER_ROLE, account)) — hasRole is now TRUE
+       because super.grantRole just set it, so !true = false → REVERT.
+    4. The role grant is reverted. numProviders is NOT incremented.
+    5. Admin must use addProvider() instead, which works correctly.
+    This is a logic bug — the grantRole code path for PROVIDER_ROLE is dead code
+    that always reverts. Impact is Low because addProvider() provides a working
+    alternative. But if any integration/frontend uses the standard grantRole interface,
+    it will always fail.
+  impact: >
+    The standard AccessControl.grantRole() interface is broken for PROVIDER_ROLE.
+    No fund loss, but operational disruption if admin/integrations rely on
+    the standard OZ grantRole interface. addProvider() works as workaround.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // The bug is at Oracle.sol lines 438-446:
+    // function grantRole(bytes32 role, address account) public override ... {
+    //     super.grantRole(role, account);    // ← GRANTS the role first
+    //     if (role == PROVIDER_ROLE) {
+    //         require(!hasRole(PROVIDER_ROLE, account), "...");  // ← ALWAYS false now
+    //         numProviders++;
+    //         emit ProviderAdded(account);
+    //     }
+    // }
+    // Fix: move the hasRole check BEFORE super.grantRole, or remove grantRole override
+    // and rely solely on addProvider().
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    KILL SIGNALS:
+    - Impact is LOW — addProvider() works fine. No funds at risk.
+    - Similarly, revokeRole (line 449-457) has the OPPOSITE pattern: it checks
+      hasRole BEFORE super.revokeRole, and decrements numProviders BEFORE revoking.
+      This is correct ordering for revoke but creates an asymmetry with grant.
+    - The revokeRole correctly checks BEFORE calling super, while grantRole
+      incorrectly checks AFTER calling super. Classic order-of-operations bug.
+    VERDICT: Valid bug, Low severity. Likely accepted as QA/Low on Immunefi.
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-03: atomicDeposit — funds sent directly, not via Pool deposit method
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-03
+  tier: 2
+  type: property
+  description: >
+    atomicDeposit (Oracle:287-322) transfers USDC to the pool via raw
+    usdc.transfer(poolAddress, amount) instead of calling pool.depositUSDCOnBehalfOfParty().
+    The pool then calls depositUSDCAtomic() which, when partyOneAmountRequested > 0
+    && partyTwoAmountRequested == 0, just emits an event and returns (SettlementPool:169-180)
+    WITHOUT doing any accounting update. The pool relies on _totalBalance()
+    (= balanceOf(address(this))) for balance checks, so the raw transfer IS reflected
+    in the balance. However, transfers_processed is NOT updated for the partyOne
+    transfer in this path — it's only checked via atomic_deposits_processed on the
+    Oracle side.
+  attack_scenario: >
+    The split accounting between Oracle.atomic_deposits_processed and
+    Pool.transfers_processed creates a consistency gap. The Oracle marks
+    parentQuoteUuid as processed in atomic_deposits_processed (line 306),
+    but the Pool never marks anything in transfers_processed for this deposit.
+    This means Pool-level queries to transfers_processed will show this
+    transfer as never having happened, while Oracle-level shows it as processed.
+    Unlikely to cause fund loss directly since Pool uses balanceOf for balance
+    tracking, but could confuse off-chain accounting/indexers that rely on
+    Pool events/state.
+  impact: >
+    No direct fund loss. Potential accounting inconsistency between Oracle and Pool
+    state. Off-chain systems that query Pool.transfers_processed for deposit
+    confirmation will not see atomicDeposit transfers.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check: after atomicDeposit with partyOne only, Pool.transfers_processed is NOT set
+    // Oracle.atomic_deposits_processed IS set
+    // This is by design but creates split state
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    KILL SIGNALS:
+    - Pool uses balanceOf(address(this)) for actual balance, not internal accounting.
+      So raw transfer IS reflected. No phantom balance.
+    - The dual-tracking (Oracle.atomic_deposits_processed vs Pool.transfers_processed)
+      is likely intentional — atomic deposits are a special path.
+    - No fund loss vector identified. Downgrading to informational.
+    VERDICT: Informational at best. The design choice is intentional.
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-04: withdrawFees — CEI pattern analysis
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-04
+  tier: 2
+  type: property
+  description: >
+    withdrawFees (SettlementPool:247-260) does the USDC transfer BEFORE setting
+    transfers_processed[fees_batch_id] = true (line 256). The transfer is inside
+    a try/catch, and the state update happens in the try success block. This is
+    technically an Interaction-before-Effect pattern. However, USDC on Arbitrum is
+    a standard ERC20 with no callbacks (not ERC777), and the function has nonReentrant.
+    Additionally, the Oracle calling this function also has nonReentrant, so there
+    are TWO mutex locks active.
+  attack_scenario: >
+    For reentrancy to work:
+    1. The requestor would need a receive/fallback that re-enters — but USDC transfer
+       does not trigger receive/fallback (it's a contract call to USDC, not ETH transfer).
+    2. USDC on Arbitrum (Bridged USDC or native) has no transfer hooks.
+    3. Pool has nonReentrant, so even if somehow re-entered, it would revert.
+    4. Oracle also has nonReentrant on collectFees that calls this.
+    NO VIABLE ATTACK PATH.
+  impact: 'None — theoretical CEI concern mitigated by multiple defenses.'
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // withdrawFees pattern:
+    // try usdc.transfer(requestor, amount) {
+    //     transfers_processed[fees_batch_id] = true;  // state after interaction
+    // } catch { revert; }
+    // Mitigations: nonReentrant on Pool + nonReentrant on Oracle + USDC has no hooks
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    KILL SIGNALS:
+    - USDC = no callbacks. Full stop.
+    - Double nonReentrant (Oracle + Pool). Even if token had hooks, blocked.
+    - The _withdrawUSDCOnBehalf (line 262-283) has the SAME pattern. Same conclusion.
+    VERDICT: Not a bug. CEI non-conformance is real but fully mitigated. Informational.
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-05: try/catch in batch functions — selective failure exploitation
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-05
+  tier: 2
+  type: property
+  description: >
+    collectFees (Oracle:28-43) and processTreasuryManagement (Oracle:142-233)
+    use try/catch so individual items can fail without reverting the batch.
+    If a pool reverts on withdrawFees, it's logged as a failure and the loop
+    continues. Question: can a malicious pool cause selective failures?
+  attack_scenario: >
+    1. Pools are created by the factory via Clones.clone(implementation), so
+       the implementation is fixed — a malicious pool contract cannot be injected
+       unless the factory's implementation is changed by the owner.
+    2. The pool address is resolved via factory.getPool(poolUuid) in collectFees
+       (line 103), NOT passed as parameter — so provider cannot supply an
+       arbitrary malicious contract.
+    3. A legitimate pool could revert withdrawFees if: insufficient balance,
+       fees_batch_id already processed, or amount == 0. These are all legitimate
+       failure conditions.
+    4. Selective failure = some fees collected, some not. But the provider controls
+       which requests are in the batch. A malicious provider could intentionally
+       include requests they know will fail to create misleading events.
+    No fund loss vector. The try/catch is a standard batch processing pattern.
+  impact: >
+    No fund loss. Misleading events at most (if provider is malicious, but
+    provider is already trusted role).
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    KILL SIGNALS:
+    - Pool addresses come from factory.getPool() — not user-supplied.
+    - Pool implementation is cloned — attacker can't inject arbitrary code.
+    - Provider is trusted role — if compromised, there are bigger problems (H-01).
+    VERDICT: Not a bug. Standard batch pattern, no exploitation vector.
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-06: USDC dust stuck in Oracle contract
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-06
+  tier: 2
+  type: property
+  description: >
+    Oracle acts as a pass-through for USDC in transferFromOLPToPool and atomicDeposit:
+    it does transferFrom(sender, oracle, amount) then transfer(pool, amount).
+    If the second transfer fails, the entire transaction reverts, so no USDC should
+    remain in Oracle. However, if someone directly transfers USDC to the Oracle
+    contract (donation), there is NO rescue function to recover those funds.
+  attack_scenario: >
+    1. User accidentally sends USDC directly to Oracle contract address.
+    2. No function exists in Oracle to sweep/recover arbitrary ERC20 tokens.
+    3. Funds are permanently stuck.
+    This is a standard "no rescue function" issue — common in many contracts but
+    generally Low/Informational.
+  impact: >
+    Any USDC (or other ERC20) directly sent to Oracle contract is permanently stuck.
+    No mechanism to recover. Only affects accidental transfers.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    KILL SIGNALS:
+    - This is an extremely common pattern — most contracts lack rescue functions.
+    - No intentional fund flow leaves USDC in Oracle — it's always pass-through.
+    - Only accidental transfers are affected.
+    VERDICT: Informational. Standard missing-rescue-function issue.
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-07: Oracle.pools vs Factory.getPool — dual pool registry inconsistency
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-07
+  tier: 1
+  type: property
+  description: >
+    Oracle maintains its OWN pool registry (mapping pools, line 21) AND the factory
+    also maintains a pool registry (getPool mapping). Oracle.createPool() (line 359-380)
+    writes to BOTH: factory.createPool() writes to factory.getPool, and then line 379
+    writes to Oracle.pools[poolUuid]. Some Oracle functions use Oracle.getPool()
+    (which reads Oracle.pools) while others use factory.getPool(). If these ever
+    diverge, fund routing could break.
+
+    Functions using Oracle.pools (via getPool): withdrawUSDC (258), atomicDeposit (296),
+    depositUSDC (350).
+
+    Functions using factory.getPool: collectFees (103), processTreasuryManagementDeposits (154),
+    processTreasuryManagementWithdrawals (203), batchAtomicDeposit (330), addOtherParty (386).
+
+    transferFromOLPToPool: uses NEITHER — takes poolAddress as raw parameter.
+  attack_scenario: >
+    1. If factory.setOracleAddress() is called to point to a NEW Oracle contract,
+       the new Oracle's pools mapping is empty, but factory.getPool still has all pools.
+    2. Functions using Oracle.getPool() (withdrawUSDC, atomicDeposit, depositUSDC) will
+       fail with "Pool not found" for all existing pools.
+    3. Functions using factory.getPool() (collectFees, treasury management) will continue
+       to work.
+    4. This creates a split where some operations work and others don't after Oracle migration.
+    This is an UPGRADE/MIGRATION issue, not exploitable by external attacker. But it
+    could cause operational disruption during Oracle contract replacement.
+  impact: >
+    After Oracle contract replacement, some functions break while others work.
+    No direct fund loss but operational disruption. Funds in pools are NOT at risk
+    (pools are independent contracts).
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: Oracle.pools[uuid] MUST equal factory.getPool(uuid) for all created pools
+    // This holds as long as createPool is the only path that adds pools.
+    // Breaks during Oracle migration (new Oracle has empty pools mapping).
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    KILL SIGNALS:
+    - Dual registry is a design smell but not exploitable by external attackers.
+    - Only relevant during Oracle contract migration — an admin operation.
+    - Pools are independent contracts with their own USDC. Not at risk.
+    - The inconsistency between which functions use which registry is concerning
+      from a maintenance perspective but doesn't create a direct attack vector.
+    VERDICT: Low/Informational. Design improvement recommendation.
+
+# ═══════════════════════════════════════════════════════════════════════
+# H-08: batchAtomicDeposit — no duplicate protection for parentQuoteUuid
+# ═══════════════════════════════════════════════════════════════════════
+- id: FLOW-08
+  tier: 2
+  type: property
+  description: >
+    batchAtomicDeposit (Oracle:324-342) calls pool.batchDepositUSDCAtomic() which
+    uses the item's parentQuoteUuid as the transferUuid for _depositUSDCOnBehalf.
+    The dupe check in _depositUSDCOnBehalf (line 97) uses Pool.transfers_processed.
+    BUT: for the first item with creatorPartyAmountRequested > 0, after the creator
+    deposit, transferUuid is reset to 0 (line 140). When transferUuid == 0,
+    _depositUSDCOnBehalf still checks transfers_processed[0], but transferUuid 0
+    is never set to true (line 106-108: only set if transferUuid != 0).
+    This means ALL second-party deposits with transferUuid=0 BYPASS the dupe check.
+    If provider submits the same batch twice, the creator deposits will be caught
+    by the dupe check (parentQuoteUuid is real), but the other party deposits with
+    transferUuid=0 will succeed again.
+  attack_scenario: >
+    1. Provider calls batchAtomicDeposit with items containing valid parentQuoteUuids.
+    2. For each item, creator deposit uses parentQuoteUuid → dupe protected.
+    3. Other party deposit uses transferUuid=0 → _depositUSDCOnBehalf checks
+       transfers_processed[0] which is always false (never set to true).
+    4. If provider replays the batch, creator deposits revert (parentQuoteUuid already
+       processed), but if creatorPartyAmountRequested is set to 0 on replay,
+       only other party deposits execute — and they pass because transferUuid=0
+       is never marked as processed.
+    5. Other party gets double-charged.
+    KILL SIGNAL: Provider is trusted. Provider controls the batch inputs. If provider
+    is honest, they won't replay. If compromised, there are bigger issues (H-01).
+    BUT: the other party's approval to the pool is what enables the charge.
+    Double-charging requires the other party to still have sufficient allowance.
+  impact: >
+    Trusted provider could double-charge the other party's USDC deposits in
+    batchAtomicDeposit. Requires provider to craft a replay with modified parameters.
+    Limited by other party's USDC allowance to the pool contract.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // In batchDepositUSDCAtomic, after creator deposit:
+    // transferUuid = 0;  // reset
+    // Then for other party:
+    // _depositUSDCOnBehalf(otherAddr, amount, 0, false);
+    //   → require(transfers_processed[0] == false) → always true (0 never set)
+    //   → transferFrom succeeds
+    //   → if (transferUuid != 0) transfers_processed[transferUuid] = true; → SKIPPED (uuid is 0)
+    // Result: no dupe protection for other party deposits
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    KILL SIGNALS:
+    - Provider is trusted role — can already steal via H-01 if compromised.
+    - Other party must have approved the pool for USDC. Approval is per-pool,
+      so the attack is limited to the other party's allowance to that specific pool.
+    - The same pattern exists in depositUSDCAtomic (line 159-216) — same risk.
+    - This is a DEFENSE-IN-DEPTH issue: even trusted roles should not be able to
+      double-charge parties. The transferUuid=0 bypass undermines the entire
+      dupe-prevention system for the second party in atomic deposits.
+    VERDICT: Medium if trusted-role bugs are in scope, Low/Info otherwise.
+    Depends on Immunefi scope rules for this program.
+  poc_sketch: |
+    function test_batchAtomicDeposit_double_charge_other_party() public {
+        // Setup: other party approves pool for 2000 USDC
+        vm.prank(otherParty);
+        usdc.approve(address(pool), 2000e6);
+
+        // First call: creator deposits 100, other deposits 100
+        SettlementPools.AtomicDepositBatchItem[] memory items = new SettlementPools.AtomicDepositBatchItem[](1);
+        items[0] = SettlementPools.AtomicDepositBatchItem({
+            otherPartyAddress: otherParty,
+            otherPartyAmountRequested: 100e6,
+            rfqUuid: 1,
+            parentQuoteUuid: 42
+        });
+        vm.prank(provider);
+        oracle.batchAtomicDeposit(poolUuid, creator, 100e6, items);
+
+        // Second call: creator amount = 0, other party = 100 again
+        // parentQuoteUuid 42 is already processed for creator path,
+        // but other party path uses transferUuid=0 → no dupe check
+        vm.prank(provider);
+        oracle.batchAtomicDeposit(poolUuid, creator, 0, items);
+        // Other party charged TWICE: 200 USDC total for what should be 100
+    }
+  call_stack: ''
+
+false_positives:
+- hunter: FlowHunter
+  id: FLOW-FP-01
+  reason: >
+    CEI violation in withdrawFees (H-04) is fully mitigated by nonReentrant on both
+    Oracle and SettlementPool, plus USDC having no transfer callbacks. Not exploitable.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: settlement.md
+    content: >
+      USDC on Arbitrum has no ERC777 hooks. CEI non-conformance in try/catch blocks
+      with nonReentrant is not exploitable — do not report as reentrancy.
+    briefing_update_applied: false
+- hunter: FlowHunter
+  id: FLOW-FP-02
+  reason: >
+    Dust stuck in Oracle (H-06) — Oracle never intentionally holds USDC. All
+    pass-through transfers are atomic (transferFrom+transfer in same tx). Only
+    accidental direct sends could get stuck. Standard missing-rescue pattern,
+    not a real finding.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

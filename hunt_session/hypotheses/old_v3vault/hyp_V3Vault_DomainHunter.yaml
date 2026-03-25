@@ -1,0 +1,451 @@
+protocol: revert-lend
+component: V3Vault
+file: src/V3Vault.sol
+domain: vault
+hunter: DomainHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: VV-D-01
+  tier: 1
+  type: property
+  description: "Solvency invariant: vault balance + outstanding debt >= total lent amount (lender claims)"
+  attack_scenario: "If balance + debt < lent, lenders cannot withdraw their full deposit. An attacker could manipulate this via donation attack on the asset token or by exploiting a rounding gap in the interest accrual path to create a deficit that grows with each operation."
+  impact: "Lenders lose funds -- the last withdrawer gets less than entitled"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 balance = IERC20(vault.asset()).balanceOf(address(vault));
+    uint256 debtRateX96 = vault.lastDebtExchangeRateX96();
+    uint256 lendRateX96 = vault.lastLendExchangeRateX96();
+    uint256 debtSharesT = vault.debtSharesTotal();
+    uint256 Q96 = 2**96;
+    // debt rounded up (liability), lent rounded up (claim)
+    uint256 debt = (debtSharesT * debtRateX96 + Q96 - 1) / Q96;
+    uint256 lent = (vault.totalSupply() * lendRateX96 + Q96 - 1) / Q96;
+    // Allow 1 unit tolerance per operation for rounding
+    uint256 tolerance = ghost_numOps + 1;
+    gte(balance + debt + tolerance, lent, "VV-D-01: vault insolvent -- balance+debt < lent");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Core solvency property. The reserve socialization in _handleReserveLiquidation reduces lendExchangeRate but should maintain this. Tolerance accounts for rounding."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-02
+  tier: 1
+  type: property
+  description: "Debt exchange rate monotonicity: debtExchangeRateX96 must never decrease (only exception: zero debt)"
+  attack_scenario: "If debt rate decreases, borrowers owe less than they should. An attacker could borrow, trigger a rate decrease, then repay at lower rate, extracting the difference from lenders."
+  impact: "Lender fund loss proportional to rate decrease magnitude"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 currentDebtRate = vault.lastDebtExchangeRateX96();
+    if (ghost_lastDebtRateX96 > 0) {
+        gte(currentDebtRate, ghost_lastDebtRateX96, "VV-D-02: debt exchange rate decreased");
+    }
+    ghost_lastDebtRateX96 = currentDebtRate;
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "Debt rate can only increase via interest accrual in _calculateGlobalInterest. There is no code path that directly decreases it. But worth fuzzing to confirm no edge case."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-03
+  tier: 1
+  type: property
+  description: "Lend exchange rate monotonicity with socialization exception: lendExchangeRateX96 must never decrease except during reserve socialization (bad debt haircut)"
+  attack_scenario: "If lend rate decreases outside of liquidation, lenders lose deposited value. An attacker could force a rate decrease by manipulating the interest rate model inputs (balance/debt ratio) via flash loan to cause a calculation underflow or precision loss."
+  impact: "Lender share value erodes without corresponding bad debt event"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 currentLendRate = vault.lastLendExchangeRateX96();
+    if (ghost_lastLendRateX96 > 0 && !ghost_liquidationInProgress) {
+        gte(currentLendRate, ghost_lastLendRateX96, "VV-D-03: lend rate decreased outside liquidation");
+    }
+    ghost_lastLendRateX96 = currentLendRate;
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Only _handleReserveLiquidation can reduce lendExchangeRateX96. The ghost_liquidationInProgress flag should be set by the liquidation handler."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-04
+  tier: 1
+  type: property
+  description: "Debt shares total conservation: sum of all individual loan debtShares must equal debtSharesTotal"
+  attack_scenario: "If these diverge, either: (a) some debt is untracked -- borrowers got free money, or (b) phantom debt exists -- someone is paying interest on nonexistent loans. A rounding asymmetry in borrow vs repay share conversions could accumulate this drift."
+  impact: "Untracked debt means protocol losses; phantom debt means user losses"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 sumShares = 0;
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+        sumShares += shares;
+    }
+    eq(sumShares, vault.debtSharesTotal(), "VV-D-04: sum of loan shares != debtSharesTotal");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "This is the fundamental debt accounting invariant. borrow() adds shares to both, repay() subtracts from both, liquidate() zeroes the loan and subtracts from total. The _cleanupLoan path during transform replacement also deletes loan shares."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-05
+  tier: 1
+  type: property
+  description: "Token ownership consistency: every tokenId in ownedTokens has correct tokenOwner mapping and vice versa"
+  attack_scenario: "If tokenOwner[id] points to wrong address or ownedTokens has stale entries, an attacker could call borrow/remove on a position they don't own, or block the real owner from operating on their position."
+  impact: "Unauthorized position control leading to theft of collateral or borrowed funds"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check each known tokenId has consistent ownership
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tid);
+        if (owner != address(0)) {
+            uint256 count = vault.loanCount(owner);
+            bool found = false;
+            for (uint256 j = 0; j < count; j++) {
+                if (vault.loanAtIndex(owner, j) == tid) {
+                    found = true;
+                    break;
+                }
+            }
+            t(found, "VV-D-05: tokenId has owner but not in ownedTokens list");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "The swap-and-pop removal in _removeTokenFromOwner could have index bugs. Also the transform replacement path does _addTokenToOwner for new token and _cleanupLoan (which does NOT call _removeTokenFromOwner -- it only deletes the loan). The old token stays owned but with zero debt."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-06
+  tier: 1
+  type: property
+  description: "No position can have debt without being tracked in vault ownership (orphan debt prevention)"
+  attack_scenario: "If a tokenId has debtShares > 0 but tokenOwner == address(0), the debt is orphaned -- nobody can repay it, nobody can be liquidated, and the debt permanently inflates the protocol's liability. This could happen if _removeTokenFromOwner is called without clearing debt first."
+  impact: "Permanent bad debt that socializes losses to all lenders"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 shares) = vault.loans(tid);
+        if (shares > 0) {
+            address owner = vault.ownerOf(tid);
+            t(owner != address(0), "VV-D-06: orphan debt -- debtShares > 0 but no owner");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "The remove() function checks debtShares != 0 before allowing removal. But _cleanupLoan in liquidation deletes the loan AFTER removing debt. Need to verify all paths."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-07
+  tier: 1
+  type: property
+  description: "Liquidation only possible for unhealthy positions: collateralValue < debt"
+  attack_scenario: "If a healthy position can be liquidated, an attacker could force-liquidate other users' positions to steal the liquidation penalty. This could happen if the oracle returns stale/manipulated prices."
+  impact: "Borrower loses collateral despite being solvent -- direct theft via liquidation penalty"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any state change, check that positions with collateralValue >= debt cannot be liquidated
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liquidationCost, uint256 liquidationValue) = vault.loanInfo(tid);
+        if (debt > 0 && collateralValue >= debt) {
+            // healthy position should have zero liquidation values
+            eq(liquidationCost, 0, "VV-D-07: healthy position has nonzero liquidation cost");
+            eq(liquidationValue, 0, "VV-D-07: healthy position has nonzero liquidation value");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "loanInfo checks _checkLoanIsHealthy without buffer (withBuffer=false). The BORROW_SAFETY_BUFFER_X32 (95%) is only used in borrow path. So a position with collateralValue just barely >= debt is healthy for liquidation purposes but would fail the borrow health check."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-08
+  tier: 1
+  type: property
+  description: "ERC4626 roundtrip safety: redeem(deposit(X)) <= X for any X (no value extraction via deposit-then-redeem)"
+  attack_scenario: "If redeem(deposit(X)) > X, an attacker can extract value in a loop. The rounding direction in _deposit (shares rounded Down) and _withdraw (assets rounded Down) should prevent this, but edge cases with small amounts or first depositor could break it."
+  impact: "Unlimited value extraction from vault, draining lender deposits"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Use ghost tracking from last deposit
+    if (ghost_lastDepositAssets > 0 && ghost_lastDepositShares > 0) {
+        uint256 lendRate = vault.lastLendExchangeRateX96();
+        uint256 Q96 = 2**96;
+        // What would redeeming those shares give back (rounded down)
+        uint256 redeemAssets = ghost_lastDepositShares * lendRate / Q96;
+        // Must not exceed what was deposited (allow 1 wei tolerance for rounding)
+        lte(redeemAssets, ghost_lastDepositAssets + 1, "VV-D-08: roundtrip extraction -- redeem > deposit");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "The deposit path uses Rounding.Down for shares (fewer shares minted), withdraw uses Rounding.Down for assets (fewer assets returned). This should be safe. But if time passes between deposit and check, interest accrual could legitimately increase assets. This invariant is only valid same-block."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-09
+  tier: 1
+  type: property
+  description: "Collateral value limit tracking: totalDebtShares per token config must equal sum of debtShares for positions using that token"
+  attack_scenario: "If tokenConfigs[token].totalDebtShares diverges from reality, the collateral value limit check in _updateAndCheckCollateral becomes ineffective. An attacker could bypass concentration limits and over-borrow against a single collateral type, creating systemic risk."
+  impact: "Collateral concentration limits bypassed -- systemic risk if one collateral crashes"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // This is hard to verify without knowing token0/token1 per position in the fuzzer
+    // But we can verify that debtSharesTotal is consistent
+    uint256 debtSharesT = vault.debtSharesTotal();
+    uint256 sumShares = 0;
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+        sumShares += shares;
+    }
+    eq(sumShares, debtSharesT, "VV-D-09: debt shares total mismatch");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "The _updateAndCheckCollateral function adds/removes difference to both token0 and token1 configs. If a position is replaced (transform) the old token pair's shares are decremented and new pair's incremented. Mismatch could occur if token pairs differ between old and new position."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-10
+  tier: 1
+  type: property
+  description: "Transform mode isolation: transformedTokenId must be 0 outside of an active transform() call"
+  attack_scenario: "If transformedTokenId gets stuck nonzero, all state-changing functions that check transformedTokenId != 0 (liquidate, decreaseLiquidityAndCollect) become permanently blocked. Additionally, borrow() gets bypass of health check for the stuck tokenId."
+  impact: "Permanent DoS of liquidation + health check bypass on one position"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Outside of transform, transformedTokenId should always be 0
+    // This property checks the state at rest (between transactions)
+    eq(vault.transformedTokenId(), 0, "VV-D-10: transformedTokenId stuck nonzero -- transform mode leak");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "The _transform function sets transformedTokenId = tokenId at the start and resets to 0 at the end. If the transformer call reverts, the whole transaction reverts, so it should always reset. But what if the transformer succeeds but the post-checks revert? The revert should propagate. This invariant catches any edge case where cleanup fails."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-11
+  tier: 1
+  type: property
+  description: "Daily limit replenishment symmetry: borrow replenishes on repay, deposit replenishes on withdraw"
+  attack_scenario: "In borrow(), dailyDebtIncreaseLimitLeft decreases by assets. In repay(), it increases by assets. In liquidate(), it increases by liquidatorCost (not full debt). If the replenishment is asymmetric (e.g., rounding differences between borrow and repay share/asset conversions), the daily limit could drift, either blocking legitimate borrows or allowing excess borrowing."
+  impact: "Gradual limit drift could either DoS borrowing or allow exceeding debt limits"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After many borrow/repay cycles, the daily limit should not have drifted significantly
+    // We check that dailyDebtIncreaseLimitLeft is not negative (underflow would revert, but we check sanity)
+    uint256 debtLimitLeft = vault.dailyDebtIncreaseLimitLeft();
+    uint256 lendLimitLeft = vault.dailyLendIncreaseLimitLeft();
+    // These should never exceed the calculated daily limit (which is based on total lent)
+    uint256 lendRate = vault.lastLendExchangeRateX96();
+    uint256 Q96 = 2**96;
+    uint256 Q32 = 2**32;
+    uint256 maxDailyDebt = (vault.totalSupply() * lendRate / Q96) * 429496729 / Q32;
+    uint256 dailyDebtMin = vault.dailyDebtIncreaseLimitMin();
+    uint256 expectedMax = maxDailyDebt > dailyDebtMin ? maxDailyDebt : dailyDebtMin;
+    // Add tolerance for replenishment during the day
+    lte(debtLimitLeft, expectedMax + ghost_totalRepaid + ghost_totalLiquidated + 1, "VV-D-11: daily debt limit exceeded maximum possible");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "The daily limit is replenished by exact asset amounts from repay/liquidate. The borrow converts assets->shares (Up) then tracks asset amounts for the limit. Repay converts shares->assets (Up for assets) then replenishes with assets. The rounding direction difference could cause slight asymmetry."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-12
+  tier: 1
+  type: property
+  description: "Reserve protection: withdrawReserves cannot drain below protected amount (reserveProtectionFactorX32 * lentAmount)"
+  attack_scenario: "If the owner can withdraw more reserves than allowed, the vault's safety buffer is depleted. When bad debt occurs, there are insufficient reserves to absorb it, and lenders take a larger haircut than expected."
+  impact: "Reduced safety buffer for lenders during bad debt events"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 lendRate = vault.lastLendExchangeRateX96();
+    uint256 debtRate = vault.lastDebtExchangeRateX96();
+    uint256 Q96 = 2**96;
+    uint256 Q32 = 2**32;
+    uint256 balance = IERC20(vault.asset()).balanceOf(address(vault));
+    uint256 debt = (vault.debtSharesTotal() * debtRate + Q96 - 1) / Q96;
+    uint256 lent = (vault.totalSupply() * lendRate + Q96 - 1) / Q96;
+    uint256 reserves = (balance + debt) > lent ? (balance + debt - lent) : 0;
+    uint256 protectedAmount = lent * vault.reserveProtectionFactorX32() / Q32;
+    // Reserves can be below protected if debt socialization happened, but balance should still hold
+    // The key invariant is: after withdrawReserves, remaining reserves >= protected
+    // This is a state invariant: at rest, if no socialization happened, reserves should be >= 0
+    gte(balance + debt + ghost_numOps, lent, "VV-D-12: vault underwater after reserve operations");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "The withdrawReserves function calculates available = min(balance, unprotected). The question is whether the calculation of 'protected' and 'reserves' can diverge from reality due to interest accrual timing."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-13
+  tier: 2
+  type: property
+  description: "Symmetric pair: borrow/repay must conserve debtSharesTotal (borrow adds X shares, repay removes at most X shares for same asset amount)"
+  attack_scenario: "If repaying the exact borrowed asset amount removes MORE shares than were added, the borrower profits from the rounding difference. Over many cycles, this drains the protocol. Borrow converts assets->shares with Rounding.Up, repay converts assets->shares with Rounding.Down. This is correct (protocol-favoring). But what if the exchange rate changes between borrow and repay?"
+  impact: "Rounding extraction over many borrow/repay cycles"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Check that after a borrow+repay cycle with same assets, debtSharesTotal returns to original
+    // This is tracked via ghost variables
+    if (ghost_totalBorrowed > 0 && ghost_totalRepaid > 0) {
+        uint256 debtShares = vault.debtSharesTotal();
+        // With interest accrual, debt shares from repay might not exactly cancel borrow shares
+        // But the rounding should always favor the protocol
+        // If no interest and borrow X then repay X, shares should be <= original
+        // We just check debtSharesTotal is sane
+        t(debtShares <= type(uint128).max, "VV-D-13: debtSharesTotal unreasonably large");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 60
+  notes: "The rounding directions are: borrow shares = ceil(assets * Q96 / rate), repay shares = floor(assets * Q96 / rate). So borrowing 100 USDC might cost 101 shares, and repaying 100 USDC only clears 99 shares. This is correct -- protocol keeps the extra. No extraction possible."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-14
+  tier: 1
+  type: property
+  description: "Liquidation penalty bounds: liquidation penalty must be between MIN_LIQUIDATION_PENALTY_X32 (2%) and MAX_LIQUIDATION_PENALTY_X32 (10%)"
+  attack_scenario: "If the penalty calculation in _calculateLiquidation overflows or underflows, a liquidator could receive an outsized penalty bonus (>10%) or the borrower could be liquidated with near-zero penalty, reducing incentives for timely liquidation."
+  impact: "Excessive lender losses if penalty too low (no liquidation incentive) or borrower losses if penalty too high"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check the _calculateLiquidation math for boundary correctness
+    // For any position with debt > 0 and unhealthy:
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt,, uint256 collateralValue, uint256 liquidationCost, uint256 liquidationValue) = vault.loanInfo(tid);
+        if (debt > 0 && liquidationCost > 0 && liquidationValue > 0) {
+            // liquidationValue = debt * (Q32 + penaltyX32) / Q32
+            // So penalty portion = liquidationValue - debt (when liquidatorCost == debt)
+            if (liquidationCost == debt) {
+                uint256 penaltyValue = liquidationValue - debt;
+                uint256 Q32 = 2**32;
+                // penalty as fraction of debt: penaltyValue / debt should be in [2%, 10%]
+                // penaltyValue * Q32 / debt should be in [MIN_PENALTY, MAX_PENALTY]
+                uint256 penaltyX32 = penaltyValue * Q32 / debt;
+                gte(penaltyX32, 85899345, "VV-D-14: penalty below 2% minimum");
+                lte(penaltyX32, 429496729 + 1, "VV-D-14: penalty above 10% maximum");
+            }
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 75
+  notes: "The penaltyFractionX96 calculation in _calculateLiquidation does Q96 - ((fullValue - maxPenaltyValue) * Q96 / (startLiquidationValue - maxPenaltyValue)). If startLiquidationValue == maxPenaltyValue (collateralValue very close to fullValue * Q32 / (Q32 + MAX_PENALTY)), division by zero."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-15
+  tier: 1
+  type: property
+  description: "NFT custody invariant: for every tracked position, the NFT must be owned by either the vault or the gaugeManager (if staked)"
+  attack_scenario: "If an NFT backing a loan escapes the vault's custody without the loan being cleaned up, the collateral backing that debt vanishes. The borrower keeps the borrowed assets and the NFT. This could happen via a malicious transformer that transfers the NFT out during transform."
+  impact: "Complete loss of collateral for that loan -- borrower steals borrowed funds"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tid);
+        if (owner != address(0)) {
+            address nftOwner = npm.ownerOf(tid);
+            bool inVault = nftOwner == address(vault);
+            bool inGauge = address(gaugeManager) != address(0) && nftOwner == address(gaugeManager);
+            // Also check if staked in a gauge directly
+            bool staked = false;
+            if (address(gaugeManager) != address(0)) {
+                try gaugeManager.tokenIdToGauge(tid) returns (address gauge) {
+                    staked = gauge != address(0);
+                } catch {}
+            }
+            t(inVault || inGauge || staked, "VV-D-15: NFT escaped vault custody while loan active");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "The _transform function checks nonfungiblePositionManager.ownerOf(newTokenId) == address(this) after the transformer call. But what about the case where the transformer swaps to a new tokenId? The old tokenId could be burned or transferred. The _cleanupLoan handles old token. Post-transform, vault checks custody of newTokenId."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: DomainHunter
+  id: VV-D-FP-01
+  reason: "Donation attack via direct ERC20 transfer to vault: totalAssets() uses balanceOf(address(this)) + debt. Direct donation would increase balance, inflating totalAssets and share price. However, this does NOT cause first-depositor attack because the vault starts with Q96 exchange rate (not calculated from balance/supply). The exchange rate is only updated via _updateGlobalInterest which uses the IRM, not raw balance. Donations just increase reserves, which benefit the protocol."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "Revert Lend V3Vault uses exchange-rate-based accounting (Q96 fixed point), not balance/supply ratio. Donations to the vault just increase reserves and cannot manipulate share price. This is NOT vulnerable to vault-001 (first depositor) or vault-002 (donation attack)."
+    briefing_update_applied: false
+- hunter: DomainHunter
+  id: VV-D-FP-02
+  reason: "minLoanSize bypass via partial repay: repay() checks if resulting loan < minLoanSize and reverts. An attacker cannot create dust loans that are too expensive to liquidate. However, a position can START with 0 debt (just collateral, no borrow) which is fine -- minLoanSize only applies when there IS debt."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null
+- hunter: DomainHunter
+  id: VV-D-FP-03
+  reason: "borrow() health check skip in transform mode: During _transform, the transformer can call borrow() and the health check is skipped. This is by design -- the health check happens AFTER the transform completes (line 621). The transformer might temporarily make the position unhealthy during its operation. The final check after transform ensures the result is healthy."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null

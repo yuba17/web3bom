@@ -1,0 +1,756 @@
+protocol: morpho-vault-v2
+component: VaultV2
+file: src/VaultV2.sol
+domain: vault
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-01: Adapter returns arbitrary ids corrupting cap tracking
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-01
+  tier: 1
+  type: property
+  title: Adapter returns arbitrary ids to inflate/deflate cap allocation tracking
+  description: >
+    In allocateInternal() (L597), the vault calls IAdapter(adapter).allocate() which
+    returns (bytes32[] ids, int256 change). The vault blindly applies this change to
+    caps[ids[i]].allocation. A malicious adapter can return ids belonging to OTHER
+    adapters, corrupting their allocation tracking. Nothing enforces that adapters
+    return only their own ids. The NatSpec says "Returned ids must not repeat" but
+    does not say "ids must belong to this adapter only."
+  attack_scenario: >
+    1. Adapter A manages id_A with allocation=100, absoluteCap=200.
+    2. Malicious adapter B is added via timelock.
+    3. Allocator calls allocate(B, data, 50). B returns ids=[id_A], change=50.
+    4. caps[id_A].allocation = 150 but actual assets went to B not A.
+    5. Legitimate allocation to A via id_A is now falsely constrained.
+    6. B can also return negative change on deallocate to underflow allocations.
+  impact: >
+    Cap accounting corruption for any id. Over-allocation to risky markets
+    or DoS of legitimate adapters. Combined with malicious adapter, enables drain.
+  impact_rating: High
+  likelihood: Medium
+  severity: High
+  confidence: 70
+  solidity: |
+    mapping(address => mapping(bytes32 => bool)) internal ghost_adapterOwnedIds;
+    address[] internal ghost_trackedAdapters;
+    bytes32[] internal ghost_trackedIds;
+
+    function property_tb_01() public {
+      // Each id should only be modified by one adapter
+      for (uint256 i = 0; i < ghost_trackedIds.length; i++) {
+        bytes32 id = ghost_trackedIds[i];
+        uint256 ownerCount = 0;
+        for (uint256 j = 0; j < ghost_trackedAdapters.length; j++) {
+          if (ghost_adapterOwnedIds[ghost_trackedAdapters[j]][id]) ownerCount++;
+        }
+        t(ownerCount <= 1, "TB-01: same id returned by multiple adapters");
+      }
+    }
+  ghost_vars:
+    - mapping(address => mapping(bytes32 => bool)) internal ghost_adapterOwnedIds;
+    - address[] internal ghost_trackedAdapters;
+    - bytes32[] internal ghost_trackedIds;
+  affected_functions:
+    - allocateInternal
+    - deallocateInternal
+  validated: false
+  priority: high
+  notes: >
+    Documented trust assumption. Vault trusts adapters to return correct ids.
+    NatSpec "loose specification" — ids can be reused across adapters intentionally,
+    but a malicious adapter exploits this to corrupt others' tracking.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-02: Gate reverts permanently DoS user withdrawals
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-02
+  tier: 1
+  type: property
+  title: Malicious gate contract blocks withdrawals via revert or gas griefing
+  description: >
+    exit() calls canSendShares(onBehalf) and canReceiveAssets(receiver) which make
+    external calls to gate contracts without try/catch or gas limits. NatSpec says
+    "Gates must never revert, nor consume too much gas" but this is NOT enforced.
+    A reverting gate permanently blocks all withdrawals. If setSendSharesGate is
+    abdicated after setting a malicious gate, funds are PERMANENTLY locked.
+  attack_scenario: >
+    1. Curator submits setSendSharesGate(maliciousGate) via submit(), waits timelock.
+    2. maliciousGate.canSendShares() always reverts.
+    3. All exit/withdraw/redeem/transfer/transferFrom calls revert.
+    4. forceDeallocate calls withdraw internally — also fails.
+    5. If setSendSharesGate is abdicated, gate cannot be changed ever.
+    6. User funds permanently locked.
+  impact: >
+    Complete DoS of all withdrawals. If gate selector abdicated, permanent fund lock.
+    Otherwise locked for timelock duration until gate is replaced.
+  impact_rating: Critical
+  likelihood: Low
+  severity: High
+  confidence: 85
+  solidity: |
+    function property_tb_02() public {
+      // Gate calls should never revert for any user with shares
+      if (vault.balanceOf(address(this)) > 0) {
+        try vault.canSendShares(address(this)) returns (bool) {
+        } catch {
+          t(false, "TB-02: canSendShares reverted — gate DoS on withdrawals");
+          return;
+        }
+        try vault.canReceiveAssets(address(this)) returns (bool) {
+        } catch {
+          t(false, "TB-02: canReceiveAssets reverted — gate DoS on withdrawals");
+        }
+      }
+    }
+  ghost_vars: []
+  affected_functions:
+    - exit
+    - canSendShares
+    - canReceiveAssets
+    - withdraw
+    - redeem
+    - transfer
+    - transferFrom
+    - forceDeallocate
+  validated: false
+  priority: high
+  notes: >
+    receiveAssetsGate has partial mitigation: address(this) always passes (L947),
+    but canSendShares has zero fallback. High confidence — clear enforcement gap.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-03: Donation via direct transfer inflates realAssets in accrueInterestView
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-03
+  tier: 1
+  type: property
+  title: Direct token donation inflates share price beyond maxRate when rate is high
+  description: >
+    accrueInterestView() (L683) reads IERC20(asset).balanceOf(address(this)) to compute
+    realAssets. A direct asset.transfer() to the vault inflates balanceOf without going
+    through deposit. The maxRate caps growth: newTotalAssets = min(realAssets, maxTotalAssets).
+    But if maxRate is high (allocator-controlled, up to MAX_MAX_RATE) or elapsed time is
+    large, a donation can inflate share price significantly, enabling sandwich attacks.
+    Known Solodit HIGH: "Side effects of underlying directly donated to VaultV2."
+  attack_scenario: >
+    1. Vault: _totalAssets=1000, totalSupply=1000, maxRate is high.
+    2. Attacker deposits 100, gets ~100 shares.
+    3. Attacker donates 10000 tokens directly: asset.transfer(vault, 10000).
+    4. accrueInterest sees realAssets=11100, capped by maxRate. If maxRate allows even
+       partial pass-through, share price increases.
+    5. Attacker redeems 100 shares at inflated price, extracting from depositors.
+  impact: >
+    Depositors lose value. Attacker extracts donated amount minus dust via redeem
+    at inflated price. maxRate is the mitigation but allocator controls it.
+  impact_rating: High
+  likelihood: Medium
+  severity: High
+  confidence: 65
+  solidity: |
+    uint256 internal ghost_sumDeposited;
+    uint256 internal ghost_sumWithdrawn;
+
+    function property_tb_03() public {
+      uint256 totalAssets = vault.totalAssets();
+      uint256 netDeposits = ghost_sumDeposited > ghost_sumWithdrawn
+        ? ghost_sumDeposited - ghost_sumWithdrawn : 0;
+      uint256 elapsed = block.timestamp - vault.lastUpdate();
+      uint256 maxGrowth = (netDeposits * elapsed * vault.maxRate()) / 1e18;
+      t(
+        totalAssets <= netDeposits + maxGrowth + 1e6,
+        "TB-03: totalAssets exceeds deposits + maxRate growth — donation attack"
+      );
+    }
+  ghost_vars:
+    - uint256 internal ghost_sumDeposited;
+    - uint256 internal ghost_sumWithdrawn;
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - deposit
+    - withdraw
+  validated: false
+  priority: high
+  notes: >
+    Known Solodit finding for Morpho VaultV2. maxRate is the primary defense.
+    The trust boundary: balanceOf(address(this)) is externally influenceable.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-04: Adapter realAssets() returns inflated value — phantom interest
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-04
+  tier: 1
+  type: property
+  title: Adapter realAssets() trusted without validation — phantom interest accrual
+  description: >
+    accrueInterestView() (L684-686) sums IAdapter(adapters[i]).realAssets() for ALL
+    adapters. The vault completely trusts return values. A malicious adapter can return
+    inflated realAssets(), causing phantom interest. This mints performance fee shares
+    to performanceFeeRecipient, diluting depositors. maxRate caps growth but a persistent
+    inflated return extracts value at maxRate pace every block.
+  attack_scenario: >
+    1. Curator adds malicious adapter via timelock.
+    2. Adapter.realAssets() returns type(uint128).max.
+    3. accrueInterest: realAssets huge, capped by maxRate → still mints fee shares.
+    4. If curator = performanceFeeRecipient, they extract via dilution.
+    5. Each interaction mints more fee shares at maxRate.
+  impact: >
+    Performance fee shares minted on phantom interest dilute all depositors.
+    At high maxRate over weeks, significant extraction possible.
+  impact_rating: High
+  likelihood: Low
+  severity: Medium
+  confidence: 55
+  solidity: |
+    uint256 internal ghost_totalAllocatedToAdapters;
+
+    function property_tb_04() public {
+      uint256 reported = 0;
+      uint256 adLen = vault.adaptersLength();
+      for (uint256 i = 0; i < adLen; i++) {
+        reported += IAdapter(vault.adapters(i)).realAssets();
+      }
+      t(
+        reported <= ghost_totalAllocatedToAdapters * 2 + 1e18,
+        "TB-04: adapters report realAssets far exceeding total allocated"
+      );
+    }
+  ghost_vars:
+    - uint256 internal ghost_totalAllocatedToAdapters;
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - allocateInternal
+    - deallocateInternal
+  validated: false
+  priority: medium
+  notes: >
+    Documented trust assumption. maxRate is mitigation. Requires malicious curator.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-05: Reverting adapter realAssets() bricks entire vault
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-05
+  tier: 1
+  type: property
+  title: Single reverting adapter.realAssets() DoS-es all vault operations
+  description: >
+    accrueInterestView() (L684) loops ALL adapters calling realAssets(). If ANY adapter
+    reverts, the entire function reverts. Since accrueInterest() is called in deposit(),
+    mint(), withdraw(), redeem(), allocate(), setMaxRate(), and fee functions, a single
+    reverting adapter completely bricks the vault. NatSpec says "Adapters should not
+    revert on realAssets" — trust assumption not enforced.
+  attack_scenario: >
+    1. Vault has 5 adapters. One adapter's underlying market gets paused.
+    2. Adapter's realAssets() calls paused market → reverts.
+    3. accrueInterestView() reverts → ALL vault functions that call accrueInterest fail.
+    4. No deposits, no withdrawals, no interest accrual.
+    5. removeAdapter requires timelock → vault frozen for days/weeks.
+  impact: >
+    Complete vault freeze. No deposits or withdrawals. User funds locked for
+    at minimum the timelock duration for removeAdapter.
+  impact_rating: High
+  likelihood: Medium
+  severity: High
+  confidence: 80
+  solidity: |
+    function property_tb_05() public {
+      // accrueInterest should never revert
+      try vault.accrueInterest() {
+        // Success — vault not bricked
+      } catch {
+        t(false, "TB-05: accrueInterest reverted — vault bricked by adapter");
+      }
+    }
+  ghost_vars: []
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - deposit
+    - mint
+    - withdraw
+    - redeem
+  validated: false
+  priority: high
+  notes: >
+    Realistic scenario — DeFi market pauses happen regularly. No try/catch in
+    the adapter loop means zero fault tolerance.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-06: forceDeallocate also fails when accrueInterest is bricked
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-06
+  tier: 1
+  type: property
+  title: Emergency forceDeallocate fails when accrueInterest reverts — zero escape
+  description: >
+    forceDeallocate() (L850-859) calls deallocateInternal() then withdraw().
+    withdraw() calls accrueInterest(). If ANY adapter's realAssets() reverts (TB-05),
+    the internal withdraw() also reverts, making forceDeallocate unusable. The supposed
+    emergency mechanism fails in the exact scenario where it's most needed.
+  attack_scenario: >
+    1. Adapter X's realAssets() reverts (market paused).
+    2. accrueInterest() → all deposit/withdraw/redeem fail.
+    3. User calls forceDeallocate(healthyAdapterY, ..., user) to escape.
+    4. deallocateInternal(Y) succeeds.
+    5. withdraw(penaltyAssets, address(this), user) calls accrueInterest() → REVERTS.
+    6. Entire forceDeallocate tx reverts. ZERO escape mechanism works.
+  impact: >
+    No user-accessible escape when vault is DoS-ed by reverting adapter.
+    Funds locked until removeAdapter timelock completes.
+  impact_rating: Critical
+  likelihood: Medium
+  severity: Critical
+  confidence: 85
+  solidity: |
+    function property_tb_06() public {
+      // forceDeallocate should work even when accrueInterest is bricked
+      // We verify the dependency: if accrueInterest reverts, forceDeallocate also reverts
+      bool accrueWorks = true;
+      try vault.accrueInterest() {} catch { accrueWorks = false; }
+      if (!accrueWorks && vault.adaptersLength() > 0) {
+        t(false, "TB-06: accrueInterest bricked — forceDeallocate also unusable");
+      }
+    }
+  ghost_vars: []
+  affected_functions:
+    - forceDeallocate
+    - withdraw
+    - accrueInterest
+  validated: false
+  priority: high
+  notes: >
+    Most critical trust boundary finding. The emergency mechanism has the same
+    dependency on accrueInterest as regular operations. Combined with TB-05,
+    creates a complete lockup scenario.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-07: firstTotalAssets transient manipulation via flash deposit
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-07
+  tier: 1
+  type: property
+  title: Transient firstTotalAssets inflated by flash deposit enables relative cap bypass
+  description: >
+    firstTotalAssets is transient storage — resets to 0 each tx. Relative cap check
+    (L612): allocation <= firstTotalAssets.mulDivDown(relativeCap, WAD). In a single
+    tx: flash deposit inflates _totalAssets → accrueInterest sets firstTotalAssets
+    high → allocator allocates beyond real relative limits → deposit withdrawn. The
+    NatSpec acknowledges "Relative caps can still be manipulated by allocators."
+  attack_scenario: >
+    1. Vault TVL = 100K. Relative cap for risky adapter = 50% → max 50K.
+    2. Colluding allocator flash deposits 10M. firstTotalAssets = ~10M.
+    3. Allocator allocates 5M to risky adapter. 5M <= 10M * 50% → passes.
+    4. Colluding depositor withdraws 10M in same tx.
+    5. Now: 5M in risky adapter, 100K real TVL. Effective allocation = 5000%.
+  impact: >
+    Relative cap bypass. Vault funds concentrated in risky market far beyond
+    intended percentage. Depositors exposed to single-market risk.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 60
+  solidity: |
+    uint256 internal ghost_realTotalAssetsPreTx;
+
+    function property_tb_07() public {
+      // After allocate, check that allocation doesn't exceed relativeCap * real assets
+      // (not transient firstTotalAssets)
+      for (uint256 i = 0; i < ghost_trackedIds.length; i++) {
+        bytes32 id = ghost_trackedIds[i];
+        uint256 alloc = vault.allocation(id);
+        uint256 relCap = vault.relativeCap(id);
+        uint256 realAssets = uint256(vault._totalAssets());
+        if (relCap < 1e18 && realAssets > 0) {
+          t(
+            alloc <= (realAssets * relCap) / 1e18 + 1,
+            "TB-07: allocation exceeds real relative cap (flash deposit bypass)"
+          );
+        }
+      }
+    }
+  ghost_vars:
+    - uint256 internal ghost_realTotalAssetsPreTx;
+    - bytes32[] internal ghost_trackedIds;
+  affected_functions:
+    - allocateInternal
+    - accrueInterest
+    - deposit
+    - enter
+  validated: false
+  priority: medium
+  notes: >
+    Documented and partially mitigated. Requires colluding allocator with capital.
+    Flash loan within same tx is mitigated by firstTotalAssets, but across-tx deposits
+    with allocator collusion bypass the mechanism.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-08: exit() raw balanceOf read — donation disrupts deallocate path
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-08
+  tier: 1
+  type: property
+  title: exit() reads raw balanceOf for idle check — donation prevents needed deallocate
+  description: >
+    exit() (L825): idleAssets = IERC20(asset).balanceOf(address(this)). If assets >
+    idleAssets, it deallocates from liquidityAdapter. An attacker can donate tokens
+    to inflate idleAssets, preventing deallocate when it should happen. After the
+    donated idle is sent to withdrawer, vault balance drops below _totalAssets tracking.
+    Next accrueInterest sees higher realAssets (adapters still hold funds + donated
+    idle is gone) → may create accounting mismatch.
+  attack_scenario: >
+    1. Vault: 100 idle + 900 in adapter. _totalAssets = 1000.
+    2. User wants to withdraw 500. Normally: idle=100<500, deallocate 400.
+    3. Attacker donates 500 to vault: idle now 600.
+    4. exit(): idle=600 >= 500. No deallocate.
+    5. 500 sent to user. Vault balance: 100 idle + 900 adapter = 1000.
+    6. _totalAssets = 500 (1000-500). But realAssets = 100+900 = 1000.
+    7. Next accrueInterest: interest = 1000-500 = 500 phantom → fee shares minted.
+  impact: >
+    Phantom interest accrual from donation-inflated idle balance. Performance fees
+    extracted from depositors on non-existent yield.
+  impact_rating: High
+  likelihood: Medium
+  severity: High
+  confidence: 65
+  solidity: |
+    function property_tb_08() public {
+      uint256 idleAssets = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 totalAssets = uint256(vault._totalAssets());
+      // Idle balance should never significantly exceed totalAssets
+      // (which would indicate external donation)
+      t(
+        idleAssets <= totalAssets + 1e6,
+        "TB-08: idle balance exceeds _totalAssets — donation detected"
+      );
+    }
+  ghost_vars: []
+  affected_functions:
+    - exit
+    - accrueInterestView
+    - withdraw
+    - redeem
+  validated: false
+  priority: high
+  notes: >
+    Related to TB-03 but targets exit path specifically. The maxRate caps
+    the phantom interest growth rate, but it still accumulates over time.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-09: AdapterRegistry deregistration leaves active adapter in vault
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-09
+  tier: 2
+  type: property
+  title: AdapterRegistry removal after addAdapter leaves non-registry adapter active
+  description: >
+    addAdapter() (L447) checks isInRegistry at addition time. If the registry later
+    removes the adapter, the vault keeps using it. NatSpec (L125-126) acknowledges:
+    "The invariant holds only if the registry cannot remove adapters (is add only)."
+    If registry is not add-only, a compromised adapter stays active in vault.
+  attack_scenario: >
+    1. Registry R approved adapter A. Curator adds A to vault.
+    2. R removes A (vulnerability found, or R governance compromised).
+    3. Vault still uses A: isAdapter[A]=true, allocate/deallocate work.
+    4. If A is compromised, funds allocated to A can be stolen.
+    5. No automatic enforcement removes A from vault.
+  impact: >
+    Deregistered (potentially compromised) adapter remains active. Funds can be
+    allocated to it and its realAssets() is still trusted.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 70
+  solidity: |
+    function property_tb_09() public {
+      address registry = vault.adapterRegistry();
+      if (registry != address(0)) {
+        uint256 adLen = vault.adaptersLength();
+        for (uint256 i = 0; i < adLen; i++) {
+          address adapter = vault.adapters(i);
+          bool inReg = IAdapterRegistry(registry).isInRegistry(adapter);
+          t(inReg, "TB-09: active adapter not in registry — desync detected");
+        }
+      }
+    }
+  ghost_vars: []
+  affected_functions:
+    - addAdapter
+    - setAdapterRegistry
+    - allocateInternal
+  validated: false
+  priority: medium
+  notes: >
+    Documented limitation. Real risk depends on whether registry is add-only.
+    setAdapterRegistry retroactively checks, but only at set time.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-10: Fee recipient blocked by gate — fees silently skipped
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-10
+  tier: 1
+  type: property
+  title: Gate blocks fee recipient — performance/management fees silently zeroed
+  description: >
+    accrueInterestView() (L692) checks canReceiveShares(performanceFeeRecipient).
+    If gate blocks fee recipient, performanceFeeAssets = 0. Fees are silently skipped.
+    The curator can set a gate that blocks fee recipients, causing them to lose all
+    entitled fees. This crosses the trust boundary between gate config and fee logic.
+  attack_scenario: >
+    1. performanceFee = 10%, performanceFeeRecipient = feeAddr.
+    2. Curator sets receiveSharesGate blocking feeAddr.
+    3. Interest accrues but canReceiveShares(feeAddr) = false.
+    4. performanceFeeAssets = 0. No fee shares minted.
+    5. Fee recipient loses all performance fees.
+    6. Depositors benefit (higher share price) — perverse incentive.
+  impact: >
+    Fee recipient loses all entitled fees. Loss of funds for fee recipient.
+    Depositors benefit, creating incentive for curators to block fee recipients.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 75
+  solidity: |
+    function property_tb_10() public {
+      uint96 perfFee = vault.performanceFee();
+      address perfRecipient = vault.performanceFeeRecipient();
+      if (perfFee > 0 && perfRecipient != address(0)) {
+        t(
+          vault.canReceiveShares(perfRecipient),
+          "TB-10: performance fee recipient blocked by gate"
+        );
+      }
+      uint96 mgmtFee = vault.managementFee();
+      address mgmtRecipient = vault.managementFeeRecipient();
+      if (mgmtFee > 0 && mgmtRecipient != address(0)) {
+        t(
+          vault.canReceiveShares(mgmtRecipient),
+          "TB-10: management fee recipient blocked by gate"
+        );
+      }
+    }
+  ghost_vars: []
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - canReceiveShares
+    - setReceiveSharesGate
+  validated: false
+  priority: medium
+  notes: >
+    Likely by-design to prevent gate DoS on vault operations. But creates silent
+    fee loss. Fee recipients may not realize they're blocked.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-11: Adapter deallocate negative change can DoS via revert or underflow
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-11
+  tier: 1
+  type: property
+  title: Adapter returns excessive negative change — allocation underflow reverts
+  description: >
+    deallocateInternal() (L635): _caps.allocation = (int256(_caps.allocation) + change).toUint256().
+    If adapter returns change more negative than allocation, the result is a negative int256.
+    toUint256() should revert on negative values (safe cast). This means a malicious adapter
+    can DoS deallocate for any id by returning overly negative changes, locking funds in
+    that adapter permanently.
+  attack_scenario: >
+    1. Adapter has allocation=100 for id X.
+    2. Adapter returns change = -200 on deallocate.
+    3. int256(100) + (-200) = -100. toUint256(-100) reverts.
+    4. deallocateInternal reverts. Funds locked in adapter.
+    5. All withdrawals that need to deallocate from this adapter fail.
+  impact: >
+    DoS on deallocate for affected ids. If this is the liquidityAdapter,
+    all exit() calls that need liquidity are blocked.
+  impact_rating: High
+  likelihood: Low
+  severity: Medium
+  confidence: 55
+  solidity: |
+    function property_tb_11() public {
+      // No allocation should exceed _totalAssets
+      uint256 totalAssets = uint256(vault._totalAssets());
+      for (uint256 i = 0; i < ghost_trackedIds.length; i++) {
+        uint256 alloc = vault.allocation(ghost_trackedIds[i]);
+        t(
+          alloc <= totalAssets + 1,
+          "TB-11: id allocation exceeds _totalAssets — overflow or corruption"
+        );
+      }
+    }
+  ghost_vars:
+    - bytes32[] internal ghost_trackedIds;
+  affected_functions:
+    - deallocateInternal
+    - allocateInternal
+  validated: false
+  priority: medium
+  notes: >
+    Depends on MathLib.toUint256() behavior. If safe cast (revert on negative),
+    this is a DoS. Need to verify MathLib implementation.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-12: Fee-on-transfer tokens break accounting progressively
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-12
+  tier: 2
+  type: property
+  title: Fee-on-transfer tokens cause progressive _totalAssets inflation
+  description: >
+    enter() (L796): safeTransferFrom for `assets` then _totalAssets += assets (L798).
+    If token charges transfer fee, vault receives fewer tokens but credits full amount.
+    NatSpec (L140-144) explicitly excludes FoT tokens. However, tokens like USDT have
+    a fee mechanism currently set to 0 — if enabled later, existing vaults using USDT
+    become vulnerable without any vault-side change.
+  attack_scenario: >
+    1. Vault created with USDT (fee currently 0%).
+    2. Tether enables 0.1% transfer fee.
+    3. Deposits: vault receives 999 but _totalAssets += 1000.
+    4. Over time, _totalAssets diverges increasingly from real balance.
+    5. Last withdrawers cannot withdraw — insufficient tokens.
+  impact: >
+    Progressive insolvency. Last depositors lose funds. Vault accounting
+    permanently inflated relative to real token balance.
+  impact_rating: High
+  likelihood: Low
+  severity: Low
+  confidence: 40
+  solidity: |
+    uint256 internal ghost_cumulativeDeposited;
+    uint256 internal ghost_cumulativeReceived;
+
+    function property_tb_12() public {
+      // Amount credited to _totalAssets should match actual tokens received
+      t(
+        ghost_cumulativeDeposited <= ghost_cumulativeReceived + 1,
+        "TB-12: totalAssets inflation — more credited than received (FoT token)"
+      );
+    }
+  ghost_vars:
+    - uint256 internal ghost_cumulativeDeposited;
+    - uint256 internal ghost_cumulativeReceived;
+  affected_functions:
+    - enter
+    - deposit
+    - mint
+  validated: false
+  priority: low
+  notes: >
+    Documented exclusion per NatSpec. Low priority as a finding. Included because
+    USDT fee-enable scenario is a known edge case that has affected vaults before.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-13: Adapter reentrancy during deallocate — no guard enforced
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-13
+  tier: 1
+  type: property
+  title: Adapter can reenter vault during deallocateInternal — stale state exploitable
+  description: >
+    deallocateInternal() (L630) calls IAdapter(adapter).deallocate() BEFORE pulling
+    tokens back (L638). During the adapter call, vault state is inconsistent: caps
+    updated but _totalAssets/totalSupply unchanged. NatSpec says adapters "must not
+    re-enter" but no reentrancy guard exists. The transient firstTotalAssets != 0
+    makes accrueInterest a no-op (L681), providing SOME protection, but direct
+    state reads (_totalAssets, totalSupply) are stale during reentrant calls.
+  attack_scenario: >
+    1. Malicious adapter added via timelock.
+    2. exit() triggers deallocateInternal(adapter, ...).
+    3. In deallocate(), adapter reenters vault.deposit() with another account.
+    4. accrueInterest() returns early (firstTotalAssets!=0). Good.
+    5. But previewDeposit uses _totalAssets which hasn't been updated yet.
+    6. If _totalAssets is stale-high, reentrant depositor gets fewer shares
+       (actually hurts the attacker). If stale-low, gets more shares.
+    7. Depends on exact state — needs case analysis per operation.
+  impact: >
+    Stale exchange rate during reentrant call. Direction of exploitation depends
+    on specific state. Could favor attacker or defender.
+  impact_rating: Medium
+  likelihood: Low
+  severity: Medium
+  confidence: 50
+  solidity: |
+    bool internal ghost_inDeallocate;
+    bool internal ghost_reenteredDuringDeallocate;
+
+    function property_tb_13() public {
+      t(
+        !ghost_reenteredDuringDeallocate,
+        "TB-13: vault reentered during deallocateInternal"
+      );
+    }
+  ghost_vars:
+    - bool internal ghost_inDeallocate;
+    - bool internal ghost_reenteredDuringDeallocate;
+  affected_functions:
+    - deallocateInternal
+    - exit
+    - deposit
+    - mint
+  validated: false
+  priority: medium
+  notes: >
+    The firstTotalAssets transient provides significant protection — accrueInterest
+    becomes a no-op. But other paths may still be exploitable. Low confidence because
+    the protection is substantial but not proven complete.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TB-14: Upgradeable adapter proxy can be changed after addAdapter check
+# ═══════════════════════════════════════════════════════════════════════════
+- id: TB-14
+  tier: 2
+  type: property
+  title: Upgradeable adapter proxy can be changed to malicious after vault addition
+  description: >
+    The vault does not check if added adapters are upgradeable proxies. An adapter
+    that passes registry+timelock review can later be upgraded to a malicious
+    implementation. The timelock on addAdapter protects against initial malicious
+    addition but not post-addition upgrades.
+  attack_scenario: >
+    1. Curator adds legitimate adapter (proxy). Community reviews the implementation.
+    2. Allocator sends 5M to adapter via allocate().
+    3. Adapter admin upgrades proxy to malicious implementation.
+    4. Malicious: realAssets() returns 5M (hiding theft), allocate() steals tokens.
+    5. Vault accounting shows 5M allocated but funds are stolen.
+    6. On deallocate, malicious adapter returns tokens from different source or reverts.
+  impact: >
+    Complete loss of funds allocated to upgradeable adapter if its admin is
+    compromised. No vault-side defense against post-addition upgrades.
+  impact_rating: Critical
+  likelihood: Low
+  severity: Medium
+  confidence: 35
+  solidity: |
+    function property_tb_14() public {
+      // Verify adapters' realAssets matches actual token holdings
+      // A proxy upgrade would break this relationship
+      uint256 adLen = vault.adaptersLength();
+      for (uint256 i = 0; i < adLen; i++) {
+        address adapter = vault.adapters(i);
+        uint256 reported = IAdapter(adapter).realAssets();
+        uint256 adapterBalance = IERC20(vault.asset()).balanceOf(adapter);
+        // reported should be >= adapterBalance (adapter may have external positions)
+        // but reported should not be wildly larger than what was allocated
+        t(
+          reported <= ghost_totalAllocatedToAdapters + 1e18,
+          "TB-14: adapter realAssets exceeds total allocated — possible proxy upgrade"
+        );
+      }
+    }
+  ghost_vars:
+    - uint256 internal ghost_totalAllocatedToAdapters;
+  affected_functions:
+    - addAdapter
+    - allocateInternal
+    - accrueInterestView
+  validated: false
+  priority: medium
+  notes: >
+    Governance/operational risk. Vault cannot prevent external proxy upgrades.
+    Mitigation: only use non-upgradeable adapters. Low confidence as reportable
+    finding since it's inherent to proxy trust model.

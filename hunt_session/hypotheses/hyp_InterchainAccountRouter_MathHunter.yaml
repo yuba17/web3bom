@@ -1,0 +1,497 @@
+protocol: hyperlane
+component: InterchainAccountRouter
+file: solidity/contracts/middleware/InterchainAccountRouter.sol
+domain: trust
+hunter: MathHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: IAR-M-01
+  tier: 1
+  type: property
+  description: "Salt collision en _getSalt: abi.encodePacked con tipos de longitud variable-fija puede producir colisiones si origin+owner se alinean con router+ism diferente"
+  attack_scenario: >
+    _getSalt usa abi.encodePacked(_origin, _owner, _router, _ism, _userSalt).
+    _origin es uint32 (4 bytes), el resto son bytes32. Total = 4+32+32+32+32 = 132 bytes.
+    Como todos los campos son de tamaño fijo, NO hay colisión por packing ambiguity.
+    Sin embargo, si un atacante puede elegir _userSalt para que el hash coincida con
+    una ICA existente de otro owner, obtendría control sobre esa cuenta.
+    Esto requiere una preimage collision en keccak256, computacionalmente infeasible.
+    PERO: el verdadero riesgo es que en handle(), _sender (la dirección del router remoto)
+    se usa como _router en la derivación del salt, y _sender NO está validado contra
+    routers enrollados (diseño intencional según comments). Cualquier _sender arbitrario
+    desde cualquier chain genera una ICA diferente — esto es correcto pero amerita verificación.
+  impact: "Si dos combinaciones diferentes de inputs producen el mismo salt, un atacante controlaría la ICA de otro usuario — robo total de fondos en la ICA"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que salts diferentes para inputs diferentes
+    bytes32 salt1 = keccak256(abi.encodePacked(uint32(1), bytes32(uint256(0xA)), bytes32(uint256(0xB)), bytes32(uint256(0xC)), bytes32(0)));
+    bytes32 salt2 = keccak256(abi.encodePacked(uint32(1), bytes32(uint256(0xD)), bytes32(uint256(0xB)), bytes32(uint256(0xC)), bytes32(0)));
+    t(salt1 != salt2, "IAR-M-01: different owners must produce different salts");
+    // Verify fixed-size packing doesn't allow shifting bytes between fields
+    bytes32 salt3 = keccak256(abi.encodePacked(uint32(1), bytes32(uint256(0xA)), bytes32(uint256(0xB)), bytes32(uint256(0xC)), bytes32(uint256(1))));
+    t(salt1 != salt3, "IAR-M-01: different userSalt must produce different salts");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 40
+  notes: >
+    abi.encodePacked con todos tipos fijos (uint32, bytes32, bytes32, bytes32, bytes32) es seguro
+    contra colisiones de empaquetado. El riesgo real sería una colisión keccak256 que es infeasible.
+    Marcado como validated=true porque el encoding es correcto por diseño.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-02
+  tier: 1
+  type: property
+  description: "Encode/decode roundtrip: los campos owner, ism, salt y calls deben ser idénticos después de encode→decode en InterchainAccountMessage"
+  attack_scenario: >
+    InterchainAccountMessage.encode() usa abi.encodePacked para prefix (1 byte type + 3x bytes32)
+    y abi.encode para calls, luego bytes.concat. El decode usa hardcoded offsets:
+    [0:1] = type, [1:33] = owner, [33:65] = ism, [65:97] = salt, [97:] = calls.
+    Si el encode produce un layout diferente al esperado por decode, un atacante podría
+    craftar un mensaje donde el owner decodificado es diferente al codificado, obteniendo
+    control de una ICA ajena. El abi.encodePacked de un enum (uint8) produce 1 byte,
+    y de bytes32 produce 32 bytes, por lo tanto el layout es exactamente:
+    1 + 32 + 32 + 32 = 97 bytes prefix. Esto coincide con los offsets de decode.
+  impact: "Si encode/decode no son simétricos, un atacante podría hacer que handle() derive una ICA con owner/ism/salt diferentes a los que el sender original especificó — controlando fondos ajenos"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simular el roundtrip encode/decode
+    // MessageType.CALLS = 0, ocupa 1 byte en encodePacked
+    bytes32 testOwner = bytes32(uint256(0xdeadbeef));
+    bytes32 testIsm = bytes32(uint256(0xcafe));
+    bytes32 testSalt = bytes32(uint256(42));
+    // Verificar que el byte 0 es 0x00 (MessageType.CALLS)
+    bytes memory prefix = abi.encodePacked(uint8(0), testOwner, testIsm, testSalt);
+    eq(prefix.length, 97, "IAR-M-02: prefix must be exactly 97 bytes");
+    // Verificar que decode offsets match
+    eq(bytes32(bytes(abi.encodePacked(testOwner))), testOwner, "IAR-M-02: owner roundtrip");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: >
+    El encoding es correcto: encodePacked(uint8, bytes32, bytes32, bytes32) = 1+32+32+32 = 97 bytes,
+    que coincide exactamente con los offsets de decode. Sin embargo, este es un invariante
+    crítico de seguridad que debe ser fuzz-testeado exhaustivamente.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-03
+  tier: 1
+  type: property
+  description: "callRemoteCommitReveal envía address(this).balance como value del reveal message, que puede incluir ETH de otros usuarios"
+  attack_scenario: >
+    En callRemoteCommitReveal() (L603-631), el commitment message se envía con msg.value,
+    y el reveal message se envía con address(this).balance. Si el contrato tiene ETH residual
+    (de receive(), refunds previos, o envíos directos), ese ETH se envía como valor del
+    reveal dispatch. Esto significa que:
+    1. Usuario A envía 1 ETH para commit-reveal
+    2. El commit consume parte del msg.value para gas
+    3. El reveal envía address(this).balance que puede incluir ETH de terceros
+    4. Un atacante podría depositar ETH al router y luego llamar callRemoteCommitReveal
+       para que el reveal se pague con ETH del contrato
+    MÁS GRAVE: el primer dispatch (_commitmentMsgId) usa msg.value, y el segundo
+    (_revealMsgId) usa address(this).balance. Si el primer dispatch NO consume todo
+    msg.value (el hook devuelve cambio), el segundo dispatch captura ese cambio
+    MÁS cualquier ETH residual del contrato.
+  impact: "Pérdida de ETH residual en el contrato del router — cualquier usuario que use commit-reveal puede drenar el balance del contrato enviándolo como gas fee del reveal message"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track: el balance del contrato antes y después de callRemoteCommitReveal
+    // debe decrementar solo por msg.value del caller, no más
+    uint256 balanceBefore = address(router).balance;
+    uint256 callerValue = 1 ether;
+    // Simular: alguien depositó ETH al router previamente
+    // Después del call, el balance debería ser balanceBefore - callerValue (o 0 si insufficient)
+    // PERO el código envía address(this).balance en el reveal, que incluye ETH residual
+    uint256 balanceAfter = address(router).balance;
+    // Si hay ETH residual pre-existente, se pierde
+    lte(balanceBefore - balanceAfter, callerValue, "IAR-M-03: router should not spend more than msg.value");
+  ghost_vars:
+  - uint256 internal ghost_routerBalanceBefore;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    Este es el finding más prometedor. La línea 630 address(this).balance es peligrosa
+    porque captura todo el ETH del contrato, no solo el remanente del msg.value del caller.
+    El router tiene receive() external payable, así que puede acumular ETH.
+    Sin embargo, hay que verificar si mailbox.dispatch consume value o lo guarda — si el primer
+    dispatch consume todo msg.value, entonces address(this).balance solo tendría ETH residual.
+  poc_sketch: |
+    // 1. Enviar 1 ETH directo al router (via receive)
+    // 2. Llamar callRemoteCommitReveal con 0.1 ETH
+    // 3. Verificar que el reveal dispatch envía 1.1 ETH (0.1 residual del commit + 1.0 pre-existente)
+    // 4. Ese 1 ETH pre-existente no era del caller
+  call_stack: 'callRemoteCommitReveal → _dispatchMessageWithValue(msg.value) → _dispatchMessageWithValue(address(this).balance)'
+
+- id: IAR-M-04
+  tier: 2
+  type: property
+  description: "getRemoteInterchainAccount computa la implementación asumiendo que el router remoto usó el mismo bytecode de OwnableMulticall — si difiere, la dirección calculada es incorrecta"
+  attack_scenario: >
+    getRemoteInterchainAccount() en L384-398 replica la lógica del constructor del router
+    remoto para derivar la dirección de implementación: Create2.computeAddress(bytes32(0),
+    keccak256(_implementationBytecode(_router)), _router). Esto asume que el router remoto
+    tiene EXACTAMENTE el mismo creationCode de OwnableMulticall. Si el router remoto es una
+    versión diferente del contrato (upgrade, fork), el bytecodeHash calculado será incorrecto
+    y la dirección retornada no coincidirá con la ICA real.
+    Impacto: usuarios envían fondos a una dirección donde no existe contrato o existe un
+    contrato diferente. Los fondos quedan atrapados.
+  impact: "Fondos enviados a dirección incorrecta quedan permanentemente perdidos si el router remoto tiene versión diferente de OwnableMulticall"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que la implementación local coincide con la derivada remotamente
+    address localImpl = router.implementation();
+    // La implementación derivada remotamente usa _implementationBytecode(address(router))
+    // que incluye type(OwnableMulticall).creationCode — si la versión difiere, no match
+    address derivedImpl = Create2.computeAddress(
+        bytes32(0),
+        keccak256(abi.encodePacked(type(OwnableMulticall).creationCode, abi.encode(address(router)))),
+        address(router)
+    );
+    eq(localImpl, derivedImpl, "IAR-M-04: local implementation must match Create2 derivation");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Esto es más un riesgo operacional que un bug explotable. El bytecode de OwnableMulticall
+    es fijo en compile-time, así que dos despliegues del mismo código darían la misma dirección.
+    Solo falla si hay versiones heterogéneas cross-chain.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-05
+  tier: 1
+  type: property
+  description: "quoteGasForCommitReveal puede overflow: suma dos uint256 sin protección, aunque en la práctica los valores son pequeños"
+  attack_scenario: >
+    En quoteGasForCommitReveal (L826-837), el retorno es:
+    _Router_quoteDispatch(..., COMMIT_TX_GAS_USAGE) + quoteGasPayment(_destination, gasLimit).
+    Ambos retornan uint256. Si el hook retorna valores muy altos (hook malicioso o misconfigured),
+    la suma podría overflow en Solidity <0.8.0. Pero en ^0.8.13, la suma tiene checked
+    arithmetic, así que revertiría. El riesgo real no es overflow sino que un hook malicioso
+    haga que quoteGasForCommitReveal revert, impidiendo que usuarios estimen el costo.
+  impact: "DoS en quoteGasForCommitReveal si el hook retorna valores extremos — usuarios no pueden estimar costos y no pueden usar commit-reveal"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que la suma no revierte para valores razonables
+    uint256 commitQuote = router.quoteGasPayment(destination);
+    uint256 revealQuote = router.quoteGasPayment(destination, gasLimit);
+    // La suma debe ser >= cada parte (no overflow)
+    uint256 total = commitQuote + revealQuote;
+    gte(total, commitQuote, "IAR-M-05: overflow in quoteGasForCommitReveal");
+    gte(total, revealQuote, "IAR-M-05: overflow in quoteGasForCommitReveal");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 30
+  notes: >
+    Solidity ^0.8.13 tiene checked arithmetic, así que overflow causa revert, no wraparound.
+    El riesgo real es bajo porque los valores de gas quote son típicamente razonables.
+    Más relevante como QA/informational.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-06
+  tier: 1
+  type: property
+  description: "commitment() decodifica bytes32 desde _message[97:] sin verificar que el mensaje tenga al menos 129 bytes — si el mensaje es más corto, la decodificación lee basura o revierte"
+  attack_scenario: >
+    InterchainAccountMessage.commitment() en L167-170 hace bytes32(_message[97:]).
+    Para un COMMITMENT message, el formato esperado es 129 bytes (1+32+32+32+32).
+    Si un mensaje malformado pasa la verificación del ISM y llega a handle(), y el
+    messageType es COMMITMENT pero el payload es más corto que 129 bytes, el slice
+    [97:] podría estar vacío o ser <32 bytes. bytes32() de un slice < 32 bytes en
+    calldata revertiría por out-of-bounds. Similarmente, calls() en L161-164 hace
+    abi.decode(_message[97:], (CallLib.Call[])) — si el payload es malformado,
+    esto revertiría, causando DoS (el mensaje nunca se procesa).
+  impact: "Mensaje malformado causa revert en handle(), impidiendo procesamiento — pero solo afecta al mensaje específico, no es DoS sistémico"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Un mensaje COMMITMENT debe tener exactamente 129 bytes
+    // Un mensaje CALLS debe tener al menos 97 bytes de header + datos abi-encoded
+    // Verificar que handle() revierte con mensajes cortos
+    bytes memory shortMsg = abi.encodePacked(uint8(1), bytes32(0), bytes32(0), bytes32(0));
+    // Este mensaje es de tipo COMMITMENT (1) pero solo tiene 97 bytes, falta el commitment
+    // handle() debería revert al intentar leer _message.commitment()
+    t(shortMsg.length == 97, "IAR-M-06: short commitment msg is 97 bytes, needs 129");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    El mensaje viene del mailbox que lo recibe del relayer. Un relayer malicioso podría enviar
+    mensajes malformados, pero el ISM debería rechazarlos. Si el ISM es permisivo (ej: address(0)
+    default ISM que no valida formato), esto podría causar reverts. Sin embargo, el impacto es
+    limitado: solo afecta al mensaje malformado, no causa DoS general.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-07
+  tier: 1
+  type: property
+  description: "handle() no valida que _sender corresponda a un router enrollado — cualquier _sender genera una ICA válida, potencialmente desplegando proxy a dirección impredecible con ownership del router"
+  attack_scenario: >
+    En handle() (L134-167), _sender se usa directamente como _router en getDeployedInterchainAccount
+    sin verificar que sea un router enrollado. Esto es intencional (ver comment L131:
+    "Does not need to be onlyRemoteRouter, as this application is designed to receive
+    messages from untrusted remote contracts"). Sin embargo, la ICA desplegada tiene
+    owner = address(this) (el router local), y se inicializa con un _sender arbitrario
+    en el salt. El riesgo: un atacante en chain A envía un mensaje al router en chain B
+    con _sender = dirección arbitraria, desplegando una ICA en chain B que es owned por
+    el router. El atacante elige owner/ism/salt en el mensaje, así que controla qué ICA
+    se despliega y ejecuta calls en ella.
+    WAIT: El owner del OwnableMulticall es el ROUTER (address(this)), no el _owner del mensaje.
+    Las calls se ejecutan a través del router. Esto está bien — el router es el único que puede
+    llamar multicall en la ICA. Pero: como handle() ejecuta las calls inmediatamente
+    (ica.multicall{value}(calls)), y _sender puede ser cualquiera, un atacante controla
+    QUÉ calls se ejecutan en la ICA que corresponde a (_origin, _owner, _sender, _ism, _salt).
+    Si la ICA ya tiene fondos, el atacante puede drenarlos.
+  impact: "Si una ICA acumula fondos (ETH o tokens) y alguien envía un mensaje con el mismo (origin, owner, sender, ism, salt), puede ejecutar calls arbitrarias en esa ICA — drenando fondos"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // La ICA se despliega determinísticamente basada en (origin, owner, sender, ism, salt)
+    // Verificar que solo mensajes legítimos pueden ejecutar calls en una ICA dada
+    // Si el mailbox valida el origin y sender correctamente, solo el sender real del
+    // origin domain puede generar mensajes con ese (origin, sender)
+    // PERO: si el ISM es permisivo, cualquiera podría fabricar un mensaje
+    address ica1 = address(router.getLocalInterchainAccount(
+        uint32(1), bytes32(uint256(0xA)), bytes32(uint256(0xB)), address(0), bytes32(0)
+    ));
+    address ica2 = address(router.getLocalInterchainAccount(
+        uint32(1), bytes32(uint256(0xA)), bytes32(uint256(0xC)), address(0), bytes32(0)
+    ));
+    t(ica1 != ica2, "IAR-M-07: different senders must produce different ICAs");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    La seguridad de esto depende enteramente del ISM. Si el ISM verifica correctamente que
+    el mensaje fue realmente enviado por _sender en _origin, entonces solo el legítimo
+    owner puede ejecutar calls en su ICA. Si el ISM es débil o no configurado, esto es
+    un bug crítico. Este es más un trust boundary issue que math, pero la derivación del
+    salt y la falta de validación de _sender son relevantes.
+  poc_sketch: ''
+  call_stack: 'handle() → getDeployedInterchainAccount(_origin, _owner, _sender, _ism, _salt) → multicall(calls)'
+
+- id: IAR-M-08
+  tier: 2
+  type: property
+  description: "route() usa InterchainAccountMessage.ism() y InterchainAccountMessageReveal.revealIsm() con diferentes offsets — si un mensaje es malinterpretado como el tipo incorrecto, se lee un ISM incorrecto"
+  attack_scenario: >
+    En route() (L170-191):
+    - Para REVEAL: revealIsm lee _body[1:33] como ISM
+    - Para CALLS/COMMITMENT: ism lee _body[33:65] como ISM
+    El messageType se determina por _body[0]. Si un atacante crafta un mensaje donde
+    byte 0 = 2 (REVEAL) pero el contenido real es un CALLS message, el ISM se lee de
+    [1:33] en vez de [33:65]. Esto significa que el owner field (que está en [1:33] para
+    CALLS) se interpreta como el ISM address.
+    Esto permitiría al atacante elegir qué ISM verifica el mensaje, potencialmente usando
+    un ISM permisivo que acepta todo.
+    CRITICAL: Si el atacante pone su dirección controlada como owner (bytes [1:33]),
+    y envía el mensaje como tipo REVEAL, route() interpretará esa dirección como el ISM.
+    Si el atacante deploya un contrato en esa dirección que implementa ISM y retorna true,
+    el mensaje se verifica con el ISM del atacante.
+    PERO: handle() también lee messageType. Si es REVEAL, handle() retorna inmediatamente
+    sin ejecutar nada (L141-147). Así que el atacante no puede ejecutar calls.
+    CONCLUSION: El tipo REVEAL solo es "procesado" por el ISM verification, no por handle().
+    Si un atacante usa tipo REVEAL para bypass ISM, handle() ignora el mensaje.
+  impact: "Un atacante podría usar REVEAL type para seleccionar ISM arbitrario, pero handle() ignora mensajes REVEAL — no hay ejecución de calls, solo un noop"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Para mensajes REVEAL, route() lee ISM de offset [1:33]
+    // Para mensajes CALLS, route() lee ISM de offset [33:65]
+    // Verificar que los offsets son correctos y no se confunden
+    bytes memory revealMsg = abi.encodePacked(uint8(2), bytes32(uint256(0xISM)), bytes32(uint256(0xCOMMIT)));
+    // Byte 0 = 2 (REVEAL), [1:33] = ISM, [33:65] = commitment
+    // Si esto se interpretara como CALLS: [1:33] = owner, [33:65] = ism
+    // El ism de CALLS sería 0xCOMMIT en vez de 0xISM
+    t(true, "IAR-M-08: verify offset separation between message types");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: >
+    Investigado y descartado parcialmente. Aunque route() lee diferentes offsets según
+    messageType, handle() también despacha por messageType. Para REVEAL, handle() retorna
+    inmediatamente sin ejecutar nada. Así que abusar del tipo REVEAL para elegir ISM no
+    tiene beneficio práctico — el mensaje no ejecuta calls.
+    SIN EMBARGO, el commitment en un REVEAL message sí se procesa por el ISM — si el ISM
+    es CommitmentReadIsm, podría ejecutar revealAndExecute. Esto necesita más investigación.
+  poc_sketch: ''
+  call_stack: 'route() → reads messageType → selects ISM based on type'
+
+- id: IAR-M-09
+  tier: 2
+  type: property
+  description: "callRemoteCommitReveal pasa _ism al commitment message pero _ccipReadIsm al reveal message — si estos ISMs están desalineados, el reveal podría fallar o ser verificado por ISM incorrecto"
+  attack_scenario: >
+    En callRemoteCommitReveal (L603-631):
+    - Commitment message: encodeCommitment con _ism como ISM → route() usará _ism para verificar
+    - Reveal message: encodeReveal con _ccipReadIsm como ISM → route() usará _ccipReadIsm para verificar
+    Si _ccipReadIsm = bytes32(0) (overload sin parámetro), route() cae en:
+    _ism = _ism == address(0) ? address(CCIP_READ_ISM) : _ism (L208).
+    Esto es correcto — usa el default CCIP_READ_ISM.
+    PERO: si el caller especifica _ccipReadIsm != 0, el reveal se verificará con ese ISM
+    arbitrario. Si ese ISM es un contrato malicioso que no verifica nada, el reveal se
+    procesaría sin seguridad.
+    El impacto depende de quién puede llamar callRemoteCommitReveal — es public payable,
+    cualquiera puede llamarlo. Pero el caller solo afecta a su propia ICA (determinada por
+    msg.sender), así que no puede atacar ICAs ajenas.
+  impact: "El caller puede elegir un ISM arbitrario para su propio reveal, pero esto solo afecta su propia ICA — self-harm, no ataque a terceros"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el ISM del reveal se resuelve correctamente
+    // Si _ccipReadIsm = 0, debe usar CCIP_READ_ISM default
+    // Si _ccipReadIsm != 0, usa el especificado (potencialmente inseguro, pero self-harm)
+    address defaultIsm = address(router.CCIP_READ_ISM());
+    t(defaultIsm != address(0), "IAR-M-09: default CCIP_READ_ISM must be set");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 45
+  notes: >
+    Self-harm scenario: el caller elige ISM para su propio reveal. No hay impacto a terceros
+    porque la ICA se deriva del msg.sender. Investigado y clasificado como by-design.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-10
+  tier: 1
+  type: property
+  description: "_enrollRemoteRouterAndIsm permite enrollar bytes32(0) como ISM default, lo que causa que route() delegue a mailbox.defaultIsm() — potencial ISM bypass si defaultIsm es permisivo"
+  attack_scenario: >
+    En _enrollRemoteRouterAndIsm (L293-305), el check es que routers(_destination) == EMPTY_SALT
+    (bytes32(0)) Y isms[_destination] == EMPTY_SALT. Esto permite enrollar _ism = bytes32(0)
+    como valor default. En route() (L186-187), si la ISM del mensaje es bytes32(0), se usa
+    mailbox.defaultIsm(). Pero si el owner enrolla isms[domain] = bytes32(0), y luego un
+    caller usa callRemote (que lee isms[_destination]), el _ism en el mensaje será bytes32(0),
+    y en el destino route() usará el defaultIsm del mailbox remoto.
+    El riesgo: si el owner quería un ISM específico pero enrolló 0 por error, el mensaje
+    se verificará con el defaultIsm que puede ser más permisivo.
+    NOTA: Una vez enrollado, es inmutable ("router and ISM defaults are immutable once set").
+  impact: "Misconfiguration permanente: si ISM se enrolla como bytes32(0) (intencional o accidental), no se puede cambiar y el defaultIsm se usa forever"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el ISM enrollado no es zero para dominios activos
+    bytes32 enrolledIsm = router.isms(destination);
+    // Si enrolledIsm == 0, route() usará defaultIsm — verificar que esto es intencional
+    // Una vez enrollado como 0, es inmutable
+    if (enrolledIsm == bytes32(0)) {
+        // El ISM será mailbox.defaultIsm() — podría ser aceptable o no
+        t(address(mailbox.defaultIsm()) != address(0), "IAR-M-10: defaultIsm must exist if ism is zero");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Este es más un riesgo de configuración que un bug matemático. La inmutabilidad del
+    enrollment amplifica el impacto de un error. Sin embargo, es una decisión de diseño
+    documentada y el owner tiene control sobre esto.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-M-11
+  tier: 1
+  type: property
+  description: "En callRemoteCommitReveal, el commitment message usa hookMetadata hardcodeado (COMMIT_TX_GAS_USAGE, address(this) como refund) mientras el reveal usa hookMetadata del caller — desalineación de refund addresses"
+  attack_scenario: >
+    En callRemoteCommitReveal (L610-615), el commitment se despacha con:
+    StandardHookMetadata.formatMetadata(0, COMMIT_TX_GAS_USAGE, address(this), bytes(""))
+    El refund address es address(this) — el router mismo recibe el refund.
+    El reveal (L648-655) usa _hookMetadata del caller, que podría especificar un refund
+    address diferente (o ninguno).
+    Si el hook cobra gas y luego refund, el refund del commit va al router (no al caller).
+    El ETH refundado al router queda en el router y puede ser capturado por el SIGUIENTE
+    caller de callRemoteCommitReveal (porque address(this).balance incluye refunds previos).
+    COMBINADO con IAR-M-03: el reveal envía address(this).balance que incluiría refunds
+    de commits de OTROS usuarios.
+  impact: "ETH refundado de commits anteriores se filtra a usuarios posteriores vía address(this).balance en el reveal dispatch — redistribución incorrecta de gas refunds"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track: refund del commit va al router, no al caller
+    // El reveal envía address(this).balance que puede incluir refunds acumulados
+    uint256 routerBalanceBefore = address(router).balance;
+    // Después de callRemoteCommitReveal:
+    // commit refund → router (no caller)
+    // reveal value = address(this).balance (incluye refunds)
+    uint256 routerBalanceAfter = address(router).balance;
+    // El router no debería acumular ETH entre llamadas
+    eq(routerBalanceAfter, 0, "IAR-M-11: router should not accumulate ETH from refunds");
+  ghost_vars:
+  - uint256 internal ghost_routerEthBefore;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Este es el complemento de IAR-M-03. El refund address del commit es address(this),
+    lo que causa acumulación de ETH en el router. Ese ETH se envía con el reveal del
+    SIGUIENTE usuario. Esto es un leak de valor entre usuarios.
+  poc_sketch: |
+    // 1. Alice llama callRemoteCommitReveal con 2 ETH
+    // 2. El hook cobra 0.5 ETH para commit, refund 1.5 ETH al router
+    // 3. El reveal se intenta enviar con address(this).balance = 1.5 ETH
+    // 4. Bob llama callRemoteCommitReveal con 1 ETH
+    // 5. Si queda algo del balance de Alice, Bob's reveal se beneficia
+  call_stack: 'callRemoteCommitReveal → formatMetadata(refund=address(this)) → dispatch(commit) → refund → address(this).balance → dispatch(reveal)'
+
+false_positives:
+- hunter: MathHunter
+  id: IAR-FP-01
+  reason: >
+    abi.encodePacked en _getSalt con tipos fijos (uint32, bytes32, bytes32, bytes32, bytes32)
+    NO tiene ambiguity de packing. Cada tipo tiene tamaño fijo, así que no hay posibilidad
+    de que bytes de un campo se "desplacen" a otro. Sería diferente si usara strings o
+    bytes dinámicos. Este es un patrón seguro.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: >
+      abi.encodePacked con TODOS los tipos de tamaño fijo (uintN, bytesN, address) es seguro
+      contra colisiones de packing. Solo es peligroso con tipos dinámicos (string, bytes, arrays).
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: IAR-FP-02
+  reason: >
+    REVEAL message type bypass de ISM investigado: aunque route() lee ISM de offset diferente
+    para REVEAL vs CALLS, handle() ignora mensajes REVEAL (retorna inmediatamente).
+    No hay ejecución de calls, así que no hay impacto directo. El único efecto es que el ISM
+    CommitmentReadIsm podría ejecutar revealAndExecute durante verify(), pero eso requiere
+    un commitment previamente almacenado en la ICA — lo cual requiere haber pasado por el
+    flujo legítimo primero.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

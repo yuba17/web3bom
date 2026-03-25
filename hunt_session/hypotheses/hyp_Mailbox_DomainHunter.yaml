@@ -1,0 +1,337 @@
+protocol: hyperlane
+component: Mailbox
+file: /home/kali/Documents/Web3/hyperlane-monorepo/solidity/contracts/Mailbox.sol
+domain: access
+hunter: DomainHunter
+generated_at: '2026-03-24T19:00:00Z'
+invariants:
+- id: M-D-01
+  tier: 1
+  type: property
+  description: "El nonce del Mailbox debe ser estrictamente monotonicamente creciente -- cada dispatch incrementa nonce en exactamente 1"
+  attack_scenario: "Si el nonce se repite o salta, dos mensajes distintos podrian generar el mismo message ID (colision de keccak256 del mensaje formateado), permitiendo replay de un mensaje en el destino o impidiendo delivery de mensajes legitimos. Un atacante podria explotar un overflow de uint32 nonce tras ~4.3B dispatches para colisionar IDs."
+  impact: "Replay de mensajes cross-chain, perdida de fondos si el mensaje transporta value transfers"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint32 currentNonce = originMailbox.nonce();
+    gte(uint256(currentNonce), uint256(ghost_lastNonce), "M-D-01: nonce decreased or overflowed");
+    if (ghost_lastNonce > 0) {
+      lte(uint256(currentNonce), uint256(ghost_lastNonce) + 100, "M-D-01: nonce jumped unexpectedly");
+    }
+    ghost_lastNonce = currentNonce;
+  ghost_vars:
+  - uint32 internal ghost_lastNonce;
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "uint32 nonce overflow es teoricamente posible tras 4.3B dispatches. En la practica, improbable en una sola chain, pero el invariante debe mantenerse. nonce += 1 en L301 no tiene unchecked, asi que en Solidity >=0.8 overflow revertira, bloqueando TODOS los dispatches futuros -- DoS permanente."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-02
+  tier: 1
+  type: property
+  description: "Un mensaje procesado (delivered == true) NUNCA debe poder ser procesado de nuevo -- replay protection absoluta"
+  attack_scenario: "Si un mensaje puede procesarse dos veces, un atacante duplica transferencias cross-chain. El check en L217 (require delivered(_id) == false) protege, pero si hay una forma de limpiar deliveries[] o si block.number == 0 causa un bypass del check delivered(), el replay es posible."
+  impact: "Doble ejecucion de mensajes cross-chain, duplicacion de token mints/transfers"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que mensajes ya procesados permanecen marcados como delivered
+    // Usar ghost tracking de IDs procesados
+    if (ghost_processedMsgCount > 0) {
+      // El ultimo mensaje procesado debe seguir marcado como delivered
+      t(destMailbox.delivered(ghost_lastProcessedId), "M-D-02: previously delivered message lost delivery status");
+    }
+  ghost_vars:
+  - uint256 internal ghost_processedMsgCount;
+  - bytes32 internal ghost_lastProcessedId;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "delivered() usa blockNumber > 0 (L362). Si un mensaje se procesa en block 0 (genesis), delivered() retornaria false, permitiendo re-process. En la practica block 0 no tiene transacciones en la mayoria de chains, pero es un edge case real. El storage de deliveries[] es la unica proteccion contra replay."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-03
+  tier: 1
+  type: property
+  description: "process() escribe delivery (EFFECTS) ANTES de verificar ISM (INTERACTIONS) -- CEI violation potencial que permite reentrancia a traves del ISM"
+  attack_scenario: "Un ISM malicioso o comprometido podria, durante verify(), hacer un reentrant call a otra funcion del Mailbox o a un contrato que consulta delivered(). Durante la ejecucion de verify(), delivered(_id) ya retorna true aunque la verificacion no ha pasado aun. Si verify() revierte, el tx entero revierte y el estado se rollbackea. PERO: si un ISM malicioso llama a un contrato externo que toma decisiones basadas en delivered() == true, ese contrato actuaria sobre informacion prematura."
+  impact: "Contratos que consultan delivered() durante la ejecucion del ISM.verify() verian un estado inconsistente -- el mensaje aparece como entregado antes de ser verificado"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: despues de process(), si delivered(id) == true, el ISM verify fue exitoso
+    // No podemos testear directamente la reentrancia aqui, pero podemos verificar consistencia
+    if (ghost_processedMsgCount > 0) {
+      // Si delivered es true, el proceso completo debio haber terminado exitosamente
+      t(destMailbox.delivered(ghost_lastProcessedId), "M-D-03: delivery state inconsistent");
+      t(destMailbox.processedAt(ghost_lastProcessedId) > 0, "M-D-03: processedAt should be > 0 for delivered msg");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: "L225-228 escribe deliveries[] ANTES de L235 ism.verify(). Esto es un CEI violation deliberado (pattern comun en Hyperlane para prevenir reentrancy a process -- la re-entrancia a process() fallaria en 'already delivered'). Sin embargo, la verificacion ISM es un external call a un contrato no trusted que podria side-effectear."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-04
+  tier: 1
+  type: property
+  description: "recipientIsm() puede retornar un ISM no-contrato (EOA) si el recipient retorna una direccion que pasa ism != address(0) pero no tiene codigo"
+  attack_scenario: "Si recipientIsm() retorna un EOA o un contrato self-destructed, la llamada ism.verify() haria un call a un EOA. En Solidity, llamar a un EOA con call retorna success=true y data vacia. Sin embargo, ism.verify() es un high-level call que espera returndata -- en Solidity >=0.8, un high-level call a un EOA que no tiene codigo revierte si el returndata no decodifica correctamente. Esto causaria un DoS permanente: nadie podria procesar mensajes para ese recipient."
+  impact: "DoS permanente en delivery de mensajes a un recipient cuyo ISM no es un contrato valido"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // recipientIsm debe retornar siempre un contrato valido o el defaultIsm
+    address recipient = address(uint160(uint256(keccak256(abi.encodePacked(ghost_processedMsgCount)))));
+    // Solo verificar si el recipient tiene codigo (es un contrato)
+    IInterchainSecurityModule ism = destMailbox.recipientIsm(address(destMailbox));
+    // El ISM retornado debe ser un contrato
+    uint256 codeSize;
+    assembly { codeSize := extcodesize(ism) }
+    t(codeSize > 0, "M-D-04: recipientIsm returned non-contract address");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: "recipientIsm() L421-450 hace staticcall al recipient, decodifica address, verifica != address(0), pero NO verifica Address.isContract(ism). Contraste con setDefaultIsm() L370-371 que SI verifica isContract. Asimetria en validacion. Si recipient.interchainSecurityModule() retorna un EOA, process() revertira siempre en ism.verify()."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-05
+  tier: 2
+  type: property
+  description: "latestDispatchedId es un valor global que puede ser front-run -- hooks que dependen de latestDispatchedId para autenticacion son vulnerables a race conditions"
+  attack_scenario: "Si un hook usa latestDispatchedId para autenticar que un postDispatch proviene del Mailbox (pattern documentado en L42-43: 'used for auth in post-dispatch hooks'), un atacante puede front-run un dispatch legitimo con su propio dispatch, cambiando latestDispatchedId antes de que el hook del usuario legitimo lo lea. Sin embargo, dentro de un mismo dispatch() call, latestDispatchedId se escribe en L300 y los hooks se llaman en L311-312, asi que la lectura del hook veria el ID correcto. El riesgo es inter-transaccion, no intra-transaccion."
+  impact: "Hooks que cachean o verifican latestDispatchedId entre transacciones podrian ser engannados"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    bytes32 currentId = originMailbox.latestDispatchedId();
+    // latestDispatchedId debe corresponder al ultimo mensaje dispatched
+    if (ghost_callRemoteCount > 0) {
+      // Debe ser no-zero despues de al menos un dispatch
+      t(currentId != bytes32(0), "M-D-05: latestDispatchedId is zero after dispatch");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: "latestDispatchedId es public storage que cambia con cada dispatch. Los hooks lo leen para auth. Si dos dispatches ocurren en el mismo bloque, el segundo sobreescribe el primero. El hook del primer dispatch ya ejecuto con el ID correcto (dentro de la misma tx), asi que el riesgo real es bajo para el flujo normal."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-06
+  tier: 1
+  type: property
+  description: "dispatch() permite a cualquier caller pasar un hook arbitrario (address(0) se reemplaza por defaultHook, pero cualquier otro address se usa directamente) -- un hook malicioso podria robar el msg.value restante"
+  attack_scenario: "Un usuario llama dispatch() con un custom hook malicioso. El hook recibe msg.value - requiredValue via postDispatch{value: ...}. El hook malicioso podria: (1) robar los fondos del caller, (2) revertir selectivamente para DoS, (3) hacer reentrancia. Sin embargo, el caller ELIGE su propio hook, asi que self-inflicted. El riesgo real es si un contrato intermediario (router, bridge) llama dispatch con un hook proporcionado por un usuario no-trusted."
+  impact: "Robo de msg.value si un contrato intermediario pasa un hook no validado del usuario"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Despues de dispatch, el balance del mailbox no debe retener fondos
+    // Todo el msg.value debe haberse distribuido a hooks
+    uint256 mailboxBalance = address(originMailbox).balance;
+    lte(mailboxBalance, ghost_mailboxBalanceBefore, "M-D-06: mailbox retained unexpected funds after dispatch");
+  ghost_vars:
+  - uint256 internal ghost_mailboxBalanceBefore;
+  validated: false
+  priority: high
+  confidence: 55
+  notes: "dispatch() L283 acepta cualquier IPostDispatchHook. L306 address(hook) == address(0) fallback a defaultHook. Pero cualquier otro address se usa directamente sin validacion. Los routers de Hyperlane (InterchainAccountRouter, WarpRouter) que llaman dispatch con hooks pasados por usuarios son el vector real."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-07
+  tier: 1
+  type: property
+  description: "Asimetria en validacion: setDefaultIsm/setDefaultHook/setRequiredHook verifican isContract(), pero recipientIsm() NO verifica isContract() en el ISM retornado por el recipient"
+  attack_scenario: "Un recipient malicioso o buggy implementa interchainSecurityModule() retornando un EOA o contrato self-destructed. recipientIsm() retorna esa address sin verificar isContract(). Luego process() llama ism.verify() que falla porque no hay codigo. Resultado: DoS permanente para ese recipient -- nadie puede entregarle mensajes."
+  impact: "DoS permanente en delivery de mensajes a recipients con ISM invalido. No hay fallback ni recovery path."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar consistencia: el defaultIsm siempre debe ser un contrato
+    address defaultIsmAddr = address(destMailbox.defaultIsm());
+    uint256 codeSize;
+    assembly { codeSize := extcodesize(defaultIsmAddr) }
+    t(codeSize > 0, "M-D-07: defaultIsm is not a contract");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "Constraint inference (0xRajeev): setDefaultIsm L370 require(isContract). setDefaultHook L384 require(isContract). setRequiredHook L397 require(isContract). recipientIsm L447 solo check ism != address(0). El check faltante es isContract en recipientIsm. La asimetria es clara."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-08
+  tier: 2
+  type: property
+  description: "process() envia todo msg.value al recipient.handle() sin que el caller pueda especificar cuanto va al recipient vs cuanto es para gas -- un relayer podria enviar mas ETH del necesario"
+  attack_scenario: "Un relayer honesto llama process{value: X}(). Todo X va al recipient.handle{value: X}(). Si el recipient tiene una funcion handle() que no maneja ETH correctamente (no tiene receive/fallback), el process() entero revierte. Alternativamente, si el recipient es malicioso, recibe ETH gratis del relayer. El relayer pierde fondos."
+  impact: "Relayers pierden ETH si el recipient no acepta ETH o si envian mas del necesario"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // process() debe enviar exactamente msg.value al recipient
+    // No hay splitting logic -- todo msg.value va al handle()
+    // Verificar que el Mailbox no retiene fondos post-process
+    uint256 mailboxBal = address(destMailbox).balance;
+    lte(mailboxBal, 1 ether, "M-D-08: destMailbox retaining excessive balance");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "L241 IMessageRecipient(recipient).handle{value: msg.value}(...). Todo msg.value va al recipient. Si el recipient revierte al recibir ETH, el relayer no puede entregar el mensaje. El relayer tiene que decidir cuanto ETH enviar sin garantia de recovery."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-09
+  tier: 1
+  type: property
+  description: "dispatch() usa nonce actual para buildMessage ANTES de incrementarlo -- si dos dispatches ocurren en la misma transaccion (ej. via contrato intermediario), cada uno usa un nonce distinto porque nonce se incrementa en L301"
+  attack_scenario: "Verificar que el nonce se incrementa correctamente entre dispatches consecutivos. Si _buildMessage usa nonce en L462 y luego nonce += 1 en L301, el orden es correcto. Pero si un reentrant call a dispatch ocurre durante postDispatch (L311-312), el segundo dispatch usaria nonce+1, lo cual es correcto. Sin embargo, el latestDispatchedId del primer dispatch seria sobreescrito por el segundo."
+  impact: "latestDispatchedId del primer dispatch sobreescrito si hay reentrancia durante postDispatch -- hooks del primer dispatch ya ejecutaron, pero el estado global es inconsistente"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Cada dispatch debe incrementar nonce en exactamente 1
+    uint32 nonceBefore = originMailbox.nonce();
+    // Despues de N dispatches, nonce debe ser exactamente nonceBefore + N
+    // Solo podemos verificar post-hoc
+    if (ghost_callRemoteCount > 0) {
+      eq(uint256(originMailbox.nonce()), uint256(ghost_nonceAtStart) + ghost_callRemoteCount, "M-D-09: nonce drift -- dispatches not incrementing correctly");
+    }
+  ghost_vars:
+  - uint32 internal ghost_nonceAtStart;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: "dispatch() no tiene nonReentrant modifier. Si requiredHook.postDispatch o hook.postDispatch reentran a dispatch(), se generaria un segundo mensaje con nonce+1. La reentrancia NO rompe el nonce (cada call incrementa), pero latestDispatchedId (L300) del primer dispatch se pierde porque el segundo lo sobreescribe. Hooks que autentican via latestDispatchedId serian afectados."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-10
+  tier: 2
+  type: property
+  description: "quoteDispatch() construye el mensaje con nonce actual, pero dispatch() incrementa nonce -- si quoteDispatch se llama y luego dispatch en txs separadas, el mensaje construido es diferente, y los quotes podrian no coincidir"
+  attack_scenario: "Un usuario llama quoteDispatch() para obtener el fee, luego en otra tx llama dispatch(). Si entre las dos llamadas alguien mas hace un dispatch, el nonce cambio. El mensaje construido en dispatch sera diferente (distinto nonce), y el hook podria cobrar un fee distinto. El usuario paga mas o menos de lo esperado."
+  impact: "Fee mismatch entre quote y dispatch real si hay dispatches intermedios"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // quoteDispatch y dispatch deben usar el mismo nonce para consistencia intra-tx
+    // En la misma tx, esto es garantizado. Entre txs, el nonce puede cambiar.
+    // Solo podemos verificar que quoteDispatch no modifica state
+    uint32 nonceBefore = originMailbox.nonce();
+    // quoteDispatch es view -- no deberia modificar nonce
+    // No podemos llamar quoteDispatch sin parametros reales, asi que verificamos nonce stability
+    uint32 nonceAfter = originMailbox.nonce();
+    eq(uint256(nonceBefore), uint256(nonceAfter), "M-D-10: nonce changed unexpectedly between reads");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: "quoteDispatch es view, asi que no puede modificar state. Pero el mensaje que construye internamente usa el nonce actual, que sera diferente al nonce cuando se haga dispatch(). Los hooks cobran fee basado en el mensaje -- si el fee depende del nonce (improbable), habria discrepancia. En la practica, los hooks de Hyperlane no dependen del nonce para fees."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-11
+  tier: 1
+  type: property
+  description: "El owner puede cambiar defaultIsm/defaultHook/requiredHook en cualquier momento sin timelock, afectando inmediatamente a TODOS los mensajes pendientes de ser procesados"
+  attack_scenario: "El owner (o un owner comprometido) cambia defaultIsm a un ISM permisivo (que retorna true para todo). Inmediatamente, cualquier mensaje fabricado puede ser procesado sin verificacion real. Alternativamente, cambiar requiredHook a un hook que roba los fees. Esto es un governance risk, pero en protocolos cross-chain el impacto es amplificado porque afecta multiples chains."
+  impact: "Cambio instantaneo de ISM permite procesar mensajes falsos, robo de fondos cross-chain"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // defaultIsm no debe cambiar sin previo aviso
+    address currentIsm = address(destMailbox.defaultIsm());
+    if (ghost_lastDefaultIsm != address(0) && currentIsm != ghost_lastDefaultIsm) {
+      // Si cambio, registrar -- en produccion esto deberia tener timelock
+      ghost_ismChangeCount += 1;
+    }
+    ghost_lastDefaultIsm = currentIsm;
+    // No deberia cambiar mas de una vez en el fuzzing normal
+    lte(ghost_ismChangeCount, 2, "M-D-11: defaultIsm changed too many times -- governance risk");
+  ghost_vars:
+  - address internal ghost_lastDefaultIsm;
+  - uint256 internal ghost_ismChangeCount;
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: "setDefaultIsm/setDefaultHook/setRequiredHook son onlyOwner sin timelock. En el contexto de un bounty, owner=trusted es comun, pero el impacto de un owner comprometido en cross-chain messaging es catastrofico. Verificar si hay timelock en la deployment real."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-D-12
+  tier: 1
+  type: property
+  description: "dispatch() no valida que recipientAddress != bytes32(0) -- un mensaje a la direccion zero es irrecuperable"
+  attack_scenario: "Un usuario o contrato llama dispatch con recipientAddress = bytes32(0). El mensaje se despacha exitosamente, se paga el fee, pero en destino process() intentara entregar a address(0). recipientIsm(address(0)) retornara defaultIsm (porque staticcall a address(0) fallara). ism.verify() podria pasar. Luego IMessageRecipient(address(0)).handle() hara call a address(0) que no tiene codigo -- revierte. El mensaje queda en limbo: dispatched pero imposible de procesar."
+  impact: "Fondos del fee perdidos, mensaje imposible de entregar. Si el dispatch incluye ETH como value, esos fondos van a los hooks, no se recuperan."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Si se ha hecho dispatch, el latestDispatchedId no debe ser zero
+    if (ghost_callRemoteCount > 0) {
+      t(originMailbox.latestDispatchedId() != bytes32(0), "M-D-12: latestDispatchedId is zero after dispatch");
+    }
+    // Nota: no podemos verificar recipientAddress directamente desde el invariant
+    // porque no tenemos acceso al mensaje decodificado
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "dispatch() no tiene require(recipientAddress != bytes32(0)). _buildMessage formatea el mensaje con cualquier recipientAddress. El mensaje se emite via evento y el nonce se incrementa, pero en destino sera undeliverable. El fee se cobra igualmente."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: DomainHunter
+  id: M-D-FP-01
+  reason: "dispatch() es intencionalmente permissionless -- cualquier address puede enviar mensajes. Esto es by design en Hyperlane: la autenticacion ocurre en el destino via ISM, no en el origen."
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "dispatch() permissionless es by design en Hyperlane -- no flaggear como missing access control"
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: M-D-FP-02
+  reason: "process() CEI violation (write delivery before verify) es intencional -- previene reentrancy a process() con el mismo messageId. Si verify revierte, el tx entero revierte y el storage se rollbackea. Esto es un pattern conocido y documentado."
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Hyperlane process() escribe delivery ANTES de verify como proteccion anti-replay reentrancy -- no es un bug CEI clasico"
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: M-D-FP-03
+  reason: "El ISM.verify() no es view/pure -- puede tener side effects (ej. actualizar nonces de multisig, marcar checkpoints como usados). Esto es by design para ISMs que necesitan estado."
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "ISM.verify() es non-view intencionalmente -- ISMs pueden tener side effects (nonce tracking, etc)"
+    briefing_update_applied: false

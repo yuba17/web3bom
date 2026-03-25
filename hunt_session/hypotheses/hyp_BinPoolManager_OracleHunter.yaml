@@ -1,0 +1,443 @@
+protocol: pancakeswap-infinity
+component: BinPoolManager
+file: src/pool-bin/BinPoolManager.sol
+domain: oracle
+hunter: OracleHunter
+generated_at: '2026-03-23T12:00:00Z'
+invariants:
+
+- id: BPM-O-01
+  tier: 1
+  type: property
+  description: "activeId must only change via swap — mint/burn/donate must not alter activeId"
+  attack_scenario: >
+    If activeId could be changed by mint or donate, an attacker could manipulate
+    the spot price (which is purely derived from activeId + binStep) without paying
+    swap fees. This would let them sandwich other users' swaps or manipulate any
+    external protocol reading getSlot0().activeId as a price oracle. In BinPool,
+    price = (1 + binStep/10000)^(activeId - 2^23), so controlling activeId IS
+    controlling the price.
+  impact: "Any protocol using activeId as price feed would be exploitable via free price manipulation"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Ghost: track activeId before and after non-swap operations
+    (uint24 activeIdBefore,,) = binPoolManager.getSlot0(poolId);
+    // ... perform mint or burn or donate ...
+    (uint24 activeIdAfter,,) = binPoolManager.getSlot0(poolId);
+    eq(uint256(activeIdBefore), uint256(activeIdAfter), "BPM-O-01: activeId changed outside swap");
+  ghost_vars:
+    - "uint24 internal ghost_activeIdPreMint;"
+    - "uint24 internal ghost_activeIdPreBurn;"
+    - "uint24 internal ghost_activeIdPreDonate;"
+  validated: true
+  priority: high
+  confidence: 90
+  notes: >
+    Verified in code: only BinPool.swap() calls self.slot0.setActiveId(). mint/burn/donate
+    do not modify activeId. This invariant confirms the design holds. Low likelihood
+    of violation but critical if it did — validates the oracle trust model.
+
+- id: BPM-O-02
+  tier: 1
+  type: property
+  description: "Spot price derived from activeId must be monotonically consistent with swap direction — swapForY moves activeId down (lower price), !swapForY moves activeId up"
+  attack_scenario: >
+    If a swap for Y (selling X for Y) moved activeId UP instead of down, the price
+    would increase when it should decrease. An attacker could execute a swap that
+    artificially inflates the price, then exploit any protocol reading the spot price.
+    In BinPool.swap(), activeId moves via getNextNonEmptyBin when a bin is depleted.
+    If the tree traversal returned a wrong direction bin, activeId could move wrong.
+  impact: "Price moves opposite to expected direction — all external price consumers get wrong price"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (uint24 activeIdBefore,,) = binPoolManager.getSlot0(poolId);
+    // perform swap
+    BalanceDelta delta = binPoolManager.swap(key, swapForY, amountSpecified, hookData);
+    (uint24 activeIdAfter,,) = binPoolManager.getSlot0(poolId);
+    if (swapForY) {
+        lte(uint256(activeIdAfter), uint256(activeIdBefore), "BPM-O-02: swapForY increased activeId");
+    } else {
+        gte(uint256(activeIdAfter), uint256(activeIdBefore), "BPM-O-02: swapForX increased activeId wrong");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: >
+    In BinPool.swap(), when swapForY and bin is depleted, getNextNonEmptyBin(true, id)
+    calls TreeMath.findFirstRight which finds lower IDs. When !swapForY, findFirstLeft
+    finds higher IDs. Invariant validates tree traversal correctness for price direction.
+
+- id: BPM-O-03
+  tier: 1
+  type: property
+  description: "activeId=0 initialization creates permanently bricked pool — BinPoolManager.initialize() does NOT validate activeId != 0"
+  attack_scenario: >
+    checkPoolInitialized() at BinPool.sol:520 reverts if activeId == 0. BinPool.initialize()
+    at L76 checks self.slot0.activeId() != 0 to prevent double-init, but does NOT validate
+    that the NEW activeId parameter is non-zero. BinPoolManager.initialize() L130 calls
+    PriceHelper.getPriceFromId(0, binStep) as a safety check — this computes
+    base.pow(-8388608) which may or may not revert depending on the Uint128x128Math.pow()
+    implementation. If pow() returns 0 or a valid number for this extreme exponent, the
+    pool is initialized with activeId=0 in slot0. After that, every call to
+    checkPoolInitialized() sees activeId==0 and reverts — the pool is permanently DOSed.
+    An attacker could grief any pool creation by front-running with activeId=0.
+  impact: "Pool initialized with activeId=0 is permanently bricked — DOS of pool creation for specific key"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Attempt to initialize with activeId = 0
+    // If this succeeds without revert, the pool is bricked
+    // After init, verify pool is usable
+    (uint24 activeId,,) = binPoolManager.getSlot0(poolId);
+    t(activeId != 0, "BPM-O-03: pool initialized with activeId=0 is bricked");
+  ghost_vars: []
+  validated: true
+  priority: critical
+  confidence: 75
+  notes: >
+    POTENTIAL REAL BUG: Need to verify if PriceHelper.getPriceFromId(0, binStep) reverts.
+    If base.pow(-8388608) overflows or returns 0, the safety check works. If it returns
+    a valid but tiny number, the pool is bricked. The Uint128x128Math.pow() implementation
+    is the key — extreme negative exponents may not be handled. Also: even if it reverts,
+    the error message is misleading (not "invalid activeId"). PoolKey is deterministic
+    from currencies+hooks+fee+parameters, so an attacker cannot front-run with a different
+    key — each key can only be initialized once. Griefing is limited to creating useless
+    pools with activeId=0 for keys the attacker controls.
+
+- id: BPM-O-04
+  tier: 1
+  type: property
+  description: "Swap across empty bin gaps moves activeId without proportional cost — pools with sparse liquidity are extremely cheap to manipulate as oracle"
+  attack_scenario: >
+    The swap loop in BinPool.swap() skips empty bins via getNextNonEmptyBin() at zero cost.
+    If liquidity is concentrated in bin A and the next non-empty bin is bin A-500:
+    1. Attacker swaps just enough to drain bin A (~cost of bin A's reserves)
+    2. ActiveId jumps to bin A-500 — a 500-bin price move for the cost of 1 bin
+    3. With binStep=100, 500 bins = massive price multiplier
+    4. Any external protocol reading activeId sees a wildly distorted price
+    5. Attacker uses this in same tx to exploit the external protocol
+    6. Swaps back (draining bin A-500) to restore price
+    The cost is only: reserves_in_bin_A + reserves_in_bin_A-500 + fees.
+    This makes thin-liquidity bin pools extremely dangerous as oracle sources.
+  impact: "Price amplification — small swap cost creates disproportionate price movement for oracle consumers"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    (uint24 activeIdBefore,,) = binPoolManager.getSlot0(poolId);
+    (uint128 rx, uint128 ry,,) = binPoolManager.getBin(poolId, activeIdBefore);
+    // Cost to drain current bin
+    uint128 drainCost = swapForY ? rx : ry;
+    // Swap to drain
+    binPoolManager.swap(key, true, -int128(drainCost + 1), "");
+    (uint24 activeIdAfter,,) = binPoolManager.getSlot0(poolId);
+    uint24 binsMoved = activeIdBefore > activeIdAfter ?
+      activeIdBefore - activeIdAfter : activeIdAfter - activeIdBefore;
+    // If bins moved >> 1, empty gap was traversed for free
+    t(binsMoved > 10, "BPM-O-04: activeId jumped >10 bins — gap traversed for free");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    This is by-design for the pool mechanics but is a critical risk for any protocol
+    using activeId as a price oracle. The key metric is: cost_to_move_activeId vs
+    value_extractable_from_oracle_consumer. In pools with sparse liquidity and large
+    gaps, the ratio heavily favors the attacker.
+
+- id: BPM-O-05
+  tier: 1
+  type: property
+  description: "Composition fee on active bin mint depends on current bin ratio — attacker can manipulate ratio via swap to maximize fees charged to innocent LPs"
+  attack_scenario: >
+    When minting into the active bin with a different ratio than the bin's current reserves,
+    a composition fee is charged (BinHelper.getCompositionFeesAmount, BinPool._updateBin L447-469).
+    The fee is proportional to the difference in composition. An attacker can:
+    1. Swap to skew the active bin's ratio to near 100% token X (almost no Y)
+    2. An innocent LP mints with a balanced 50/50 ratio — massive composition fee
+    3. The composition fee goes to existing LPs (the attacker, who minted before the skew)
+    4. Attacker swaps back to restore ratio
+    The LP lost tokens to composition fees that the attacker captures as share value.
+  impact: "Loss of funds for LPs depositing in active bin with ratio different from attacker-manipulated ratio"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    (uint24 activeId,,) = binPoolManager.getSlot0(poolId);
+    (uint128 rx, uint128 ry,,) = binPoolManager.getBin(poolId, activeId);
+    uint256 ratioOriginal = rx > 0 ? uint256(ry) * 1e18 / rx : type(uint256).max;
+    // Attacker swaps to distort ratio
+    binPoolManager.swap(key, true, -int128(uint128(LARGE_AMOUNT)), "");
+    (uint128 rxAfter, uint128 ryAfter,,) = binPoolManager.getBin(poolId, activeId);
+    uint256 ratioAfter = rxAfter > 0 ? uint256(ryAfter) * 1e18 / rxAfter : type(uint256).max;
+    // Ratio changed drastically — LPs depositing now pay higher composition fee
+    t(ratioAfter * 100 / (ratioOriginal + 1) < 50 || ratioAfter * 100 / (ratioOriginal + 1) > 200,
+      "BPM-O-05: ratio del active bin cambió >2x por swap");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Needs analysis of whether the composition fee extraction is profitable after paying
+    swap fees for the ratio manipulation. At low fee pools (0.01%), the swap cost is
+    minimal but the composition fee is also low. At high fee pools (10%), the composition
+    fee extraction is larger but the swap cost to manipulate is also large.
+
+- id: BPM-O-06
+  tier: 1
+  type: property
+  description: "donate() destination is solely determined by activeId — attacker can redirect donations to bins they dominate by manipulating activeId via swap"
+  attack_scenario: >
+    donate() at BinPoolManager.sol L293 sends funds ONLY to reserveOfBin[activeId].
+    An attacker can:
+    1. Mint concentrated liquidity in an off-active bin X, owning 90%+ of shares
+    2. Swap to move activeId to bin X (cost = liquidity between current activeId and X)
+    3. Call donate() or wait for automated donate (hook, MEV redistribution, protocol fees)
+    4. Donation goes to bin X — attacker receives 90% of donated value
+    5. Swap back to restore activeId
+    The minBinShareForDonate check (2^128 default) prevents donation to bins with very few
+    shares but does NOT prevent donation to bins where one entity dominates share ownership.
+    This is especially dangerous if an external protocol calls donate() as a fee distribution
+    mechanism.
+  impact: "Theft of donated funds by redirecting activeId to attacker-dominated bin"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint24 attackerBin = activeId - 50;
+    (,,, uint256 totalShares) = binPoolManager.getBin(poolId, attackerBin);
+    // Assume attacker already has dominant share in this bin
+    // Swap to move activeId to attackerBin
+    binPoolManager.swap(key, true, -int128(uint128(ENOUGH_TO_REACH_BIN)), "");
+    (uint24 newActiveId,,) = binPoolManager.getSlot0(poolId);
+    eq(uint256(newActiveId), uint256(attackerBin), "BPM-O-06: activeId moved to attacker bin");
+    // donate() now goes to attacker-dominated bin
+    (,,, uint256 currentShares) = binPoolManager.getBin(poolId, attackerBin);
+    gte(currentShares, uint256(2) ** 128, "BPM-O-06: bin passes minBinShareForDonate check");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    PancakeSwap documents the JIT liquidity risk in donate() NatSpec. However, the
+    ACTIVE BIN REDIRECTION via swap is a different vector — it's not about adding JIT
+    liquidity to the current active bin, but about MOVING the active bin to one the
+    attacker already controls. The profitability depends on: swap cost to move activeId
+    vs donation value captured.
+
+- id: BPM-O-07
+  tier: 2
+  type: property
+  description: "No native TWAP mechanism exists — BinPoolManager is an oracle SOURCE without manipulation resistance, unlike Uniswap v3's cumulative tick oracle"
+  attack_scenario: >
+    Uniswap v3 has Oracle.sol with observations[] accumulating tick*time for TWAP.
+    PancakeSwap Infinity BinPoolManager has NONE of this:
+    - No observations array
+    - No cumulative activeId tracking
+    - No observe() or consult() function
+    - No OracleHelper library (confirmed: does not exist in codebase)
+    This means any external protocol needing manipulation-resistant pricing from a bin pool
+    must either: (1) build its own off-chain TWAP, (2) use a hook that implements TWAP,
+    or (3) use getSlot0().activeId directly (vulnerable to single-block manipulation).
+    The absence of native TWAP pushes integrators toward the least secure option.
+    Historical precedent: Uniswap v2 lacked TWAP and was exploited many times before v3.
+  impact: "Systemic risk — integrators likely to use manipulable spot price without native TWAP alternative"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify no TWAP mechanism exists
+    (uint24 activeId1,,) = binPoolManager.getSlot0(poolId);
+    // This is the ONLY price read available — no historical or averaged alternative
+    // Single-block manipulation: swap to distort, read, swap back — all in 1 tx
+    t(true, "BPM-O-07: confirmed — no native TWAP exists, only spot activeId");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    This is a design decision, not a bug in the contract itself. However, it's worth
+    flagging as a systemic risk for the PancakeSwap Infinity ecosystem. If PancakeSwap
+    documentation or SDK suggests using getSlot0().activeId as a price oracle without
+    warning about manipulation, it would be reportable as an informational finding.
+    The delegation to hooks for oracle functionality is architecturally sound but
+    creates fragmentation — each hook may implement TWAP differently (or not at all).
+
+- id: BPM-O-08
+  tier: 2
+  type: property
+  description: "Tree corruption via mint/burn race — bin removed from tree at MINIMUM_SHARE but reserves remain non-zero, creating invisible liquidity skipped by swaps"
+  attack_scenario: >
+    At BinPool.sol L338, a bin is removed from the tree when supply - amountToBurn == MINIMUM_SHARE.
+    But MINIMUM_SHARE = 1e3 shares remain, and corresponding reserves (however small) stay in
+    reserveOfBin[id]. These reserves are invisible to swaps because getNextNonEmptyBin()
+    won't find the bin. This means:
+    1. The reserves are permanently stuck (nobody can swap against them)
+    2. The swap price jumps OVER this bin, creating a larger price impact than expected
+    3. The share holder of those 1e3 shares cannot burn them (they're locked in the bin)
+    For oracle purposes: the price reported by activeId after a swap may be less accurate
+    because a bin with real reserves was skipped, creating a phantom gap in the price curve.
+  impact: "Micro-amounts of reserves permanently stuck in removed bins — dust-level but accumulative"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After burning down to MINIMUM_SHARE, verify bin is removed from tree
+    // but reserves may still be non-zero
+    (uint128 rx, uint128 ry,, uint256 shares) = binPoolManager.getBin(poolId, targetBinId);
+    if (shares == 1e3) { // MINIMUM_SHARE
+        // Bin should NOT be in tree (getNextNonEmptyBin won't find it)
+        // But reserves may be > 0
+        if (rx > 0 || ry > 0) {
+            t(false, "BPM-O-08: bin at MINIMUM_SHARE has non-zero reserves — stuck funds");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    The MINIMUM_SHARE mechanism prevents share inflation attacks but creates a side effect
+    where dust reserves become permanently locked. This is likely acceptable for the protocol
+    (dust amounts) but worth documenting. The price impact is negligible for individual bins
+    but could theoretically accumulate over many bins in a high-activity pool.
+
+- id: BPM-O-09
+  tier: 1
+  type: property
+  description: "donate() reserves accounting must be exact — donated amount must increase reserveOfBin[activeId] by exactly (amount0, amount1) with no rounding loss"
+  attack_scenario: >
+    donate() at BinPool.sol:352 adds amountIn to reserveOfBin[activeId] via
+    PackedUint128Math.add(). If the packed addition has any rounding behavior or if the
+    MAX_LIQUIDITY_PER_BIN check causes a partial donation to be accepted, the reserves
+    could differ from expected. This would mean: either donated value is lost (not reflected
+    in reserves) or the share price calculation (which depends on reserves/shares) becomes
+    inaccurate. The check at L365 reverts if MAX_LIQUIDITY_PER_BIN is exceeded — this is
+    an all-or-nothing check, so partial donations shouldn't happen. But if the add()
+    function has edge cases with packed encoding, value could leak.
+  impact: "Donated tokens lost (not reflected in share price) or phantom reserves created"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (uint128 rxBefore, uint128 ryBefore,,) = binPoolManager.getBin(poolId, activeId);
+    binPoolManager.donate(key, amount0, amount1, hookData);
+    (uint128 rxAfter, uint128 ryAfter,,) = binPoolManager.getBin(poolId, activeId);
+    eq(uint256(rxAfter), uint256(rxBefore) + uint256(amount0), "BPM-O-09: reserveX mismatch after donate");
+    eq(uint256(ryAfter), uint256(ryBefore) + uint256(amount1), "BPM-O-09: reserveY mismatch after donate");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: >
+    PackedUint128Math.add should be exact (no rounding) for uint128 values. The encoding
+    packs two uint128 into a bytes32. Addition is done component-wise. Overflow would revert
+    in Solidity 0.8.x. The MAX_LIQUIDITY_PER_BIN provides a secondary cap. This invariant
+    validates the accounting is exact, which is critical for price accuracy.
+
+flash_loan_analysis:
+  swap:
+    reads_manipulable_state: true
+    affects_fund_movement: true
+    same_tx_consumable: true
+    post_action_verification: false
+    reentrancy_guard: false  # relies on vault lock
+    spot_price_used: true  # activeId IS the spot price
+    reward_by_instant_balance: false
+    cap_crossable_atomically: true  # activeId can move many bins in one swap
+    verdict: >
+      swap() uses spot bin reserves and activeId to determine output. The activeId
+      IS the price oracle. A flash loan can: (1) swap large amount to move activeId,
+      (2) exploit any external protocol reading activeId as price, (3) swap back.
+      The cost is swap fees (up to 10% per direction). For pools with low fees and
+      thin liquidity, this is economically viable. NO TWAP exists — purely spot.
+  mint:
+    reads_manipulable_state: true
+    affects_fund_movement: true
+    same_tx_consumable: true
+    spot_price_used: true
+    verdict: >
+      mint() in active bin reads reserves to compute shares and composition fees.
+      A donation before mint inflates reserves, changing the share ratio. However,
+      since shares are proportional to liquidity contribution, the inflation equally
+      distributes — no extraction possible via this path alone. Composition fee
+      manipulation via swap-based ratio distortion IS a viable vector (BPM-O-05).
+  donate:
+    reads_manipulable_state: true
+    affects_fund_movement: true
+    same_tx_consumable: true
+    verdict: >
+      donate() increases reserves for ALL share holders in the active bin proportionally.
+      Two vectors: (1) JIT liquidity in active bin (documented known risk), (2) activeId
+      redirection via swap to attacker-dominated bin (BPM-O-06). The minBinShareForDonate
+      (2^128) mitigates JIT but not redirection.
+
+oracle_deep_check:
+  summary: >
+    BinPoolManager does NOT use external oracles (no Chainlink, no TWAP feeds).
+    The price mechanism is entirely internal: activeId determines the price via
+    getPriceFromId(activeId, binStep) = (1 + binStep/10000)^(activeId - 2^23).
+    This makes BinPoolManager itself an oracle SOURCE, not an oracle consumer.
+    External protocols reading getSlot0().activeId as a price feed are subject to
+    all the manipulation vectors described above (swap-based activeId movement).
+    There is ZERO manipulation resistance built into the contract — no TWAP,
+    no cumulative observations, no time-weighting, no multi-block requirements.
+  no_chainlink: true
+  no_twap: true
+  is_oracle_source: true
+  manipulation_cost: "swap fees (0-10%) on round-trip + slippage through drained bins"
+  key_risk: >
+    Any protocol using BinPoolManager's activeId as a price oracle is vulnerable
+    to single-block, single-transaction manipulation. The cost is proportional to
+    the TVL in bins traversed, which can be very low for sparse-liquidity pools.
+    Empty bin gaps amplify the price movement at zero additional cost.
+
+false_positives:
+- hunter: OracleHunter
+  id: BPM-O-FP-01
+  reason: >
+    Hook-based oracle manipulation: Hooks (beforeSwap, afterSwap, etc.) are FULLY TRUSTED
+    by design. A malicious hook that manipulates prices is not a reportable finding because
+    trust in hooks is explicit — the pool deployer chooses the hook and LPs accept that risk
+    by depositing. Do not report attacks requiring a malicious hook.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: OracleHunter
+  id: BPM-O-FP-02
+  reason: >
+    lpFeeOverride manipulation via hooks: beforeSwap can return an lpFeeOverride that
+    modifies the swapFee. This could reduce fees to 0, making swaps free and activeId
+    manipulation cheaper. BUT: requires a malicious hook, which is trusted by design.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: OracleHunter
+  id: BPM-O-FP-03
+  reason: >
+    Composition fee formula produces fees > swap fee (11% vs 10% at max): This is by-design.
+    FeeHelper.getCompositionFee uses amount * totalFee * (totalFee + PRECISION) / SQUARED_PRECISION
+    which is intentionally higher than the regular swap fee to prevent implicit-swap arbitrage
+    via unbalanced minting. Not a bug — documented design choice.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "BinPool composition fee is intentionally ~10% higher than swap fee to prevent implicit-swap arbitrage via unbalanced mint"
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: BPM-O-FP-04
+  reason: >
+    MAX_LIQUIDITY_PER_BIN as DoS vector: The check at BinPool.sol:181 and L479 could
+    theoretically be used to DoS a pool by inflating bin liquidity to the cap. However,
+    the cap is ~6.5e70 which requires astronomical amounts of real tokens. Not economically
+    viable as an attack vector.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

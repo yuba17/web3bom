@@ -1,0 +1,373 @@
+protocol: chainlink-pa-v2
+component: PriceManager
+file: src/PriceManager.sol
+domain: oracle
+hunter: MathHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-01 — uint224 overflow en toUint224() para feeds con decimales altos
+# Tier 2: SafeCast revierte, pero bloquea transmit() para el asset afectado
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-01
+  tier: 2
+  type: property
+  description: >
+    En transmit() L179, el precio escalado a 18 decimales se castea a uint224 via SafeCast.
+    uint224 max = 2^224 - 1 ≈ 2.69e67. Un precio de 1e18 (1 USD en 18 decimales) cabe sin
+    problema. Sin embargo, si un feed tiene un precio extremadamente alto Y se escala UP
+    (feedDecimals < 18), el resultado podría teóricamente acercarse al límite. Ejemplo:
+    un feed con 8 decimales reporta un precio de ~2.69e49 — al escalar ×1e10, alcanza
+    2.69e59, que aún cabe. En la práctica, ningún activo real alcanza estos valores, por lo
+    que toUint224 es seguro para precios realistas. Sin embargo, si el feed es configurado
+    con decimales incorrectos (ej: 0 decimales, escala ×1e18), un precio raw de ~2.69e49
+    podría causar overflow en la multiplicación antes del cast (uint256 overflow imposible
+    con 256 bits, pero el toUint224 posterior revertería). Esto bloquearía la transmisión
+    para ese asset — DoS parcial por misconfiguration.
+  attack_scenario: >
+    Un ASSET_ADMIN configura un feed con dataStreamsFeedDecimals = 1 (o un valor muy bajo
+    relativo al feed real). El price ADMIN transmite un reporte cuyo precio raw es alto.
+    Al escalar × 10^(18-1) = 10^17, el resultado puede exceder uint224 max si el precio
+    raw > 2.69e50. SafeCast revierte y transmit() falla para TODOS los reportes del batch
+    (no hay try/catch individual). Un solo asset misconfigured bloquea el batch entero.
+    Impacto: DoS de transmisión de precios. Mitigación: los reportes se verifican
+    individualmente via verifyBulk pero se procesan en un solo loop sin try/catch.
+  solidity: |
+    // Invariante: escalar un precio y castearlo a uint224 nunca debe revertir
+    // para valores razonables de precio (< 1e30) y decimales (1-24)
+    uint256 rawPrice = 1e30; // precio extremo pero teórico
+    uint8 feedDecimals = 1;  // configuración agresiva
+    uint256 scaled = rawPrice * 10 ** (18 - feedDecimals);
+    // scaled = 1e30 * 1e17 = 1e47 — cabe en uint224 (max ~2.69e67)
+    // Para romper: rawPrice > 2.69e50 con feedDecimals=1
+    // SafeCast.toUint224(scaled) revertiría si scaled > type(uint224).max
+    lte(scaled, type(uint224).max, "PM-01: precio escalado excede uint224");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 25
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-02 — Inconsistencia de precio entre Data Streams y Data Feed fallback
+# por diferencia en método de lectura de decimales
+# Tier 1: el protocolo podría usar un precio con escala incorrecta
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-02
+  tier: 1
+  type: property
+  description: >
+    En transmit() (L167), los decimales del Data Streams feed se leen de
+    feedInfo.dataStreamsFeedDecimals — un valor CONFIGURADO por el admin en
+    applyFeedInfoUpdates(). En _getAssetPrice() (L394/L410), los decimales del Data Feed
+    fallback se leen DINÁMICAMENTE de feedInfo.usdDataFeed.decimals(). Si el admin configura
+    dataStreamsFeedDecimals con un valor incorrecto (distinto del decimals real del Data
+    Streams feed), el precio Data Streams se escala incorrectamente. Cuando el sistema
+    cae al fallback Data Feed, ese precio se escala correctamente (decimals() on-chain).
+    Resultado: el mismo asset puede tener dos precios con escala diferente dependiendo de
+    si la fuente es Data Streams (mal escalado) o Data Feed (bien escalado). Esto crea una
+    discontinuidad de precio en el momento del fallback que puede ser explotada por
+    consumidores del precio.
+  attack_scenario: >
+    Supongamos que un feed Data Streams reporta con 8 decimales, pero el admin configura
+    dataStreamsFeedDecimals = 18 (no se valida contra ninguna fuente on-chain — no existe
+    un oracle on-chain para Data Streams decimals). El precio raw de 3000e8 (ETH a $3000)
+    NO se escala (18 == 18, no entra en ningún if). Se almacena como 3000e8 = 3e11, pero
+    debería ser 3e21. El precio almacenado es 1e10 veces menor al real. Cuando el Data
+    Streams price expira y se usa el fallback Data Feed (Chainlink con 8 decimals leídos
+    on-chain), se escala correctamente a 3e21. El consumidor ve un salto de 3e11 a 3e21.
+    Un atacante podría abrir posiciones baratas cuando Data Streams está activo (precio
+    bajo artificial) y cerrarlas con ganancia cuando el fallback activa el precio correcto.
+    NOTA: esto requiere misconfiguration por el admin — no es un bug de código sino de
+    configuración. Pero el código NO valida ni previene la misconfiguration.
+  solidity: |
+    // Invariante: el precio de Data Streams y el precio del Data Feed fallback
+    // para el mismo asset, cuando ambos están fresh, deben estar dentro de un
+    // margen razonable (ej: 5%)
+    (uint256 streamsPrice,,) = priceManager.getAssetPrice(asset);
+    // Forzar fallback manipulando timestamp
+    // Comparar ambos precios — divergencia > 5% indica misconfiguration
+    // Este invariante solo es testeable en fork con ambas fuentes activas
+    uint256 tolerance = streamsPrice * 5 / 100;
+    uint256 diff = streamsPrice > feedPrice ? streamsPrice - feedPrice : feedPrice - streamsPrice;
+    lte(diff, tolerance, "PM-02: divergencia >5% entre Data Streams y Data Feed");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-03 — Precision loss en downscaling cuando feedDecimals > 18
+# Tier 2: truncamiento por división entera puede redondear precio a cero
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-03
+  tier: 2
+  type: property
+  description: >
+    En transmit() L170-171 y _getAssetPrice() L398-399, cuando feedDecimals > 18
+    (Data Streams) o decimals > 18 (Data Feed), el precio se divide por
+    10^(feedDecimals - 18). División entera trunca: si el precio raw es menor que
+    10^(feedDecimals - 18), el resultado es 0. El check de usdPrice == 0 en L174 (transmit)
+    lo revierte. En _getAssetPrice() L404-406, el precio se marca como isValid=false si es 0.
+    Sin embargo, para precios PEQUEÑOS pero no cero, la pérdida de precisión puede ser
+    significativa. Ej: feedDecimals=24, precio raw=5e5 (un activo de 0.000005 USD con 24
+    decimales). Downscaled: 5e5 / 1e6 = 0 → revert. Precio raw=1.5e6 → 1.5e6/1e6 = 1 →
+    precio = 1 wei (= 1e-18 USD). El precio real es 1.5e-18 USD — se perdió el 33%.
+    En la práctica, feeds con >18 decimales son extremadamente raros en Chainlink. Data
+    Streams usa 18 decimales típicamente. Pero el código lo permite configurar así.
+  attack_scenario: >
+    Si un feed con >18 decimales reporta precios de activos de muy bajo valor, la
+    truncación sistemática redondea precios hacia abajo. Un consumidor del precio
+    que usa el valor para liquidaciones podría calcular mal el collateral value,
+    permitiendo posiciones sub-colateralizadas. El impacto depende de cuánto pesa
+    la pérdida de precisión — para activos de alto valor es negligible (ETH con 24
+    decimales: 3000e24 / 1e6 = 3e21 = exacto). Solo afecta a activos sub-cent con
+    muchos decimales.
+  solidity: |
+    // Invariante: la pérdida de precisión por downscaling no debe exceder 1 bip
+    // del precio original
+    uint256 rawPrice = report.price;
+    uint8 feedDecimals = feedInfo.dataStreamsFeedDecimals;
+    uint256 scaled;
+    if (feedDecimals > 18) {
+      uint256 divisor = 10 ** (feedDecimals - 18);
+      scaled = rawPrice / divisor;
+      uint256 reconstructed = scaled * divisor;
+      uint256 loss = rawPrice - reconstructed;
+      // loss / rawPrice < 1/10000 (1 bip)
+      lte(loss * 10000, rawPrice, "PM-03: precision loss > 1 bip en downscaling");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-04 — Underflow en block.timestamp - stalenessThreshold
+# Tier 2: underflow si stalenessThreshold > block.timestamp (edge case temprano)
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-04
+  tier: 2
+  type: property
+  description: >
+    En transmit() L162: `report.observationsTimestamp < block.timestamp - feedInfo.stalenessThreshold`
+    y en _getAssetPrice() L378/394: `block.timestamp - feedInfo.stalenessThreshold`.
+    Solidity 0.8.26 tiene checked arithmetic. Si feedInfo.stalenessThreshold > block.timestamp,
+    la resta revierte con underflow. stalenessThreshold es uint32 (max ~4.29e9 ≈ 136 años).
+    block.timestamp actual es ~1.74e9 (2025). Entonces un stalenessThreshold > 1.74e9 (~55 años)
+    causaría underflow y revertiría. El admin podría configurar un stalenessThreshold absurdamente
+    alto (ej: type(uint32).max) pensando "nunca stale" — esto haría que transmit() Y
+    _getAssetPrice() reviertan SIEMPRE. DoS permanente para ese asset hasta que el admin
+    corrija la configuración. No hay validación de upper bound para stalenessThreshold.
+  attack_scenario: >
+    Un ASSET_ADMIN configura stalenessThreshold = type(uint32).max (4294967295 ≈ 136 años)
+    con la intención de desactivar el check de staleness. Resultado: block.timestamp (1.74e9)
+    menos 4.29e9 causa underflow → revert. Tanto transmit() como getAssetPrice() se bloquean
+    permanentemente para ese asset. Si el contrato que hereda PriceManager depende de
+    _getAssetPrice() con withValidation=true, toda la funcionalidad del asset queda bloqueada.
+    Requiere admin error pero el código no previene el caso.
+  solidity: |
+    // Invariante: stalenessThreshold nunca debe exceder block.timestamp
+    // para evitar underflow en la resta
+    uint32 threshold = feedInfo.stalenessThreshold;
+    lt(uint256(threshold), block.timestamp, "PM-04: stalenessThreshold >= block.timestamp causa underflow");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-05 — Negative price del Data Feed fallback causa revert por SafeCast
+# Tier 1: DoS si Chainlink devuelve precio negativo (circuit breaker)
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-05
+  tier: 1
+  type: property
+  description: >
+    En _getAssetPrice() L392/L408: `price = answer.toUint256()` donde `answer` es int256
+    de latestRoundData(). SafeCast.toUint256() revierte si answer < 0. Chainlink puede
+    devolver precios negativos en condiciones extremas (ejemplo histórico: petróleo en 2020).
+    El mismo patrón se usa en transmit() L160/L176: `int256(report.price).toUint256()`.
+    Si el Data Streams price es stale y el fallback Data Feed devuelve un precio negativo,
+    _getAssetPrice() con withValidation=true revierte. Sin withValidation (getAssetPrice
+    público), también revierte porque SafeCast es unconditional — NO está dentro de un
+    try/catch. Esto bloquea la lectura de precios para el asset afectado.
+    NOTA: Para feeds USD/asset, precios negativos son teóricos pero posibles según
+    Chainlink docs. El contrato no tiene handling para este caso.
+  attack_scenario: >
+    Escenario: un activo cuyo Chainlink feed devuelve un precio negativo (evento extremo
+    de mercado o feed malfunction). El Data Streams price ya es stale (razón por la que
+    se cae al fallback). El fallback llama latestRoundData() → answer = -1e8. SafeCast
+    revierte. _getAssetPrice() revierte. Cualquier contrato hijo que llame
+    _getAssetPrice(asset, true) dentro de funciones críticas (ej: liquidaciones, apertura
+    de posiciones) se bloquea para ese asset. El asset queda sin precio válido y sin
+    forma de consultar getAssetPrice() — ni siquiera devuelve isValid=false, directamente
+    revierte. Impacto: DoS de funcionalidad dependiente de precio.
+    CONTRAARGUMENTO: este es un patrón estándar en la industria. Muchos protocolos usan
+    SafeCast sin catch para precios negativos. Chainlink USD feeds para crypto típicamente
+    no devuelven negativos. Severity podría ser Low/QA.
+  solidity: |
+    // Invariante: _getAssetPrice() nunca debe revertir por precio negativo —
+    // debe devolver isValid=false en su lugar
+    // Test: configurar un mock Data Feed que devuelva answer = -1
+    // Llamar getAssetPrice(asset) — si revierte, el invariante falla
+    // (en lugar de devolver (0, updatedAt, false))
+    try priceManager.getAssetPrice(asset) returns (uint256 p, uint256 t, bool v) {
+      // Si el feed devuelve negativo, esperamos que llegue aquí con v=false
+      // Si llega con p=0 y v=false, el handling es correcto
+    } catch {
+      t(false, "PM-05: getAssetPrice revierte en vez de devolver isValid=false");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-06 — Transmit no verifica que observationsTimestamp > precio previo
+# Tier 1: un reporte antiguo pero dentro del threshold puede sobrescribir uno nuevo
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-06
+  tier: 1
+  type: property
+  description: >
+    En transmit() L178-179, el staleness check solo verifica que el reporte no sea
+    más viejo que stalenessThreshold. NO verifica que el nuevo timestamp sea >= al
+    timestamp del precio almacenado previamente. Si el PRICE_ADMIN transmite un batch
+    con un reporte cuyo observationsTimestamp es MENOR que el precio ya almacenado
+    (pero aún dentro del threshold), el precio se sobrescribe con un valor más antiguo.
+    Esto constituye un retroceso temporal del precio: el protocolo "viaja al pasado"
+    y usa un precio desactualizado. En un mercado volátil, la diferencia entre el
+    precio actual y uno de hace N segundos puede ser significativa.
+  attack_scenario: >
+    Secuencia: T1: PRICE_ADMIN transmite reporte con timestamp=1000, price=3000e18.
+    T2: PRICE_ADMIN transmite reporte con timestamp=1010, price=3100e18.
+    T3 (block.timestamp=1015): PRICE_ADMIN transmite reporte con timestamp=1005
+    (stalenessThreshold=60, 1005 > 1015-60=955, pasa el check). El precio se sobrescribe
+    de 3100e18 a 3000e18 (o lo que sea el precio en T=1005). Un PRICE_ADMIN comprometido
+    o un MEV bot que reorganice el orden de transmisión podría forzar precios stale pero
+    "válidos" según el threshold. Impacto depende de quién consume el precio y cómo.
+    NOTA: requiere PRICE_ADMIN comprometido o comportamiento anómalo del keeper. En un
+    sistema bien diseñado el keeper siempre envía reportes monótonamente crecientes, pero
+    el contrato no lo enforce.
+  solidity: |
+    // Invariante: el timestamp del precio almacenado nunca debe decrecer
+    // Ghost variable: lastTimestamp[asset]
+    uint32 prevTimestamp = ghost_lastTimestamp[asset];
+    // Después de transmit():
+    uint32 newTimestamp = s_dataStreamsPrice[asset].timestamp;
+    gte(uint256(newTimestamp), uint256(prevTimestamp), "PM-06: timestamp retrocedio tras transmit");
+    ghost_lastTimestamp[asset] = newTimestamp;
+  ghost_vars:
+    - "mapping(address => uint32) ghost_lastTimestamp"
+  validated: false
+  priority: high
+  confidence: 70
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-07 — Batch transmit atomicity: un reporte inválido revierte TODO el batch
+# Tier 2: DoS selectivo por envenenamiento de batch
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-07
+  tier: 2
+  type: property
+  description: >
+    transmit() procesa todos los reportes en un solo loop sin try/catch. Si uno de los
+    reportes causa revert (precio negativo SafeCast L176, precio cero L174, staleness L162,
+    uint224 overflow L179), TODO el batch se revierte — incluyendo reportes válidos para
+    otros assets. Un atacante que pueda influir en qué reportes se incluyen en el batch
+    (ej: front-running al keeper para hacer stale un reporte específico) podría bloquear
+    la actualización de precios de assets legítimos repetidamente.
+    NOTA: el PRICE_ADMIN es trusted, pero si el keeper es un bot automatizado que no
+    filtra reportes problemáticos, podría auto-DoSear.
+  attack_scenario: >
+    El keeper bot agrupa reportes de 5 assets en un batch. Un asset tiene un feed
+    misconfigured (ej: PM-01 o PM-04). Cada vez que el keeper intenta transmitir,
+    el batch completo revierte. Los 4 assets restantes no reciben actualizaciones
+    de precio. Si el keeper no implementa retry-sin-el-asset-problemático, todos
+    los assets se quedan con precios stale indefinidamente. No es un ataque externo
+    sino un riesgo operacional amplificado por la atomicidad del batch.
+  solidity: |
+    // Invariante: transmit() con N reportes válidos siempre debe completar
+    // (no debe revertir por un reporte N+1 inválido en el batch)
+    // Este invariante describe el COMPORTAMIENTO DESEADO, no el actual
+    // Test: crear batch con 1 reporte válido + 1 inválido (stale)
+    // Verificar que al menos los válidos se procesan
+    // NOTA: actualmente el contrato NO cumple esto — es by-design (atomicidad)
+    // pero vale documentar como riesgo operacional
+    t(true, "PM-07: invariante de diseño — batch atomicity es riesgo operacional");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PM-08 — Data Feed fallback no valida answeredInRound >= roundId
+# Tier 1: precio stale del Data Feed podría usarse como "fresh"
+# ─────────────────────────────────────────────────────────────────────────────
+- id: PM-08
+  tier: 1
+  type: property
+  description: >
+    En _getAssetPrice() L386/L402, se llama latestRoundData() y solo se usa `answer` y
+    `dataFeedUpdatedAt`. Los valores `roundId` y `answeredInRound` se ignoran (descartados
+    con `,`). Según las best practices de Chainlink, se debe verificar que
+    answeredInRound >= roundId para confirmar que la respuesta es del round actual.
+    Sin esta verificación, un precio de un round anterior (potencialmente stale) podría
+    ser tratado como fresh si su updatedAt aún está dentro del stalenessThreshold.
+    Adicionalmente, no se verifica que answer > 0 antes del SafeCast — esto está
+    cubierto por PM-05 pero aquí el punto es la falta de validación completa de
+    latestRoundData().
+  attack_scenario: >
+    El Chainlink aggregator tiene un round que no fue respondido correctamente
+    (answeredInRound < roundId). latestRoundData() devuelve el último answer con
+    un updatedAt que aún está dentro del threshold. El PriceManager acepta este
+    precio como válido y lo escala a 18 decimales. Si el precio real ha cambiado
+    significativamente desde ese round, el consumidor del precio opera con un
+    valor desactualizado. Esto puede causar liquidaciones incorrectas o permitir
+    posiciones sub-colateralizadas.
+    CONTRAARGUMENTO: En la práctica, latestRoundData() de Chainlink devuelve
+    answeredInRound == roundId en casi todos los casos. Este check es más
+    "defense-in-depth" que un vector de ataque activo. Muchos protocolos lo omiten.
+  solidity: |
+    // Invariante: latestRoundData() debe tener answeredInRound >= roundId
+    (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) =
+      feedInfo.usdDataFeed.latestRoundData();
+    gte(uint256(answeredInRound), uint256(roundId), "PM-08: answeredInRound < roundId indica precio stale");
+    gt(answer, int256(0), "PM-08: answer <= 0 del Data Feed");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+
+false_positives:
+  - id: PM-FP-01
+    description: >
+      int192 a int256 widening en L160/176: `int256(report.price)` — el cast de int192
+      a int256 es siempre seguro (int192 cabe completamente en int256). No hay
+      truncamiento ni cambio de signo. Solo el posterior .toUint256() puede revertir
+      si el valor es negativo, lo cual es el comportamiento correcto (precio negativo
+      no tiene sentido para la mayoría de feeds).
+    lesson: >
+      Widening casts (smaller → larger signed type) son siempre seguros en Solidity.
+      No confundir con narrowing casts que sí truncan.
+
+  - id: PM-FP-02
+    description: >
+      Overflow en la multiplicación `usdPrice * 10 ** (PRICE_DECIMALS - feedDecimals)` en
+      L169. PRICE_DECIMALS = 18, feedDecimals mínimo = 1 (validado en L253/269). El
+      máximo multiplicador es 10^17. usdPrice es uint256. Para overflow: usdPrice >
+      type(uint256).max / 1e17 ≈ 1.15e60. Ningún precio real se acerca. El overflow
+      de la multiplicación uint256 no es un riesgo práctico.
+    lesson: >
+      Antes de reportar overflow en multiplicación, calcular el valor concreto que lo
+      causaría y evaluar si es realista. 1e60 USD por unidad no existe.
+
+  - id: PM-FP-03
+    description: >
+      El check `usdPrice == 0` en transmit() L174 cubre el caso donde downscaling
+      trunca a cero. No es un bug — es el handling correcto. El revert con
+      Errors.ZeroFeedData() previene almacenar un precio de 0.
+    lesson: >
+      Verificar los checks post-operación antes de reportar — la truncación a cero
+      está manejada correctamente con el revert.

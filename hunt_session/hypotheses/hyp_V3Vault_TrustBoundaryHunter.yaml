@@ -1,0 +1,607 @@
+protocol: revert-lend
+component: V3Vault
+file: src/V3Vault.sol
+domain: vault
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: VV-TB-01
+  tier: 1
+  type: property
+  description: "Transformer call cannot leave NFT outside vault custody after transform completes -- the vault MUST own the newTokenId NFT at the end of _transform"
+  attack_scenario: >
+    A malicious transformer (whitelisted by owner but buggy/upgradeable) receives the approved NFT,
+    transfers it to an attacker address, then sends a different NFT back to the vault. The vault checks
+    ownerOf(newTokenId) == address(this) at L603, but if the transformer manipulates transformedTokenId
+    via onERC721Received to point to the new NFT while the original (with debt) is gone, the vault loses
+    collateral. The check at L604 uses newTokenId (read from transformedTokenId at L592) not the original
+    tokenId -- so the debt migrates to the new token but old collateral is stolen.
+  impact: "Loss of collateral NFT worth the full position value. Attacker steals the LP position."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any transform, vault must still own the active token
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        if (owner != address(0)) {
+            // If vault tracks this token, the NFT manager must report vault as owner
+            // (or gauge manager if staked)
+            address nftOwner;
+            try npm.ownerOf(tokenId) returns (address o) {
+                nftOwner = o;
+            } catch {
+                continue; // burned token
+            }
+            t(
+                nftOwner == address(vault) || nftOwner == address(mockGaugeManager),
+                "VV-TB-01: vault-tracked token not in vault or gauge custody"
+            );
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "The _transform function checks ownerOf(newTokenId) at L603 but the transformer has full control during the call. The key trust assumption is that whitelisted transformers are audited contracts."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-02
+  tier: 1
+  type: property
+  description: "Transformer approval is always cleared after transform -- no lingering NFT approvals on vault-held positions"
+  attack_scenario: >
+    If nonfungiblePositionManager.approve(address(0), newTokenId) at L609 fails silently or the
+    transformer swaps tokens such that the old approval persists on a token still held by vault,
+    the transformer retains transfer rights over vault collateral. The try-catch at L612 means
+    approval clearing for old tokenId is best-effort. If old tokenId is NOT burned but still in vault
+    (edge case where tokenId == newTokenId path is not taken but approval persists), the transformer
+    keeps approval.
+  impact: "Transformer retains perpetual approval to transfer vault collateral NFTs."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check no lingering approvals on vault-held tokens
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        if (owner != address(0)) {
+            // transformedTokenId should be 0 outside of transform
+            uint256 tid = vault.transformedTokenId();
+            if (tid == 0) {
+                address approved;
+                try npm.getApproved(tokenId) returns (address a) {
+                    approved = a;
+                } catch {
+                    continue;
+                }
+                t(
+                    approved == address(0) || approved == address(mockGaugeManager),
+                    "VV-TB-02: lingering NFT approval on vault-held token"
+                );
+            }
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "L609-L612: approve(address(0)) for old token is wrapped in try-catch. If the old token is not burned and still tracked, the approval may persist."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-03
+  tier: 1
+  type: property
+  description: "transformedTokenId is ALWAYS zero outside of an active _transform call -- reentrancy sentinel integrity"
+  attack_scenario: >
+    If transformedTokenId is left non-zero due to an uncaught revert path or a transformer that
+    manipulates state such that the reset at L623 is skipped, the vault enters a permanent
+    transform-mode state. This blocks liquidations (L770-L772), blocks decreaseLiquidityAndCollect
+    (L690-L692), and allows anyone calling borrow() to bypass the owner check (L631) if they are
+    a whitelisted transformer.
+  impact: "Permanent DoS on liquidations and collateral withdrawals. Potential unauthorized borrowing."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // transformedTokenId must be 0 when no transform is in progress
+    uint256 tid = vault.transformedTokenId();
+    t(tid == 0, "VV-TB-03: transformedTokenId stuck non-zero outside transform");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "The reset at L623 only executes if _transform completes successfully. If the transformer.call at L586 reverts, the whole tx reverts (checked call), so this should be safe. But if a callback re-enters before L623..."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-04
+  tier: 1
+  type: property
+  description: "onERC721Received during transform mode cannot overwrite an existing active loan -- replacement token must be fresh (no prior owner or debt)"
+  attack_scenario: >
+    During transform mode, onERC721Received at L479 checks tokenOwner[tokenId] == address(0) &&
+    loans[tokenId].debtShares == 0 for the replacement token. If an attacker can send a token that
+    already has an active loan in the vault (through a different path), the check at L482 should catch it.
+    However, if the attacker first removes the token (setting tokenOwner to 0, debtShares already 0
+    because remove() requires debtShares == 0), then re-sends it during transform, the token passes the
+    check. The old debt from the transformed token gets copied to this recycled tokenId at L494.
+    This is actually safe by design since removed tokens have no debt.
+  impact: "Potential accounting corruption if a previously-used tokenId with residual state is reintroduced."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Every token tracked by vault must have consistent ownership
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        (uint256 debtShares) = vault.loans(tokenId);
+        // If token has no owner in vault, it must have no debt
+        if (owner == address(0)) {
+            eq(debtShares, 0, "VV-TB-04: orphaned debt -- token has no owner but has debt shares");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "L482 checks both tokenOwner and debtShares. The _cleanupLoan at L500 deletes the old loan. This invariant catches if the cleanup ever fails."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-05
+  tier: 1
+  type: property
+  description: "Only the NFT position manager can trigger onERC721Received -- no other contract can inject tokens into vault accounting"
+  attack_scenario: >
+    If a contract other than nonfungiblePositionManager calls onERC721Received on the vault,
+    it could create fake loan entries without transferring a real NFT. The check at L447 verifies
+    msg.sender == address(nonfungiblePositionManager), but a malicious contract could use
+    delegatecall or a proxy pattern to spoof msg.sender. However, msg.sender is the actual caller
+    in EVM, not spoofable via delegatecall (delegatecall preserves msg.sender of the outer call).
+    The real risk: if nonfungiblePositionManager itself is upgradeable or has a callback that
+    allows arbitrary callers to trigger safeTransferFrom.
+  impact: "Fake collateral injection -- attacker creates phantom loan entries and borrows real assets."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Vault loan count must match actual NFT custody
+    uint256 vaultLoanCountAlice = vault.loanCount(alice);
+    uint256 vaultLoanCountBob = vault.loanCount(bob);
+    // Total tracked tokens should not exceed positions created
+    lte(
+        vaultLoanCountAlice + vaultLoanCountBob,
+        ghost_positionsCreated,
+        "VV-TB-05: more vault loans than positions ever created"
+    );
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "L447 check is correct but relies on nonfungiblePositionManager being a trusted immutable contract."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-06
+  tier: 1
+  type: property
+  description: "totalAssets uses balanceOf(address(this)) which is manipulable via direct token transfer (donation attack) -- share price can be inflated"
+  attack_scenario: >
+    totalAssets() at L288 returns IERC20(asset).balanceOf(address(this)) + debt. An attacker can
+    directly transfer asset tokens to the vault (donation) to inflate balanceOf without going through
+    deposit(). This inflates totalAssets, which inflates the exchange rate for existing shares.
+    Combined with first-depositor attack: deposit 1 wei, donate large amount, next depositor gets
+    0 shares due to rounding. The vault does NOT use virtual shares offset (_decimalsOffset).
+    However, the vault uses internal debt tracking + exchange rates (lastLendExchangeRateX96) which
+    are only updated through _updateGlobalInterest, so donation does NOT affect the exchange rate
+    directly. The balanceOf reading only affects _getBalanceAndReserves for liquidity checks, not
+    share pricing. Share pricing uses exchange rates.
+  impact: "If exploitable: first depositor steals subsequent deposits. But exchange rate based pricing may mitigate."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // totalAssets should be consistent with internal accounting
+    (uint256 debt, uint256 lent, uint256 balance, uint256 reserves,,) = vault.vaultInfo();
+    uint256 totalAssets = vault.totalAssets();
+    // totalAssets = balanceOf(vault) + debt -- which should approximate lent + reserves
+    // But donations can make balance > lent + reserves - debt
+    // The key invariant: share price should not be manipulable
+    if (vault.totalSupply() > 0 && ghost_totalDeposited > 0) {
+        uint256 sharePrice = vault.convertToAssets(1e18);
+        // Share price should not exceed deposited + reasonable interest
+        // Using a generous 2x bound (100% interest)
+        lte(
+            sharePrice,
+            2e18 + ghost_numOps,
+            "VV-TB-06: share price suspiciously high -- possible donation attack"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 60
+  notes: "Exchange rate is internally tracked, not derived from balanceOf. Donation affects reserves calculation but not share price directly. Likely a false positive for share inflation, but the balanceOf dependency in totalAssets is still a trust boundary concern."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-07
+  tier: 1
+  type: property
+  description: "borrow() in transform mode sends funds to msg.sender (the transformer) not the loan owner -- transformer must be trusted to forward funds correctly"
+  attack_scenario: >
+    At L679, borrow() does SafeERC20.safeTransfer(IERC20(asset), msg.sender, assets). In transform
+    mode, msg.sender is the transformer contract (L631 checks transformerAllowList[msg.sender]).
+    The transformer receives the borrowed funds. If the transformer is malicious or buggy, it can
+    keep the borrowed funds instead of forwarding them to the position owner. The debt is recorded
+    against the position owner's NFT. This is by design (trusted transformer), but if a transformer
+    is compromised after being whitelisted, all positions that approve it are at risk.
+  impact: "Trusted transformer steals borrowed funds. Debt remains on victim's position."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After borrow in non-transform mode, vault balance should decrease by borrowed amount
+    (,,uint256 balance,,,) = vault.vaultInfo();
+    uint256 totalBorrowed = ghost_totalBorrowed;
+    uint256 totalRepaid = ghost_totalRepaid;
+    // Net outflow from borrowing should not exceed what was deposited
+    if (totalBorrowed > totalRepaid) {
+        uint256 netBorrowed = totalBorrowed - totalRepaid;
+        lte(
+            netBorrowed,
+            ghost_totalDeposited + ghost_totalLiquidated + ghost_numOps,
+            "VV-TB-07: net borrowed exceeds total deposits -- possible fund extraction"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 65
+  notes: "This is a design-level trust assumption. The invariant checks the accounting consequence rather than the mechanism. setTransformer is onlyOwner with blacklist of dangerous addresses (L887-L893)."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-08
+  tier: 1
+  type: property
+  description: "setGaugeManager is one-shot (cannot be changed once set) -- a misconfigured gauge manager permanently bricks staking"
+  attack_scenario: >
+    setGaugeManager at L1369 reverts if gaugeManager != address(0). Once set, it cannot be changed.
+    If owner sets a malicious or buggy gauge manager, all staking operations are permanently compromised.
+    The gauge manager gets NFT approval at L1406 via _stake(). A malicious gauge manager could steal
+    all staked NFTs. Since it cannot be changed, the only mitigation would be to unstake all positions
+    before the malicious manager acts -- but the manager controls unstakePosition too (L1402).
+  impact: "Permanent loss of all staked NFT collateral if gauge manager is malicious."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // If gauge manager is set, it must be a contract (not EOA)
+    address gm = vault.gaugeManager();
+    if (gm != address(0)) {
+        // gauge manager should remain the same address forever (immutable after set)
+        if (ghost_lastGaugeManager != address(0)) {
+            t(
+                gm == ghost_lastGaugeManager,
+                "VV-TB-08: gauge manager changed after initial set"
+            );
+        }
+        ghost_lastGaugeManager = gm;
+    }
+  ghost_vars:
+  - address internal ghost_lastGaugeManager;
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: "The one-shot pattern is by design (documented in comments). The risk is operational. This invariant verifies the immutability guarantee."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-09
+  tier: 2
+  type: property
+  description: "Multicall inheritance allows batching of state-changing operations -- combined calls may bypass per-function checks"
+  attack_scenario: >
+    V3Vault inherits Multicall from OpenZeppelin. This allows batching multiple calls in a single tx.
+    An attacker could batch: (1) deposit to get shares, (2) borrow against a position, (3) withdraw
+    all shares -- all atomically. Each individual call passes its checks, but the combined effect
+    may create an inconsistent state. For example, the daily limit checks use state that changes
+    within the multicall but the limit reset only happens once per day. Multicall uses delegatecall
+    internally, so msg.sender is preserved and all calls share the same transaction context.
+  impact: "Potential bypass of daily limits or other per-transaction checks via batched operations."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Daily limits should never go negative (underflow protection)
+    // After any sequence of operations, limits should be consistent
+    uint256 dailyLendLeft = vault.dailyLendIncreaseLimitLeft();
+    uint256 dailyDebtLeft = vault.dailyDebtIncreaseLimitLeft();
+    // These are uint256, so they can't go negative, but they could be
+    // manipulated to be artificially large via deposit+withdraw cycling
+    uint256 dailyLendMin = vault.dailyLendIncreaseLimitMin();
+    uint256 dailyDebtMin = vault.dailyDebtIncreaseLimitMin();
+    // Lend limit left should not exceed the calculated maximum
+    // max = max(minLimit, totalLent * 10%)
+    (,uint256 lent,,,,uint256 lendRate) = vault.vaultInfo();
+    uint256 maxLendLimit = lent / 10;
+    if (dailyLendMin > maxLendLimit) { maxLendLimit = dailyLendMin; }
+    // Add tolerance for replenishment from withdrawals
+    lte(
+        dailyLendLeft,
+        maxLendLimit + ghost_totalWithdrawn + ghost_numOps + 1,
+        "VV-TB-09: daily lend limit exceeded theoretical maximum"
+    );
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 55
+  notes: "Multicall + daily limits: withdraw replenishes dailyLendIncreaseLimitLeft (L1043). An attacker could cycle deposit/withdraw to keep the limit high. This is by design but worth verifying bounds."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-10
+  tier: 1
+  type: property
+  description: "External call to transformer at L586 is unchecked delegated execution -- transformer.call(data) allows arbitrary code execution with vault's NFT approval"
+  attack_scenario: >
+    At L586, _transform does transformer.call(data) where data is user-supplied calldata. The
+    transformer has been approved for the tokenId NFT at L584. The transformer can call back into
+    the vault's borrow() for the same tokenId (this is intentional per L631). But the transformer
+    could also: (1) call nonfungiblePositionManager.transferFrom to steal the NFT, (2) call other
+    vault functions that check transformedTokenId, (3) manipulate external state (oracle, pools)
+    before the health check at L621. The reentrancy guard (transformedTokenId != 0 at L559) prevents
+    re-entering transform, but other paths are open.
+  impact: "Malicious transformer can drain borrowed funds and manipulate collateral during transform."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that after all operations, no position has debt exceeding its collateral value
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        if (debt > 0 && collateralValue > 0) {
+            // Healthy loan: collateralValue >= debt (without buffer for simplicity)
+            // This catches cases where transformer manipulated collateral
+            t(
+                collateralValue >= debt || fullValue == 0,
+                "VV-TB-10: unhealthy loan exists -- possible transformer manipulation"
+            );
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "The post-transform health check at L621 should catch this. But if the transformer manipulates oracle state (e.g., Uniswap pool price) during the call, the health check uses the manipulated price."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-11
+  tier: 1
+  type: property
+  description: "SafeERC20 usage protects against non-standard ERC20 tokens, but the vault asset is set once in constructor -- fee-on-transfer tokens break accounting"
+  attack_scenario: >
+    If the vault asset is a fee-on-transfer token, _pullAssetFromSender at L1102 transfers X tokens
+    but the vault receives X - fee. However, the vault records X in its accounting (debt shares,
+    lend exchange rates). Over time, the vault's actual balance diverges from its internal accounting.
+    Eventually, withdrawals fail due to insufficient balance. The vault uses SafeERC20 (no silent
+    failures) but does NOT check actual received amount after transferFrom.
+  impact: "Gradual insolvency if asset is fee-on-transfer. Last withdrawers/lenders cannot withdraw."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Vault balance should be consistent with inflows - outflows
+    (,,uint256 balance, uint256 reserves,,) = vault.vaultInfo();
+    uint256 inflows = ghost_totalDeposited + ghost_totalRepaid + ghost_totalLiquidated;
+    uint256 outflows = ghost_totalWithdrawn + ghost_totalBorrowed;
+    // With fee-on-transfer, balance would be less than expected
+    if (inflows > outflows) {
+        uint256 expectedMinBalance = 0; // Can't assert exact due to interest
+        // But balance + total borrowed should >= total deposited (conservation)
+        // With tolerance for rounding
+        uint256 tolerance = ghost_numOps > 0 ? ghost_numOps : 1;
+        gte(
+            balance + ghost_totalBorrowed + ghost_totalWithdrawn + tolerance,
+            ghost_totalDeposited + ghost_totalRepaid,
+            "VV-TB-11: vault balance inconsistent -- possible fee-on-transfer drain"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 60
+  notes: "The vault uses SafeERC20 but never checks received amounts. If the asset is standard ERC20 (USDC, WETH), this is not exploitable. But the vault's design allows any ERC20 as asset."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-12
+  tier: 2
+  type: property
+  description: "InterestRateModel is immutable -- a buggy IRM can permanently break the vault by returning extreme rates"
+  attack_scenario: >
+    interestRateModel is set in constructor and is immutable. _calculateGlobalInterest at L1314
+    calls interestRateModel.getRatesPerSecondX64(balance, debt). If the IRM returns an extremely
+    high borrowRateX64, the debt exchange rate at L1318 could overflow uint256 or grow so fast
+    that all positions become instantly liquidatable. Since the IRM is immutable, this cannot be
+    fixed. The vault has no rate cap on the returned values.
+  impact: "Extreme interest rates could make all loans instantly liquidatable or overflow accounting."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Exchange rates should be monotonically non-decreasing and bounded
+    (,,,,uint256 debtRate, uint256 lendRate) = vault.vaultInfo();
+    // Rates start at Q96 and only grow
+    gte(debtRate, 2**96, "VV-TB-12: debt exchange rate below Q96");
+    gte(lendRate, 2**96, "VV-TB-12: lend exchange rate below Q96");
+    // Rates should not grow more than 100x in any reasonable scenario
+    lte(debtRate, 100 * 2**96, "VV-TB-12: debt exchange rate unreasonably high");
+    lte(lendRate, 100 * 2**96, "VV-TB-12: lend exchange rate unreasonably high");
+    // Debt rate must always be >= lend rate (borrowers pay more than lenders receive)
+    gte(debtRate, lendRate, "VV-TB-12: debt rate less than lend rate");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "The IRM is a trust boundary. No validation on returned rates in _calculateGlobalInterest. But IRM is typically a simple contract with bounded math."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-13
+  tier: 1
+  type: property
+  description: "Oracle is immutable and fully trusted -- a manipulated oracle getValue() return directly determines liquidation eligibility and collateral value"
+  attack_scenario: >
+    _checkLoanIsHealthy at L1430 calls oracle.getValue(tokenId, address(asset), ignoreFees).
+    The oracle return directly determines if a position is liquidatable. If the oracle is manipulated
+    (e.g., Uniswap TWAP manipulation via large swap), an attacker can make healthy positions appear
+    liquidatable and liquidate them for profit. The oracle is immutable (set in constructor), so if
+    it has a vulnerability, it cannot be patched.
+  impact: "Forced liquidations via oracle manipulation. Attacker profits from liquidation penalty on healthy positions."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Every position with debt should have non-zero collateral value
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        if (debt > 0) {
+            gt(fullValue, 0, "VV-TB-13: position with debt has zero oracle value");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 65
+  notes: "This is a fundamental trust boundary. The invariant checks the symptom (zero value for position with debt) rather than the root cause (oracle manipulation). Full oracle analysis belongs to OracleHunter."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-14
+  tier: 1
+  type: property
+  description: "onERC721Received owner override via calldata -- anyone who can call safeTransferFrom on the NFT can set arbitrary owner in vault"
+  attack_scenario: >
+    At L459-464, when data.length != 0, the owner is decoded from data instead of using `from`.
+    This means whoever triggers safeTransferFrom can set any address as the loan owner.
+    The comment at L460-463 says this is intentional. But consider: if an approved operator calls
+    safeTransferFrom for someone else's NFT with data encoding their own address as owner, they
+    become the loan owner in the vault. This is documented as an accepted trust assumption, but
+    it means any NFT operator/approved address can claim ownership of positions in the vault.
+  impact: "NFT operator can claim vault loan ownership, then borrow against stolen collateral."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Position ownership should only change through legitimate vault operations
+    // Track that created positions belong to expected actors
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        // Owner must be a known actor (alice, bob, carol) or address(0) if removed
+        t(
+            owner == address(0) || owner == alice || owner == bob || owner == carol || owner == admin,
+            "VV-TB-14: position owned by unknown address -- possible owner hijack"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "Documented as intentional at L460-463. The trust model assumes whoever can trigger safeTransferFrom has authority to choose the owner. This is standard for integrator flows but could surprise users who approve operators."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-TB-15
+  tier: 2
+  type: property
+  description: "USDC/USDT blocklist -- if vault address is blocklisted, all lender withdrawals and borrower operations permanently fail"
+  attack_scenario: >
+    USDC and USDT have admin-controlled blocklists. If the vault contract address is added to the
+    blocklist, SafeERC20.safeTransfer will revert on all outgoing transfers. This permanently locks
+    all deposited funds. Similarly, if a borrower's address is blocklisted, they cannot repay
+    (safeTransferFrom from their address reverts), making their position permanently unliquidatable
+    via the normal path (liquidation pulls from liquidator, not borrower, so this specific path
+    is not blocked -- but repayment is).
+  impact: "Permanent fund lock if vault is blocklisted. Borrower DoS if borrower address is blocklisted."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify withdrawals still work -- vault should be able to transfer assets out
+    (,,uint256 balance,,,) = vault.vaultInfo();
+    if (balance > 0 && vault.totalSupply() > 0) {
+        // This is more of a liveness check than a property
+        uint256 maxW = vault.maxWithdraw(alice);
+        // maxWithdraw should be > 0 if alice has shares and vault has balance
+        uint256 aliceShares = vault.balanceOf(alice);
+        if (aliceShares > 0) {
+            gt(maxW, 0, "VV-TB-15: alice cannot withdraw despite having shares and vault having balance");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 50
+  notes: "External risk from asset token admin. Cannot be mitigated at the smart contract level. This is an accepted operational risk for USDC-denominated vaults."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: VV-TB-FP-01
+  reason: >
+    Investigated whether transformer.call(data) at L586 could be used for reentrancy back into
+    _transform itself. The check at L559 (transformedTokenId != 0 reverts Reentrancy) prevents
+    this. The transformer can call borrow() for the same tokenId (intentional), but cannot
+    re-enter transform() or start a new transform for a different token.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "V3Vault transform reentrancy is blocked by transformedTokenId sentinel at L559 -- transformer can only callback into borrow() for same token"
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: VV-TB-FP-02
+  reason: >
+    Investigated first-depositor / share inflation attack. V3Vault uses exchange rate based
+    accounting (lastLendExchangeRateX96) not totalAssets/totalSupply ratio. Donations to the vault
+    increase balanceOf but do NOT affect the lend exchange rate. The exchange rate only changes via
+    _updateGlobalInterest which uses the interest rate model. Therefore the classic share inflation
+    attack does not apply here.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "V3Vault uses exchange-rate accounting (Q96), NOT totalAssets/totalSupply. Donation attack does not affect share pricing -- excess tokens become reserves."
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: VV-TB-FP-03
+  reason: >
+    Investigated ERC777 token hook reentrancy. V3Vault uses SafeERC20 for all transfers and the
+    asset is set once in constructor (immutable). If the asset were ERC777, transfer hooks could
+    re-enter. However, (1) the vault is designed for standard ERC20 tokens like USDC/WETH,
+    (2) SafeERC20 does not prevent reentrancy from ERC777 hooks, but (3) all critical state changes
+    happen BEFORE external transfers (checks-effects-interactions pattern in most functions).
+    Borrow at L679 transfers after state update. Withdraw at L1039-L1040 burns before transfer.
+    Deposit at L1005-L1007 transfers before mint -- this could be a reentrancy vector if asset
+    were ERC777, but it is not a practical concern for standard ERC20 assets.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "V3Vault _deposit does transferFrom before _mint (L1005-1007). If asset were ERC777, this would be a reentrancy vector. Not practical for standard ERC20 assets (USDC, WETH)."
+    briefing_update_applied: false

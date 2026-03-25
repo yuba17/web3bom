@@ -1,0 +1,694 @@
+protocol: hyperlane
+component: InterchainAccountRouter
+file: solidity/contracts/middleware/InterchainAccountRouter.sol
+domain: trust
+hunter: FlowHunter
+generated_at: '2026-03-24T00:00:00Z'
+
+state_machine:
+  states:
+    - ICA_NOT_DEPLOYED
+    - ICA_DEPLOYED_IDLE
+    - ICA_EXECUTING_CALLS
+    - ICA_COMMITMENT_PENDING
+    - ICA_COMMITMENT_REVEALED
+    - ROUTER_UNCONFIGURED
+    - ROUTER_CONFIGURED
+  transitions:
+    - from: ICA_NOT_DEPLOYED
+      to: ICA_DEPLOYED_IDLE
+      via: "getDeployedInterchainAccount() — Create2 deploy on first handle()"
+      guard: "Address.isContract(_account) == false"
+    - from: ICA_DEPLOYED_IDLE
+      to: ICA_EXECUTING_CALLS
+      via: "handle() with MessageType.CALLS → ica.multicall{value}(calls)"
+      guard: "onlyMailbox"
+    - from: ICA_EXECUTING_CALLS
+      to: ICA_DEPLOYED_IDLE
+      via: "multicall completes (all calls succeed)"
+      guard: "none — atomic"
+    - from: ICA_DEPLOYED_IDLE
+      to: ICA_COMMITMENT_PENDING
+      via: "handle() with MessageType.COMMITMENT → ica.setCommitment()"
+      guard: "onlyMailbox, commitment not already pending"
+    - from: ICA_COMMITMENT_PENDING
+      to: ICA_COMMITMENT_REVEALED
+      via: "CommitmentReadIsm.verify() → ica.revealAndExecute()"
+      guard: "keccak256(salt, calls) == commitment"
+    - from: ICA_COMMITMENT_REVEALED
+      to: ICA_DEPLOYED_IDLE
+      via: "revealAndExecute completes, commitment deleted"
+      guard: "none — atomic"
+    - from: ROUTER_UNCONFIGURED
+      to: ROUTER_CONFIGURED
+      via: "enrollRemoteRouterAndIsm()"
+      guard: "onlyOwner, router and ISM must be EMPTY_SALT (immutable once set)"
+  anomalies:
+    - type: no_sender_validation
+      description: >
+        handle() removes the onlyRemoteRouter check from Router base. Any _sender from
+        any origin is accepted as long as it comes through the mailbox. This is by design
+        (documented in NatSpec) but means the _sender value is attacker-controlled and
+        directly used in ICA salt derivation. A malicious remote router can create ICAs
+        that the real owner never intended.
+    - type: reentrancy_via_multicall
+      description: >
+        handle() → ica.multicall() executes arbitrary external calls. If any call targets
+        a contract that calls back into the router (or mailbox), there is no reentrancy
+        guard. The multicall itself has no nonReentrant modifier.
+    - type: value_leak_commit_reveal
+      description: >
+        callRemoteCommitReveal sends msg.value for the commitment dispatch, then sends
+        address(this).balance for the reveal dispatch. If the router holds ETH from other
+        sources (receive() is open), that ETH gets sent with the reveal message.
+    - type: stuck_commitment
+      description: >
+        If a commitment is set via handle() but the reveal message never arrives or fails
+        ISM verification, the commitment remains pending forever. There is no timeout or
+        cancellation mechanism. The same commitment hash cannot be reused.
+
+invariants:
+- id: IAR-01
+  tier: 1
+  type: property
+  description: >
+    callRemoteCommitReveal uses address(this).balance for the reveal dispatch, which
+    includes the router's pre-existing ETH balance plus any leftover from the commitment
+    dispatch. An attacker can front-run or donate ETH to the router to inflate the value
+    sent with the reveal, or conversely, a concurrent callRemoteCommitReveal can drain
+    the balance leaving the second reveal underfunded.
+  attack_scenario: >
+    1. User A calls callRemoteCommitReveal with 1 ETH. Commitment dispatch uses 0.5 ETH for gas.
+    2. Before the reveal dispatch line executes (same tx, sequential), address(this).balance
+       includes 0.5 ETH leftover. Reveal sends 0.5 ETH.
+    3. But if the router already held 10 ETH (from receive()), the reveal dispatch sends
+       10.5 ETH instead of 0.5 ETH. Those 10 ETH belong to other users/operations.
+    4. Conversely: two concurrent commit-reveal calls in a block — the first takes all
+       balance, the second gets 0.
+  impact: "Theft/loss of ETH held by router. Any ETH donated or accumulated is drained by next commit-reveal caller."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track balance before and after callRemoteCommitReveal
+    uint256 balBefore = address(router).balance;
+    uint256 sentValue = 1 ether;
+    // If router had pre-existing balance, the reveal takes more than msg.value
+    uint256 balAfter = address(router).balance;
+    // The router should never send more than msg.value total across both dispatches
+    gte(balBefore + sentValue, balBefore - balAfter + sentValue,
+        "IAR-01: commit-reveal consumed more than msg.value from router");
+  ghost_vars:
+    - uint256 internal ghost_routerBalanceBefore;
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    Line 630 (address(this).balance) is the key. The receive() function at
+    AbstractInterchainAccountRouter L107 accepts arbitrary ETH. The balance read
+    is NOT msg.value but the full contract balance. This is a classic pattern for
+    fund theft — using address(this).balance instead of tracking a specific amount.
+  poc_sketch: ""
+  call_stack: >
+    callRemoteCommitReveal() L603-656 →
+      _dispatchMessageWithValue(msg.value) L606 →
+      _dispatchMessageWithValue(address(this).balance) L624-631
+
+- id: IAR-02
+  tier: 1
+  type: property
+  description: >
+    handle() accepts messages from ANY sender (no onlyRemoteRouter check). An attacker on
+    a remote chain can deploy a malicious contract, dispatch a message through the mailbox
+    targeting this router with a crafted _sender, and force creation of an ICA they control.
+    The ICA address depends on (origin, owner, sender, ism, salt) — attacker controls sender.
+  attack_scenario: >
+    1. Attacker deploys contract on chain A.
+    2. Attacker dispatches message through mailbox to InterchainAccountRouter on chain B.
+    3. The _sender in the message is the attacker's contract address.
+    4. handle() creates an ICA derived from (origin=A, owner=attacker, sender=attacker_contract, ism, salt).
+    5. This ICA is distinct from any ICA the real remote router would create, so no collision.
+    6. But: the ICA executes arbitrary calls. If the ICA had been pre-funded (e.g., via
+       getLocalInterchainAccount prediction + direct ETH send), attacker drains those funds.
+  impact: "Arbitrary code execution via ICA from untrusted sender. Fund theft if ICA pre-funded."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After handle from untrusted sender, verify ICA owner isolation
+    // Ghost: track all senders that triggered handle
+    // The ICA created should NOT be the same as one from the enrolled router
+    bytes32 trustedRouter = router.routers(originDomain);
+    bytes32 maliciousSender = bytes32(uint256(uint160(attacker)));
+    // These must derive different ICAs
+    address icaTrusted = address(router.getLocalInterchainAccount(
+        originDomain, owner32, trustedRouter, ism));
+    address icaMalicious = address(router.getLocalInterchainAccount(
+        originDomain, owner32, maliciousSender, ism));
+    t(icaTrusted != icaMalicious, "IAR-02: untrusted sender created same ICA as trusted router");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The NatSpec explicitly says "designed to receive messages from untrusted remote contracts."
+    The security model relies on each (origin, sender, owner, ism) tuple producing a unique
+    ICA. The real question is whether an attacker can trick a user into sending funds to an
+    ICA that the attacker's messages control. This depends on ISM choice — if ISM is address(0),
+    it defaults to mailbox.defaultIsm() which may or may not validate the sender.
+  poc_sketch: ""
+  call_stack: >
+    handle() L134-168 → getDeployedInterchainAccount(origin, owner, _sender_, ism, salt)
+
+- id: IAR-03
+  tier: 1
+  type: property
+  description: >
+    The route() function returns an ISM address directly from the message body for non-REVEAL
+    messages (InterchainAccountMessage.ism). A malicious message can specify ISM=address(0) to
+    fall back to mailbox.defaultIsm(), or specify a custom ISM that always returns true. The
+    attacker controls which ISM verifies their message, enabling bypass of security checks.
+  attack_scenario: >
+    1. Attacker crafts message with _ism field set to an attacker-deployed contract that
+       always returns true from verify().
+    2. route() returns that ISM address.
+    3. The mailbox calls ism.verify() which always passes.
+    4. handle() executes the attacker's arbitrary calls through the ICA.
+  impact: "Complete bypass of ISM security — arbitrary remote execution if attacker-controlled ISM is accepted."
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // The ISM used for verification must be either the enrolled ISM or defaultIsm
+    // not an arbitrary attacker-supplied address
+    bytes32 msgIsm = InterchainAccountMessage.ism(messageBody);
+    address resolvedIsm = address(router.route(fullMessage));
+    address enrolledIsm = router.isms(originDomain).bytes32ToAddress();
+    address defaultIsm = address(mailbox.defaultIsm());
+    // resolvedIsm should be one of the trusted ISMs
+    bool isTrusted = (resolvedIsm == enrolledIsm) || (resolvedIsm == defaultIsm);
+    t(isTrusted, "IAR-03: route() returned untrusted ISM from message body");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    This is THE critical question for this router. The router itself IS the ISM
+    (implements AbstractRoutingIsm). The route() function is called by the mailbox to
+    determine which ISM to use. If the mailbox trusts whatever route() returns, and
+    route() returns whatever the message says... that's circular trust. The security
+    depends on whether the mailbox validates that the ISM returned by route() is
+    actually trusted. Need to check Mailbox.process() flow.
+  poc_sketch: ""
+  call_stack: >
+    Mailbox.process() → recipient.interchainSecurityModule() → returns address(this) →
+    AbstractRoutingIsm.verify() → route() → returns ISM from message body →
+    ism.verify() with attacker-controlled ISM
+
+- id: IAR-04
+  tier: 2
+  type: property
+  description: >
+    revealAndExecute in OwnableMulticall has NO onlyOwner modifier. Anyone can call it
+    if they know the commitment hash (salt + calls). The commit-reveal scheme's security
+    relies on the commitment being secret until reveal time. But the commitment hash is
+    emitted on-chain via CommitmentSet event, and if the off-chain CCIP service is compromised
+    or the calls are guessable, anyone can front-run the reveal.
+  attack_scenario: >
+    1. User submits commitment via callRemoteCommitReveal. Commitment dispatched on-chain.
+    2. handle() on destination sets commitment in ICA via setCommitment().
+    3. CommitmentSet event emits the commitment hash publicly.
+    4. The calls and salt must be revealed via CCIP read. If an attacker intercepts the
+       CCIP response or can guess salt+calls, they call revealAndExecute directly.
+    5. Since revealAndExecute has no access control beyond knowing the preimage,
+       front-running the ISM verify is possible.
+  impact: "Front-running of commit-reveal execution. MEV extraction from user's intended operations."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Commitment should only be executable by the ISM verify flow, not by arbitrary callers
+    // Check that revealAndExecute doesn't revert when called by non-owner
+    bool reverted = false;
+    try ica.revealAndExecute(calls, salt) {
+        // If this succeeds from non-owner, the commit-reveal has no access control
+    } catch {
+        reverted = true;
+    }
+    // Note: this is intentional design — anyone with the preimage can reveal.
+    // The security relies on CCIP-read keeping the data secret until the ISM verifies.
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The CommitmentReadIsm.verify() calls ica.revealAndExecute() directly. revealAndExecute
+    is external with no onlyOwner. The DESIGN is that the ISM is the one calling it during
+    mailbox.process(). But nothing prevents a direct call if the preimage is known. This is
+    potentially by design for the commit-reveal scheme but creates MEV risk.
+  poc_sketch: ""
+  call_stack: >
+    CommitmentReadIsm.verify() → ica.revealAndExecute(calls, salt)
+    OR: attacker.directCall() → ica.revealAndExecute(calls, salt)
+
+- id: IAR-05
+  tier: 1
+  type: property
+  description: >
+    handle() forwards msg.value to ica.multicall{value: msg.value}(calls). However, the
+    calls themselves specify individual values (CallLib.Call.value). There is no validation
+    that sum(calls[i].value) <= msg.value. If msg.value < sum of call values, the multicall
+    uses the ICA's pre-existing ETH balance to cover the deficit.
+  attack_scenario: >
+    1. ICA holds 10 ETH from previous operations.
+    2. Attacker dispatches message with calls that transfer 10 ETH to attacker's address,
+       each call specifying value > 0.
+    3. handle() is called with msg.value = 0 (relayer sends no ETH).
+    4. multicall{value: 0} is called, but individual calls use ICA's balance.
+    5. Attacker drains ICA's accumulated ETH.
+  impact: "Drainage of ICA's ETH balance via crafted calls. Depends on ICA having accumulated ETH."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track ICA balance before and after handle
+    uint256 icaBalBefore = address(ica).balance;
+    // After handle with msg.value=0, ICA balance should not decrease
+    // unless the calls were authorized by the legitimate owner
+    uint256 icaBalAfter = address(ica).balance;
+    // The balance decrease should not exceed msg.value forwarded
+    lte(icaBalBefore - icaBalAfter, msgValueSent,
+        "IAR-05: ICA lost more ETH than msg.value forwarded");
+  ghost_vars:
+    - uint256 internal ghost_icaBalancePreHandle;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is mitigated by the fact that only the ICA owner (remote sender) can trigger
+    calls through the ICA. But combined with IAR-02 (untrusted sender), if an attacker
+    can create a message targeting an ICA that holds funds, they can drain it. The
+    multicall in CallLib.sol does individual Address.functionCallWithValue() which uses
+    the contract's balance, not just the forwarded value.
+  poc_sketch: ""
+  call_stack: >
+    handle() → ica.multicall{value: msg.value}(calls) →
+    CallLib.multicall → CallLib.call → Address.functionCallWithValue(to, data, call.value)
+
+- id: IAR-06
+  tier: 2
+  type: property
+  description: >
+    approveFeeTokenForHook() in AbstractInterchainAccountRouter has NO access control.
+    Anyone can call it to approve type(uint256).max of any ERC20 token to any address
+    (claimed to be a "hook"). This grants infinite allowance from the router to an
+    arbitrary address.
+  attack_scenario: >
+    1. Router holds ERC20 tokens (e.g., from fee collection or user deposits).
+    2. Attacker calls approveFeeTokenForHook(tokenAddr, attackerAddr).
+    3. Router approves type(uint256).max of tokenAddr to attackerAddr.
+    4. Attacker calls token.transferFrom(router, attacker, router_balance).
+  impact: "Complete drainage of any ERC20 tokens held by the router."
+  impact_rating: Critical
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // approveFeeTokenForHook should only be callable by owner or authorized parties
+    // Check: calling from non-owner should revert
+    bool reverted = false;
+    try router.approveFeeTokenForHook(tokenAddr, attackerAddr) {
+        // If succeeds from non-owner, this is a critical vulnerability
+        t(false, "IAR-06: approveFeeTokenForHook has no access control");
+    } catch {
+        reverted = true;
+    }
+    t(reverted, "IAR-06: approveFeeTokenForHook should revert for non-owner");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    AbstractInterchainAccountRouter.sol line 109: approveFeeTokenForHook is external
+    with NO modifier. This looks like a CRITICAL vulnerability unless there's a reason
+    the router should never hold ERC20 tokens. But _dispatchMessageWithValue (line 241)
+    does safeTransferFrom(msg.sender, address(this), _fee) — so the router DOES hold
+    tokens temporarily. The forceApprove at line 242 also has no access control issue
+    since it's internal, but the public approveFeeTokenForHook allows approval to
+    ARBITRARY addresses, not just hooks.
+  poc_sketch: >
+    1. Deploy mock ERC20, send 100 tokens to router
+    2. Call router.approveFeeTokenForHook(token, attacker) from random address
+    3. Call token.transferFrom(router, attacker, 100) from attacker
+    4. Assert attacker received 100 tokens
+  call_stack: >
+    approveFeeTokenForHook(feeToken, hook) → IERC20(feeToken).forceApprove(hook, MAX)
+
+- id: IAR-07
+  tier: 2
+  type: property
+  description: >
+    _dispatchMessageWithValue computes the fee via _Router_quoteDispatch and then
+    safeTransferFrom(msg.sender, ..., _fee). But quoteDispatch uses an empty body
+    (bytes("")) instead of the actual message body. If the hook's fee depends on
+    message size, the quoted fee will be wrong (too low), and the dispatch will
+    either revert or underpay.
+  attack_scenario: >
+    1. User calls callRemoteWithOverrides with a large calls array and a feeToken.
+    2. _dispatchMessageWithValue quotes fee with empty body → low fee.
+    3. safeTransferFrom takes the low fee from user.
+    4. mailbox.dispatch is called with the actual (large) body.
+    5. If hook checks fee against actual body, dispatch reverts. If not, fee is underpaid.
+  impact: "DoS if hook validates fee against body, or economic loss to relayers if fee is underpaid."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // The fee quoted with empty body should match fee quoted with actual body
+    uint256 feeEmpty = router._Router_quoteDispatch(dest, bytes(""), hookMeta, hookAddr);
+    uint256 feeReal = router._Router_quoteDispatch(dest, actualBody, hookMeta, hookAddr);
+    eq(feeEmpty, feeReal, "IAR-07: fee mismatch between empty and actual body");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    In _dispatchMessageWithValue line 234, the quote uses bytes("") as body. This is a
+    potential fee calculation mismatch. Most Hyperlane hooks may not care about body size,
+    but if a custom hook does, this creates a discrepancy.
+  poc_sketch: ""
+  call_stack: >
+    _dispatchMessageWithValue() L222-253 →
+      _Router_quoteDispatch(dest, bytes(""), hookMeta, hookAddr) L234 →
+      mailbox.dispatch{value}(dest, router, _body, hookMeta, hook) L246
+
+- id: IAR-08
+  tier: 2
+  type: property
+  description: >
+    In callRemoteCommitReveal, the commitment message uses a hardcoded refund address of
+    address(this) (the router) via StandardHookMetadata.formatMetadata(0, COMMIT_TX_GAS_USAGE,
+    address(this), bytes("")). Gas refunds from the hook go to the router instead of to
+    msg.sender. This ETH accumulates in the router and can be stolen via IAR-01 (the
+    address(this).balance drain in the reveal dispatch).
+  attack_scenario: >
+    1. Many users call callRemoteCommitReveal. Each commitment dispatch specifies
+       address(this) as refund address.
+    2. Hooks refund excess gas to the router. Router accumulates ETH.
+    3. Next callRemoteCommitReveal user's reveal dispatch sends address(this).balance,
+       which includes all accumulated refunds.
+    4. That user effectively captures other users' refunded ETH.
+  impact: "Accumulated gas refunds stolen by subsequent commit-reveal callers."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Refund address for commitment should be msg.sender, not address(this)
+    // After multiple commit-reveal calls, router should not accumulate ETH
+    uint256 routerBal = address(router).balance;
+    // After N commit-reveal operations, router balance should be near zero
+    lte(routerBal, 1 ether, "IAR-08: router accumulated excess ETH from refunds");
+  ghost_vars:
+    - uint256 internal ghost_routerBalAfterCommitReveal;
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    Line 610-615: StandardHookMetadata.formatMetadata(0, COMMIT_TX_GAS_USAGE, address(this),
+    bytes("")). The third parameter is the refund address. This is set to the router itself.
+    Combined with the receive() fallback and line 630 (address(this).balance for reveal),
+    this creates a compounding value leak.
+  poc_sketch: ""
+  call_stack: >
+    callRemoteCommitReveal() L603 →
+      formatMetadata(0, GAS, address(this), "") L610-615 →
+      [hook refunds excess to router] →
+      _dispatchMessageWithValue(address(this).balance) L624-631
+
+- id: IAR-09
+  tier: 2
+  type: property
+  description: >
+    enrollRemoteRouterAndIsm enforces immutability: once a router+ISM is set for a domain,
+    it cannot be changed. But _enrollRemoteRouter (from Router base) can still be called
+    via enrollRemoteRouter(uint32, bytes32) which is onlyOwner on the base Router. The
+    override in AbstractInterchainAccountRouter routes through _enrollRemoteRouterAndIsm
+    which checks immutability. However, if the owner calls the base Router.enrollRemoteRouter
+    directly... need to verify the override chain.
+  attack_scenario: >
+    1. Owner enrolls router+ISM for domain 42.
+    2. Owner (or compromised owner) tries to change router for domain 42.
+    3. If the immutability check can be bypassed, attacker redirects messages to malicious router.
+  impact: "Router redirect enabling message interception and ICA hijack."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Once enrolled, router for a domain should never change
+    bytes32 routerBefore = router.routers(domain);
+    // After any state-changing operations...
+    bytes32 routerAfter = router.routers(domain);
+    if (routerBefore != bytes32(0)) {
+        eq(routerBefore, routerAfter, "IAR-09: enrolled router changed after initial set");
+    }
+  ghost_vars:
+    - mapping(uint32 => bytes32) internal ghost_enrolledRouters;
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    The virtual override chain: Router._enrollRemoteRouter is overridden in
+    AbstractInterchainAccountRouter._enrollRemoteRouter which calls _enrollRemoteRouterAndIsm.
+    That function checks routers(_destination) == EMPTY_SALT. But unenrollRemoteRouter exists
+    in Router base (onlyOwner) — if owner unenrolls then re-enrolls with different values,
+    the immutability is bypassed. Need to check if unenroll is blocked too.
+  poc_sketch: ""
+  call_stack: >
+    enrollRemoteRouter() → _enrollRemoteRouter() [virtual] →
+    AbstractInterchainAccountRouter._enrollRemoteRouter() →
+    _enrollRemoteRouterAndIsm() → require(routers == EMPTY_SALT)
+
+- id: IAR-10
+  tier: 1
+  type: property
+  description: >
+    The commit-reveal flow has a race condition: the commitment message and reveal message
+    are dispatched sequentially in the SAME transaction, but they are processed as separate
+    messages on the destination chain. If the reveal message is processed BEFORE the commitment
+    message (e.g., different relayer priority, reorg), the reveal will fail because no
+    commitment exists yet. More critically, if an attacker replays the commitment after the
+    reveal fails, the commitment stays pending forever (stuck state).
+  attack_scenario: >
+    1. User calls callRemoteCommitReveal. Two messages dispatched: commitment + reveal.
+    2. On destination, relayer processes reveal first. CommitmentReadIsm.verify() calls
+       ica.revealAndExecute() which checks commitments[hash] — it's false → reverts.
+    3. Reveal message permanently fails. Commitment message then processes successfully,
+       setting commitment to pending.
+    4. No one can trigger the reveal again (the reveal message was already "processed" or
+       failed). The commitment is stuck forever.
+  impact: "Permanent DoS: user's intended cross-chain calls never execute, commitment stuck."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Commitment must be set before reveal can execute
+    // Track ordering: ghost_commitmentSet[hash] must be true before revealAndExecute
+    bool commitmentPending = ica.commitments(commitmentHash);
+    // Before reveal, this must be true
+    t(commitmentPending, "IAR-10: reveal attempted before commitment was set");
+  ghost_vars:
+    - mapping(bytes32 => bool) internal ghost_commitmentSetBeforeReveal;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The protocol relies on message ordering (commitment processed before reveal). Hyperlane
+    does not guarantee cross-message ordering. The mailbox processes messages independently.
+    If the commitment uses a different ISM path than the reveal, processing order is not
+    guaranteed.
+  poc_sketch: ""
+  call_stack: >
+    callRemoteCommitReveal() → dispatch(commitment) → dispatch(reveal)
+    [destination] → process(reveal) BEFORE process(commitment) → FAIL
+
+- id: IAR-11
+  tier: 2
+  type: property
+  description: >
+    handle() does not validate that the message type byte is within the valid enum range
+    (0=CALLS, 1=COMMITMENT, 2=REVEAL). If _messageType is not CALLS and not REVEAL,
+    execution falls through to the else branch which calls ica.setCommitment(). Any
+    invalid message type >= 3 would be treated as COMMITMENT. However, the MessageType
+    enum cast at line 141 would revert for out-of-range values in Solidity >=0.8.
+  attack_scenario: >
+    1. This is likely a false positive for Solidity >=0.8 which reverts on invalid enum cast.
+    2. But if the first byte is 1 (COMMITMENT), the else branch fires, and an attacker
+       from any origin (no sender check) can set arbitrary commitments on any ICA.
+  impact: "Arbitrary commitment setting from untrusted sender, potentially enabling execution of unintended calls."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Message type should be validated — only CALLS and COMMITMENT should reach the ICA
+    // REVEAL returns early. Invalid types should revert.
+    uint8 rawType = uint8(message[0]);
+    t(rawType <= 2, "IAR-11: invalid message type accepted");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Solidity >=0.8 reverts on out-of-range enum cast, so type >= 3 is safe. The real
+    concern is type=1 (COMMITMENT) from an untrusted sender — this is covered by IAR-02
+    already. Marking as lower priority.
+  poc_sketch: ""
+  call_stack: >
+    handle() L139-167 → MessageType(uint8(_message[0]))
+
+- id: IAR-12
+  tier: 1
+  type: property
+  description: >
+    _dispatchMessageWithHook (line 759) passes msg.value to _dispatchMessageWithValue.
+    But callRemoteWithOverrides (the 7-param version at line 554) also calls
+    _dispatchMessageWithHook. If a user calls callRemoteWithOverrides with a custom
+    hook that charges a fee AND sends msg.value, the entire msg.value goes to the
+    mailbox dispatch. But _dispatchMessageWithValue also does safeTransferFrom for
+    ERC20 fees if feeToken != address(0). This means the user pays BOTH native ETH
+    and ERC20 — double payment.
+  attack_scenario: >
+    1. User calls callRemoteWithOverrides with hookMetadata that specifies a feeToken.
+    2. _dispatchMessageWithValue quotes the fee in feeToken, transfers it from user.
+    3. It also passes msg.value to mailbox.dispatch.
+    4. User pays fee in ERC20 AND in native ETH. The native ETH may be lost.
+  impact: "Users double-pay fees (native + ERC20) when using feeToken. Native ETH portion may be unrecoverable."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // When feeToken is set, msg.value should be 0 or should not be forwarded to dispatch
+    address feeToken = hookMetadata.feeToken();
+    if (feeToken != address(0)) {
+        eq(msg.value, 0, "IAR-12: msg.value sent alongside feeToken payment");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    _dispatchMessageWithValue line 246 sends _value (which is msg.value) to
+    mailbox.dispatch{value: _value}. Line 241 also does safeTransferFrom for ERC20 fee.
+    If feeToken is set, the msg.value is still forwarded. This could be intentional
+    (some hooks need both) or a bug.
+  poc_sketch: ""
+  call_stack: >
+    callRemoteWithOverrides() → _dispatchMessageWithHook() L759 →
+    _dispatchMessageWithValue(msg.value) L743 →
+    [safeTransferFrom for ERC20 fee] L241 +
+    [mailbox.dispatch{value: msg.value}] L246
+
+flash_loan_analysis:
+  handle:
+    q1_reads_manipulable_state: false
+    q2_affects_fund_movement: true
+    q3_same_tx_consumable: true
+    q4_post_action_verification: false
+    q5_reentrancy_guard: false
+    q6_callback_verifies_initiator: false
+    q7_spot_vs_twap: N/A
+    q8_reward_by_balance: false
+    q9_threshold_crossable: false
+    q10_self_liquidation: false
+    q11_fee_rounding_zero: false
+    q12_checkpoint_storage_or_memory: storage
+    verdict: >
+      handle() has no reentrancy guard (Q5=no) and executes arbitrary external calls
+      via multicall (Q2=yes, Q3=yes). The ICA multicall could callback into the router.
+      However, handle is onlyMailbox so re-entry through handle requires going through
+      the mailbox again. The real risk is re-entry into other router functions during
+      multicall execution.
+
+  callRemoteCommitReveal:
+    q1_reads_manipulable_state: true
+    q2_affects_fund_movement: true
+    q3_same_tx_consumable: true
+    q4_post_action_verification: false
+    q5_reentrancy_guard: false
+    q6_callback_verifies_initiator: N/A
+    q7_spot_vs_twap: N/A
+    q8_reward_by_balance: false
+    q9_threshold_crossable: false
+    q10_self_liquidation: false
+    q11_fee_rounding_zero: false
+    q12_checkpoint_storage_or_memory: N/A
+    verdict: >
+      Reads address(this).balance (Q1=yes, manipulable via donations/receive).
+      Sends that balance in the reveal dispatch (Q2=yes). No post-verification (Q4=no).
+      Classic flash-loan compatible: donate ETH to router → call commit-reveal →
+      reveal dispatch takes extra ETH. Key finding: IAR-01.
+
+  callRemoteWithOverrides:
+    q1_reads_manipulable_state: false
+    q2_affects_fund_movement: true
+    q3_same_tx_consumable: true
+    q4_post_action_verification: false
+    q5_reentrancy_guard: false
+    q6_callback_verifies_initiator: N/A
+    q7_spot_vs_twap: N/A
+    q8_reward_by_balance: false
+    q9_threshold_crossable: false
+    q10_self_liquidation: false
+    q11_fee_rounding_zero: false
+    q12_checkpoint_storage_or_memory: N/A
+    verdict: >
+      Relatively clean — uses msg.value directly, no balance reads. The main risk is
+      the feeToken double-payment (IAR-12). No reentrancy concerns since it only
+      dispatches to mailbox.
+
+  approveFeeTokenForHook:
+    q1_reads_manipulable_state: false
+    q2_affects_fund_movement: true
+    q3_same_tx_consumable: true
+    q4_post_action_verification: false
+    q5_reentrancy_guard: false
+    q6_callback_verifies_initiator: N/A
+    q7_spot_vs_twap: N/A
+    q8_reward_by_balance: false
+    q9_threshold_crossable: false
+    q10_self_liquidation: false
+    q11_fee_rounding_zero: false
+    q12_checkpoint_storage_or_memory: N/A
+    verdict: >
+      CRITICAL: No access control (Q4=no). Anyone can approve infinite tokens to any
+      address. If router holds any ERC20 balance, this enables immediate drainage.
+      Key finding: IAR-06.
+
+false_positives:
+- hunter: FlowHunter
+  id: IAR-FP-01
+  reason: >
+    handle() not checking onlyRemoteRouter is INTENTIONAL per NatSpec comment. The design
+    allows untrusted senders — each sender gets a unique ICA. This is not a vulnerability
+    per se, but it changes the security model. The real risk is in ISM selection (IAR-03).
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: >
+      Hyperlane InterchainAccountRouter intentionally accepts messages from untrusted senders.
+      Each (origin, sender, owner, ism, salt) tuple derives a unique ICA. Do NOT flag the
+      missing onlyRemoteRouter as a bug — instead focus on ISM selection trust model.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: IAR-FP-02
+  reason: >
+    OwnableMulticall.revealAndExecute() having no onlyOwner is INTENTIONAL for the
+    commit-reveal scheme. The ISM calls it during verify(). The security relies on
+    commitment secrecy, not access control. However, this is still a trust assumption
+    worth noting (IAR-04).
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

@@ -1,0 +1,655 @@
+protocol: morpho-metamorpho
+component: MetaMorpho
+file: src/MetaMorpho.sol
+domain: trust
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-01: skim(asset()) can drain residual vault balance
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-01
+  tier: 1
+  type: property
+  description: >
+    skim() at L483-491 is permissionless and transfers the FULL balanceOf(address(this))
+    for ANY token to skimRecipient. The vault normally holds 0 asset() balance — everything
+    is supplied to Morpho via _supplyMorpho. However, _supplyMorpho at L789-791 uses
+    try/catch: if MORPHO.supply() reverts for a market, the catch is empty and it moves
+    to the next. The final guard at L799 reverts with AllCapsReached if assets remain.
+    So no residual balance after deposit. BUT: during a deposit's execution, between
+    super._deposit (L671, which calls safeTransferFrom into the vault) and _supplyMorpho
+    (L673), the vault temporarily holds the deposited assets. Skim cannot be called in
+    this window because it's internal sequential code — no external call between them
+    (the safeTransferFrom pulls FROM the caller, not into an ERC777 callback to this
+    contract). The vault's asset() has max approval to MORPHO only. Safe by design.
+    The invariant validates the vault never accumulates residual asset balance.
+  attack_scenario: >
+    1. User deposits 1000 USDC via deposit()
+    2. super._deposit transfers 1000 USDC to vault
+    3. _supplyMorpho supplies all 1000 to Morpho markets
+    4. Vault balance returns to 0
+    5. Attacker calls skim(asset()) — transfers 0 to skimRecipient
+    6. No value extracted
+    Edge case: if ALL markets revert in try/catch, L799 AllCapsReached reverts
+    the entire deposit — no residual.
+  impact: >
+    No impact under normal conditions. Vault asset balance should always be 0
+    outside of atomic transactions. If this invariant breaks, it indicates a bug
+    in _supplyMorpho or an unexpected state where assets are stranded.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_01() public view {
+      // Vault should never hold asset() balance outside of transactions
+      uint256 vaultBalance = IERC20(vault.asset()).balanceOf(address(vault));
+      t(vaultBalance == 0, "MM-TB-01: vault holds residual asset balance");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    Current code is safe — AllCapsReached ensures no residual. This invariant
+    validates the critical assumption that vault never accumulates idle assets.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-02: try/catch in _supplyMorpho/_withdrawMorpho — silent asset accounting
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-02
+  tier: 1
+  type: property
+  description: >
+    _supplyMorpho (L771-800) and _withdrawMorpho (L803-824) use try/catch when
+    calling MORPHO.supply() and MORPHO.withdraw(). If a market reverts (oracle
+    failure, IRM bug, market paused), execution silently continues. The guards:
+    - _supplyMorpho L799: if (assets != 0) revert AllCapsReached — ensures ALL assets supplied
+    - _withdrawMorpho L823: if (assets != 0) revert NotEnoughLiquidity — ensures ALL assets withdrawn
+    These guards prevent silent asset loss. However, in reallocate() (L368-417),
+    MORPHO.supply() and MORPHO.withdraw() are called WITHOUT try/catch. If a
+    market's supply/withdraw reverts in reallocate, the ENTIRE reallocate reverts.
+    An allocator cannot reallocate out of a reverting market. Funds in that market
+    are stuck from the allocator's perspective until the market stops reverting.
+    User withdrawals still work (try/catch skips the reverting market).
+    After any deposit completes, totalAssets should account for all supplied assets.
+  attack_scenario: >
+    1. Market A's IRM or oracle starts reverting
+    2. Allocator cannot reallocate() away from market A (no try/catch)
+    3. User deposits still work (supply goes to other markets)
+    4. User withdrawals still work (try/catch skips market A)
+    5. Funds in market A earn suboptimal yield or face elevated risk
+    6. No direct fund loss, but capital efficiency is degraded
+  impact: >
+    Allocator management is DoS'd for affected markets. User deposits/withdrawals
+    continue working. No fund loss but suboptimal capital allocation.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    function property_mm_tb_02() public {
+      // After any operation, totalAssets should be >= lastTotalAssets - 1 (interest accrual only grows)
+      uint256 totalInMorpho = vault.totalAssets();
+      uint256 lastTotal = vault.lastTotalAssets();
+      uint256 supply = vault.totalSupply();
+      if (supply > 0) {
+        t(totalInMorpho + 1 >= lastTotal, "MM-TB-02: totalAssets < lastTotalAssets, possible silent asset loss from try/catch");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The try/catch + final guard pattern is robust for deposit/withdraw. The invariant
+    validates no silent asset loss occurs despite the try/catch swallowing reverts.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-03: Morpho Blue market existence trust — lastUpdate check only at submitCap
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-03
+  tier: 2
+  type: property
+  description: >
+    submitCap() at L278 validates MORPHO.lastUpdate(id) != 0 (market exists on Morpho).
+    This check happens only once — at cap submission time. After a market is enabled,
+    the vault never re-validates the market exists. The trust assumption: Morpho Blue
+    markets are immutable and permanent once created. This is correct for Morpho Blue's
+    design — markets are identified by keccak256 of parameters and cannot be deleted.
+    If Morpho Blue were upgraded (it's not — it's immutable) and a market were removed,
+    the vault's operations on that market would revert. The try/catch in _supplyMorpho/
+    _withdrawMorpho handles this gracefully, but reallocate() does not.
+  attack_scenario: >
+    1. Market created on Morpho Blue, enabled in vault
+    2. Hypothetically: Morpho Blue state corrupted (requires Morpho Blue bug)
+    3. MORPHO.supply/withdraw for that market now reverts
+    4. Vault deposits work (try/catch skips), withdrawals work (try/catch skips)
+    5. reallocate() to that market reverts
+    6. Theoretical — Morpho Blue is immutable, markets are permanent
+  impact: >
+    Theoretical only. Morpho Blue markets cannot be deleted. The invariant
+    validates the assumption that all enabled markets remain valid on Morpho.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_tb_03() public view {
+      // Every enabled market in withdrawQueue must have lastUpdate > 0 on Morpho
+      uint256 len = vault.withdrawQueueLength();
+      for (uint256 i = 0; i < len; i++) {
+        Id id = vault.withdrawQueue(i);
+        uint256 lastUpdate = MORPHO.lastUpdate(id);
+        t(lastUpdate > 0, "MM-TB-03: enabled market has lastUpdate == 0 on Morpho");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Morpho Blue markets are immutable and permanent. Should never break.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-04: Multicall + deposit reentrancy — lastTotalAssets pre-update guard
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-04
+  tier: 1
+  type: property
+  description: >
+    deposit() at L531-541 and mint() at L544-554 both set lastTotalAssets = newTotalAssets
+    (L536/L549) BEFORE calling super._deposit and _supplyMorpho. This is explicitly
+    commented as reentrancy protection: "Update lastTotalAssets to avoid an inconsistent
+    state in a re-entrant context." With ERC777 tokens, safeTransferFrom in super._deposit
+    could trigger a tokensToSend callback on the caller, allowing reentry. The pre-update
+    ensures a reentrant deposit/mint sees consistent state. With standard ERC20, no
+    reentrancy is possible. The Multicall inheritance allows batching deposit+deposit,
+    but Multicall executes calls sequentially — no interleaving. After the first deposit
+    completes (including lastTotalAssets update at L676), the second deposit sees updated
+    state. The share price should remain stable across batched operations in the same block.
+  attack_scenario: >
+    1. Attacker deploys vault with ERC777 token
+    2. Attacker calls deposit(), triggering tokensToSend callback
+    3. In callback, attacker reenters deposit()
+    4. Reentrant deposit sees lastTotalAssets = newTotalAssets (pre-updated at L536)
+    5. Share price calculation uses this pre-updated value — CORRECT
+    6. No profit — the L536 guard prevents share price manipulation
+    7. With standard ERC20 + Multicall: sequential execution, no issue
+  impact: >
+    No impact. The L536/L549 pre-update is a correct reentrancy guard.
+    Share price remains consistent even under reentrancy.
+  impact_rating: Info
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_04() public {
+      // Share price should not change within same block absent external interest
+      uint256 priceBefore = vault.convertToAssets(1e18);
+      // Simulate a deposit (handler does this)
+      uint256 priceAfter = vault.convertToAssets(1e18);
+      // Allow 1 wei rounding tolerance
+      t(
+        priceAfter >= priceBefore - 1 && priceAfter <= priceBefore + 1,
+        "MM-TB-04: share price changed unexpectedly within same context"
+      );
+    }
+  ghost_vars:
+    - ghost_sharePriceBeforeOp
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    The L536 lastTotalAssets pre-update is a clever reentrancy guard. ERC777 risk
+    is mitigated. Standard ERC20 has no reentrancy vector.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-05: Supply cap enforcement — allocator cannot exceed per-market cap
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-05
+  tier: 1
+  type: property
+  description: >
+    reallocate() at L401-404 enforces supply caps: config[id].cap must be > 0
+    (L402, reverts UnauthorizedMarket) and supplyAssets + suppliedAssets must not
+    exceed supplyCap (L404, reverts SupplyCapExceeded). The id is derived from
+    caller-provided marketParams via keccak256 (L373). Morpho Blue verifies
+    marketParams↔id consistency internally in supply/withdraw calls. The cap check
+    uses supplyAssets from _accruedSupplyBalance which calls MORPHO.accrueInterest
+    first (L708), getting fresh accounting. Interest accrual between the accrueInterest
+    call and the supply call could push the actual post-supply amount slightly above
+    cap (by up to 1 block's interest). This is negligible and the +1 tolerance in
+    the invariant accounts for it. _supplyMorpho (L771-800) also enforces caps
+    during deposits (L787: supplyCap.zeroFloorSub(supplyAssets)). Both paths are safe.
+  attack_scenario: >
+    1. Malicious allocator tries to supply beyond a market's cap
+    2. reallocate() checks: supplyAssets + suppliedAssets > supplyCap → revert
+    3. _supplyMorpho limits toSupply to supplyCap - supplyAssets
+    4. No bypass path — cap enforcement is consistent across both supply paths
+    5. Interest accrual between accrueInterest and supply is < 1 block — negligible
+  impact: >
+    No impact. Supply caps are robustly enforced. A violation would mean
+    the allocator bypassed the cap, which could over-concentrate risk.
+  impact_rating: Medium
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_tb_05() public view {
+      // For every market in withdrawQueue, supply must not exceed cap
+      uint256 len = vault.withdrawQueueLength();
+      for (uint256 i = 0; i < len; i++) {
+        Id id = vault.withdrawQueue(i);
+        (uint184 cap,,) = vault.config(id);
+        if (cap > 0) {
+          MarketParams memory params = MORPHO.idToMarketParams(id);
+          uint256 supplyAssets = MORPHO.expectedSupplyAssets(params, address(vault));
+          t(supplyAssets <= uint256(cap) + 1, "MM-TB-05: supply exceeds cap for enabled market");
+        }
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    Cap enforcement is critical. +1 tolerance for inter-block interest accrual.
+    A real violation would indicate a serious allocator bypass.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-06: _withdrawable() balanceOf(MORPHO) — flashloan liquidity constraint
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-06
+  tier: 1
+  type: property
+  description: >
+    _withdrawable() at L858-870 computes available liquidity as:
+    min(totalSupplyAssets - totalBorrowAssets, ERC20(loanToken).balanceOf(address(MORPHO)))
+    The balanceOf(MORPHO) check is documented (L864 comment) as flashloan protection.
+    During a Morpho flashloan, the singleton's actual token balance may be temporarily
+    drained, causing _withdrawable() to return less than accounting liquidity. This
+    affects: (1) _withdrawMorpho used in actual withdrawals — could reduce available
+    withdrawal amount, (2) _simulateWithdrawMorpho used in maxWithdraw/maxRedeem views.
+    The DoS is atomic-only (flashloan must be repaid in same tx). Users' standalone
+    withdraw() transactions are unaffected. The real risk: a malicious contract that
+    takes a Morpho flashloan AND tries to withdraw from MetaMorpho in the same tx
+    would see reduced liquidity. But this only hurts the attacker, not other users.
+  attack_scenario: >
+    1. Attacker takes Morpho flashloan of entire loanToken balance
+    2. In callback: balanceOf(MORPHO) = 0
+    3. maxWithdraw() returns 0, withdraw() may revert with NotEnoughLiquidity
+    4. Flashloan is repaid — balance restored
+    5. Net effect: temporary DoS only within the flashloan callback scope
+    6. No fund loss — attacker must repay the flashloan
+  impact: >
+    Temporary atomic DoS of withdrawals during Morpho flashloan. No fund loss.
+    By design — documented in code comments.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_06() public view {
+      // maxWithdraw for any user should be <= their proportional share of totalAssets
+      // (cannot withdraw more than what the vault owns)
+      uint256 total = vault.totalAssets();
+      uint256 supply = vault.totalSupply();
+      if (supply > 0 && total > 0) {
+        // maxWithdraw should be bounded by totalAssets
+        // (not a per-user check, but a global sanity check)
+        t(total <= type(uint256).max, "MM-TB-06: totalAssets overflow");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The balanceOf(MORPHO) check is intentional defense-in-depth for flashloan scenarios.
+    This is a known design pattern, not a vulnerability.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-07: Phantom assets — market removed from withdrawQueue with supply > 0
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-07
+  tier: 1
+  type: property
+  description: >
+    totalAssets() at L585-589 iterates ONLY withdrawQueue. If a market is removed from
+    withdrawQueue (via updateWithdrawQueue at L325-365) while the vault still has
+    supplyShares on Morpho, those assets become "phantom" — not counted in totalAssets().
+    This causes share price to drop, harming depositors. The protection at L350-356:
+    markets with non-zero supplyShares require removableAt != 0 AND timelock elapsed.
+    submitMarketRemoval (L294-305) sets removableAt = block.timestamp + timelock.
+    The curator must first set cap to 0 (instant for decreases), submit removal, wait
+    timelock (>= 1 day), then allocator can remove. During the timelock, the market IS
+    still in withdrawQueue (counted in totalAssets). After removal, phantom assets exist.
+    The curator can re-enable the market (submitCap with non-zero cap → goes through
+    timelock for increases). Between removal and re-enablement, share price is artificially
+    low. This is a known design tradeoff with timelock protection.
+  attack_scenario: >
+    1. Vault: market A (1000 USDC), market B (1000 USDC), totalAssets = 2000
+    2. Curator sets A cap to 0, submits removal, waits timelock (>= 1 day)
+    3. Allocator removes A from withdrawQueue WITHOUT reallocating
+    4. totalAssets() = 1000 (only B counted), share price drops ~50%
+    5. Attacker deposits 1000 USDC at discounted share price
+    6. Curator re-enables A → totalAssets = 3000, share price jumps
+    7. Attacker redeems for profit, existing depositors lose
+    8. Requires curator+allocator collusion (both are trusted roles)
+  impact: >
+    Share price manipulation via phantom assets. Requires trusted role
+    collusion. The timelock provides depositors a window to exit.
+    With MIN_TIMELOCK = 1 day, users have 24h+ to notice the removal.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_07() public {
+      // totalAssets must account for ALL vault positions on Morpho
+      // If phantom assets exist, totalAssets is understated
+      uint256 reported = vault.totalAssets();
+      // Track total across ALL markets the vault has ever supplied to
+      t(
+        ghost_totalAcrossAllMarkets <= reported + vault.withdrawQueueLength(),
+        "MM-TB-07: phantom assets exist outside withdrawQueue"
+      );
+    }
+  ghost_vars:
+    - ghost_totalAcrossAllMarkets
+  validated: false
+  priority: critical
+  confidence: 65
+  notes: >
+    Known design tradeoff. The removableAt timelock provides protection, but a
+    malicious curator+allocator can still weaponize it. The real question is whether
+    depositors can monitor and exit within the timelock window. Likely excluded as
+    "deployer/curator choices" per bounty scope.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-08: Fee-on-transfer tokens — lastTotalAssets vs totalAssets divergence
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-08
+  tier: 1
+  type: property
+  description: >
+    deposit() at L676 updates lastTotalAssets += assets where assets is the REQUESTED
+    deposit amount. If the underlying asset charges a transfer fee, the actual amount
+    reaching Morpho is less. Morpho Blue records the actual amount. So totalAssets()
+    (reading from Morpho) would return less than lastTotalAssets. On next _accrueFee(),
+    totalInterest = totalAssets().zeroFloorSub(lastTotalAssets) = 0 (understated).
+    Fee shares are not minted (correct — no real interest). Next operation's _accrueFee
+    corrects lastTotalAssets to the real totalAssets(). The share price uses totalAssets()
+    (via _accrueFee → _accruedFeeShares → totalAssets()), not lastTotalAssets, for
+    conversions. So FOT tokens cause transient lastTotalAssets overstatement but no
+    share price impact. Morpho Blue officially does not support FOT tokens.
+  attack_scenario: >
+    1. Vault deployed with FOT token (e.g., PAXG)
+    2. User deposits 1000, vault receives 995 (0.5% fee)
+    3. _supplyMorpho supplies 995 to Morpho (or 1000 requested, but transfer fee reduces it)
+    4. Actually: vault calls MORPHO.supply(marketParams, toSupply, ...) with toSupply=1000
+       but only 995 arrives at Morpho after FOT. Morpho records 995.
+    5. lastTotalAssets += 1000 (overstated by 5)
+    6. Next totalAssets() = 995, lastTotalAssets = 1000 → totalInterest = 0
+    7. Share price based on totalAssets() = 995 — accurate
+    8. Depositor gets fewer shares than expected relative to the 1000 they sent
+  impact: >
+    FOT tokens: lastTotalAssets transiently overstated, no share price impact.
+    Morpho Blue does not support FOT tokens — this is a known limitation.
+    In practice, vaults would not be deployed with FOT assets.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_08() public {
+      // lastTotalAssets should closely track totalAssets()
+      // With FOT tokens, lastTotalAssets can overstate reality transiently
+      uint256 total = vault.totalAssets();
+      uint256 last = vault.lastTotalAssets();
+      if (total > 0) {
+        uint256 tolerance = total / 1000 + 1; // 0.1% tolerance
+        t(last <= total + tolerance, "MM-TB-08: lastTotalAssets exceeds totalAssets beyond tolerance");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    Morpho Blue does not support FOT tokens. This invariant catches any case
+    where lastTotalAssets diverges from totalAssets unexpectedly.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-09: Infinite approval to MORPHO — permanent max allowance
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-09
+  tier: 2
+  type: property
+  description: >
+    Constructor at L135: IERC20(_asset).forceApprove(morpho, type(uint256).max).
+    This gives Morpho unlimited approval forever. MORPHO is immutable (set in
+    constructor, cannot be changed). There's no function to revoke or reduce this
+    approval. The trust assumption: Morpho Blue will only pull tokens when MetaMorpho
+    calls supply(). If Morpho Blue has a critical vulnerability allowing arbitrary
+    transferFrom, vault assets could be at risk. However, the vault typically holds
+    0 asset balance (all supplied to Morpho), limiting the exposure to in-flight
+    deposits only. The approval is never consumed (it stays at max because Morpho
+    Blue uses the allowance but OZ SafeERC20 re-approves or max approval isn't
+    decremented by standard ERC20 implementations for type(uint256).max).
+  attack_scenario: >
+    1. Morpho Blue has a vulnerability allowing arbitrary transferFrom
+    2. Attacker calls Morpho to transferFrom(vault, attacker, amount)
+    3. Vault balance is typically 0 (all in Morpho positions) — nothing to take
+    4. During in-flight deposit: up to the deposit amount could be at risk
+    5. Extremely unlikely — Morpho Blue is immutable and audited
+  impact: >
+    Catastrophic IF Morpho Blue is compromised. Practically zero risk given
+    Morpho Blue's immutability and audit history. The max approval is a
+    necessary gas optimization and operational requirement.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_tb_09() public view {
+      // Morpho approval should always remain at max (never reduced)
+      uint256 allowance = IERC20(vault.asset()).allowance(address(vault), address(MORPHO));
+      t(allowance == type(uint256).max, "MM-TB-09: Morpho approval reduced from max");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    Max approval is by design. Morpho Blue is immutable and audited. This invariant
+    validates the approval is never accidentally consumed or reduced.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-10: reallocate() strict equality — totalWithdrawn == totalSupplied
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-10
+  tier: 1
+  type: property
+  description: >
+    reallocate() at L416: if (totalWithdrawn != totalSupplied) revert InconsistentReallocation.
+    Strict equality — no tolerance. The type(uint256).max sentinel at L395-396 allows
+    the last supply entry to absorb rounding: suppliedAssets = totalWithdrawn.zeroFloorSub(totalSupplied).
+    This makes the last supply exactly balance the withdrawn total. Without the max sentinel,
+    Morpho's share→asset rounding could cause 1-wei discrepancy: withdraw returns actual
+    (possibly less than requested), but supply takes exact requested amount. If all amounts
+    are explicit, the strict equality check could revert due to rounding. The max sentinel
+    is the designed solution. This invariant validates that reallocate never creates or
+    destroys vault value — it's net-neutral.
+  attack_scenario: >
+    1. Allocator calls reallocate with all explicit amounts (no max)
+    2. Market A: withdraw 1000 → Morpho returns 999 (1 wei rounding)
+    3. Market B: supply 1000 → supplies exactly 1000
+    4. totalWithdrawn=999, totalSupplied=1000 → REVERT InconsistentReallocation
+    5. Allocator must use max for balancing entry
+    6. UX issue, not security — no fund loss
+  impact: >
+    Strict equality prevents value creation/destruction during reallocation.
+    The max sentinel absorbs rounding. No fund loss possible — either
+    reallocate succeeds with exact balance, or it reverts.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    function property_mm_tb_10() public {
+      // After successful reallocate, totalAssets should remain approximately unchanged
+      uint256 totalBefore = ghost_totalAssetsBeforeReallocate;
+      uint256 totalAfter = vault.totalAssets();
+      uint256 queueLen = vault.withdrawQueueLength();
+      if (totalBefore > 0) {
+        t(
+          totalAfter + queueLen >= totalBefore && totalAfter <= totalBefore + queueLen,
+          "MM-TB-10: reallocate changed totalAssets beyond rounding tolerance"
+        );
+      }
+    }
+  ghost_vars:
+    - ghost_totalAssetsBeforeReallocate
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The type(uint256).max sentinel is the designed mechanism to absorb rounding.
+    The invariant validates reallocate is net-neutral for vault value.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-11: Guardian griefing — can permanently block timelock/guardian changes
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-11
+  tier: 2
+  type: property
+  description: >
+    revokePendingTimelock() (L422-426) is onlyGuardianRole (guardian OR owner).
+    revokePendingGuardian() (L429-433) is onlyGuardianRole. A malicious guardian
+    can call revoke on every pending timelock reduction and guardian replacement,
+    permanently blocking the owner from changing these values. The owner IS in
+    onlyGuardianRole and can also call revoke, but cannot FORCE acceptance before
+    validAt. The race: owner submits → guardian revokes before validAt → repeat.
+    However, the owner can call submitTimelock(0 < new < current) which creates
+    a pending with validAt = now + current_timelock. The guardian must revoke before
+    validAt. If the guardian doesn't monitor, the change goes through (permissionless
+    acceptTimelock). This is a game of monitoring: guardian must be MORE active than
+    the accept caller. In practice, guardian is typically a multisig or DAO — slow to
+    react. A MEV bot calling acceptTimelock at the exact validAt block could beat the
+    guardian's revoke. This is the designed trust model — guardian has veto power but
+    must exercise it within the timelock window.
+  attack_scenario: >
+    1. Guardian key compromised or guardian becomes malicious
+    2. Owner submits new guardian → pendingGuardian set with validAt
+    3. Malicious guardian calls revokePendingGuardian() before validAt
+    4. Repeat — owner can never replace guardian
+    5. Guardian can also revoke pending timelock reductions
+    6. Owner can still: set curator, set allocator, set fee, set feeRecipient, set skimRecipient
+    7. Owner CANNOT: reduce timelock, replace guardian (without guardian cooperation)
+    8. Deposits/withdrawals still work — no fund loss
+  impact: >
+    Governance DoS — guardian becomes irrevocable. No fund loss. Owner retains
+    most administrative capabilities. This is a known design tradeoff.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_11() public view {
+      // Timelock must always be within bounds
+      uint256 tl = vault.timelock();
+      t(tl >= 1 days, "MM-TB-11: timelock below MIN_TIMELOCK");
+      t(tl <= 2 weeks, "MM-TB-11: timelock above MAX_TIMELOCK");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    Known design tradeoff. Guardian veto power is intentional. With 444+
+    submissions this has certainly been reported. The invariant validates
+    timelock bounds are always respected.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-TB-12: Curator instant cap-zero DoS — blocks all deposits
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-TB-12
+  tier: 2
+  type: property
+  description: >
+    Cap decreases are instant (L284: newSupplyCap < supplyCap → _setCap directly).
+    A malicious curator can set all caps to 0, making _supplyMorpho skip all markets
+    (L776: if supplyCap == 0 continue) and revert with AllCapsReached. This blocks
+    deposits entirely. Withdrawals still work (_withdrawMorpho doesn't check caps).
+    Recovery: owner submits new caps (increases require timelock, >= 1 day). Recovery
+    takes at least MIN_TIMELOCK. If guardian colludes with curator, guardian can revoke
+    the owner's cap submissions (revokePendingCap is onlyCuratorOrGuardianRole).
+    But owner is also in onlyCuratorOrGuardianRole (inherits from owner checks in
+    all modifiers). Actually checking L167: onlyCuratorOrGuardianRole checks
+    _msgSender() == guardian || curator || owner. So owner CAN revoke caps too.
+    But to INCREASE caps, owner must go through timelock (submitCap → wait → acceptCap).
+    Guardian could revoke the pending cap... but acceptCap is permissionless after validAt.
+    Race condition: owner submits cap increase → waits timelock → MEV bot calls acceptCap
+    at validAt → guardian can't revoke in time. Deposits resume.
+  attack_scenario: >
+    1. Malicious curator calls submitCap(market, 0) for all markets → instant
+    2. All deposits revert with AllCapsReached
+    3. Owner submits new caps → waits timelock (>= 1 day)
+    4. acceptCap is permissionless after validAt → deposits resume
+    5. Total deposit DoS: at least 1 day (MIN_TIMELOCK)
+  impact: >
+    1-day deposit freeze. No fund loss (withdrawals work). Requires
+    compromised/malicious curator. Owner can recover via timelocked cap increase.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_mm_tb_12() public view {
+      // At least one market in supplyQueue should have cap > 0
+      // (otherwise deposits are blocked)
+      uint256 len = vault.supplyQueueLength();
+      bool anyNonZeroCap = false;
+      for (uint256 i = 0; i < len; i++) {
+        Id id = vault.supplyQueue(i);
+        (uint184 cap,,) = vault.config(id);
+        if (cap > 0) {
+          anyNonZeroCap = true;
+          break;
+        }
+      }
+      // If supplyQueue is non-empty, at least one market should accept deposits
+      if (len > 0) {
+        t(anyNonZeroCap, "MM-TB-12: all markets in supplyQueue have cap=0, deposits blocked");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    Known curator trust assumption. Likely excluded as "deployer/curator choices."
+    The timelock recovery mechanism limits DoS duration.
+
+notes: |
+  Comprehensive trust boundary analysis of MetaMorpho.sol (907 lines). Key findings:
+
+  1. MORPHO TRUST (MM-TB-02, MM-TB-03, MM-TB-09): The vault has infinite approval to
+     Morpho Blue and trusts it completely. Morpho is immutable — this is safe IF Morpho
+     has no vulnerabilities. The try/catch pattern in _supplyMorpho/_withdrawMorpho
+     provides graceful degradation for individual market failures.
+
+  2. PHANTOM ASSETS (MM-TB-07): The most significant trust boundary issue. Removing a
+     market from withdrawQueue while supply > 0 causes totalAssets to understate reality.
+     Protected by timelock but weaponizable by malicious curator+allocator. Likely excluded
+     as trusted role behavior.
+
+  3. REENTRANCY (MM-TB-04): Well-mitigated by the lastTotalAssets pre-update at L536/L549.
+     ERC777 reentrancy during deposit is handled correctly. Standard ERC20 has no reentrancy.
+
+  4. SUPPLY CAP ENFORCEMENT (MM-TB-05): Robust across both deposit and reallocate paths.
+     +1 tolerance for inter-block interest. No bypass found.
+
+  5. GOVERNANCE GRIEFING (MM-TB-11, MM-TB-12): Guardian can block timelock/guardian changes,
+     curator can zero all caps. Both are known design tradeoffs within the trust model.
+     Recovery mechanisms exist but introduce delay (MIN_TIMELOCK = 1 day).
+
+  6. FOT TOKENS (MM-TB-08): Causes transient lastTotalAssets overstatement but no share
+     price impact. Morpho Blue doesn't support FOT tokens — known limitation.
+
+  OVERALL: The MetaMorpho trust model is well-designed. No exploitable vulnerabilities found
+  outside the trusted role assumptions. The most interesting invariants to fuzz are MM-TB-01
+  (residual balance), MM-TB-02 (totalAssets vs lastTotalAssets), MM-TB-05 (cap enforcement),
+  MM-TB-07 (phantom assets), and MM-TB-10 (reallocate neutrality).

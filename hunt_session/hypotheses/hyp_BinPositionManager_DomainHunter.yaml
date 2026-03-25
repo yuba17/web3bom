@@ -1,0 +1,427 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: BPM-D01
+  tier: 1
+  type: property
+  description: "Position mapping for binId=0 is permanently unrecordable — _positions[tokenId] never gets stored for the real bin 0"
+  attack_scenario: >
+    In _addLiquidity, the guard `if (_positions[tokenId].binId == 0)` is used to detect whether a position
+    has already been recorded. But bin ID 0 is a valid bin in Liquidity Book pools. If a user mints liquidity
+    into bin 0, the _positions mapping stores binId=0 for that tokenId. On subsequent mints to the same
+    tokenId, the guard `_positions[tokenId].binId == 0` is still true, so it overwrites the position again
+    (harmless for same bin). However, the `positions()` view function checks
+    `if (PoolId.unwrap(position.poolId) == 0) revert InvalidTokenID()` — if poolId happens to be bytes32(0)
+    (extremely unlikely but theoretically possible via hash collision), it would brick the position query.
+    More practically: the binId=0 sentinel makes it impossible to distinguish "uninitialized" from "initialized
+    at bin 0" in the _positions mapping, which could confuse off-chain integrations and indexers relying on
+    the positions() view. The real impact is limited since the ERC1155 token balance is tracked separately.
+  impact: "Low — the ERC1155 balance is still correct; only the _positions metadata lookup has an ambiguity for binId=0"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Mint to bin 0, then query positions() — should NOT revert
+    // This tests whether binId=0 is properly handled
+    uint256 tokenId = poolId.toTokenId(0); // bin 0
+    // After addLiquidity to bin 0:
+    (PoolKey memory key, uint24 returnedBinId) = binPositionManager.positions(tokenId);
+    // returnedBinId should be 0, and it should NOT revert with InvalidTokenID
+    // The real check: poolId should not be bytes32(0)
+    t(PoolId.unwrap(key.toId()) != bytes32(0), "BPM-D01: bin 0 position should be queryable");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    binId=0 is valid in Liquidity Book (it's the leftmost bin). The sentinel check uses poolId==0
+    not binId==0 for the revert, so positions() actually works. But the _positions write guard
+    `if (_positions[tokenId].binId == 0)` means re-minting to bin 0 always overwrites (no-op since
+    same values). Low severity but worth documenting the design quirk.
+
+- id: BPM-D02
+  tier: 1
+  type: property
+  description: "idSlippage check has underflow risk when activeIdDesired < idSlippage"
+  attack_scenario: >
+    In _addLiquidity line 276: `if (activeIdDesired - idSlippage > activeId)`. If activeIdDesired=0
+    and idSlippage=1, this computes 0-1 which underflows in uint256 arithmetic to type(uint256).max,
+    which is always > activeId, so the check ALWAYS reverts even if activeId=0 (which is within the
+    "desired" range). This means users cannot add liquidity with activeIdDesired values near 0 if
+    they specify any idSlippage. The earlier check ensures both fit in uint24, so activeIdDesired
+    ranges 0..16777215 and idSlippage 0..16777215. If idSlippage > activeIdDesired, the subtraction
+    underflows. The attacker can front-run to move activeId to 0, then the LP's tx with
+    activeIdDesired=5 and idSlippage=10 would underflow at (5-10) and revert, DOSing the mint.
+    Wait — but 5-10 in uint256 wraps to huge number > activeId, so it reverts. The user INTENDED
+    to allow bins 0..15 (5±10), but the underflow makes the lower bound check always fail.
+  impact: "Medium — legitimate addLiquidity calls revert when activeIdDesired < idSlippage, DOSing users who want to allow slippage below their desired ID into very low bins"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Try to add liquidity with activeIdDesired=5, idSlippage=10, activeId=0
+    // Expected: should succeed (0 is within range [0, 15])
+    // Actual: reverts due to underflow at (5 - 10) in uint256
+    uint256 activeIdDesired = 5;
+    uint256 idSlippage = 10;
+    uint24 activeId = 0; // current active bin
+    // Reproduce the check:
+    bool upperOk = (activeIdDesired + idSlippage >= activeId); // 15 >= 0 => true
+    bool lowerOk;
+    if (activeIdDesired >= idSlippage) {
+        lowerOk = (activeIdDesired - idSlippage <= activeId); // would be false but no underflow
+    } else {
+        lowerOk = true; // lower bound is negative, so any activeId >= 0 passes
+    }
+    // But the contract does unchecked: activeIdDesired - idSlippage => underflows
+    // t(lowerOk, "BPM-D02: idSlippage underflow DOS");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    This is a real underflow. Solidity 0.8.26 reverts on underflow by default, so
+    activeIdDesired - idSlippage would revert with panic(0x11) NOT wrap. This means
+    the transaction reverts with an arithmetic underflow error instead of the
+    IdSlippageCaught custom error. The user experience is bad but the DOS impact is
+    the same — they cannot add liquidity when idSlippage > activeIdDesired.
+    UPDATE: Solidity 0.8.x default checked arithmetic means this is a revert, not a
+    wrap-around. The function reverts with panic, not with the custom error. Still a
+    bug: users with low activeIdDesired cannot set broad slippage tolerance.
+
+- id: BPM-D03
+  tier: 1
+  type: property
+  description: "ERC1155 LP token totalSupply conservation: sum of all balances must equal totalSupply for every tokenId"
+  attack_scenario: >
+    If _mint or _burn has an accounting error, or if batchTransferFrom has an overflow in the
+    unchecked block (balanceOf[to][id] += amount), totalSupply could desync from actual balances.
+    In BinFungibleToken._mint, totalSupply is incremented with checked math but balanceOf is
+    incremented in unchecked block. If totalSupply[id] is near max and a mint pushes balanceOf[to][id]
+    past max in the unchecked block, we get a silent overflow on the balance while totalSupply reverts.
+    Actually: totalSupply is checked, so if totalSupply overflows it reverts. balanceOf is unchecked
+    but since totalSupply >= balanceOf always (invariant), if totalSupply didn't overflow then
+    balanceOf can't overflow either. This invariant should hold but is worth fuzzing.
+  impact: "Critical if broken — LP tokens could be minted from thin air or destroyed, allowing theft of pool liquidity"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For a given tokenId, sum all known holders' balances and compare to totalSupply
+    uint256 tokenId = poolId.toTokenId(binId);
+    uint256 supply = binPositionManager.totalSupply(tokenId);
+    uint256 sumBalances = 0;
+    for (uint256 i = 0; i < actors.length; i++) {
+        sumBalances += binPositionManager.balanceOf(actors[i], tokenId);
+    }
+    eq(sumBalances, supply, "BPM-D03: totalSupply must equal sum of balances");
+  ghost_vars:
+    - "uint256 internal ghost_totalMinted;"
+    - "uint256 internal ghost_totalBurned;"
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    Standard ERC1155 conservation invariant. The unchecked blocks in _mint and batchTransferFrom
+    are the attack surface. In _mint, the unchecked is safe IF totalSupply check passes first
+    (which it does — checked arithmetic). In batchTransferFrom, the unchecked balanceOf[to][id] += amount
+    is safe because we just subtracted from balanceOf[from][id] (so total stays same). Worth fuzzing
+    to confirm.
+
+- id: BPM-D04
+  tier: 1
+  type: property
+  description: "Distribution truncation attack: uint64 cast of distributionX/Y silently truncates values > type(uint64).max"
+  attack_scenario: >
+    In _addLiquidity, distributionX[i] and distributionY[i] are uint256 from calldata but cast to
+    uint64 at line 269-270: `uint64(distributionX[i])`. If a user passes a value like
+    (1 << 64) + desiredAmount, the uint64 cast silently truncates to desiredAmount. This could allow
+    a user to bypass intended distribution constraints. For example, if the frontend or an integrator
+    validates that sum(distributionX) == 1e18 but passes values > uint64.max, the actual distribution
+    used would be different from what was validated. However, LiquidityConfigurations.encodeParams
+    expects uint64, and the Liquidity Book math works on these uint64 distributions internally.
+    The truncation means the user gets a different distribution than they specified — potentially
+    concentrating liquidity in wrong bins. The user hurts themselves (wrong distribution) but could
+    also affect pool price if the misdistributed liquidity changes bin composition significantly.
+  impact: "Medium — user gets wrong liquidity distribution; could be exploited by a malicious integrator contract that validates on uint256 but the actual uint64 truncated value produces a different distribution"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Pass distributionX[0] = (1 << 64) + 5e17 (should be 0.5e18 = 50%)
+    // After uint64 cast, it becomes 5e17 which is correct
+    // But if we pass (1 << 64) + 0, it becomes 0 — all X goes to other bins
+    uint256 bigDistribution = (uint256(1) << 64) + 0;
+    uint64 truncated = uint64(bigDistribution);
+    // truncated == 0, not the intended "1 << 64"
+    eq(uint256(truncated), bigDistribution, "BPM-D04: distribution truncated silently");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    The uint64 max is ~1.8e19 which is > 1e18 (100% distribution). So valid distribution values
+    (0 to 1e18) all fit in uint64 without truncation. This is only exploitable if someone passes
+    values > uint64.max which would never represent a valid percentage. Likely by-design but the
+    silent truncation (no revert) is still worth noting. Confidence lowered because valid inputs
+    are always < uint64.max.
+
+- id: BPM-D05
+  tier: 1
+  type: property
+  description: "initializePool silently swallows all errors — pool can appear initialized when it's not"
+  attack_scenario: >
+    initializePool uses try/catch that catches ALL errors and does nothing:
+    `try binPoolManager.initialize(key, activeId) {} catch {}`.
+    If initialization fails for any reason (invalid parameters, out-of-gas in the internal call,
+    invalid currency order, etc.), the function succeeds silently. A user or integrator calling
+    initializePool followed by addLiquidity in separate transactions could believe the pool is
+    initialized when it's not. The subsequent addLiquidity would then fail with a confusing error
+    from binPoolManager.mint (pool not initialized) instead of a clear initialization error.
+    More critically: if a front-runner initializes the pool with a different activeId, the original
+    caller's initializePool silently succeeds (because the pool is already initialized — the try
+    returns successfully), and the user proceeds to add liquidity at a manipulated activeId.
+    The idSlippage check protects against this, but only if the user set it correctly.
+  impact: "Medium — front-running initializePool to set a malicious activeId, then the victim's idSlippage might be too loose, causing them to deposit at unfavorable bins"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Step 1: Attacker front-runs and initializes pool with activeId=100 (high price)
+    // Step 2: Victim calls initializePool with activeId=50 — silently succeeds (no-op, pool exists)
+    // Step 3: Victim adds liquidity thinking activeId~50 but it's actually 100
+    // If victim's idSlippage >= 50, the add succeeds at wrong price
+    (uint24 realActiveId,,) = binPoolManager.getSlot0(poolKey.toId());
+    // Victim expected activeId ~50 but got 100
+    t(realActiveId <= 60, "BPM-D05: activeId was front-run manipulated");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The try/catch is intentionally permissive (comment says "if the pool revert due to other error,
+    then the follow-up action to the pool will still revert accordingly"). The design assumes
+    callers will handle pool-not-initialized errors in subsequent calls. But the initializePool
+    front-running vector is real — attacker sets activeId, victim's tx silently no-ops. The
+    idSlippage check in addLiquidity is the defense, but users may set overly loose slippage.
+
+- id: BPM-D06
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock has no deadline check — transactions can be delayed indefinitely by miners/sequencers"
+  attack_scenario: >
+    modifyLiquidities() has checkDeadline(deadline) modifier, but modifyLiquiditiesWithoutLock()
+    does NOT have any deadline check. A user calling modifyLiquiditiesWithoutLock to add or remove
+    liquidity has no protection against their transaction being held in the mempool and executed
+    at a much later time when prices have moved significantly. While the idSlippage and amount
+    slippage checks provide some protection, they don't protect against time-based MEV: a validator
+    can hold the tx until the price moves to the edge of the slippage tolerance, then execute it
+    for maximum extractable value. This is the classic "missing deadline" DEX vulnerability.
+  impact: "Medium — transactions without deadline can be held by validators and executed at unfavorable times, extracting MEV from LPs"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // modifyLiquiditiesWithoutLock has no deadline parameter
+    // Call at block.timestamp = T, validator holds until T+3600 when price moved
+    // The tx still executes because there's no deadline check
+    // Verify: modifyLiquidities requires deadline, modifyLiquiditiesWithoutLock does not
+    // This is an asymmetry in the two entry points
+    // Invariant: both entry points should have equivalent protections
+    t(false, "BPM-D06: modifyLiquiditiesWithoutLock missing deadline");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    modifyLiquiditiesWithoutLock is designed for use by other contracts (hook callbacks,
+    etc.) where the vault is already locked. In that context, the outer call likely already
+    has a deadline. But if called directly as an entry point (it's external), there's no
+    deadline. The isNotLocked modifier ensures the vault isn't currently locked, so it IS
+    callable as a standalone entry point. This is a real asymmetry worth investigating.
+
+- id: BPM-D07
+  tier: 1
+  type: property
+  description: "Liquidity Book bin composition attack: adding liquidity to only one side of active bin at manipulated price"
+  attack_scenario: >
+    In Liquidity Book, the active bin holds both tokens. Bins above active hold only token X,
+    bins below hold only token Y. An attacker can: (1) swap to move activeId to an extreme,
+    (2) victim adds liquidity with deltaIds relative to the new activeId, depositing tokens
+    into bins that are entirely one-sided, (3) attacker swaps back, victim's liquidity is now
+    all in out-of-range bins worth less. The idSlippage check protects against large moves, but
+    within the slippage tolerance, the attacker can still extract value. The key insight is that
+    deltaIds are RELATIVE to the current activeId (line 266: `int256(_id) = int256(uint256(activeId)) + deltaIds[i]`).
+    So if activeId shifts within slippage, the user's liquidity lands in different absolute bins
+    than intended. This is the classic sandwich on LP provision.
+  impact: "High — LPs deposit at manipulated price, attacker profits from the price movement back"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Ghost vars track total value deposited vs total value withdrawn per user
+    // After add+remove cycle, user should not lose more than fees
+    uint256 valueBefore = _getUserTotalValue(user, poolKey);
+    // ... user adds liquidity ...
+    // ... attacker sandwiches ...
+    // ... user removes liquidity ...
+    uint256 valueAfter = _getUserTotalValue(user, poolKey);
+    // Allow for swap fees but not sandwich profit
+    gte(valueAfter, valueBefore * 99 / 100, "BPM-D07: LP sandwiched for >1% loss");
+  ghost_vars:
+    - "mapping(address => uint256) internal ghost_depositValue;"
+    - "mapping(address => uint256) internal ghost_withdrawValue;"
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    The idSlippage check runs BEFORE the mint call (line 272), so it uses the pre-mint activeId.
+    If a hook's beforeMint changes the activeId, the comment on line 271 says the txn will fail.
+    But a sandwich swap BEFORE the addLiquidity call (not in the hook) would pass the slippage
+    check if within tolerance. This is inherent to all AMMs but the relative deltaId design
+    amplifies it compared to absolute bin specification.
+
+- id: BPM-D08
+  tier: 1
+  type: property
+  description: "removeLiquidity burns ERC1155 tokens but never cleans up _positions mapping — stale position metadata persists"
+  attack_scenario: >
+    When _removeLiquidity burns LP tokens, it only calls _burn (which reduces balanceOf and
+    totalSupply) but never deletes _positions[tokenId]. If ALL liquidity for a tokenId is burned
+    (totalSupply reaches 0), the _positions entry still exists. This means positions(tokenId)
+    returns valid-looking data for a position with zero liquidity. An off-chain system or
+    integrator contract relying on positions() to check if a position is "active" would get
+    incorrect results. More importantly, if a DIFFERENT pool is created that happens to produce
+    the same tokenId (hash collision between keccak256(poolId1, binId1) and keccak256(poolId2, binId2)),
+    the stale _positions data could be returned for the new pool's position. Practically,
+    keccak256 collisions are infeasible, so this is informational.
+  impact: "Low — stale metadata in _positions mapping after full burn; no fund loss due to hash collision infeasibility"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 tokenId = poolId.toTokenId(binId);
+    // After burning ALL liquidity for this tokenId
+    uint256 supply = binPositionManager.totalSupply(tokenId);
+    eq(supply, 0, "BPM-D08: precondition — all liquidity burned");
+    // _positions[tokenId] should be cleaned up but isn't
+    // positions() should revert for zero-supply tokens but doesn't (poolId != 0)
+    // This is a state inconsistency
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    Confirmed by code reading: _removeLiquidity never touches _positions mapping.
+    The positions() view only reverts if poolId == 0, not if totalSupply == 0.
+    Gas optimization (not cleaning storage) but creates inconsistency.
+
+- id: BPM-D09
+  tier: 1
+  type: property
+  description: "permit2 transferFrom truncation: uint160 cast of amount in _pay can silently truncate amounts > 2^160"
+  attack_scenario: >
+    In _pay (line 378): `permit2.transferFrom(payer, address(vault), uint160(amount), ...)`.
+    The amount parameter is uint256 but gets cast to uint160 for the permit2 call. If amount
+    > type(uint160).max, it silently truncates. In practice, ERC20 token supplies rarely exceed
+    2^160 (~1.46e48), so this is unlikely with normal tokens. However, with extremely high-supply
+    tokens or intentionally crafted tokens, a user could end up paying less than the vault expects.
+    The vault.settle() after _pay would then fail because insufficient tokens were transferred,
+    so the transaction reverts. This makes it a DOS vector (not a fund theft vector) for tokens
+    with supply > 2^160.
+  impact: "Low — DOS for extremely high supply tokens; vault.settle() would revert if insufficient amount transferred"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // If amount > type(uint160).max, the uint160 cast truncates
+    uint256 largeAmount = uint256(type(uint160).max) + 1;
+    uint160 truncated = uint160(largeAmount);
+    // truncated == 0, not the intended amount
+    // vault.settle() would fail because not enough tokens transferred
+    t(uint256(truncated) == largeAmount, "BPM-D09: permit2 amount truncated");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    permit2 interface uses uint160 for amounts (Uniswap design choice for gas efficiency).
+    All normal tokens have supply < 2^160. This is a known limitation of the permit2 integration,
+    not specific to BinPositionManager. Low confidence this is reportable.
+
+- id: BPM-D10
+  tier: 1
+  type: property
+  description: "cachePoolKey collision: two different PoolKeys producing same poolId would cache only the first one"
+  attack_scenario: >
+    cachePoolKey stores the PoolKey in _poolIdToPoolKey only if getBinStep() == 0 (i.e., not yet
+    cached). PoolId is computed as keccak256 of the PoolKey. If two different PoolKeys somehow
+    produce the same PoolId (hash collision), only the first PoolKey is stored, and the second
+    pool's positions would return incorrect metadata via positions(). Additionally, the check
+    uses getBinStep() == 0 as sentinel for "not cached" — but what if a valid pool has binStep=0?
+    Looking at BinPoolParametersHelper, binStep=0 might be invalid (most LB implementations
+    require binStep > 0), so this sentinel is likely safe. But if binStep=0 is ever valid, the
+    poolKey would never be cached.
+  impact: "Low — binStep=0 is likely invalid in practice; hash collision is infeasible"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that binStep=0 is never valid for a real pool
+    // If it is, cachePoolKey would never store the poolKey
+    PoolId poolId = cachePoolKey(poolKey);
+    PoolKey memory cached = _poolIdToPoolKey[PoolId.unwrap(poolId)];
+    t(cached.parameters.getBinStep() != 0, "BPM-D10: binStep=0 pool would never be cached");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    The sentinel check `getBinStep() == 0` assumes binStep is always > 0 for valid pools.
+    This is standard in Liquidity Book (binStep defines the price granularity). If the core
+    BinPoolManager enforces binStep > 0 on initialization, this is safe by-design.
+
+false_positives:
+- hunter: DomainHunter
+  id: BPM-FP-01
+  reason: >
+    Hook attacks on beforeMint/afterMint — hooks are FULLY TRUSTED per contest scope.
+    A malicious hook could manipulate activeId, steal tokens, etc. but this is out of scope.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "PancakeSwap Infinity hooks are fully trusted — don't report hook-based attacks"
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: BPM-FP-02
+  reason: >
+    batchTransferFrom unchecked overflow on balanceOf[to][id] — safe because we just
+    subtracted the same amount from balanceOf[from][id], so the total across all holders
+    stays constant. totalSupply is not modified in transfers. The unchecked is correct.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: BPM-FP-03
+  reason: >
+    _sweep allows anyone to sweep contract balance to any recipient — but BinPositionManager
+    should never hold token balances (tokens go to vault). _sweep is only callable as an action
+    within a batched call by the locker, and the contract should have 0 balance in normal
+    operation. Leftover dust from rounding could be swept, which is intended behavior.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

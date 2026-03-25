@@ -1,0 +1,524 @@
+hunter: DeepDiveHunter
+component: V3Vault
+date: "2026-03-24"
+status: complete
+
+analysis_notes: |
+  ## Section 1: Design Assumption Analysis
+
+  Key assumptions identified:
+  1. The developer assumes totalLent can always absorb a single position's bad debt during
+     reserve socialization (missing <= totalLent). If violated, _handleReserveLiquidation
+     underflows and reverts, permanently blocking liquidation.
+  2. The developer assumes staked positions have ~0 collectable fees after unstaking (gauge
+     collects pre-stake fees on deposit, in-gauge fees accrue to gauge accounting). This is
+     correct per GaugeManager code.
+  3. The developer assumes daily limits replenishment on liquidation (liquidatorCost only,
+     not full debt) is acceptable. But underwater liquidations replenish less than was
+     borrowed, permanently shrinking daily headroom.
+  4. The developer assumes decreaseLiquidityAndCollect + restake health check will pass.
+     But collecting fees from a barely-healthy staked position, then restaking (which excludes
+     fees), can make the position unhealthy -- trapping the user.
+
+  ## Section 2: Cross-Function State Analysis
+
+  Critical pairs analyzed:
+  - liquidate() x _handleReserveLiquidation(): If one loan's bad debt exceeds totalLent,
+    the subtraction at L1232 underflows -> revert -> liquidation blocked -> more bad debt.
+  - decreaseLiquidityAndCollect() x _stake(): User unstakes, collects fees, restakes.
+    Post-restake health check uses ignoreFees=true. If fees were the margin of health,
+    the restake health check fails -> user cannot collect even though they need to.
+  - borrow() x liquidate() via daily limits: Borrow reduces dailyDebtIncreaseLimitLeft by
+    `assets`. Liquidation replenishes by `liquidatorCost`. When underwater, liquidatorCost <
+    original borrow assets. Net effect: daily limit shrinks permanently by the shortfall.
+  - _checkLoanIsHealthy (staked, ignoreFees=true) x _sendPositionValue (feeValue=0):
+    When staked position is partially liquidated with feeValue=0, the else branch at L1127
+    sets fees0/fees1 = type(uint128).max (take ALL fees). But fees should be ~0 post-unstake
+    per gauge mechanics. Approximately correct but worth fuzzing.
+
+  ## Section 3: Value Exit Trace (samczsun methodology)
+
+  Value exit points:
+  1. SafeERC20.safeTransfer in borrow() -- L653: sends borrowed assets. Guarded by health check.
+  2. nonfungiblePositionManager.collect in _sendPositionValue -- L1141: sends collateral during
+     liquidation. Guarded by !isHealthy check + _calculateLiquidation math.
+  3. nonfungiblePositionManager.collect in decreaseLiquidityAndCollect -- L695: sends position
+     value to owner. Guarded by health check post-collection.
+  4. SafeERC20.safeTransfer in _withdraw -- L1014: sends lender assets. Guarded by share burn.
+  5. SafeERC20.safeTransfer in withdrawReserves -- L851: sends reserves to owner. Guarded by
+     reserve protection factor.
+  6. nonfungiblePositionManager.safeTransferFrom in remove -- L827: returns NFT. Guarded by
+     debtShares == 0 check.
+
+  Backward trace for exit #2 (liquidation collateral):
+  - _sendPositionValue uses fullValue/feeValue from _checkLoanIsHealthy
+  - These are fetched BEFORE _unstakeIfNeeded (L742-748)
+  - Position state changes between oracle read and actual token operations
+  - If unstaking changes collectable fees or liquidity, the proportioning could be wrong
+
+  ## Section 4: State Machine Attack Paths
+
+  FSM from FlowHunter analyzed. Key anomalies:
+  - STAKED_BORROWED -> LIQUIDATED requires _unstakeIfNeeded. If GaugeManager reverts,
+    stuck in STAKED_BORROWED. (Already covered by VV-DOS-02, but deeper: this means ONE
+    bricked gauge can block ALL staked liquidations. With one-time setGaugeManager, no fix.)
+  - BORROWED -> COLLATERAL via full repay requires assets >= debt. But minLoanSize prevents
+    partial repay to reduce debt. User in range [minLoanSize, 2*minLoanSize] debt is trapped.
+    (Covered by VV-DOS-05.)
+  - NEW: BORROWED/STAKED_BORROWED -> (decreaseLiquidityAndCollect) -> revert if post-restake
+    health fails. This is a stuck transition: user cannot reduce collateral to repay debt
+    because restake health check fails. Only option: unstakePosition first (needs to be owner),
+    then decreaseLiquidityAndCollect without restake. BUT: the code auto-restakes if wasStaked.
+
+  ## Section 5: Convergence Deep-Dive
+
+  Convergence 1 (Math M-08 + DoS): Reserve socialization underflow -> liquidation DoS.
+    4 hunters flagged related issues. The deeper bug: a cascade where first underwater
+    liquidation socializes losses, reducing totalLent, making the NEXT underwater position
+    even harder to liquidate (totalLent is now smaller). Multiple bad positions can create
+    a cascading failure where later liquidations are impossible.
+
+  Convergence 2 (Wildcard W-10 + Oracle O-02 + DoS DOS-08): Staked valuation inconsistency.
+    The fee exclusion for staked positions creates a health check gap. When a position is
+    staked, it's valued WITHOUT fees. The decreaseLiquidityAndCollect function unstakes,
+    collects, restakes, then checks health with ignoreFees=true. This can trap users.
+
+  Convergence 3 (Flow F-09 + DoS DOS-04): Daily limit asymmetric drain.
+    Borrow deducts from dailyDebtIncreaseLimitLeft. Repay/liquidation add back. But
+    underwater liquidations add back less (liquidatorCost < debt). Over time with bad debt,
+    the daily limit permanently shrinks, limiting new borrowing.
+
+hypotheses:
+  - id: VV-DD-01
+    tier: 1
+    type: property
+    hunter: DeepDiveHunter
+    description: >
+      Reserve socialization underflow blocks liquidation when a single position's bad debt
+      exceeds total lender deposits. In _handleReserveLiquidation (L1232), the computation
+      (totalLent - missing) * lendRate / totalLent underflows if missing > totalLent because
+      Solidity 0.8 reverts on underflow. This makes the liquidate() call revert permanently
+      for that position. Bad debt accumulates, making subsequent liquidations also fail
+      (cascading failure). This is a convergence of Math M-08 and DoS findings.
+    attack_scenario: |
+      1. Protocol has 100 USDC total lent (from depositors)
+      2. Attacker deposits high-value NFT collateral, borrows 90 USDC
+      3. Collateral value crashes to 0 (oracle update or price crash)
+      4. Liquidation: debt=90, fullValue=0, liquidatorCost=0, reserveCost=90
+      5. _handleReserveLiquidation: reserves ~10, missing=90-10=80
+      6. totalLent=100. (100-80)*lendRate/100 = 20*lendRate/100. This works.
+      7. NOW: second position also crashes. debt=50, reserveCost=50.
+         New totalLent = 100*(20/100) = 20. missing = 50 - 0 = 50.
+         (20 - 50) underflows -> REVERT. Liquidation permanently blocked.
+      8. All remaining lender funds are trapped.
+    solidity: |
+      // VV-DD-01: Reserve socialization must not exceed totalLent (prevents liquidation DoS)
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 totalLent = (vault.totalSupply() * lendRate + Q96_val - 1) / Q96_val;
+      if (totalLent > 0) {
+          for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+              (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+              if (shares > 0) {
+                  uint256 loanDebt = (shares * debtRate + Q96_val - 1) / Q96_val;
+                  // In worst case (fullValue=0), reserveCost = debt, missing = debt - reserves
+                  // reserves can be 0. So missing can equal full loanDebt.
+                  // If loanDebt > totalLent, liquidation reverts.
+                  t(loanDebt <= totalLent, "VV-DD-01: single loan debt > totalLent -- socialization underflow blocks liquidation");
+              }
+          }
+      }
+    poc_sketch: |
+      // Foundry fork test:
+      // 1. Setup vault with small total deposits (e.g., 100 USDC)
+      // 2. Create position with high collateral, borrow near max
+      // 3. Manipulate oracle to crash collateral value to 0
+      // 4. First liquidation succeeds but socializes losses, reducing totalLent
+      // 5. Second position also crashes. Try to liquidate.
+      // 6. Expect: revert due to underflow in _handleReserveLiquidation
+      //
+      // function test_cascadingSocializationDoS() public {
+      //     // deposit 100 USDC as lender
+      //     vault.deposit(100e6, lender);
+      //     // create two positions, each borrows 40 USDC
+      //     vault.borrow(tokenId1, 40e6);
+      //     vault.borrow(tokenId2, 40e6);
+      //     // crash both positions to 0 value
+      //     mockOracle.setValue(tokenId1, 0, 0, 0);
+      //     mockOracle.setValue(tokenId2, 0, 0, 0);
+      //     // first liquidation works (reserves can absorb or socialize 40)
+      //     vault.liquidate(LiquidateParams(tokenId1, ...));
+      //     // totalLent reduced by socialized amount
+      //     // second liquidation should revert if remaining debt > new totalLent
+      //     vm.expectRevert(); // arithmetic underflow
+      //     vault.liquidate(LiquidateParams(tokenId2, ...));
+      // }
+    call_stack: |
+      liquidate() -> _checkLoanIsHealthy() [position unhealthy]
+        -> _unstakeIfNeeded()
+        -> _calculateLiquidation() [reserveCost = debt when fullValue=0]
+        -> _handleReserveLiquidation(reserveCost)
+          -> _getBalanceAndReserves() [reserves may be 0 after first socialization]
+          -> missing = reserveCost - reserves [missing = debt]
+          -> totalLent = totalSupply * lendRate / Q96
+          -> (totalLent - missing) [UNDERFLOW if debt > totalLent] -> REVERT
+    validated: true
+    priority: critical
+    confidence: 70
+
+  - id: VV-DD-02
+    tier: 1
+    type: property
+    hunter: DeepDiveHunter
+    description: >
+      Staked position with debt cannot collect fees via decreaseLiquidityAndCollect if the
+      post-restake health check fails. The function auto-unstakes (step 1), lets user collect
+      fees/liquidity (step 2), then auto-restakes (step 3), and checks health with
+      ignoreFees=true (step 4). If the position was barely healthy and the collected amount
+      reduces collateral value, the post-restake check fails. The user is trapped: they need
+      to collect to get funds to repay, but collecting reverts. Convergence of W-10, O-02,
+      DOS-08.
+    attack_scenario: |
+      1. User has staked position with 1000 USDC worth of liquidity + 50 USDC fees
+      2. Debt = 850 USDC, collateral factor = 90%, so collateralValue = 900
+      3. Staked health check (ignoreFees=true): 900 >= 850 -> healthy
+      4. User tries decreaseLiquidityAndCollect to collect 50 USDC fees only (liquidity=0)
+      5. Function unstakes, collects 50 fees, restakes
+      6. After restake: position value = 1000 (fees gone, liquidity unchanged)
+         But wait -- fees were gauge-side while staked, so collecting post-unstake gets ~0
+      7. Actually the deeper issue is if user collects LIQUIDITY (not just fees):
+         User collects 100 USDC of liquidity. Remaining: 900 USDC liquidity.
+         Post-restake health (ignoreFees=true): collateralValue = 900*0.9 = 810 < 850 debt
+         -> CollateralFail revert. User cannot partially withdraw collateral to repay.
+    solidity: |
+      // VV-DD-02: staked positions should be able to reduce collateral via decreaseLiquidityAndCollect
+      // without getting trapped by post-restake health check
+      // Test: for each staked borrowed position, the health margin must be sufficient
+      // to survive a minimal collateral withdrawal + restake
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              address gm = vault.gaugeManager();
+              if (gm != address(0)) {
+                  try IGaugeManager(gm).tokenIdToGauge(tokenId) returns (address gauge) {
+                      if (gauge != address(0)) {
+                          // Position is staked with debt -- check it has health margin
+                          (uint256 debt, uint256 fullValue, uint256 collateralValue, , ) = vault.loanInfo(tokenId);
+                          // If barely healthy (collateralValue within 5% of debt), user may be trapped
+                          if (collateralValue > 0 && debt > 0) {
+                              uint256 margin = collateralValue > debt ? collateralValue - debt : 0;
+                              uint256 fivePercent = fullValue / 20;
+                              t(margin > fivePercent || debt == 0,
+                                "VV-DD-02: staked position with tight margin -- may trap user on collateral withdrawal");
+                          }
+                      }
+                  } catch {}
+              }
+          }
+      }
+    poc_sketch: |
+      // Foundry fork test:
+      // 1. Create position with 1000 USDC collateral value, stake it
+      // 2. Borrow until barely healthy (collateralValue * 0.95 = debt)
+      // 3. Try decreaseLiquidityAndCollect to withdraw small amount
+      // 4. Expect: revert because post-restake health check fails
+      //    (reduced collateral * collateralFactor < debt)
+      //
+      // function test_stakedPositionCollateralTrap() public {
+      //     // setup position, stake, borrow to near max
+      //     vault.stakePosition(tokenId);
+      //     vault.borrow(tokenId, nearMaxAmount);
+      //     // try to collect small amount of liquidity
+      //     vm.expectRevert(V3Vault.CollateralFail.selector);
+      //     vault.decreaseLiquidityAndCollect(
+      //         DecreaseLiquidityAndCollectParams(tokenId, smallLiquidity, 0, 0, 0, 0, recipient, block.timestamp)
+      //     );
+      //     // User is trapped: can't reduce collateral, can't get funds to repay
+      // }
+    call_stack: |
+      decreaseLiquidityAndCollect()
+        -> _unstakeIfNeeded(tokenId) [wasStaked = true, gauge.withdraw + NFT back to vault]
+        -> nonfungiblePositionManager.decreaseLiquidity() [reduces position value]
+        -> nonfungiblePositionManager.collect() [sends tokens to user]
+        -> _stake(tokenId) [restakes, NFT goes to gauge]
+        -> _requireLoanIsHealthy(tokenId, debt)
+          -> _checkLoanIsHealthy(tokenId, debt, true)
+            -> _isStaked(tokenId) [true -- just restaked]
+            -> oracle.getValue(tokenId, asset, ignoreFees=true) [reduced fullValue, no fees]
+            -> collateralValue = fullValue * collateralFactor / Q32
+            -> isHealthy = collateralValue * BORROW_SAFETY_BUFFER / Q32 >= debt
+            [FAILS if collateral reduction pushed below threshold]
+          -> REVERT CollateralFail
+    validated: true
+    priority: high
+    confidence: 65
+
+  - id: VV-DD-03
+    tier: 1
+    type: property
+    hunter: DeepDiveHunter
+    description: >
+      Daily debt increase limit permanently shrinks through underwater liquidations.
+      When a user borrows X, dailyDebtIncreaseLimitLeft decreases by X. On liquidation,
+      it increases by liquidatorCost (L767). For underwater positions where fullValue < debt,
+      liquidatorCost < debt (can even be 0 for free liquidations). The difference
+      (debt - liquidatorCost) is a permanent reduction in daily headroom that only resets
+      at the next day boundary. But the next day's cap is computed from totalLent which
+      was ALSO reduced by the socialization. Over many underwater liquidations, both the daily
+      cap and the daily remaining shrink, gradually choking new borrowing. Convergence of
+      FlowHunter F-09 + DoSHunter DOS-04.
+    attack_scenario: |
+      1. Day starts: dailyDebtIncreaseLimitLeft = 1000 USDC (10% of 10K lent)
+      2. Attacker borrows 800 USDC. dailyDebtIncreaseLimitLeft = 200.
+      3. Position goes underwater (fullValue = 100, debt = 800).
+      4. Liquidation: liquidatorCost = max(0, 100 - 80) = 20. reserveCost = 780.
+      5. dailyDebtIncreaseLimitLeft += 20. Now = 220.
+      6. But 800 was borrowed and only 20 returned to the limit. Net loss: 780.
+      7. Next day: totalLent reduced by socialized 780. New cap = 10% of (10K - 780) = 922.
+      8. Attacker repeats. Each cycle shrinks the pool and the daily cap.
+      9. Eventually no one can borrow -- protocol is DoS'd for borrowers.
+    solidity: |
+      // VV-DD-03: daily debt limit should not be permanently drained by liquidations
+      // After any liquidation, dailyDebtIncreaseLimitLeft + (debt - liquidatorCost) should
+      // still allow reasonable borrowing
+      uint256 limitLeft = vault.dailyDebtIncreaseLimitLeft();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 totalLent = vault.totalSupply() * lendRate / Q96_val;
+      uint256 dailyMin = vault.dailyDebtIncreaseLimitMin();
+      // The limit should be at least the admin-configured minimum (if day has been reset)
+      // This just checks the current state is internally consistent
+      if (totalLent > 0 && dailyMin > 0) {
+          // limitLeft should not be 0 unless genuinely at capacity
+          uint256 totalDebt = vault.debtSharesTotal() * vault.lastDebtExchangeRateX96() / Q96_val;
+          uint256 globalDebtLimit = vault.globalDebtLimit();
+          if (totalDebt < globalDebtLimit / 2) {
+              // If less than half debt capacity is used, limit should have headroom
+              gte(limitLeft + 1, dailyMin / 10,
+                "VV-DD-03: daily debt limit drained despite low utilization -- asymmetric drain");
+          }
+      }
+    poc_sketch: |
+      // Foundry test:
+      // 1. Setup vault with 10K USDC deposits
+      // 2. Borrow large amount, crash collateral to near zero
+      // 3. Liquidate (free liquidation, liquidatorCost = 0)
+      // 4. Check dailyDebtIncreaseLimitLeft -- it should NOT have recovered the borrowed amount
+      // 5. Try to borrow with a different user -- should be severely limited
+      //
+      // function test_dailyLimitDrainViaUnderwaterLiquidation() public {
+      //     vault.deposit(10_000e6, lender);
+      //     vault.borrow(tokenId, 5_000e6); // uses half the daily limit
+      //     // crash collateral
+      //     mockOracle.setValue(tokenId, 0, 0, 0);
+      //     vault.liquidate(...); // free liquidation, liquidatorCost = 0
+      //     // Check: daily limit only recovered 0, not 5000
+      //     uint256 limitAfter = vault.dailyDebtIncreaseLimitLeft();
+      //     // limitAfter should be much less than initial (1000 - 5000 + 0 = underflow, but capped)
+      //     // Other borrowers are now blocked
+      // }
+    call_stack: |
+      borrow(tokenId, 5000e6)
+        -> dailyDebtIncreaseLimitLeft -= 5000 [e.g., 1000 -> underflow? No, check first]
+        -> Actually: `if (assets > dailyDebtIncreaseLimitLeft) revert`
+        -> So borrow is capped at dailyDebtIncreaseLimitLeft
+      liquidate()
+        -> dailyDebtIncreaseLimitLeft += liquidatorCost [0 for free liq]
+        -> Net: limit reduced by (borrowed - 0) = borrowed amount
+      Next day:
+        -> _resetDailyDebtIncreaseLimit()
+        -> limit = max(minLimit, totalLent_new * 10% / Q32)
+        -> totalLent_new < totalLent_old (socialization reduced it)
+        -> New daily cap is lower. Permanent degradation.
+    validated: true
+    priority: high
+    confidence: 65
+
+  - id: VV-DD-04
+    tier: 1
+    type: property
+    hunter: DeepDiveHunter
+    description: >
+      Liquidation health check uses staked valuation (ignoreFees=true) but
+      _sendPositionValue operates on the now-unstaked position with the staked-era
+      feeValue and fullValue. After _unstakeIfNeeded at L748, the NFT is back in the vault.
+      But _calculateLiquidation and _sendPositionValue use fullValue/feeValue from the
+      staked check (L742-743). For a staked position: feeValue=0, fullValue excludes fees.
+      In _sendPositionValue, when liquidationValue < fullValue (partial liquidation), the
+      code at L1127-1131 enters the else branch with feeValue=0: sets fees to uint128.max
+      (collect ALL available fees) and takes proportional liquidity. But the position is now
+      UNSTAKED, and per GaugeManager comments, fees accrued during staking are gauge-side
+      (not collectable). However, any fees that accrued between the last gauge reward claim
+      and the unstake are NOT forwarded. These residual fees go to the liquidator for free.
+    attack_scenario: |
+      1. Position is staked in gauge. Fees accrue in gauge accounting.
+      2. Just before liquidation, the gauge has unclaimed rewards + a small amount of
+         NFT-level fees from the unstake process.
+      3. Health check: ignoreFees=true, fullValue=1000 (liquidity only), feeValue=0
+      4. _unstakeIfNeeded: gauge.withdraw returns NFT. GaugeManager claims rewards for owner.
+         But NFT-level fees from the brief unstake moment are now collectable.
+      5. _sendPositionValue with feeValue=0: takes liquidity proportional to
+         liquidationValue/fullValue, PLUS sets fees0=fees1=uint128.max -> collects ALL
+         available fees (the residual ones from unstake).
+      6. Liquidator gets these residual fees as bonus, which were not accounted in the
+         liquidation math. This is value leaking from the position owner to the liquidator.
+    solidity: |
+      // VV-DD-04: After liquidation of staked position, residual fees should not leak to liquidator
+      // This is hard to test as a property -- we check the invariant that
+      // liquidation should not extract more value than fullValue from the position
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liqCost, uint256 liqValue) = vault.loanInfo(tokenId);
+              // If liquidatable, the liquidation value should not exceed fullValue
+              if (liqValue > 0) {
+                  lte(liqValue, fullValue, "VV-DD-04: liquidation extracts more than fullValue");
+                  // Also check: for staked positions, fullValue already excludes fees
+                  // So actual extracted value (liqValue + residual fees) > oracle-reported fullValue
+                  // This property can only be checked via a before/after balance comparison in a PoC
+              }
+          }
+      }
+    poc_sketch: |
+      // Foundry fork test:
+      // 1. Create position, stake it, accrue some time
+      // 2. Make position unhealthy (oracle price drop)
+      // 3. Record liquidator balance before
+      // 4. Liquidate staked position
+      // 5. Record liquidator balance after
+      // 6. Compare: actual received value vs oracle-reported liquidationValue
+      // 7. If actual > liquidationValue, residual fees leaked
+      //
+      // function test_stakedLiquidationFeeLeak() public {
+      //     // setup: create, stake, borrow, time passes, make unhealthy
+      //     uint256 balBefore0 = token0.balanceOf(liquidator);
+      //     uint256 balBefore1 = token1.balanceOf(liquidator);
+      //     (uint256 amount0, uint256 amount1) = vault.liquidate(params);
+      //     // value received = oracle.getPrice(amount0) + oracle.getPrice(amount1)
+      //     // compare to reported liquidationValue from loanInfo
+      //     // if received > liquidationValue, fee leakage confirmed
+      // }
+    call_stack: |
+      liquidate(params)
+        -> _checkLoanIsHealthy(tokenId, debt, false)
+          -> _isStaked(tokenId) [true]
+          -> oracle.getValue(tokenId, asset, ignoreFees=true)
+            -> returns (fullValue_no_fees, feeValue=0, ...)
+        -> _unstakeIfNeeded(tokenId)
+          -> gaugeManager.unstakeIfStaked(tokenId)
+            -> _claimAndSendRewardsBestEffort() [claims AERO rewards for owner]
+            -> gauge.withdraw(tokenId) [NFT back to gaugeManager]
+            -> nfpm.safeTransferFrom(gm, vault, tokenId) [NFT in vault]
+            -> [NOTE: residual NFT fees from brief unstake window now collectable]
+        -> _calculateLiquidation(debt, fullValue_no_fees, collateralValue_no_fees)
+        -> _sendPositionValue(tokenId, liqValue, fullValue_no_fees, feeValue=0, ...)
+          -> oracle.getLiquidityAndFees(tokenId) [may now see residual fees]
+          -> else branch: fees0=uint128.max, fees1=uint128.max [collect ALL]
+          -> nfpm.collect() [liquidator gets liquidity portion + ALL residual fees]
+    validated: true
+    priority: high
+    confidence: 60
+
+  - id: VV-DD-05
+    tier: 1
+    type: property
+    hunter: DeepDiveHunter
+    description: >
+      Token replacement during transform creates a window where the old tokenId's
+      _cleanupLoan subtracts from tokenConfigs[token0/token1].totalDebtShares, and the new
+      tokenId's _updateAndCheckCollateral adds to token configs. If old and new positions have
+      DIFFERENT token pairs (e.g., old = WETH/USDC, new = WBTC/USDC), the debt shares are
+      removed from WETH+USDC configs but added to WBTC+USDC configs. This is correct
+      behavior. BUT: the collateralValueLimitFactorX32 check at L1332-1346 only runs when
+      newShares > oldShares (increasing debt). During replacement, _updateAndCheckCollateral
+      for the NEW token is called with oldShares=0, newShares=debtShares. This IS an increase.
+      However, the limit check uses the current totalDebtShares for the new token pair's
+      configs AFTER the cleanup already subtracted from the old pair. If old pair == new pair,
+      the subtraction+addition cancel out. If old pair != new pair, the new pair's limit could
+      be exceeded because it suddenly gains all the debt shares from the replaced position
+      without the old pair's subtraction helping.
+    attack_scenario: |
+      1. tokenConfig[WBTC] has collateralValueLimitFactorX32 set to allow max 50% of lent as
+         WBTC-backed debt. Current WBTC totalDebtShares is at 45%.
+      2. Attacker has position A (WETH/USDC pair) with large debt (30% of lent).
+      3. Attacker calls transform() with a transformer that swaps position A (WETH/USDC) for
+         position B (WBTC/USDC).
+      4. During onERC721Received replacement:
+         - _cleanupLoan(oldTokenId) subtracts debt from WETH+USDC configs
+         - _updateAndCheckCollateral(newTokenId, 0, debtShares) adds debt to WBTC+USDC configs
+         - WBTC totalDebtShares jumps from 45% to 75% -- exceeds 50% limit
+         - But the check runs: 75% > 50% -> revert CollateralValueLimit
+      5. WAIT: this actually reverts, so the replacement fails. This is a DoS: attacker
+         cannot rebalance position to a token pair that's near its limit.
+      6. The deeper issue: is this check ALWAYS applied? Looking at _updateAndCheckCollateral:
+         the check only triggers when newShares > oldShares. For replacement: oldShares=0,
+         newShares=debtShares. So newShares > oldShares -> check runs. This IS correct.
+      7. However, what about the HEALTH check at L477? _updateAndCheckCollateral is called,
+         then the position must be healthy. If the new position has different collateral
+         factors, the health check uses min(factor0, factor1) of the NEW pair. An attacker
+         could replace a high-CF position with a low-CF one to avoid liquidation.
+         WAIT: that would make the position LESS healthy (lower CF), not more. Not exploitable.
+      8. REVERSE: replace a low-CF position with a high-CF one. Now collateralValue increases.
+         Could this allow the position to be healthy when it shouldn't be? No -- the debt
+         stays the same, higher CF means higher collateralValue, so the position becomes MORE
+         healthy. This benefits the borrower but doesn't harm the protocol.
+    solidity: |
+      // VV-DD-05: per-token collateral value limits must hold after token replacement
+      // Specifically: when a transform replaces one position with another of different token pair
+      // the new pair's totalDebtShares must not exceed its collateralValueLimitFactorX32
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 Q32_val = 4294967296;
+      uint256 lentAssets = (vault.totalSupply() * lendRate + Q96_val - 1) / Q96_val;
+      if (lentAssets > 0) {
+          // For each configured token, verify limit is respected
+          // We check the vault asset as a representative token
+          address assetAddr = vault.asset();
+          (uint32 cf, uint32 cvlf, uint192 totalDebt) = vault.tokenConfigs(assetAddr);
+          if (cvlf > 0 && cvlf < type(uint32).max) {
+              uint256 debtValue = (uint256(totalDebt) * debtRate + Q96_val - 1) / Q96_val;
+              uint256 limit = lentAssets * cvlf / Q32_val;
+              lte(debtValue, limit + ghost_numOps + 1,
+                "VV-DD-05: collateral value limit exceeded after token replacement");
+          }
+      }
+    poc_sketch: |
+      // Foundry fork test:
+      // 1. Configure WBTC with tight collateralValueLimitFactorX32 (50%)
+      // 2. Fill WBTC debt to 45% of limit
+      // 3. Create large WETH/USDC position with debt
+      // 4. Transform: replace WETH/USDC with WBTC/USDC
+      // 5. Check if collateral value limit is enforced or bypassed
+      //
+      // function test_tokenReplacementBypassesCollateralLimit() public {
+      //     // config: WBTC limit = 50%
+      //     vault.setTokenConfig(WBTC, cf, 0.5e9); // 50% as Q32
+      //     // fill WBTC debt near limit
+      //     vault.borrow(wbtcTokenId, nearLimitAmount);
+      //     // create large WETH position with debt
+      //     vault.borrow(wethTokenId, largeAmount);
+      //     // transform: swap WETH position for WBTC position
+      //     // This should revert with CollateralValueLimit
+      //     vm.expectRevert(V3Vault.CollateralValueLimit.selector);
+      //     vault.transform(wethTokenId, autoRange, swapData);
+      // }
+    call_stack: |
+      transform(tokenId=oldId, transformer, data)
+        -> transformedTokenId = oldId
+        -> transformer.call(data) [swaps position, sends new NFT to vault]
+          -> nfpm.safeTransferFrom(transformer, vault, newId)
+            -> vault.onERC721Received(transformer, newId, ...)
+              -> oldTokenId = transformedTokenId [= oldId]
+              -> newId != oldId -> replacement path
+              -> loans[newId] = Loan(debtShares) [copy debt]
+              -> _cleanupLoan(oldId) [subtract from old token pair configs]
+              -> _updateAndCheckCollateral(newId, 0, debtShares) [add to new pair configs]
+                -> newShares > oldShares -> collateral value limit check
+                -> if new pair at limit -> revert CollateralValueLimit
+    validated: true
+    priority: high
+    confidence: 65

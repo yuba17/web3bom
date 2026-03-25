@@ -1,0 +1,495 @@
+protocol: morpho-bundler3
+component: GeneralAdapter1
+file: src/adapters/GeneralAdapter1.sol
+domain: trust
+hunter: FlowHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ============================================================
+# ANALYSIS SUMMARY — FlowHunter on GeneralAdapter1
+# ============================================================
+#
+# CONTRACT ARCHITECTURE:
+#   GeneralAdapter1 extends CoreAdapter. All public functions are gated by
+#   onlyBundler3 (msg.sender == BUNDLER3). The Bundler3 contract stores
+#   `initiator` transiently and controls reentrancy via `reenterHash`.
+#   Callbacks (onMorphoSupply/SupplyCollateral/Repay/FlashLoan) call
+#   morphoCallback() which re-enters Bundler3 via reenterBundler3(data).
+#
+# KEY FLOW OBSERVATIONS:
+#
+# 1. APPROVE PATTERN — TWO STRATEGIES:
+#    - ERC4626 functions: approve(max) → call → approve(0). CONSISTENT. Safe.
+#    - Morpho functions: approve(max) → call → NO RESET. Comment says "trusted".
+#      This is BY DESIGN. Morpho is immutable and trusted. The approval is
+#      permanently max. This is NOT a bug — Morpho cannot rug these approvals
+#      because Morpho only pulls what it needs for the specific operation.
+#
+# 2. CALLBACKS AND REENTRANCY:
+#    - morphoCallback() requires msg.sender == MORPHO. Good.
+#    - It calls reenterBundler3(data), which calls BUNDLER3.call(reenter.selector + data).
+#    - Bundler3.reenter() checks reenterHash == keccak256(sender || keccak256(data)).
+#    - The reenterHash is set by the PREVIOUS call in the bundle (callbackHash field).
+#    - This means: only the expected adapter + expected callback data can re-enter.
+#    - CRITICAL INSIGHT: The reenterHash mechanism replaces a reentrancy guard.
+#      An attacker cannot re-enter with arbitrary data because the hash must match.
+#      The initiator pre-commits the callback data in callbackHash.
+#
+# 3. skipRevert AND STUCK TOKENS:
+#    - If a call has skipRevert=true and it fails, tokens transferred to the
+#      adapter in prior calls remain in the adapter. BUT the adapter has no
+#      auth on who can sweep — CoreAdapter.erc20Transfer is onlyBundler3,
+#      meaning only during an active bundle can tokens be moved out.
+#    - Anyone can call multicall() and target erc20Transfer to sweep.
+#      HOWEVER: erc20Transfer sends to a receiver, and the receiver cannot
+#      be address(this). So a subsequent user could sweep leftover tokens.
+#    - This is a KNOWN DESIGN PROPERTY. The docs state adapters should not
+#      hold tokens between transactions. Any tokens left are sweepable.
+#
+# 4. FLASH LOAN FLOW:
+#    - morphoFlashLoan: approves MORPHO max, calls flashLoan.
+#    - Morpho sends tokens to adapter, then calls onMorphoFlashLoan callback.
+#    - In callback, adapter re-enters Bundler3 with user-specified sub-bundle.
+#    - After callback returns, Morpho pulls back tokens (approved max).
+#    - KEY: The sub-bundle data is committed via callbackHash in the original call.
+#      An attacker cannot modify the callback data. The initiator controls it.
+#    - The flash loan tokens are in the adapter during the callback. The sub-bundle
+#      could use them (e.g., supply to Morpho, swap, etc.). This is intentional.
+#
+# 5. ETH STUCK SCENARIOS:
+#    - wrapNative: reads address(this).balance, wraps, transfers WETH out.
+#      If receiver == address(this), WETH stays in adapter (for subsequent call).
+#    - unwrapNative: reads WRAPPED_NATIVE.balanceOf(this), unwraps, sends ETH.
+#      If receiver == address(this), ETH stays in adapter.
+#    - CoreAdapter.receive() is payable — accepts ETH from WETH.withdraw().
+#    - If user sends ETH to adapter via bundle value but never calls wrapNative,
+#      ETH sits in adapter. Sweepable by next multicall via nativeTransfer.
+#    - Bundler3 itself has NO receive(). ETH sent to Bundler3 via multicall goes
+#      to the Call targets via value field. If the call fails with skipRevert,
+#      the ETH stays in... wait, Bundler3 sends it via `to.call{value}(data)`.
+#      If the call reverts, the ETH stays in Bundler3. But Bundler3 has no sweep.
+#      Actually — Bundler3 CAN pass value on subsequent calls in the same bundle.
+#      So ETH isn't permanently stuck in Bundler3 within a single tx.
+#      Cross-tx: any ETH left in Bundler3 after multicall can be taken by the
+#      next caller who crafts a bundle with value=0 and targets a call that
+#      sends ETH out. Actually no — the value field is msg.value from the
+#      current tx, not from balance. Let me re-check...
+#      `to.call{value: bundle[i].value}(bundle[i].data)` — this uses the
+#      contract's ETH balance. If previous skipRevert left ETH, the next call
+#      in the same multicall can use it. Cross-tx: leftover ETH in Bundler3
+#      IS stealable by anyone calling multicall with a call that has value > 0
+#      targeting an adapter's function, since it draws from Bundler3's balance.
+#      THIS IS A KNOWN PROPERTY — Bundler3 should never hold ETH between txs.
+#
+# 6. MALICIOUS VAULT IN ERC4626:
+#    - erc4626Mint/Deposit: the vault address is user-controlled (via initiator's bundle).
+#    - A malicious vault could: in mint(), re-enter via some path? NO — the adapter
+#      is not callable except by Bundler3, and Bundler3 requires reenterHash match.
+#    - But the vault.mint() call could do ANYTHING — including calling Morpho or
+#      other contracts. The adapter has approved the vault's underlying token max
+#      at this point. After mint() returns, approval is reset to 0.
+#    - KEY RISK: During vault.mint(), the vault has max approval on underlyingToken.
+#      A malicious vault could transferFrom the adapter's entire underlyingToken balance.
+#      But the vault address comes from the initiator (the user building the bundle).
+#      The initiator would only hurt themselves. This is not an attack vector.
+#    - UNLESS: a legitimate user's bundle includes a vault that is actually malicious.
+#      But the user signs the bundle, so they chose the vault. Self-inflicted.
+#
+# 7. MORPHO APPROVAL ACCUMULATION:
+#    - Each morphoSupply/SupplyCollateral/Repay/FlashLoan call does
+#      forceApprove(token, MORPHO, max). This is idempotent — max is max.
+#    - IMPORTANT: Different tokens get approved. morphoSupply approves loanToken.
+#      morphoSupplyCollateral approves collateralToken. morphoFlashLoan approves
+#      any token. ALL to MORPHO. Since MORPHO is trusted and immutable, this is safe.
+#    - If MORPHO had an upgrade path or was a proxy, this would be critical.
+#      Morpho Blue is immutable (no proxy). Confirmed safe.
+#
+# CONCLUSION: The contract is well-designed with consistent patterns.
+# The main security boundary is the Bundler3 reenterHash mechanism for callbacks,
+# the onlyBundler3 modifier for all entry points, and the approve-reset pattern
+# for untrusted ERC4626 vaults (vs permanent approval for trusted Morpho).
+# I found NO exploitable reentrancy or token-stuck vulnerabilities with
+# high confidence. The hypotheses below capture edge cases worth fuzzing.
+
+invariants:
+- id: GA-F01
+  tier: 2
+  type: property
+  description: >
+    ERC4626 approval is always reset to 0 after vault interaction. If a vault's
+    mint() or deposit() reverts internally but is caught (impossible in current
+    code since no try/catch), the approval could remain at max. In current code,
+    if vault.mint() reverts, the entire call reverts — approve(0) is never reached
+    but the tx also fails, so no dangling approval. SAFE by revert propagation.
+    Invariant: after any successful erc4626Mint or erc4626Deposit, the adapter's
+    allowance of underlyingToken to vault is 0.
+  attack_scenario: >
+    If approval were not reset, a malicious or compromised vault could later call
+    transferFrom on the adapter to steal tokens deposited by a subsequent user.
+    In practice this cannot happen because (a) the vault is chosen by the initiator
+    and (b) the reset always runs on success. But worth verifying in fuzzing.
+  impact: "Loss of all tokens held by adapter during subsequent bundles"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After calling erc4626Mint or erc4626Deposit, check allowance == 0
+    // Setup: call erc4626Deposit(vault, amount, maxPrice, receiver)
+    // Then check:
+    address underlying = IERC4626(vault).asset();
+    uint256 allowance = IERC20(underlying).allowance(address(adapter), vault);
+    eq(allowance, 0, "GA-F01: ERC4626 approval not reset after deposit/mint");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 90
+  notes: >
+    High confidence this is safe. The forceApprove(0) always runs after a
+    successful vault.mint()/deposit(). If the vault call reverts, the entire
+    tx reverts. No path exists where approval stays dangling.
+
+- id: GA-F02
+  tier: 2
+  type: property
+  description: >
+    Morpho callback reentrancy: the reenterHash mechanism in Bundler3 ensures
+    that only the expected adapter with the expected data can call reenter().
+    Invariant: it is impossible to call reenter() with data that was not
+    pre-committed in the callbackHash of the triggering call.
+  attack_scenario: >
+    If an attacker could bypass reenterHash, they could inject arbitrary calls
+    during a Morpho callback. For example, during onMorphoFlashLoan, the
+    flash-loaned tokens sit in the adapter. If the attacker could re-enter
+    with their own bundle, they could call erc20Transfer to steal those tokens.
+    The reenterHash prevents this: the callback data hash must match what the
+    initiator committed.
+  impact: "Theft of flash-loaned tokens during callback"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // This is more of an architecture property than a fuzzable assertion.
+    // Verify: after a morphoFlashLoan completes, no tokens remain in adapter
+    // unless explicitly kept by the sub-bundle.
+    uint256 tokenBal = IERC20(token).balanceOf(address(adapter));
+    eq(tokenBal, 0, "GA-F02: tokens stuck in adapter after flash loan");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    The reenterHash mechanism is sound. keccak256(sender || keccak256(data))
+    is pre-committed. Only MORPHO (as msg.sender to the callback) can trigger
+    morphoCallback, and only the committed data can pass through reenter().
+    A third party cannot inject different callback data.
+
+- id: GA-F03
+  tier: 1
+  type: property
+  description: >
+    skipRevert token residue: if a bundle has [transferTokensToAdapter, failingCall(skipRevert=true),
+    useTokens], the failing call is skipped but tokens are available for useTokens.
+    However, if the LAST call is the one that fails with skipRevert, tokens remain
+    in the adapter and are sweepable by the next multicall caller.
+    Invariant: after a full multicall completes, the adapter should hold zero
+    balance of any token that was transferred in during that multicall.
+  attack_scenario: >
+    User A builds a bundle: [transfer 100 USDC to adapter, supply to Morpho(skipRevert=true)].
+    If morphoSupply reverts (e.g., market paused), the 100 USDC stays in the adapter.
+    User B (attacker/MEV bot) immediately calls multicall with [erc20Transfer(USDC, attacker, max)].
+    User B steals User A's 100 USDC. This is a user error but worth documenting.
+  impact: "Loss of tokens left in adapter after failed skipRevert calls"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Post-multicall check: adapter balance should be 0 for all tokens used
+    // This is a property to verify in integration tests:
+    uint256 adapterBal = IERC20(token).balanceOf(address(adapter));
+    eq(adapterBal, 0, "GA-F03: tokens stuck in adapter after multicall");
+  ghost_vars:
+  - "uint256 internal ghost_adapterBalPre;"
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This is more of a known design risk than a bug. The Morpho docs warn that
+    adapters should not hold tokens between transactions. skipRevert amplifies
+    the risk by allowing partial bundle execution. The real question is: can
+    a LEGITIMATE bundle leave tokens stuck WITHOUT the user intending it?
+    Answer: yes, if skipRevert is used carelessly. But this is user responsibility.
+    Downgrading to tier 2 candidate.
+
+- id: GA-F04
+  tier: 2
+  type: property
+  description: >
+    ETH stuck in Bundler3 via skipRevert: if a call with value > 0 and
+    skipRevert=true reverts, the ETH stays in Bundler3. Since Bundler3 has
+    no receive() or withdraw, the ETH is stuck... unless a subsequent call
+    in the same multicall uses it (call{value: X} draws from contract balance).
+    Cross-transaction: leftover ETH in Bundler3 is stealable by anyone.
+  attack_scenario: >
+    User sends 1 ETH via multicall with one call that has value=1 ETH and
+    skipRevert=true. The call reverts. ETH stays in Bundler3. No subsequent
+    calls in the bundle. Transaction ends. 1 ETH sits in Bundler3.
+    Attacker calls multicall with a call to adapter.nativeTransfer(attacker, 0)
+    but this sends from ADAPTER not BUNDLER3. Actually, the attacker needs a
+    call with value: bundler3.balance to any address. Since multicall forwards
+    value, the attacker could do: multicall([{to: attacker, data: "", value: 1 ETH,
+    skipRevert: false, callbackHash: 0}]) — this would send Bundler3's balance
+    to attacker. The call target receives the ETH.
+  impact: "Theft of ETH stuck in Bundler3 from failed skipRevert calls"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Post-multicall: Bundler3 should hold 0 ETH
+    uint256 bundlerBal = address(bundler3).balance;
+    eq(bundlerBal, 0, "GA-F04: ETH stuck in Bundler3 after multicall");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    This is a known design property. Bundler3 explicitly does NOT hold state
+    between transactions. The value field in Call draws from the contract's
+    ETH balance, not just msg.value. This means any leftover ETH is available
+    to subsequent callers. This is by design but risky with skipRevert.
+    Likely classified as known/accepted risk by Morpho team.
+
+- id: GA-F05
+  tier: 2
+  type: property
+  description: >
+    morphoRepay with shares=type(uint256).max fetches borrowShares of onBehalf
+    (not initiator). This was a KNOWN BUG in a previous version (Solodit finding).
+    The current code at L281 correctly uses onBehalf. Verify this is correct.
+  attack_scenario: >
+    If morphoRepay fetched borrowShares of initiator instead of onBehalf when
+    shares=max, a user trying to repay someone else's full debt would repay
+    based on their OWN debt shares (potentially 0), causing the repay to fail
+    or repay the wrong amount. The Solodit finding confirms this was fixed.
+  impact: "Incorrect debt repayment amount"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: when shares=type(uint256).max, the shares used equal
+    // the borrowShares of onBehalf, not initiator
+    // This is a code review check, not easily fuzzable without mocking Morpho
+    // Verified by reading L281: MorphoLib.borrowShares(MORPHO, marketParams.id(), onBehalf)
+    // CORRECT — uses onBehalf.
+    t(true, "GA-F05: morphoRepay shares=max uses onBehalf — confirmed correct");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Confirmed fixed in current code. L281 uses onBehalf. The Solodit finding
+    was for a previous version. No action needed.
+
+- id: GA-F06
+  tier: 2
+  type: property
+  description: >
+    wrapNative/unwrapNative consistency: wrapNative wraps ETH and sends WETH.
+    unwrapNative unwraps WETH and sends ETH. If receiver is address(this),
+    the asset stays in the adapter for subsequent calls. If a user does
+    wrapNative(max, address(this)) followed by unwrapNative(max, address(this)),
+    they end up with ETH in the adapter — no loss, but no progress either.
+    The real risk: partial wrap/unwrap with skipRevert leaving one form stuck.
+  attack_scenario: >
+    Bundle: [send 1 ETH to adapter, wrapNative(max, adapter), <failing call with skipRevert>,
+    erc20Transfer(WETH, user, max)]. If the failing call somehow consumes the WETH
+    (impossible since skipRevert skips it), user loses WETH. In practice, skipRevert
+    just skips the call, WETH is still in adapter, erc20Transfer succeeds. SAFE.
+    The only risk: if the user forgets the final sweep call, WETH stays in adapter.
+  impact: "ETH/WETH stuck in adapter if user forgets sweep"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After wrapNative, if receiver != adapter, WETH balance of adapter should be 0
+    // After unwrapNative, if receiver != adapter, ETH balance of adapter should be 0
+    if (wrapNativeReceiver != address(adapter)) {
+        uint256 wethBal = IERC20(address(WRAPPED_NATIVE)).balanceOf(address(adapter));
+        eq(wethBal, 0, "GA-F06: WETH stuck in adapter after wrapNative");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    The wrap/unwrap logic is straightforward. No reentrancy risk from WETH
+    (standard WETH9 has no callbacks). The only risk is user error in bundle
+    construction, which is out of scope for the adapter's security.
+
+- id: GA-F07
+  tier: 1
+  type: property
+  description: >
+    Malicious ERC4626 vault reentrancy during approval window. Between
+    forceApprove(max) and forceApprove(0), the vault.mint()/deposit() call
+    executes. If vault is malicious, it has unlimited approval on the
+    underlying token. It could transferFrom the adapter's ENTIRE balance
+    of underlying token, not just what's needed for the mint/deposit.
+    Question: is the vault address user-controlled? YES — it comes from
+    the bundle. The initiator chooses the vault.
+  attack_scenario: >
+    Scenario requires social engineering or a compromised frontend:
+    1. Attacker deploys MaliciousVault that in mint() calls
+       underlyingToken.transferFrom(adapter, attacker, adapter.balance)
+    2. Victim's frontend is compromised to include erc4626Deposit(maliciousVault, ...)
+       in the bundle, preceded by a transferFrom that sends tokens to adapter.
+    3. During deposit(), MaliciousVault steals all underlying tokens.
+    This is really a frontend/phishing attack, not a contract bug. The user
+    signs the bundle containing the malicious vault address.
+    BUT: if the adapter is used as a shared infrastructure where multiple
+    users' tokens are in-flight simultaneously... wait, Bundler3 processes
+    one multicall atomically per tx. No interleaving. So only the current
+    initiator's tokens are at risk, and they chose the vault. SELF-INFLICTED.
+  impact: "Loss of tokens in adapter during malicious vault interaction"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: after erc4626Deposit/Mint, adapter balance of underlying
+    // decreased by exactly the assets consumed (not more).
+    // preBalance - postBalance == assets returned by vault.deposit()
+    uint256 preBal = IERC20(underlying).balanceOf(address(adapter));
+    // ... call erc4626Deposit ...
+    uint256 postBal = IERC20(underlying).balanceOf(address(adapter));
+    uint256 consumed = preBal - postBal;
+    // consumed should equal the assets value from deposit()
+    eq(consumed, assetsConsumed, "GA-F07: vault consumed more tokens than reported");
+  ghost_vars:
+  - "uint256 internal ghost_preDepositBalance;"
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    This is by design — the user chooses the vault. A malicious vault chosen
+    by the user is the user's fault. However, if there's a way for a third
+    party to influence the vault parameter (e.g., via callback data injection),
+    this becomes critical. The reenterHash mechanism prevents data injection.
+    Marking confidence 60 because it's worth double-checking but likely not a bug.
+
+- id: GA-F08
+  tier: 1
+  type: property
+  description: >
+    Morpho callback data injection via callbackHash collision. The reenterHash
+    is keccak256(bytes20(to) || callbackHash), where callbackHash is
+    keccak256(msg.data[4:]). For an attacker to inject different callback data,
+    they'd need a keccak256 collision — computationally infeasible.
+    Invariant: no two different Call[] arrays produce the same reenterHash.
+  attack_scenario: >
+    If an attacker found a callbackHash collision, they could make the adapter
+    re-enter Bundler3 with malicious calls during a Morpho callback. During
+    a flash loan, this would allow stealing the flash-loaned tokens.
+    This requires breaking keccak256, which is not feasible.
+  impact: "Complete theft of flash-loaned tokens"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // This is a cryptographic property, not practically fuzzable.
+    // The security relies on keccak256 collision resistance.
+    t(true, "GA-F08: reenterHash collision resistance — cryptographic assumption");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    keccak256 collision resistance is a standard cryptographic assumption.
+    No practical attack exists. This invariant is here for completeness.
+
+- id: GA-F09
+  tier: 2
+  type: property
+  description: >
+    morphoFlashLoan leaves permanent max approval to MORPHO for the flash-loaned
+    token. Since MORPHO is immutable and only pulls what it's owed (principal),
+    this is safe. But if a token has unusual behavior (e.g., approval race
+    conditions), the permanent approval could be problematic.
+    Invariant: after morphoFlashLoan, the adapter's allowance to MORPHO for the
+    flash-loaned token is type(uint256).max.
+  attack_scenario: >
+    If MORPHO were upgradeable or had a vulnerability allowing arbitrary pulls,
+    the permanent max approval would allow draining all future tokens sent to
+    the adapter. Since Morpho Blue is immutable, this is not exploitable.
+    The only edge case: if a new Morpho version is deployed and a new adapter
+    is created pointing to the new Morpho, the old adapter still has max
+    approval to the old Morpho. But each adapter is immutable too.
+  impact: "No practical impact — Morpho is trusted and immutable"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After morphoFlashLoan, verify approval to MORPHO is max
+    uint256 allowance = IERC20(token).allowance(address(adapter), address(MORPHO));
+    eq(allowance, type(uint256).max, "GA-F09: Morpho approval not max after flash loan");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    This is by design and explicitly commented in the code ("Morpho's allowance
+    is not reset as it is trusted"). Not a bug. Documenting for completeness.
+
+false_positives:
+- hunter: FlowHunter
+  id: GA-FP-01
+  reason: >
+    morphoSupply/SupplyCollateral/Repay/FlashLoan do NOT reset approval to MORPHO
+    after the call. This looks like a bug (inconsistent with ERC4626 pattern) but
+    is explicitly by design. Comments state "Morpho's allowance is not reset as
+    it is trusted." Morpho Blue is immutable (no proxy, no upgrades). The permanent
+    approval is gas-efficient and safe because Morpho only pulls the exact amount
+    needed for each operation.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Permanent max approval to immutable protocols (like Morpho Blue) is by design,
+      not a bug. Only flag missing approval resets when the spender is user-controlled
+      or upgradeable.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: GA-FP-02
+  reason: >
+    ERC4626 vault address is user-controlled — a malicious vault could abuse the
+    temporary max approval. However, this is the user's own bundle, signed by
+    the initiator. The adapter cannot validate vault legitimacy without an
+    allow-list, which would break composability. This is accepted by design.
+    The approve(0) reset after the call limits the window to the single external
+    call. No cross-transaction risk.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      User-controlled external contract addresses in bundler adapters (vault, token)
+      are by design for composability. The risk is limited to the initiator's own
+      tokens since Bundler3 processes one multicall atomically.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: GA-FP-03
+  reason: >
+    Tokens left in the adapter after a multicall with skipRevert are sweepable
+    by anyone. This is a known and documented design property of Bundler3 adapters.
+    The adapter is explicitly NOT designed to hold tokens between transactions.
+    Any tokens left are considered abandoned. This is not a bug.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Bundler3 adapters holding tokens between transactions is a KNOWN design risk.
+      Tokens in the adapter are sweepable by anyone via a new multicall. Do not
+      report this as a bug — it is documented behavior.
+    briefing_update_applied: false

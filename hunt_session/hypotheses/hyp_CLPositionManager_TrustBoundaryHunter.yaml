@@ -1,0 +1,544 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-23T07:00:00Z'
+compiler_version: '0.8.26'
+compiler_bugs_checked: true
+compiler_notes: >
+  Solidity 0.8.26 — no known critical compiler bugs for this version per
+  docs.soliditylang.org/en/latest/bugs.html. Uses transient storage (tstore/tload)
+  which is supported from 0.8.24+. No Vyper.
+invariants:
+
+- id: CLPM-TB-01
+  tier: 1
+  type: property
+  description: >
+    modifyLiquiditiesWithoutLock has NO deadline check, unlike modifyLiquidities.
+    A transaction calling modifyLiquiditiesWithoutLock can be held in the mempool
+    indefinitely and executed at an arbitrarily later time when pool conditions
+    (price, liquidity, fees) have changed drastically. This is especially dangerous
+    for mint/increase actions where the user may add liquidity at a very different
+    price than intended, or for decrease/burn where the returned amounts reflect
+    stale expectations.
+  attack_scenario: >
+    1. User (or composing contract) calls modifyLiquiditiesWithoutLock to mint a
+       position with amount0Max/amount1Max based on current price.
+    2. Transaction sits in mempool for hours/days (L1) or is delayed on L2.
+    3. Price moves significantly. The mint executes at the new price.
+    4. Although slippage params exist (amount0Max/amount1Max), the user set them
+       relative to the old price. If they were generous (as is common to avoid
+       reverts), the user mints at a much worse ratio.
+    5. Attacker front-runs/sandwiches the stale tx for profit.
+    Note: modifyLiquidities (line 124) HAS checkDeadline. The without-lock variant
+    (line 135) explicitly omits it. This is a design inconsistency — any contract
+    composing via modifyLiquiditiesWithoutLock inside a vault.lock callback loses
+    deadline protection unless it implements its own.
+  impact: >
+    Users or composing contracts that use modifyLiquiditiesWithoutLock lose funds
+    to stale execution or sandwich attacks. Severity depends on whether callers
+    are expected to implement their own deadline — but the asymmetry with
+    modifyLiquidities is a trust boundary violation.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // This is a design-level check — verify that composing contracts calling
+    // modifyLiquiditiesWithoutLock implement their own deadline.
+    // Cannot be directly fuzzed as a property, but can be verified via grep:
+    // All callers of modifyLiquiditiesWithoutLock MUST check block.timestamp.
+    // Invariant: if action is mint/increase via WithoutLock path, deadline was checked externally.
+    // Pseudo-assertion (manual review required):
+    // assert(block.timestamp <= userDeadline, "CLPM-TB-01: no deadline on WithoutLock path");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This mirrors Uniswap V4 PositionManager which also has this split. The design
+    intent is that modifyLiquiditiesWithoutLock is for composing contracts that
+    already hold the vault lock and manage their own deadlines. However, nothing
+    enforces that the caller actually checks a deadline. If a hook or router
+    contract calls this without its own deadline check, the user is exposed.
+    Confidence 70% because it depends on how callers use it — it's a trust boundary
+    that may or may not be violated by specific integrators.
+
+- id: CLPM-TB-02
+  tier: 1
+  type: property
+  description: >
+    Subscriber (CLNotifier) external calls can revert and block critical position
+    operations. notifySubscribe, notifyBurn, and notifyModifyLiquidity all revert
+    if the subscriber call fails (via bubbleUpAndRevertWith). A malicious or buggy
+    subscriber can permanently block decrease, increase, and burn operations on a
+    subscribed position.
+  attack_scenario: >
+    1. Position owner subscribes to a malicious contract as subscriber.
+    2. The malicious subscriber's notifyModifyLiquidity always reverts.
+    3. Now _modifyLiquidity always reverts for this tokenId (line 463-465).
+    4. The owner cannot decrease liquidity or collect fees.
+    5. The owner CAN unsubscribe (notifyUnsubscribe uses try/catch on line 79
+       of CLNotifier.sol), but only if the vault is unlocked and they are approved.
+    6. However, notifyBurn (line 98-104) also reverts if subscriber reverts.
+       So burning is blocked until unsubscribe.
+    7. transferFrom forces unsubscribe (line 490), so transfer is an escape path.
+    Key trust boundary: the subscriber is an untrusted external contract that can
+    DoS the position owner's core operations (modify, burn) until they unsubscribe
+    or transfer. If the subscriber was set by an approved operator (not the owner
+    themselves), the owner may not realize they need to unsubscribe first.
+  impact: >
+    Temporary DoS on position operations. Owner can always escape via unsubscribe()
+    or transferFrom(). Not fund loss but can delay fee collection or force
+    suboptimal timing of liquidity removal. Griefing vector if an approved operator
+    subscribes to a malicious contract.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that a subscribed position can always be unsubscribed
+    // even if the subscriber is malicious.
+    // Setup: subscribe tokenId to a contract that reverts on all calls.
+    // Then: unsubscribe should still succeed (uses try/catch).
+    // Then: decrease/burn should work after unsubscribe.
+    bool canUnsubscribe = true;
+    try positionManager.unsubscribe(tokenId) {
+        canUnsubscribe = true;
+    } catch {
+        canUnsubscribe = false;
+    }
+    t(canUnsubscribe, "CLPM-TB-02: cannot unsubscribe from malicious subscriber");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The escape hatch (unsubscribe uses try/catch, transferFrom auto-unsubscribes)
+    mitigates this to Low. But the trust boundary is real: subscribe() lets an
+    approved address attach an untrusted contract that can DoS the owner. The owner
+    must know to unsubscribe before they can modify/burn. Confidence 60% because
+    the escape paths exist — this is more of a UX/griefing issue than a fund loss bug.
+
+- id: CLPM-TB-03
+  tier: 1
+  type: property
+  description: >
+    _pay uses permit2.transferFrom to pull tokens from the payer (msg.sender).
+    The uint160 cast of amount (line 472) silently truncates amounts larger than
+    type(uint160).max. If amount exceeds 2^160, the actual transfer is for
+    amount mod 2^160, but the vault accounting expects the full amount.
+  attack_scenario: >
+    1. A hypothetical scenario where amount > type(uint160).max is passed to _pay.
+    2. permit2.transferFrom receives uint160(amount) which is truncated.
+    3. The vault's sync/settle expects the full amount but only receives the
+       truncated amount.
+    4. The delta accounting is off — the settler gets credited for paying more
+       than they actually transferred.
+    In practice, no ERC20 token has totalSupply > 2^160 (that's ~1.46e48), so this
+    is extremely unlikely. However, the SafeCast library is used elsewhere in the
+    contract for safe conversions — the inconsistency here is notable.
+  impact: >
+    Theoretical: attacker could settle debts by paying less than owed.
+    Practical: no known ERC20 has supply > 2^160, making this unexploitable
+    in practice. The permit2 interface enforces uint160 amounts by design.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that amount passed to _pay never exceeds uint160 max
+    // In practice this is enforced by token supplies, but the truncation is silent.
+    // This is a code quality / defense-in-depth check.
+    uint256 amount = vault.currencyDelta(address(this), currency);
+    if (amount > 0) {
+        t(amount <= type(uint160).max, "CLPM-TB-03: amount exceeds uint160 in _pay");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    This is by design — permit2 uses uint160 for amounts, and no real token
+    exceeds this. The cast is intentional to match the permit2 interface.
+    Marking confidence 40% — very unlikely to be exploitable. Including for
+    completeness of trust boundary analysis.
+
+- id: CLPM-TB-04
+  tier: 1
+  type: property
+  description: >
+    Multicall uses delegatecall to self, which preserves msg.sender and msg.value.
+    In a multicall batch, msg.value is reusable across all subcalls. If multiple
+    actions in a multicall batch each read msg.value (e.g., multiple WRAP actions
+    or multiple modifyLiquidities with native ETH settlement), the same ETH can
+    be "spent" multiple times in the accounting, creating phantom credit.
+  attack_scenario: >
+    1. Attacker calls multicall([modifyLiquidities_A, modifyLiquidities_B]) with
+       msg.value = 1 ETH.
+    2. Both modifyLiquidities calls go through vault.lock separately (each has
+       isNotLocked — but multicall resets the lock between calls since isNotLocked
+       sets locker to msg.sender at start and clears at end).
+    3. Actually: isNotLocked checks _getLocker() != address(0) and reverts if
+       already locked. So the first modifyLiquidities sets locker, executes, clears.
+       The second modifyLiquidities then sets locker again, executes, clears. OK.
+    4. But within each call, if the action is SETTLE with native currency,
+       vault.settle{value: amount}() is called. The contract's balance includes
+       msg.value. After the first settle, the ETH is in the vault. The second
+       call's settle would fail because the contract no longer has the ETH.
+    5. HOWEVER: if the first call only does a WRAP (deposits msg.value to WETH9),
+       and the second call also does a WRAP... _wrap calls WETH9.deposit{value: amount}.
+       After first wrap, the ETH is gone. Second wrap would revert with insufficient balance.
+    Conclusion: The vault.settle and WETH9.deposit actually consume the ETH, so
+    double-spend of msg.value is prevented by balance checks. But the SWEEP action
+    (line 439-442) can sweep the contract's balance to any recipient. If SWEEP
+    is combined with SETTLE in a multicall, the order matters and could leak value.
+  impact: >
+    After deeper analysis: msg.value double-spend is prevented because settle/wrap
+    actually transfer the ETH out. The real risk is in the SWEEP action: if tokens
+    are left in the contract between multicall subcalls, SWEEP can be used to
+    extract them. But this requires tokens to be sitting in the contract, which
+    shouldn't happen in normal flows.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that multicall with msg.value cannot double-count ETH
+    // Test: multicall with two WRAP actions, each for msg.value
+    // Expected: second WRAP should revert (insufficient balance)
+    // If it doesn't revert, msg.value is being double-counted.
+    uint256 contractBalanceBefore = address(positionManager).balance;
+    // After multicall with 1 ETH and two WRAPs of 1 ETH each:
+    // The second should revert. If total WETH minted > msg.value, it's a bug.
+    uint256 wethBalance = WETH9.balanceOf(address(positionManager));
+    lte(wethBalance, msg.value, "CLPM-TB-04: msg.value double-counted in multicall");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    After analysis, msg.value double-spend is mitigated by actual ETH transfers
+    consuming the balance. The Uniswap V4 PositionManager has the same pattern.
+    However, the multicall+delegatecall pattern remains a known attack surface
+    (see Sushiswap RouteProcessor exploit). Confidence 55% — the specific double-
+    spend is likely prevented, but edge cases in action ordering within multicall
+    deserve fuzzing. Lowering to potential false positive but keeping for fuzz validation.
+
+- id: CLPM-TB-05
+  tier: 1
+  type: property
+  description: >
+    _sweep transfers the entire contract balance of a currency to a specified
+    recipient with no access control beyond being part of a modifyLiquidities
+    action batch. Any caller can sweep any tokens sitting in the contract.
+    If tokens are accidentally sent to the contract (direct transfer, not via
+    the action system), any user can sweep them.
+  attack_scenario: >
+    1. A user accidentally sends ERC20 tokens directly to the CLPositionManager
+       address (not via the action system).
+    2. Any other user calls modifyLiquidities with a SWEEP action for that token,
+       specifying themselves as recipient.
+    3. The tokens are swept to the attacker.
+    This is by design (similar to Uniswap V4 — sweep is a rescue mechanism).
+    But it means the contract has zero custody guarantees for tokens sent outside
+    the action system. Any tokens sitting in the contract are up for grabs.
+  impact: >
+    Loss of accidentally-sent tokens. This is by design — the contract is not
+    meant to hold token balances. But it's a trust boundary: users must understand
+    that the contract provides no custody protection.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that sweep can extract any tokens in the contract
+    // This is by design but documents the trust boundary.
+    uint256 balanceBefore = token.balanceOf(address(positionManager));
+    // If balanceBefore > 0, anyone can sweep it.
+    // After sweep:
+    uint256 balanceAfter = token.balanceOf(address(positionManager));
+    eq(balanceAfter, 0, "CLPM-TB-05: sweep should empty contract balance");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    This IS by design (same as Uniswap V4). Not a bug. Documenting as a
+    trust boundary that composing contracts must be aware of. Any contract
+    that sends tokens to CLPositionManager outside the action system will lose them.
+
+- id: CLPM-TB-06
+  tier: 2
+  type: property
+  description: >
+    initializePool (line 113-121) swallows ALL errors from clPoolManager.initialize
+    via a bare try/catch, returning type(int24).max on failure. A caller cannot
+    distinguish between "pool already initialized" (benign) and "invalid pool key"
+    or "malicious hook reverted" (dangerous). Subsequent actions that depend on the
+    pool being initialized may behave unexpectedly.
+  attack_scenario: >
+    1. User calls multicall([initializePool, mintPosition]) expecting the pool
+       to be created then a position minted.
+    2. initializePool fails silently (e.g., pool already exists with different
+       parameters, or hook rejects initialization).
+    3. Returns type(int24).max instead of reverting.
+    4. mintPosition proceeds with the existing pool state which may have a
+       different sqrtPriceX96 than the user expected.
+    5. User mints position at unexpected price, losing value.
+    The trust boundary violation: the caller trusts that initializePool either
+    succeeds or reverts. The swallowed error breaks this assumption.
+  impact: >
+    User may mint positions at unexpected prices if initializePool silently fails.
+    Slippage checks (amount0Max/amount1Max) provide some protection, but the user
+    calculated those based on the expected initialization price.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: if initializePool returns type(int24).max, the pool was NOT
+    // initialized by this call. Subsequent mints should be aware.
+    int24 result = positionManager.initializePool(poolKey, sqrtPriceX96);
+    if (result == type(int24).max) {
+        // Pool was not initialized — either already exists or invalid params.
+        // Subsequent mint should still respect slippage.
+        // Get actual pool price:
+        (uint160 actualSqrt,,,) = clPoolManager.getSlot0(poolKey.toId());
+        // If actualSqrt != sqrtPriceX96, the user is minting at a different price.
+        // This is the trust boundary violation.
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The comment in the code says "Swallow any error" — this is intentional design
+    to make multicall(initializePool + mint) idempotent. The risk is real but
+    mitigated by slippage checks on the subsequent mint. Confidence 55% because
+    the slippage checks provide a safety net, but the silent failure is still a
+    trust boundary issue for integrators who check the return value.
+
+- id: CLPM-TB-07
+  tier: 1
+  type: property
+  description: >
+    _mint (line 300-335) allows the owner parameter to be any address via
+    _mapRecipient. A caller can mint an NFT position directly to any address.
+    Combined with the hookData parameter (which is passed to clPoolManager and
+    potentially to a pool hook), a malicious hook could use the mint flow to
+    execute arbitrary logic in the context of the vault lock.
+  attack_scenario: >
+    1. Attacker deploys a malicious pool with a hook that, on beforeModifyLiquidity
+       or afterModifyLiquidity, calls back into CLPositionManager via
+       modifyLiquiditiesWithoutLock (since vault is locked, but CLPositionManager's
+       ReentrancyLock blocks this — isNotLocked would revert because the locker
+       is already set).
+    2. Actually: the hook callback happens inside the vault.lock context. The
+       CLPositionManager's transient LOCKED_BY_SLOT is set to msg.sender. A
+       reentrant call to modifyLiquidities or modifyLiquiditiesWithoutLock
+       would hit isNotLocked and revert (locker != address(0)).
+    3. However, the hook CAN call other external contracts during the callback.
+       The hookData is user-controlled and passed directly to the pool manager.
+    4. If the hook is a legitimate hook (e.g., fee-taking hook), but the hookData
+       contains unexpected parameters, the hook may behave differently than the
+       user expects.
+    Trust boundary: hookData is an opaque blob passed from user → CLPositionManager
+    → clPoolManager → hook. CLPositionManager does not validate or inspect it.
+  impact: >
+    If a user interacts with a pool whose hook is malicious, the hook can execute
+    arbitrary logic during the vault lock. However, the reentrancy lock prevents
+    re-entering CLPositionManager. The risk is limited to what the hook can do
+    within its own scope. This is by design — hooks are trusted by the pool creator.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Reentrancy test: during a modifyLiquidity callback from a hook,
+    // attempting to call modifyLiquidities should revert.
+    // This verifies the ReentrancyLock protects against hook reentrancy.
+    // (Test setup required: deploy malicious hook that tries to re-enter)
+    // After the hook callback, verify no unexpected state changes occurred.
+    uint256 tokenIdBefore = positionManager.nextTokenId();
+    // ... execute modifyLiquidity with malicious hook ...
+    uint256 tokenIdAfter = positionManager.nextTokenId();
+    // Only the expected number of positions should be minted.
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    The ReentrancyLock effectively prevents hook reentrancy into CLPositionManager.
+    The hookData trust boundary is by design — Infinity (like Uniswap V4) treats
+    hooks as trusted by the pool deployer. Users should not interact with pools
+    whose hooks they don't trust. Confidence 50% — this is a known design pattern,
+    not a bug, but documenting the trust assumption.
+
+- id: CLPM-TB-08
+  tier: 1
+  type: property
+  description: >
+    Fee-on-transfer tokens: _pay uses permit2.transferFrom to send tokens to the
+    vault. For fee-on-transfer tokens, the vault receives less than `amount`.
+    However, vault.sync() + vault.settle() measures the actual balance change.
+    So if sync() is called before _pay, and settle() after, the delta credited
+    should match actual tokens received. But in _settle (DeltaResolver line 35-44),
+    sync is called BEFORE _pay, and settle AFTER — this is the correct order.
+    The trust boundary is that the vault's settle() returns the actual paid amount,
+    and the delta accounting respects it. If the pool manager uses the `amount`
+    parameter (not the settle return value) for accounting, fee-on-transfer tokens
+    would break the invariant.
+  attack_scenario: >
+    1. Pool is created with a fee-on-transfer token (2% fee).
+    2. User mints position, _settle is called with amount = 100.
+    3. sync() snapshots vault balance. _pay transfers 100 tokens but vault
+       receives 98. settle() credits 98 to the delta.
+    4. But _modifyLiquidity already computed the liquidity based on the original
+       amounts from the pool manager (which expected 100 tokens).
+    5. The 2-token shortfall means the vault's actual reserves don't match
+       the pool's accounting. Over time this accumulates.
+    6. Last withdrawer gets less than owed (classic fee-on-transfer bug).
+  impact: >
+    Gradual fund loss for LPs in pools with fee-on-transfer tokens. Each
+    deposit/withdrawal leaks value equal to the transfer fee. Eventually the
+    pool becomes insolvent — last withdrawers get nothing.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify: for fee-on-transfer tokens, vault actual balance matches
+    // pool accounting after mint+burn cycle.
+    uint256 vaultBalanceBefore = feeOnTransferToken.balanceOf(address(vault));
+    // ... user mints position with feeOnTransferToken ...
+    // ... user burns position ...
+    uint256 vaultBalanceAfter = feeOnTransferToken.balanceOf(address(vault));
+    // Vault should have at least as much as the pool manager thinks it has.
+    uint256 poolReserves = vault.reservesOfApp(address(clPoolManager), currency);
+    gte(vaultBalanceAfter, poolReserves, "CLPM-TB-08: fee-on-transfer token breaks vault solvency");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is a CLASSIC DeFi bug pattern. The question is whether PancakeSwap Infinity
+    explicitly excludes fee-on-transfer tokens (many protocols do). Need to check
+    docs/known issues. If fee-on-transfer tokens are explicitly out of scope, this
+    is a known issue. If they're in scope, this is High severity.
+    The vault's sync/settle pattern DOES measure actual received amounts, which
+    partially mitigates this. But the pool manager's liquidity math may still
+    use the pre-fee amounts. Need to trace the full flow through clPoolManager.
+
+- id: CLPM-TB-09
+  tier: 2
+  type: property
+  description: >
+    nextTokenId uses unchecked increment (line 313-315). If nextTokenId overflows
+    (wraps to 0), the next mint would create tokenId 0. Subsequent lookups for
+    positionInfo[0] would return the EMPTY_POSITION_INFO, and poolKeys[0] would
+    return a zero PoolKey. This could cause getPoolAndPositionInfo to return
+    invalid data. In practice, uint256 overflow requires 2^256 mints which is
+    physically impossible, but the unchecked block is worth noting.
+  attack_scenario: >
+    Physically impossible. 2^256 mints would require more energy than the sun
+    produces. This is purely a code quality observation — the unchecked is safe.
+  impact: Theoretical only — no practical impact.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify nextTokenId never wraps to 0
+    uint256 tokenId = positionManager.nextTokenId();
+    t(tokenId > 0, "CLPM-TB-09: nextTokenId wrapped to 0");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 20
+  notes: >
+    Not a real vulnerability. The unchecked increment is a gas optimization
+    and is safe because overflow of uint256 is physically impossible.
+    Including for completeness only.
+
+- id: CLPM-TB-10
+  tier: 1
+  type: property
+  description: >
+    transferFrom is overridden (line 488-491) to auto-unsubscribe when a position
+    NFT is transferred, but ONLY calls unsubscribe via the internal _unsubscribe
+    (not the external unsubscribe which requires onlyIfApproved). The unsubscribe
+    uses try/catch for notifyUnsubscribe, so a malicious subscriber cannot block
+    the transfer. However, the onlyIfVaultUnlocked modifier IS applied to
+    transferFrom. This means position NFTs CANNOT be transferred while the vault
+    is locked (during a vault.lock callback). This could block legitimate
+    operations where a composing contract needs to transfer a position NFT as
+    part of an atomic operation within a vault lock.
+  attack_scenario: >
+    1. A DeFi protocol builds a "position migration" contract that, in a single
+       vault.lock callback, decreases liquidity from position A, transfers the
+       NFT, and mints a new position.
+    2. The transferFrom call reverts because vault.getLocker() != address(0)
+       (the vault IS locked during the callback).
+    3. The entire migration transaction reverts.
+    4. This is by design to prevent subscriber notification issues during locked
+       state, but creates a trust boundary for composing contracts.
+  impact: >
+    Composing contracts cannot transfer position NFTs during vault.lock callbacks.
+    This limits composability. Not a direct fund loss but constrains protocol design.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify: transferFrom reverts when vault is locked.
+    // This documents the trust boundary for composing contracts.
+    // During vault.lock:
+    //   positionManager.transferFrom(from, to, tokenId) should revert
+    //   with VaultMustBeUnlocked()
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    This is intentional design — the vault must be unlocked for transfers to
+    ensure subscriber notifications happen in a clean state. But it's a meaningful
+    trust boundary that composing protocols must be aware of. They need to
+    structure their operations to transfer NFTs outside of vault.lock callbacks.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-01
+  reason: >
+    Investigated reentrancy via Multicall delegatecall: multicall uses delegatecall
+    to self, which preserves msg.sender. However, the ReentrancyLock (transient
+    storage based) prevents re-entering modifyLiquidities/modifyLiquiditiesWithoutLock
+    during a callback. The isNotLocked modifier correctly blocks reentrant calls.
+    Additionally, vault.lock itself has LockerAlreadySet protection. Double reentrancy
+    protection makes this a non-issue.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update: null
+
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-02
+  reason: >
+    Investigated ERC721 approval front-running: a user could front-run an approved
+    operator's transaction by removing approval. But this is standard ERC721 behavior
+    and not specific to CLPositionManager. The onlyIfApproved check correctly
+    validates at execution time. Not a vulnerability — by design.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update: null
+
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-03
+  reason: >
+    Investigated _clearOrTake (line 427-436): if delta <= amountMax, the delta is
+    cleared (forfeit). This looks like it could be used to steal from the contract,
+    but clear() only forfeits POSITIVE deltas (credit owed TO the caller). The caller
+    is choosing to forfeit their own credit. The vault.clear function verifies the
+    exact amount. Not exploitable — the caller only hurts themselves.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update: null
+
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-04
+  reason: >
+    Investigated rebasing token handling: rebasing tokens (stETH, AMPL) would cause
+    the vault's actual balance to diverge from its accounting. But this is the same
+    class as fee-on-transfer (CLPM-TB-08) and is typically documented as a known
+    limitation. Most DEX position managers explicitly exclude rebasing tokens.
+    Merging with CLPM-TB-08 analysis — not a separate finding.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update: null

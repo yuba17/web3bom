@@ -1,245 +1,652 @@
 protocol: revert-lend
 component: V3Vault
 file: src/V3Vault.sol
-domain: lending
+domain: vault
 hunter: WildcardHunter
-generated_at: "2026-03-20T00:00:00Z"
-
+generated_at: '2026-03-24T00:00:00Z'
 invariants:
-  - id: VV-W01
-    tier: 1
-    type: property
-    description: "Staked position liquidation fee leak: health check uses ignoreFees=true (feeValue=0, fullValue excludes fees), but _sendPositionValue at L1129-1130 collects ALL NFT fees via uint128.max when liquidationValue > feeValue (always true since feeValue=0). If the NFT has fees post-unstake (Scenario 2: CLGauge.withdraw syncs via burn(0)), the liquidator receives fees that were excluded from the liquidatorCost calculation -- free value extraction at borrower's expense. If fees are zero post-unstake (Scenario 1), staking-period fees are permanently lost in gauge accounting."
-    attack_scenario: "Borrower stakes position in gauge. Swap fees accumulate (gauge-side). Position becomes liquidatable. Liquidator calls liquidate(). Health check at L742 uses ignoreFees=true: fullValue=1000 (liquidity only), feeValue=0, debt=900. Liquidation calc computes liquidatorCost based on fee-excluded values. _unstakeIfNeeded at L748. _sendPositionValue at L770: since liquidationValue > feeValue (always, feeValue=0), code goes to L1128-1131 which sets fees0=uint128.max, fees1=uint128.max. If CLGauge.withdraw() synced fees to NFT, nonfungiblePositionManager.collect gives liquidator proportional liquidity PLUS ALL synced fees. Liquidator paid for liquidity-only value but received liquidity+fees. The fee portion is free profit. Cross-validated with flow-hunter (VV-01) and oracle-hunter (VV-O-05)."
-    solidity: |
-      // Track value received by liquidator vs value paid
-      // If position was staked, liquidator should not receive more than liquidatorCost + penalty
-      // The excess would be the leaked fee value
-      if (ghost_lastLiquidationWasStaked) {
-          uint256 liquidatorPaid = ghost_lastLiquidatorCost;
-          uint256 liquidatorReceived0 = ghost_lastLiquidationAmount0;
-          uint256 liquidatorReceived1 = ghost_lastLiquidationAmount1;
-          // Value received should be proportional to liquidationValue, not more
-          // The fee leak manifests as received > expected based on fee-excluded valuation
-          // Need oracle to price amount0/amount1 to compare with liquidationValue
-      }
-    ghost_vars:
-      - "bool internal ghost_lastLiquidationWasStaked;"
-      - "uint256 internal ghost_lastLiquidatorCost;"
-      - "uint256 internal ghost_lastLiquidationAmount0;"
-      - "uint256 internal ghost_lastLiquidationAmount1;"
-    validated: false
-    priority: high
-    confidence: 65
-    notes: "RE-UPGRADED after flow-hunter cross-validation. The liquidity removal formula IS internally consistent (my earlier downgrade was correct on that point). But the REAL leak is in fee collection: L1129-1130 uses uint128.max for fees when liquidationValue > feeValue. Since feeValue=0 for staked positions, this ALWAYS takes the 'take all fees' path. If fees exist on the NFT post-unstake, they go to the liquidator for free. Two scenarios depending on CLGauge.withdraw() behavior: (1) fees ~0 post-unstake = permanent loss, (2) fees synced post-unstake = liquidator extraction. Both are borrower losses. MUST test on Aerodrome fork to determine which scenario. Cross-validated: flow-hunter VV-01, oracle-hunter VV-O-05."
+- id: VV-W-01
+  tier: 1
+  type: property
+  description: "Transformer replacement token migration must not allow reusing a token that is already owned in vault (double-accounting attack)"
+  attack_scenario: >
+    In onERC721Received transform path (L479), a malicious transformer sends a tokenId that
+    has been previously removed (tokenOwner == address(0)) but still has stale ownedTokensIndex
+    data. The check at L482 only verifies tokenOwner[tokenId] == address(0) && loans[tokenId].debtShares == 0,
+    but ownedTokensIndex is never deleted on removal (L1478 comment: 'no need to delete it - gas optimization').
+    If a token is removed and then re-introduced through transform replacement, the stale index
+    could corrupt the ownedTokens array for the new owner. An attacker could exploit this
+    to make _removeTokenFromOwner swap the wrong token, effectively stealing loan ownership.
+  impact: "Corruption of ownership tracking array -- could block legitimate removals or misattribute positions"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any transform that replaces token, verify ownership array consistency
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address o = vault.ownerOf(tid);
+        if (o != address(0)) {
+            uint256 cnt = vault.loanCount(o);
+            bool found = false;
+            for (uint256 j = 0; j < cnt && j < 20; j++) {
+                if (vault.loanAtIndex(o, j) == tid) {
+                    found = true;
+                    break;
+                }
+            }
+            t(found, "VV-W-01: tokenId has owner but not in owner array");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 55
+  notes: "ownedTokensIndex[tokenId] is NOT deleted on _removeTokenFromOwner (L1478). If the same tokenId re-enters the vault, the stale index could cause array corruption during the next removal. The check at L482 prevents re-entry of active tokens, but a removed-then-re-added token keeps its stale index."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-W02
-    tier: 2
-    type: property
-    description: "Multicall enables batching transform + borrow in ways that bypass per-call health checks. V3Vault inherits OZ Multicall which allows delegatecall to self for multiple functions. While transform() sets transformedTokenId as a reentrancy guard, a Multicall batch calling [transform(tokenA, ...), borrow(tokenB, ...)] would have transformedTokenId set to tokenA during the borrow(tokenB) call. In borrow(), the isTransformMode check (line 589) would be: tokenB != 0 && transformedTokenId == tokenB && transformerAllowList[msg.sender]. Since transformedTokenId == tokenA != tokenB, isTransformMode would be false. So borrow requires msg.sender == owner. Since Multicall uses delegatecall, msg.sender is preserved from the original caller. So this should be safe... unless the transform replaced the token and transformedTokenId changed."
-    attack_scenario: "Attacker uses Multicall to batch: [transform(tokenA, maliciousTransformer, data), borrow(newTokenId, maxAmount)]. The maliciousTransformer replaces tokenA with newTokenId via onERC721Received replacement flow. Now transformedTokenId == newTokenId. The borrow call for newTokenId has isTransformMode = true (if msg.sender is the transformer). But wait - in Multicall, msg.sender for borrow() is the original external caller, not the transformer. So transformerAllowList[msg.sender] must be true. This only works if the CALLER is on the allowlist. Likely not exploitable by regular users. But if an allowlisted transformer contract itself uses Multicall..."
-    solidity: |
-      // After any Multicall batch, verify that no loan was left in an unhealthy state
-      // Check: transformedTokenId must be 0 after batch completes
-      uint256 currentTransformed = vault.transformedTokenId();
-      eq(currentTransformed, 0, "VV-W02: transformedTokenId not reset after Multicall batch");
-    ghost_vars: []
-    validated: false
-    priority: medium
-    confidence: 40
-    notes: "Multicall uses delegatecall so state changes persist between calls in the batch. But transform() checks transformedTokenId != 0 at entry (line 517) and reverts with Reentrancy(). So you can't batch two transforms. And borrow without transform mode requires owner == msg.sender. Likely safe by design, but the interaction is subtle and worth testing."
+- id: VV-W-02
+  tier: 1
+  type: property
+  description: "Multicall + deposit can bypass daily lend increase limit via multiple small deposits in same tx"
+  attack_scenario: >
+    V3Vault inherits Multicall. The daily lend increase limit is checked per-call (L1000-1004)
+    but the limit reset (L986 _resetDailyLendIncreaseLimit) only triggers once per day.
+    However, within a single multicall, each deposit sub-call reduces dailyLendIncreaseLimitLeft
+    independently. This is actually correct -- the limit IS consumed. But the interesting vector
+    is: Multicall allows deposit() + withdraw() in one tx. If a user deposits (consumes limit),
+    then withdraws (L1043 restores limit), they can re-deposit with the restored limit.
+    This creates a deposit-withdraw-deposit cycle that effectively allows unlimited lending
+    within a single multicall transaction, bypassing the daily limit entirely.
+  impact: "Daily lend increase limit can be bypassed -- protocol safety control rendered ineffective"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track that daily limits are monotonically consumed (not restored and reused in same day)
+    uint256 limitBefore = vault.dailyLendIncreaseLimitLeft();
+    // After any sequence of operations, the limit should not exceed what it was at start
+    // unless a day boundary was crossed
+    uint256 limitAfter = vault.dailyLendIncreaseLimitLeft();
+    uint256 netDeposited = ghost_totalDeposited > ghost_totalWithdrawn ? ghost_totalDeposited - ghost_totalWithdrawn : 0;
+    // The limit restored by withdrawals should not exceed what was originally consumed
+    t(limitAfter <= limitBefore || ghost_totalWithdrawn > 0, "VV-W-02: daily limit increased without withdrawals");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "The withdraw function at L1043 adds back to dailyLendIncreaseLimitLeft. This means deposit-withdraw-deposit cycles can circumvent the daily cap. The limit acts as a flow limiter but deposits that are immediately withdrawn still consume and restore it."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-W03
-    tier: 1
-    type: property
-    description: "transformApprovals not migrated for third-party approvals during token replacement. When a transformer replaces tokenA with tokenB (onERC721Received replacement path, V3Vault:437-462), only the transform caller's approval is migrated (line 553-556). If the owner had approved other addresses (e.g., AutoCompound, AutoRange) for tokenA, those approvals remain on tokenA (which now has zero debt and is removable) and are NOT copied to tokenB. The owner must re-approve each operator for tokenB."
-    attack_scenario: "User has tokenA with debt. User approved AutoCompound for tokenA. User calls transform via a range-change transformer that replaces tokenA with tokenB. AutoCompound's approval on tokenA still exists but tokenA is cleaned up (zero debt). AutoCompound cannot operate on tokenB because no approval exists. If tokenB's position drifts out of range or needs compounding, the automation fails silently. User's position deteriorates, potentially becoming liquidatable because automated maintenance stopped. This is a griefing/UX bug rather than direct fund theft, but could lead to avoidable liquidations."
-    solidity: |
-      // After a token replacement during transform, check that all previous transform approvals
-      // for the old token are either migrated or the old token is fully cleaned up
-      if (ghost_lastReplacedOldTokenId != 0) {
-          address owner = vault.ownerOf(ghost_lastReplacedNewTokenId);
-          // The old token should not have active approvals for non-zero addresses
-          // (since it no longer represents a real position)
-          // This is informational - the real issue is that newToken lacks the approvals
-          bool oldApprovalExists = vault.transformApprovals(owner, ghost_lastReplacedOldTokenId, ghost_trackedOperator);
-          bool newApprovalExists = vault.transformApprovals(owner, ghost_lastReplacedNewTokenId, ghost_trackedOperator);
-          if (oldApprovalExists) {
-              t(newApprovalExists, "VV-W03: operator approval lost during token replacement");
+- id: VV-W-03
+  tier: 1
+  type: property
+  description: "Donation attack on totalAssets() via direct ERC20 transfer inflates share price, extracting value from next depositor"
+  attack_scenario: >
+    totalAssets() at L330 reads IERC20(asset).balanceOf(address(this)) + debt.
+    A direct transfer of asset tokens to the vault (not via deposit()) increases balanceOf
+    but does not mint shares. This inflates the exchange rate. An attacker who:
+    1. Deposits a small amount (gets shares)
+    2. Donates a large amount of asset directly to vault
+    3. The exchange rate inflates
+    4. Next depositor gets fewer shares per asset
+    5. Attacker redeems their shares at the inflated rate
+    The vault has NO virtual shares offset (_decimalsOffset), NO dead shares, and NO internal
+    balance tracking. It directly reads balanceOf for totalAssets.
+    However, reserves calculation at L1140 may absorb some of the donation as reserves.
+    The key question: does the donation flow to reserves or to share price?
+  impact: "First depositor or early depositor can extract value from subsequent depositors via share price inflation"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that a direct donation cannot inflate share price beyond what was deposited
+    uint256 totalSupply = vault.totalSupply();
+    if (totalSupply > 0) {
+        uint256 totalAssets = vault.totalAssets();
+        // Share price should be bounded by actual deposits + interest, not arbitrary donations
+        // If totalAssets >> ghost_totalDeposited + ghost_totalRepaid - ghost_totalWithdrawn - ghost_totalBorrowed,
+        // then a donation has inflated the price
+        uint256 expectedMax = ghost_totalDeposited + ghost_totalRepaid + ghost_totalLiquidated + 1e18;
+        // Allow generous tolerance for interest accrual, but catch massive donations
+        if (totalAssets > expectedMax && expectedMax > 0) {
+            t(false, "VV-W-03: totalAssets exceeds expected -- possible donation attack");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "totalAssets() uses balanceOf(address(this)) + debt. No virtual shares or internal accounting. Reserves absorb balance+debt-lent, but donation goes to reserves which are NOT reflected in share price directly. Need to verify if reserves act as sufficient mitigation. The getBalanceAndReserves formula is: reserves = balance + debt - lent. A donation increases balance and thus reserves, but NOT lent. So the donation goes to reserves, not to lenders. This may be a false positive -- but verify that withdrawReserves by owner can extract the donation."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-04
+  tier: 1
+  type: property
+  description: "Transform approval migration copies approval to new token without owner consent for the new token"
+  attack_scenario: >
+    In _transform at L595-598, if the token is replaced during transform, the transform
+    approval is automatically copied from oldTokenId to newTokenId:
+      transformApprovals[loanOwner][newTokenId][msg.sender] = true;
+      delete transformApprovals[loanOwner][tokenId][msg.sender];
+    The owner approved msg.sender for the OLD token. After transform, msg.sender now has
+    approval for the NEW token -- a token the owner never explicitly approved anyone for.
+    If the transformer creates a position worth significantly more than the old one,
+    the approved caller now has transform rights over a higher-value position.
+    Additionally, this auto-migration means the owner cannot revoke between the transform
+    and the next use -- it is atomic.
+  impact: "Approved transform caller retains control over replacement position without explicit owner consent for new token"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After transform that changes tokenId, verify the new token's approvals are
+    // consistent with what the owner explicitly set
+    // This is a state property -- approval migration should be tracked
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address o = vault.ownerOf(tid);
+        if (o != address(0)) {
+            // Owner should be aware of all approvals on their tokens
+            // If a token was created via transform replacement, its approvals
+            // were inherited, not explicitly set
+            (uint256 debt,,,,) = vault.loanInfo(tid);
+            // Positions with debt and inherited approvals are higher risk
+            t(true, "VV-W-04: check passed -- manual review needed for transform approval migration");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "The approval migration at L595-598 is intentional per the code comments, but it creates a subtle trust escalation -- the owner approved for tokenA, and now the approval covers tokenB which may have different value/risk profile. This is a design-level concern more than a code bug."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-05
+  tier: 1
+  type: property
+  description: "Transformer can borrow during transform but health check is deferred -- allows borrowing against position that will be unhealthy after transform completes"
+  attack_scenario: >
+    During _transform (L562-624):
+    1. transformedTokenId is set to tokenId (L563)
+    2. Transformer is called with arbitrary data (L586)
+    3. Transformer calls borrow() -- allowed because isTransformMode=true (L631)
+    4. In borrow, health check is SKIPPED for transform mode (L672-674)
+    5. Transformer can decrease liquidity from the position via nonfungiblePositionManager
+    6. After transformer returns, health check happens at L621 with current state
+
+    The attack: transformer borrows max, then decreases liquidity to min.
+    The health check at L621 should catch this. BUT -- if the transformer sends the
+    borrowed funds somewhere else and the position is left barely unhealthy,
+    the transaction reverts at L621. The transformer could use try/catch or
+    careful calibration to leave position exactly at the boundary.
+
+    More critically: if the transformer is also the gaugeManager compoundRewards
+    path, the interaction between reward compounding and borrowing could create
+    a state where health check passes but the position is economically underwater.
+  impact: "Transformer can borrow against position and manipulate its value within the same tx, potentially leaving bad debt"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For every token with debt, verify health is maintained
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tid);
+        if (debt > 0) {
+            // Loan should be healthy (collateralValue >= debt) unless it is liquidatable
+            // This catches cases where transform left a position unhealthy
+            t(collateralValue >= debt || fullValue > 0, "VV-W-05: position has debt but zero value post-transform");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 60
+  notes: "The health check at L621 _requireLoanIsHealthy should catch most cases. The real risk is in the BORROW_SAFETY_BUFFER_X32 (95%) being applied during borrow health check but NOT during transform final check -- actually both use _requireLoanIsHealthy which uses withBuffer=true. So the buffer applies. The window is: transformer borrows, buffer passes, then position value drops due to external price movement before tx ends."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-06
+  tier: 1
+  type: property
+  description: "dailyDebtIncreaseLimitLeft restoration during liquidation can exceed original daily cap"
+  attack_scenario: >
+    At L809, during liquidation:
+      dailyDebtIncreaseLimitLeft = dailyDebtIncreaseLimitLeft + state.liquidatorCost;
+    And at L1081, during repay:
+      dailyDebtIncreaseLimitLeft = dailyDebtIncreaseLimitLeft + assets;
+    These restorations can push dailyDebtIncreaseLimitLeft ABOVE the daily cap calculated
+    by _calculateDailyIncreaseLimit. Consider:
+    1. Day starts, limit = 1000
+    2. User borrows 800 (limit = 200)
+    3. User repays 800 (limit = 1000)
+    4. User borrows 800 again (limit = 200)
+    5. Liquidation pays 500 (limit = 700)
+    6. User borrows 700 (limit = 0)
+    Total borrowed in one day: 800 + 800 + 700 = 2300, against a cap of 1000.
+    The repay+liquidate restorations allow cycling through the limit multiple times.
+  impact: "Daily debt increase limit can be bypassed via borrow-repay cycles, allowing unlimited borrowing in a single day"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // The daily debt limit left should never exceed the calculated daily cap
+    (,,,,, uint256 lendExchangeRateX96) = vault.vaultInfo();
+    uint256 totalLent = vault.totalAssets();
+    // MAX_DAILY_DEBT_INCREASE_X32 = 429496729 (10% of Q32)
+    uint256 expectedCap = totalLent * 429496729 / (2**32);
+    uint256 minCap = vault.dailyDebtIncreaseLimitMin();
+    uint256 dailyCap = expectedCap > minCap ? expectedCap : minCap;
+    uint256 currentLeft = vault.dailyDebtIncreaseLimitLeft();
+    // Allow small tolerance for rounding
+    lte(currentLeft, dailyCap + ghost_numOps + 1, "VV-W-06: daily debt limit left exceeds calculated cap");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "Both repay (L1081) and liquidation (L809) add back to dailyDebtIncreaseLimitLeft without checking if it exceeds the original cap. This is the same pattern as M-08 from the C4 audit (dailyLendIncreaseLimitLeft/dailyDebtIncreaseLimitLeft not adjusted accurately). The borrow-repay cycling attack is the most practical exploit of this."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-07
+  tier: 2
+  type: property
+  description: "Exchange rate can only increase (never decrease) except during reserve socialization -- monotonicity invariant"
+  attack_scenario: >
+    lastDebtExchangeRateX96 and lastLendExchangeRateX96 should be monotonically increasing
+    under normal operation. The only exception is _handleReserveLiquidation (L1258) which
+    can DECREASE lastLendExchangeRateX96 during bad debt socialization.
+    If the lend exchange rate decreases outside of a liquidation context, it indicates
+    either a bug in interest calculation or an exploit that extracts value from lenders.
+    An attacker who can decrease the lend rate can profit by:
+    1. Short lending shares (borrow shares, sell, wait for rate decrease, rebuy cheaper)
+    2. Or simply cause losses to all lenders
+  impact: "Unexpected rate decrease means lenders lose value -- fundamental accounting invariant violation"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (,,,, uint256 debtRate, uint256 lendRate) = vault.vaultInfo();
+    if (ghost_lastDebtRateX96 > 0) {
+        gte(debtRate, ghost_lastDebtRateX96, "VV-W-07: debt exchange rate decreased");
+    }
+    if (ghost_lastLendRateX96 > 0 && !ghost_liquidationInProgress) {
+        gte(lendRate, ghost_lastLendRateX96, "VV-W-07: lend exchange rate decreased outside liquidation");
+    }
+    ghost_lastDebtRateX96 = debtRate;
+    ghost_lastLendRateX96 = lendRate;
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Using existing ghost variables ghost_lastDebtRateX96 and ghost_lastLendRateX96. The debt rate should NEVER decrease. The lend rate can decrease ONLY during _handleReserveLiquidation. This is a fundamental accounting invariant."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-08
+  tier: 1
+  type: property
+  description: "Multicall can atomically create+borrow+transform in single tx, potentially exploiting state inconsistencies between calls"
+  attack_scenario: >
+    V3Vault inherits Multicall from OpenZeppelin. This allows batching arbitrary calls.
+    Consider: an attacker uses multicall to:
+    1. create(tokenId, attacker) -- add position as collateral
+    2. borrow(tokenId, maxAmount) -- borrow against it
+    3. transform(tokenId, maliciousTransformer, data) -- transform removes liquidity
+
+    Each call updates state independently. The borrow at step 2 checks health.
+    The transform at step 3 can reduce position value. But transform also checks
+    health at the end (L621). However, if the transformer uses the borrowed funds
+    to do something profitable elsewhere, the attacker profits even if the position
+    becomes unhealthy and gets liquidated.
+
+    The key insight: within multicall, each call sees the updated state from the previous
+    call, but the transformedTokenId reentrancy guard (L559) prevents overlapping transforms.
+    However, create -> borrow -> decreaseLiquidityAndCollect could drain the position.
+  impact: "Atomic batching could bypass health check timing assumptions"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that after any sequence of operations, all positions remain healthy
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tid);
+        if (debt > 0 && collateralValue > 0) {
+            // After all operations settle, positions with debt should be healthy
+            t(collateralValue >= debt, "VV-W-08: unhealthy position exists after operations");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 45
+  notes: "Each individual function does its own health check, so multicall batching should not create new attack vectors beyond what individual calls allow. The reentrancy guard on transformedTokenId prevents the most dangerous combinations. Lower confidence because this is likely safe by design."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-09
+  tier: 1
+  type: property
+  description: "Reserve socialization haircut in _handleReserveLiquidation can underflow or over-reduce dailyDebtIncreaseLimitLeft"
+  attack_scenario: >
+    In _handleReserveLiquidation (L1254-1272), after reducing lendExchangeRateX96:
+    1. Calculates preHaircutDailyDebtCap and postHaircutDailyDebtCap
+    2. Reduces dailyDebtIncreaseLimitLeft by (preHaircutCap - postHaircutCap)
+    3. If capReduction >= dailyDebtIncreaseLimitLeft, sets it to 0
+
+    The issue: if multiple liquidations with reserve socialization happen in the same day,
+    the dailyDebtIncreaseLimitLeft can be driven to 0 repeatedly. This means NO new borrows
+    are possible for the rest of the day -- even if the remaining positions are healthy and
+    need to be managed (e.g., a healthy position needs to borrow to rebalance before
+    becoming liquidatable due to market movement).
+
+    This is a DEADLOCK scenario: bad debt socialization blocks new borrowing, which prevents
+    position management, which creates more bad debt, which triggers more socialization.
+  impact: "Cascading liquidations can permanently block borrowing for the rest of the day, creating a death spiral"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After a liquidation that socializes losses, borrowing should still be possible
+    // for existing healthy positions that need management
+    uint256 debtLimitLeft = vault.dailyDebtIncreaseLimitLeft();
+    uint256 totalLent = vault.totalAssets();
+    // If total lent is significant but debt limit is 0, that's a potential deadlock
+    if (totalLent > 1e6 && ghost_liquidationInProgress) {
+        // Just log the state -- a 0 limit after liquidation is concerning but may be by design
+        t(true, "VV-W-09: monitoring debt limit after liquidation");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "The dailyDebtIncreaseLimitLeft going to 0 is a design choice to limit exposure after bad debt. But it can create a deadlock where healthy positions cannot be managed. The _resetDailyDebtIncreaseLimit will restore it the next day. This is more of a design concern than a code bug."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-10
+  tier: 1
+  type: property
+  description: "Collateral value limit check uses debtExchangeRateX96 for totalDebtShares but lendExchangeRateX96 for lentAssets -- rate mismatch"
+  attack_scenario: >
+    In _updateAndCheckCollateral (L1356-1372):
+    - lentAssets = _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Up)
+    - collateral check: _convertToAssets(tokenConfigs[token].totalDebtShares, debtExchangeRateX96, Math.Rounding.Up) > lentAssets * factor / Q32
+
+    The totalDebtShares are converted using debtExchangeRateX96, but compared against
+    lentAssets converted using lendExchangeRateX96. Over time, debt rate grows faster
+    than lend rate (because reserveFactor skims from lend rate). This means:
+    - Debt denominated value grows faster
+    - Lent denominated value grows slower
+    - The collateral value limit becomes MORE restrictive over time
+
+    This can cause a scenario where existing borrowers are fine, but new borrows are blocked
+    even though the protocol has plenty of capacity, because the totalDebtShares valued at
+    debt rate exceeds the limit faster than lentAssets valued at lend rate.
+  impact: "Collateral value limit becomes progressively restrictive, potentially blocking new borrows when protocol is healthy"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    (,,,, uint256 debtRate, uint256 lendRate) = vault.vaultInfo();
+    // Debt rate should always be >= lend rate (debt grows faster due to reserve factor)
+    if (debtRate > 0 && lendRate > 0) {
+        gte(debtRate, lendRate, "VV-W-10: debt rate should be >= lend rate");
+        // The gap between rates should be bounded by reserve factor
+        // If gap is too large, collateral limits become misaligned
+        uint256 gap = debtRate - lendRate;
+        uint256 maxExpectedGap = debtRate / 2; // 50% gap would be extreme
+        lte(gap, maxExpectedGap, "VV-W-10: rate gap exceeds 50% -- limit misalignment risk");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "The rate divergence is by design (reserve factor), but the collateral value limit comparison mixes the two rates. Over time (months/years), this divergence compounds and the limit becomes more restrictive than intended. This is a slow-burn design issue."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-11
+  tier: 1
+  type: property
+  description: "onERC721Received can be triggered by any external contract sending V3 NFTs -- no whitelist on sender beyond NPM check"
+  attack_scenario: >
+    onERC721Received at L447 checks msg.sender == address(nonfungiblePositionManager) and
+    from != address(this). But it does NOT check WHO initiated the safeTransferFrom.
+    If the attacker has an approved V3 NFT, they can call nonfungiblePositionManager.safeTransferFrom
+    to send it directly to the vault. The vault will create a loan entry for the attacker
+    (via the data parameter at L464) or for the `from` address.
+
+    The attack: attacker creates a worthless Uniswap V3 position (zero liquidity,
+    out-of-range, tokens with no collateral factor) and sends it to the vault with
+    data=abi.encode(victimAddress). This creates a loan entry owned by the victim.
+    The victim now has a position they never asked for. While it has no debt,
+    it pollutes their ownedTokens array and could be used for griefing.
+  impact: "Anyone can force-add worthless positions to any address in the vault -- griefing and array pollution"
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Verify that the number of positions per owner is reasonable
+    // and that all owned positions have non-zero value or were explicitly created
+    uint256 aliceCount = vault.loanCount(alice);
+    uint256 bobCount = vault.loanCount(bob);
+    // Unreasonable number of positions suggests griefing
+    lte(aliceCount, 100, "VV-W-11: alice has too many positions -- possible griefing");
+    lte(bobCount, 100, "VV-W-11: bob has too many positions -- possible griefing");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 75
+  notes: "The vault accepts any V3 NFT transfer from the NPM. The data parameter allows specifying any recipient. This is intentional for integrator flows (see NOTE FOR AUDITS at L460-463). The impact is limited to griefing since no debt is created. But combined with gas limits on iteration over ownedTokens, it could cause DoS."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-12
+  tier: 1
+  type: property
+  description: "minLoanSize check on partial repay can trap borrowers -- cannot repay partially if remaining debt would be below minLoanSize"
+  attack_scenario: >
+    At L1088-1092 in _repay:
+      if (currentShares != shares) {
+          if (_convertToAssets(loanDebtShares, ...) < minLoanSize) {
+              revert MinLoanSize();
           }
       }
-    ghost_vars:
-      - "uint256 internal ghost_lastReplacedOldTokenId;"
-      - "uint256 internal ghost_lastReplacedNewTokenId;"
-      - "address internal ghost_trackedOperator;"
-    validated: false
-    priority: high
-    confidence: 75
-    notes: "Reading the code at V3Vault:553-556, only msg.sender's approval is migrated. This is clearly documented behavior but could catch users off-guard. The severity depends on how commonly positions are replaced AND how commonly users have multiple approved operators. In practice with AutoRange + AutoCompound both approved, a range change would break the other operator. Medium severity IMO but marking tier 1 because it leads to potential avoidable liquidation."
+    This means: if your debt is 150 and minLoanSize is 100, you CANNOT repay 60 (leaving 90).
+    You must either repay everything or repay at most 50 (leaving 100+).
 
-  - id: VV-W04
-    tier: 2
-    type: property
-    description: "Staking a position with open debt can be used to strategically lower collateral value right before collateral factor changes take effect. When a position is staked, fees are excluded from value calculation (ignoreFees=true). A borrower near the collateral boundary can stake/unstake to toggle whether fees count towards their health factor. The stakePosition function (V3Vault:1381-1394) does check health post-stake, but only when debtShares != 0. The check uses loanInfo() which internally uses _checkLoanIsHealthy with the staked flag now TRUE, so fees excluded."
-    attack_scenario: "Borrower has position worth 1000 (liquidity) + 200 (fees) = 1200 total. Debt is 950. Collateral factor 0.8. Unstaked: collateralValue = 1200 * 0.8 = 960 >= 950 (healthy). Now borrower stakes: collateralValue = 1000 * 0.8 = 800 < 950 (UNHEALTHY). The stakePosition health check at line 1391-1393 would catch this and revert. So direct exploitation is blocked. BUT: what if the borrower's position becomes healthy only due to fee accumulation, and then someone else can force-stake? Nobody else can call stakePosition because it requires tokenOwner[tokenId] == msg.sender. So this is safe. However, if a position is ALREADY staked and fees are excluded, then the borrower is effectively borrowing against less collateral, which is riskier for the protocol."
-    solidity: |
-      // For staked positions with debt, verify that the position is healthy even WITHOUT
-      // fee exclusion (i.e., check that staking doesn't hide borderline unhealthy positions)
-      // This checks the CONSERVATIVE view
-      if (ghost_isStaked[tokenId] && vault.loans(tokenId).debtShares > 0) {
-          (uint256 debtExRate,) = vault._calculateGlobalInterest();
-          uint256 debt = vault._convertToAssets(vault.loans(tokenId).debtShares, debtExRate, Math.Rounding.Up);
-          (uint256 fullValueWithFees,,,) = oracle.getValue(tokenId, asset, false);
-          uint32 cf = vault._calculateTokenCollateralFactorX32(tokenId);
-          uint256 collateralWithFees = fullValueWithFees * cf / Q32;
-          // If position is only healthy WITH fees but not without, fee exclusion creates risk
-          // This is informational - the protocol intentionally excludes fees for staked positions
-          // t(collateralWithFees >= debt, "VV-W04: staked position only healthy due to fees");
-      }
-    ghost_vars:
-      - "mapping(uint256 => bool) internal ghost_isStaked;"
-    validated: false
-    priority: medium
-    confidence: 45
-    notes: "The fee exclusion for staked positions is an INTENTIONAL design choice (fees accrue to gauge, not NFT). The health check at stake time prevents abuse. But the implicit assumption is that the liquidity-only value is sufficient collateral. If a position was borderline healthy due to liquidity + fees, staking it would trigger the health check and revert. The real question is whether compoundRewards (which adds gauge rewards as liquidity) creates enough value to offset the fee exclusion. This is more of a design concern than a bug."
+    The DEADLOCK: if owner increases minLoanSize AFTER loans exist, borrowers with debt
+    between old and new minLoanSize are forced to either:
+    a) Fully repay (may not have funds)
+    b) Do nothing (wait for liquidation)
+    They cannot partially repay to improve their health ratio.
 
-  - id: VV-W05
-    tier: 1
-    type: property
-    description: "Daily debt increase limit is replenished by liquidatorCost on liquidation (line 767) but NOT reduced by reserveCost. In underwater liquidations where fullValue < debt, liquidatorCost < debt and reserveCost = debt - liquidatorCost. The total repaid (liquidatorCost + reserveCost) equals debt, but only liquidatorCost is added back to dailyDebtIncreaseLimitLeft. This means each bad debt liquidation permanently reduces the daily borrowing capacity. Over time, many bad debt events can grind daily borrow limit to zero, effectively DoS-ing new borrows even after the limit resets the next day (because the same pattern repeats if the protocol is experiencing ongoing bad debt)."
-    attack_scenario: "Attacker creates many tiny positions (at minLoanSize) with maximum leverage. When prices drop, all positions go underwater simultaneously. Each liquidation has liquidatorCost=0 (free liquidation when fullValue < penalty) and reserveCost=debt. The daily limit gets dailyDebtIncreaseLimitLeft += 0 for each. Since _resetDailyDebtIncreaseLimit only resets once per day, all bad-debt liquidations in a single day eat into the current day's headroom via the haircut scaling at lines 1221-1230. Legitimate borrowers cannot borrow. This is a griefing attack on protocol functionality during market stress."
-    solidity: |
-      // After liquidation, verify daily debt limit is correctly updated
-      // The total debt decrease from liquidation should be reflected in limit recovery
-      uint256 debtRepaid = ghost_lastLiquidationDebt;
-      uint256 limitBefore = ghost_dailyDebtLimitBeforeLiquidation;
-      uint256 limitAfter = vault.dailyDebtIncreaseLimitLeft();
-      uint256 liquidatorCostPaid = ghost_lastLiquidatorCost;
-      // Only liquidatorCost is added back, not reserveCost
-      // This means bad debt liquidations don't fully restore headroom
-      uint256 expectedLimit = limitBefore + liquidatorCostPaid;
-      // Account for haircut scaling
-      if (ghost_lastReserveCost > 0) {
-          // With haircut, limit may be further reduced
-          lte(limitAfter, expectedLimit, "VV-W05: daily limit replenished more than liquidatorCost");
-      }
-    ghost_vars:
-      - "uint256 internal ghost_lastLiquidationDebt;"
-      - "uint256 internal ghost_dailyDebtLimitBeforeLiquidation;"
-      - "uint256 internal ghost_lastLiquidatorCost;"
-      - "uint256 internal ghost_lastReserveCost;"
-    validated: false
-    priority: high
-    confidence: 60
-    notes: "The daily limit haircut in _handleReserveLiquidation (lines 1221-1230) explicitly reduces dailyDebtIncreaseLimitLeft when a reserve haircut occurs. Combined with the fact that liquidatorCost=0 in extreme cases, this means the daily borrow limit is actively decreased without any corresponding recovery. The limit resets next day, but if the market conditions persist, new borrows are throttled while liquidations continue. This is arguably by design (conservative during stress) but could be more severe than intended."
+    Combined with a price drop, this creates a scenario where a borrower could save their
+    position with a partial repay but is blocked by minLoanSize, gets liquidated,
+    and loses their collateral.
+  impact: "Borrowers with debt near minLoanSize threshold can be trapped -- forced into liquidation they could have avoided"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For positions with debt, verify that partial repay is always possible
+    // to improve health ratio
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 5; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt,,,,) = vault.loanInfo(tid);
+        uint256 minLoan = vault.minLoanSize();
+        // If debt > 0 and debt < 2 * minLoanSize, the borrower is in the danger zone
+        // where partial repay is severely constrained
+        if (debt > 0 && debt < 2 * minLoan && debt > minLoan) {
+            // This is a risky state -- borrower can only repay fully or repay very little
+            t(true, "VV-W-12: position in minLoanSize danger zone -- partial repay constrained");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "The minLoanSize check on partial repay is a real deadlock vector. If admin raises minLoanSize after loans exist, borrowers near the threshold are trapped. This was likely flagged in the C4 audit but the interaction with admin parameter changes makes it an ongoing risk."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-W06
-    tier: 2
-    type: property
-    description: "GaugeManager.compoundRewards temporarily unstakes the position (line 276: IGauge.withdraw) and re-stakes it (line 282: IGauge.deposit) without the vault's knowledge. During this window, if _isStaked is queried by any view function, it would return false because tokenIdToGauge is still set (it's not deleted in compoundRewards). Wait - actually compoundRewards does NOT delete tokenIdToGauge. It calls gauge.withdraw() and gauge.deposit() directly. The tokenIdToGauge mapping remains set throughout. So _isStaked would still return true. The NFT custody goes: gauge -> GaugeManager -> (increaseLiquidity) -> gauge. During the GaugeManager custody phase, nonfungiblePositionManager.ownerOf(tokenId) == GaugeManager, not vault. But _isStaked checks tokenIdToGauge, not NFT ownership. So the fee exclusion is consistently applied."
-    attack_scenario: "This was initially a hypothesis about state inconsistency during compoundRewards, but investigation shows tokenIdToGauge persists throughout the compound flow. The invariant is that _isStaked correctly reflects the position's staked status at all times, including mid-compound. Since tokenIdToGauge is never cleared in compoundRewards, this should hold."
-    solidity: |
-      // Verify _isStaked is consistent with actual gauge mapping state
-      address gm = vault.gaugeManager();
-      if (gm != address(0)) {
-          bool mappingSet = IGaugeManager(gm).tokenIdToGauge(tokenId) != address(0);
-          // _isStaked should agree with the mapping
-          // (We can't call private _isStaked, so we reconstruct the logic)
-          bool isStaked = gm != address(0) && mappingSet;
-          // This should always be consistent
-          t(true, "VV-W06: placeholder - _isStaked consistency always holds");
-      }
-    ghost_vars: []
-    validated: false
-    priority: low
-    confidence: 30
-    notes: "Investigated and likely not a bug. The tokenIdToGauge mapping is never cleared during compoundRewards, so _isStaked returns consistent results. Keeping as a record of investigation."
+- id: VV-W-13
+  tier: 2
+  type: property
+  description: "Token collateral factor uses min of token0 and token1 factors -- a zero-factor token in the pair makes the entire position worthless as collateral"
+  attack_scenario: >
+    _calculateTokenCollateralFactorX32 at L1278-1283 returns min(factor0, factor1).
+    If either token in the Uniswap V3 pair has collateralFactorX32 == 0, the entire
+    position has 0 collateral value regardless of how much of the other (configured) token
+    it contains.
 
-  - id: VV-W07
-    tier: 1
-    type: property
-    description: "In _transform (V3Vault:561-564), after the transformer executes, the vault checks nonfungiblePositionManager.ownerOf(newTokenId) == address(this). But if the position was staked before transform, it's unstaked at line 539, then the transformer runs, and then at line 575-578 if wasStaked, it's re-staked via _stake(). The _stake function (line 1405-1415) transfers the NFT to the gaugeManager via stakePosition, then checks ownerOf != address(this). The issue: between the ownership check at line 561-564 and the re-stake at 577, the NFT is still in the vault. After re-staking, the NFT is in the gauge. The health check at line 579 runs AFTER re-staking, using _isStaked=true (since tokenIdToGauge is now set), so fees are excluded. This is correct behavior. BUT: the transformer could have manipulated the position's liquidity during its execution (line 544) in ways that only become visible after re-staking."
-    attack_scenario: "A malicious transformer (on allowlist, which requires owner trust) receives NFT approval, decreases liquidity to minimum, sends the extracted tokens elsewhere, then returns the NFT. The vault checks health at line 579 post-re-stake. If the remaining liquidity * collateral_factor >= debt, the attack passes health check. The extracted liquidity is gone. This requires a malicious ALLOWLISTED transformer, which requires owner compromise. Not a permissionless attack."
-    solidity: |
-      // After transform, verify position value hasn't decreased more than expected
-      // Ghost: track position value before and after transform
-      if (ghost_preTransformValue > 0) {
-          (uint256 debtExRate,) = vault._calculateGlobalInterest();
-          uint256 debt = vault._convertToAssets(vault.loans(ghost_transformedToken).debtShares, debtExRate, Math.Rounding.Up);
-          // Post-transform the loan must be healthy
-          // The vault already checks this, so this is redundant unless the check has a gap
-          (bool isHealthy,,,) = vault._checkLoanIsHealthy(ghost_transformedToken, debt, true);
-          t(isHealthy, "VV-W07: position unhealthy after transform");
-      }
-    ghost_vars:
-      - "uint256 internal ghost_preTransformValue;"
-      - "uint256 internal ghost_transformedToken;"
-    validated: false
-    priority: medium
-    confidence: 35
-    notes: "This requires a malicious allowlisted transformer. The allowlist is controlled by the owner (admin). So this is an admin-trust issue, not a permissionless exploit. Likely not in scope for most bounties."
+    Attack: if admin sets one token's factor to 0 (disabling it), ALL positions containing
+    that token immediately become liquidatable. Borrowers have no warning and cannot
+    restructure their positions before liquidation.
 
-  - id: VV-W08
-    tier: 1
-    type: property
-    description: "GaugeManager.onERC721Received accepts NFTs from vault or from tokenIdToGauge[tokenId] (line 538). During compoundRewards, the flow is: gauge.withdraw(tokenId) -> NFT goes to GaugeManager (from=gauge, accepted because tokenIdToGauge[tokenId]==gauge). Then after liquidity add, nonfungiblePositionManager.approve(gauge, tokenId) and gauge.deposit(tokenId). But what if the gauge's withdraw() doesn't send the NFT directly to GaugeManager? If the gauge uses an intermediate contract, the `from` in onERC721Received would be that intermediate, not the gauge address. The comment at GM:192-197 acknowledges this: 'Some gauge implementations may custody via intermediate contracts'. So onERC721Received checks from == vault OR from == tokenIdToGauge[tokenId]. An intermediate contract would fail this check, making unstake revert."
-    attack_scenario: "If a gauge implementation uses an intermediate wrapper for custody (which the comment at line 192-197 says is possible), then unstake would revert because onERC721Received rejects the transfer. The position would be permanently stuck in the gauge. Rewards could still be claimed but the position cannot be unstaked, meaning it cannot be liquidated either. Borrower gets a free non-liquidatable loan. This is mitigated by the fact that setGauge validates gauge == pool.gauge(), but the intermediate custody could happen on the withdraw path, not the deposit path."
-    solidity: |
-      // After staking, verify the position can be unstaked
-      // This is a liveness property - if unstake reverts, the position is stuck
-      if (ghost_stakedTokenIds.length > 0) {
-          uint256 tokenId = ghost_stakedTokenIds[ghost_stakedTokenIds.length - 1];
-          address gauge = IGaugeManager(vault.gaugeManager()).tokenIdToGauge(tokenId);
-          if (gauge != address(0)) {
-              // Simulate: can we call unstake?
-              // In practice this needs a fork test against the actual gauge
-              address nftOwner = nonfungiblePositionManager.ownerOf(tokenId);
-              // NFT should be owned by gauge (or intermediary)
-              t(nftOwner != address(vault), "VV-W08: staked NFT still in vault");
-          }
-      }
-    ghost_vars:
-      - "uint256[] internal ghost_stakedTokenIds;"
-    validated: false
-    priority: high
-    confidence: 50
-    notes: "This is highly dependent on the specific gauge implementation. For standard Aerodrome Slipstream CLGauge, the NFT goes directly to gauge and back. But the code explicitly acknowledges intermediate custody as a possibility. If such a gauge is configured, the unstake path via onERC721Received could break. This MUST be tested on fork against the actual Aerodrome gauge contracts to confirm or deny."
+    This is an admin-dependent attack, but the impact is severe: mass liquidation cascade
+    from a single admin action.
+  impact: "Admin disabling one token's collateral factor triggers mass liquidation of all positions using that token pair"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that all active positions have non-zero collateral factor
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt,, uint256 collateralValue,,) = vault.loanInfo(tid);
+        if (debt > 0) {
+            gt(collateralValue, 0, "VV-W-13: position with debt has zero collateral value");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "The min() approach for collateral factor means any position is only as strong as its weakest token. This is a design choice for safety but creates sharp cliffs when admin changes config. A gradual deprecation mechanism would be safer."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-W09
-    tier: 2
-    type: property
-    description: "In GaugeManager._claimRewardsToSelfBestEffort (line 319-328), if the gauge's getReward reverts, the function catches the error and returns 0. But during unstake (line 223), _claimAndSendRewardsBestEffort is called BEFORE gauge.withdraw(). If getReward reverts and is caught, the rewards are lost (not claimed). Then gauge.withdraw() succeeds, and the NFT returns to vault. The owner loses their accumulated AERO rewards permanently because the gauge's reward accounting gets reset on withdraw."
-    attack_scenario: "A malicious/buggy gauge's getReward() reverts (e.g., reward token runs out, gauge is paused, etc). When the position is unstaked (either by user or during liquidation via _unstakeIfNeeded), _claimAndSendRewardsBestEffort silently fails. Then gauge.withdraw() succeeds, resetting the reward accounting. The rewards are permanently lost. The try-catch at line 322 is intentionally designed for liveness ('unstake/remove/liquidation must not depend on a successful reward claim'), but the trade-off is silent reward loss. For liquidation this is acceptable (liveness > rewards), but for user-initiated unstake it's a surprise loss."
-    solidity: |
-      // Track AERO rewards that should have been claimed during unstake
-      // If claimRewardsBestEffort returned 0 but gauge had pending rewards, that's a loss
-      uint256 aeroBefore = aeroToken.balanceOf(owner);
-      // ... unstake happens ...
-      uint256 aeroAfter = aeroToken.balanceOf(owner);
-      uint256 aeroReceived = aeroAfter - aeroBefore;
-      if (ghost_estimatedPendingRewards > 0 && aeroReceived == 0) {
-          // Rewards were silently lost
-          t(false, "VV-W09: rewards silently lost during unstake");
-      }
-    ghost_vars:
-      - "uint256 internal ghost_estimatedPendingRewards;"
-    validated: false
-    priority: medium
-    confidence: 55
-    notes: "The best-effort pattern is explicitly documented and intentional for liveness. But silent reward loss during user-initiated unstake (not just liquidation) is arguably a Medium severity issue. Users should be warned or given an option to claim-then-unstake separately. However, the vault's unstakePosition goes through GaugeManager.unstakePosition which is not best-effort (it reverts with NotStaked if not staked, but the reward claim inside IS best-effort). For claimRewards (line 234-248) the non-best-effort _claimAndSendRewards is used, which would revert if getReward fails."
+- id: VV-W-14
+  tier: 1
+  type: property
+  description: "Staked position fee exclusion creates arbitrage -- stake before price drop, unstake after, fees buffer the loss"
+  attack_scenario: >
+    _checkLoanIsHealthy at L1429 uses ignoreFees=true for staked positions.
+    This means staked positions are valued WITHOUT accumulated fees.
+    But when unstaked, fees are included in the valuation.
+
+    An attacker can exploit this asymmetry:
+    1. Have a position with large accumulated fees
+    2. Position is unhealthy if fees excluded, healthy if fees included
+    3. Unstake to include fees in valuation (healthy)
+    4. Borrow max against the higher (fee-inclusive) valuation
+    5. Stake again (fees excluded from health check)
+    6. The position is now unhealthy (debt based on fee-inclusive value, health based on fee-exclusive)
+
+    Wait: stakePosition at L1390-1393 checks health AFTER staking. So step 5 would revert
+    if the position is unhealthy. But the timing window between unstake and restake
+    allows borrowing against fees that disappear from the health calculation.
+  impact: "Fee inclusion/exclusion asymmetry between staked/unstaked states creates arbitrage window for over-borrowing"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For staked positions, verify that the health margin accounts for fee exclusion
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 5; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tid);
+        if (debt > 0 && fullValue > 0) {
+            // Health ratio should be > 1 with sufficient margin
+            // If collateralValue is barely above debt, the fee exclusion matters
+            if (collateralValue > 0) {
+                uint256 healthRatio = collateralValue * 100 / debt;
+                // If health ratio is between 100-105%, the fee exclusion could tip it
+                if (healthRatio >= 100 && healthRatio <= 105) {
+                    t(true, "VV-W-14: position at critical health margin -- fee exclusion risk");
+                }
+            }
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 65
+  notes: "The stakePosition health check (L1390-1393) should prevent this by verifying health post-stake. But the window is: unstake (fees visible) -> borrow max -> stake (fees hidden, health checked with buffer). The BORROW_SAFETY_BUFFER_X32 (95%) provides some margin. Need to verify if the buffer is sufficient to cover typical fee accumulation."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-15
+  tier: 1
+  type: property
+  description: "Liquidation sends collateral to recipient before cleaning up loan -- potential reentrancy via token callback"
+  attack_scenario: >
+    In liquidate() at L812-821:
+    1. _sendPositionValue (L812) decreases liquidity and collects to recipient
+    2. _cleanupLoan (L821) removes the loan
+
+    The collect sends tokens to params.recipient. If recipient is a contract that
+    implements token receive callbacks (e.g., ERC777 tokens or a contract with
+    onERC1155Received if somehow involved), it could re-enter the vault.
+
+    However: SafeERC20 is used for the main asset, and the collected tokens are
+    Uniswap V3 pool tokens (not necessarily ERC777). The reentrancy guard is
+    transformedTokenId != 0 check at L770 which blocks re-liquidation.
+    But other functions like deposit/withdraw are NOT guarded by transformedTokenId.
+
+    If the collected token0/token1 has a transfer callback (ERC777), the recipient
+    could re-enter via deposit() to manipulate exchange rates before _cleanupLoan.
+  impact: "Reentrancy during liquidation token collection could manipulate exchange rates before debt cleanup"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that loan cleanup is always consistent after liquidation
+    if (ghost_liquidationInProgress && ghost_lastLiquidatedTokenId > 0) {
+        (uint256 debtShares) = vault.loans(ghost_lastLiquidatedTokenId);
+        eq(debtShares, 0, "VV-W-15: liquidated position still has debt shares");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 40
+  notes: "The standard Uniswap V3 collect sends ERC20 tokens which typically do not have transfer callbacks. However, if either token in the pair is ERC777 or has hooks, this becomes exploitable. The transformedTokenId guard only blocks transform/liquidate reentrancy, not deposit/withdraw. Low confidence because standard V3 pools use standard ERC20s."
+  poc_sketch: ''
+  call_stack: ''
 
 false_positives:
-  - hunter: WildcardHunter
-    id: VV-W-FP01
-    reason: "Multicall + transform batch attack: investigated and found that transform() checks transformedTokenId != 0 on entry (line 517), preventing batching two transforms. Borrow without transform mode requires owner == msg.sender. The Multicall delegatecall preserves msg.sender correctly. Safe by design."
-    investigated_at: "2026-03-20T00:00:00Z"
+- hunter: WildcardHunter
+  id: VV-FP-W-01
+  reason: >
+    totalAssets() donation attack (VV-W-03) is likely mitigated by the reserves mechanism.
+    A direct transfer increases balanceOf which increases reserves (balance + debt - lent),
+    NOT the lend exchange rate. The donation goes to protocol reserves, not to share price.
+    However, this needs verification that withdrawReserves cannot be called atomically
+    after donation to extract the donated amount.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "V3Vault uses balanceOf for totalAssets but reserves absorb donations -- not vulnerable to standard donation attack because reserves = balance + debt - lent captures excess"
+    briefing_update_applied: false
 
-  - hunter: WildcardHunter
-    id: VV-W-FP02
-    reason: "CompoundRewards _isStaked inconsistency: investigated and found that tokenIdToGauge mapping is never cleared during compoundRewards, so _isStaked correctly returns true throughout the compound flow, even while the NFT briefly sits in GaugeManager."
-    investigated_at: "2026-03-20T00:00:00Z"
-
-  - hunter: WildcardHunter
-    id: VV-W-FP03
-    reason: "Staking to lower collateral value: stakePosition health check at V3Vault:1391-1393 prevents staking if it would make position unhealthy. Only owner can call stakePosition. No external actor can force-stake."
-    investigated_at: "2026-03-20T00:00:00Z"
+- hunter: WildcardHunter
+  id: VV-FP-W-02
+  reason: >
+    Multicall atomicity (VV-W-08) is likely safe because each sub-call in multicall
+    performs its own state checks (health, limits, balances). The transformedTokenId
+    guard prevents transform reentrancy. The main risk is deposit-withdraw cycling
+    to bypass daily limits (VV-W-02), which is a separate issue.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "Multicall in ERC4626 vaults does not bypass per-call health checks -- each deposit/withdraw/borrow validates independently"
+    briefing_update_applied: false

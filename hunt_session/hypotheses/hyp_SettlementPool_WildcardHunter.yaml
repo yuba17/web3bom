@@ -1,0 +1,474 @@
+protocol: variational
+component: SettlementPool
+file: variational-audit/src/SettlementPool.sol
+domain: reentrancy
+hunter: WildcardHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: SP-W-01
+  tier: 1
+  type: property
+  description: >
+    batchDepositUSDCAtomic charges creatorPartyAmountRequested ONCE PER ITEM
+    in the batch loop, but the event emits it as a single amount — Oracle/off-chain
+    may believe only one deposit of creatorPartyAmountRequested was taken, while
+    N*creatorPartyAmountRequested was actually transferred from the creator wallet.
+    This is a logic discrepancy: the loop calls _depositUSDCOnBehalf for
+    creatorPartyAmountRequested on EVERY iteration, draining the creator N times.
+  attack_scenario: >
+    Oracle (PROVIDER_ROLE) calls batchAtomicDeposit with creatorPartyAmountRequested=1000
+    USDC and items.length=5. The creator is charged 5*1000=5000 USDC total (1000 per
+    iteration). However, the BatchDepositedAtomic event only records
+    creatorPartyAmountRequested=1000, not the total 5000. Off-chain systems reconciling
+    via events will show 1000 deposited while 5000 was taken. Additionally, after the
+    first iteration the transferUuid is set to 0 which bypasses the dupe check — so
+    iterations 2-N deposit with transferUuid=0 which SKIPS the transfers_processed
+    marking (line 106: if transferUuid != 0). This means the same parentQuoteUuid from
+    item[0] is marked processed, but items[1..N] creator deposits have no replay
+    protection at all. A malicious or buggy provider could re-call with same items
+    and drain creator funds again.
+  impact: >
+    Creator wallet drained of N*amount instead of expected amount. With N=10 batch
+    items each requiring 10K USDC creator deposit, creator loses 100K instead of 10K.
+    Off-chain reconciliation sees only 10K.
+  impact_rating: High
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Track total USDC transferred from creator across a batchDepositUSDCAtomic call
+    // Ghost: ghost_creatorBalanceBefore (set before batch call)
+    // Ghost: ghost_creatorBalanceAfter (set after batch call)
+    // The event claims creatorPartyAmountRequested was deposited, but
+    // actual drain = ghost_creatorBalanceBefore - ghost_creatorBalanceAfter
+    uint256 actualDrain = ghost_creatorBalanceBefore - ghost_creatorBalanceAfter;
+    // If there were N items and creatorPartyAmountRequested > 0, the creator
+    // was charged N * creatorPartyAmountRequested
+    // The invariant: actualDrain should equal creatorPartyAmountRequested (single charge)
+    // If this FAILS, it proves the N*charge bug
+    lte(actualDrain, ghost_creatorAmountRequested, "SP-W-01: creator charged more than creatorPartyAmountRequested");
+  ghost_vars:
+    - uint256 internal ghost_creatorBalanceBefore;
+    - uint256 internal ghost_creatorBalanceAfter;
+    - uint256 internal ghost_creatorAmountRequested;
+  validated: false
+  priority: critical
+  confidence: 95
+  notes: >
+    This is almost certainly a real bug. Reading the code: batchDepositUSDCAtomic
+    iterates over items[] and calls _depositUSDCOnBehalf(creatorPartyAddress,
+    creatorPartyAmountRequested, ...) on EVERY iteration where creatorPartyAmountRequested > 0.
+    The amount is NOT divided by items.length — it's the full amount each time.
+    The comment and event suggest this is meant to be a single creator deposit shared
+    across all items, but the code charges it per-item. Compare with depositUSDCAtomic
+    which handles a single 2-party deposit correctly. The batch version multiplies
+    the creator's cost by the number of items.
+  poc_sketch: |
+    // Deploy pool, set creator with 10000 USDC approved
+    // Call batchAtomicDeposit with creatorPartyAmountRequested=1000, items.length=5
+    // Assert creator balance decreased by 5000, not 1000
+    // Assert pool balance increased by 5000 + sum(otherParty amounts)
+  call_stack: >
+    Oracle.batchAtomicDeposit -> SettlementPool.batchDepositUSDCAtomic
+    -> loop[0]: _depositUSDCOnBehalf(creator, 1000, uuid0) -> transferFrom(creator, pool, 1000)
+    -> loop[1]: _depositUSDCOnBehalf(creator, 1000, 0) -> transferFrom(creator, pool, 1000) [uuid=0, no dupe check!]
+    -> loop[2]: _depositUSDCOnBehalf(creator, 1000, 0) -> transferFrom(creator, pool, 1000)
+    ...
+
+- id: SP-W-02
+  tier: 1
+  type: property
+  description: >
+    transferUuid=0 bypasses transfers_processed replay protection in _depositUSDCOnBehalf.
+    When transferUuid is 0, the function skips both the duplicate check (line 97 checks
+    transfers_processed[0] which is shared/global) AND skips marking it as processed
+    (line 106-107: if transferUuid != 0). This means deposits with transferUuid=0 have
+    NO replay protection whatsoever.
+  attack_scenario: >
+    In batchDepositUSDCAtomic, after the first creator deposit, transferUuid is reset to 0
+    (line 140). All subsequent creator deposits in the loop use transferUuid=0. The
+    _depositUSDCOnBehalf function checks transfers_processed[0] == false (line 97).
+    Since transferUuid=0 is never marked as processed (line 106: if transferUuid != 0),
+    this check always passes. A malicious provider could also call depositUSDCNoEvent
+    with transferUuid=0 (no require != 0 check there!) to deposit on behalf of any
+    address without replay protection.
+  impact: >
+    Funds can be repeatedly pulled from any address that has approved the pool,
+    as long as the Oracle calls depositUSDCNoEvent with transferUuid=0.
+    No replay protection means same logical transfer can execute multiple times.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a deposit with transferUuid=0, transfers_processed[0] should be true
+    // But it won't be, proving the bypass
+    // Call _depositUSDCOnBehalf with transferUuid=0 twice
+    // Both should succeed — proving no replay protection
+    bool processedZero = settlementPool.transfers_processed(0);
+    // After deposit with uuid=0, this should be true but will be false
+    t(processedZero == false, "SP-W-02: transferUuid=0 is never marked processed — no replay protection");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 90
+  notes: >
+    depositUSDCNoEvent does NOT require transferUuid != 0, unlike depositUSDC and
+    depositUSDCOnBehalfOfParty which do. This creates an inconsistency where the
+    Oracle-called path has weaker protections than the party-called path.
+    The transferUuid=0 bypass is used intentionally in atomic deposits to avoid
+    double-marking, but it creates a systemic weakness.
+  poc_sketch: |
+    // 1. User approves pool for 1000 USDC
+    // 2. Oracle calls depositUSDCNoEvent(user, 500, 0) — succeeds
+    // 3. Oracle calls depositUSDCNoEvent(user, 500, 0) again — also succeeds!
+    // 4. User has been charged 1000 but only one logical deposit occurred
+  call_stack: >
+    Oracle.processTreasuryManagementDeposits -> SettlementPool.depositUSDCNoEvent
+    -> _depositUSDCOnBehalf(sender, amount, 0, false)
+    -> require(transfers_processed[0] == false) // ALWAYS true since 0 is never set
+    -> transferFrom succeeds
+    -> if (transferUuid != 0) { ... } // SKIPPED — never marks processed
+
+- id: SP-W-03
+  tier: 1
+  type: property
+  description: >
+    withdrawFees has no balance check — Oracle can withdraw more USDC than the pool
+    holds, causing subsequent legitimate withdrawals to fail (griefing/fund theft).
+    The function relies on USDC.transfer reverting on insufficient balance, but the
+    try/catch catches this and reverts with a generic message. More critically, there
+    is no accounting: the pool has no internal tracking of how much belongs to fees
+    vs party deposits, so the Oracle can extract party funds as "fees".
+  attack_scenario: >
+    A compromised or malicious provider calls collectFees with an inflated
+    amountRequested that exceeds actual fees owed. Since withdrawFees only checks
+    that amountRequested > 0 and fees_batch_id hasn't been processed, but does NOT
+    verify that amountRequested <= actual fees owed, the provider can drain the
+    entire pool balance. The USDC.transfer will succeed as long as pool has sufficient
+    balance, regardless of whether the amount represents real fees.
+  impact: >
+    Complete pool drainage. All party deposits stolen under the guise of "fee collection".
+    The pool has no internal accounting to distinguish fee obligations from party collateral.
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After withdrawFees, pool balance should still cover all party deposits
+    // Since there's no internal accounting, we check that total withdrawals
+    // via fees don't exceed a reasonable % of deposits
+    uint256 poolBalance = usdc.balanceOf(address(settlementPool));
+    uint256 totalFeeWithdrawn = ghost_totalFeesWithdrawn;
+    uint256 totalDeposited = ghost_totalDeposited;
+    // Fees should never exceed total deposited (conservation)
+    lte(totalFeeWithdrawn, totalDeposited, "SP-W-03: fees withdrawn exceed total deposits");
+  ghost_vars:
+    - uint256 internal ghost_totalFeesWithdrawn;
+    - uint256 internal ghost_totalDeposited;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This is a trust assumption issue. The entire system trusts the Oracle (PROVIDER_ROLE)
+    to submit correct fee amounts. If the provider is compromised, there is no on-chain
+    guardrail. Whether this is "by design" depends on the threat model — if the provider
+    is a multisig/EOA controlled by the protocol team, this is a centralization risk.
+    If it's a smart contract, it could have its own bugs. Worth flagging as the pool
+    has ZERO internal accounting — it's a pure custodial escrow with no balance tracking.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.collectFees -> SettlementPool.withdrawFees(provider, 1000000, batchId)
+    -> usdc.transfer(provider, 1000000) // drains entire pool
+
+- id: SP-W-04
+  tier: 1
+  type: property
+  description: >
+    depositUSDCAtomic emits DepositedAtomic event and returns early when
+    partyOneAmountRequested > 0 && partyTwoAmountRequested == 0, WITHOUT actually
+    performing any deposit or transfer. The comment says "we already completed the
+    single party transfer in the calling function" — this refers to Oracle.atomicDeposit
+    which does a direct transferFrom to the pool address. But crucially, this path
+    SKIPS the transfers_processed[parentQuoteUuid] check in _depositUSDCOnBehalf,
+    relying instead on atomic_deposits_processed in Oracle. If the Oracle path is
+    called directly (not through Oracle.atomicDeposit), the event is emitted without
+    any transfer happening, creating a phantom deposit event.
+  attack_scenario: >
+    If depositUSDCAtomic is called directly by the Oracle (which it can, since it has
+    onlyOracle modifier), with partyOneAmountRequested > 0 and partyTwoAmountRequested == 0,
+    the function emits a DepositedAtomic event without any USDC transfer. Off-chain
+    systems tracking deposits via events would record a deposit that never happened.
+    The parentQuoteUuid is NOT marked as processed in transfers_processed, only in
+    Oracle's atomic_deposits_processed. If a different Oracle is set later (factory.setOracleAddress),
+    the new Oracle has a fresh atomic_deposits_processed mapping — enabling replay.
+  impact: >
+    Phantom deposit events mislead off-chain accounting. After Oracle migration,
+    previously processed atomic deposits can be replayed since the new Oracle has
+    no memory of past atomic_deposits_processed entries.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before and after depositUSDCAtomic with partyOne>0, partyTwo==0:
+    // Pool USDC balance should increase by partyOneAmountRequested
+    uint256 balanceBefore = ghost_poolBalanceBefore;
+    uint256 balanceAfter = usdc.balanceOf(address(settlementPool));
+    // If event was emitted claiming partyOneAmountRequested deposited,
+    // balance must have increased by at least that amount
+    if (ghost_lastAtomicPartyOneAmount > 0 && ghost_lastAtomicPartyTwoAmount == 0) {
+        gte(balanceAfter - balanceBefore, ghost_lastAtomicPartyOneAmount,
+            "SP-W-04: DepositedAtomic event emitted but no USDC transferred");
+    }
+  ghost_vars:
+    - uint256 internal ghost_poolBalanceBefore;
+    - uint256 internal ghost_lastAtomicPartyOneAmount;
+    - uint256 internal ghost_lastAtomicPartyTwoAmount;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The early return path is designed to work with Oracle.atomicDeposit which does
+    the transfer directly. But this creates a coupling assumption — if depositUSDCAtomic
+    is ever called from a different code path (new Oracle, upgrade), the event/transfer
+    mismatch becomes exploitable.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.atomicDeposit:
+      1. transferFrom(partyOne -> oracle -> pool)  [direct, no SP involvement]
+      2. pool.depositUSDCAtomic(partyOne, partyTwo, amount, 0, rfq, uuid)
+         -> early return + emit DepositedAtomic (no transfer in SP)
+
+- id: SP-W-05
+  tier: 1
+  type: property
+  description: >
+    Oracle.transferFromOLPToPool sends USDC directly to the pool address via
+    usdc.transfer(poolAddress, amount), bypassing SettlementPool's deposit functions
+    entirely. This means the pool receives USDC without any transfers_processed entry,
+    no event from the pool, and no internal accounting update. These "ghost funds" sit
+    in the pool's USDC balance but are invisible to the pool's transfer tracking system.
+    Since _totalBalance() reads raw balanceOf, and withdrawals check transfers_processed
+    but not balance, the OLP transfer creates untracked balance that can be extracted
+    via any withdrawal path.
+  attack_scenario: >
+    1. OLP wallet deposits 100K USDC into pool via transferFromOLPToPool.
+    2. Pool balance is now 100K but transfers_processed has no record.
+    3. Oracle calls withdrawFees(attacker, 100K, newBatchId) — succeeds because
+       pool has 100K balance and newBatchId is fresh.
+    4. The 100K is extracted without any corresponding deposit record.
+    This is a cross-contract composability issue: Oracle and SettlementPool have
+    inconsistent views of what constitutes a valid deposit.
+  impact: >
+    Untracked USDC in the pool can be extracted by any withdrawal mechanism.
+    The pool has no way to distinguish OLP-sourced funds from party deposits.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Total pool balance should equal sum of all tracked deposits minus tracked withdrawals
+    uint256 poolBalance = usdc.balanceOf(address(settlementPool));
+    uint256 trackedNet = ghost_totalTrackedDeposits - ghost_totalTrackedWithdrawals;
+    eq(poolBalance, trackedNet, "SP-W-05: pool balance != tracked net — untracked funds present");
+  ghost_vars:
+    - uint256 internal ghost_totalTrackedDeposits;
+    - uint256 internal ghost_totalTrackedWithdrawals;
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    This may be intentional design — the Oracle manages all accounting off-chain
+    and the pool is just a custodial escrow. But the lack of on-chain accounting
+    means any Oracle bug or compromise has no on-chain safety net. The pool cannot
+    distinguish legitimate from illegitimate withdrawals.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.transferFromOLPToPool -> usdc.transferFrom(olp, oracle) -> usdc.transfer(pool, amount)
+    [pool.balanceOf increases but no SettlementPool state update]
+
+- id: SP-W-06
+  tier: 2
+  type: property
+  description: >
+    Oracle.grantRole override has an inverted check: it calls super.grantRole FIRST
+    (which grants the role), then checks require(!hasRole(PROVIDER_ROLE, account)) —
+    but by this point hasRole returns TRUE because super.grantRole already granted it.
+    This means grantRole for PROVIDER_ROLE ALWAYS reverts, making it impossible to add
+    providers via the standard AccessControl grantRole path.
+  attack_scenario: >
+    Admin tries to add a provider via grantRole(PROVIDER_ROLE, newProvider).
+    super.grantRole executes first, granting the role. Then the require checks
+    !hasRole(PROVIDER_ROLE, account) which is now false (just granted). Reverts.
+    The only way to add providers is via addProvider() which doesn't have this bug.
+    If any external system or contract calls grantRole instead of addProvider,
+    it will always fail. This could brick provider management in certain upgrade
+    scenarios.
+  impact: >
+    grantRole for PROVIDER_ROLE is permanently broken. numProviders counter can
+    become desynced if providers are added/removed via other AccessControl paths
+    (renounceRole doesn't decrement numProviders). Over time, numProviders may
+    not reflect reality, potentially allowing removal of the last real provider
+    (numProviders says 3, reality is 1).
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // numProviders should equal the actual count of addresses with PROVIDER_ROLE
+    uint256 claimed = oracle.numProviders();  // Note: numProviders is private, may need accessor
+    // If we can enumerate providers (we can't easily), check:
+    // claimed == actualCount
+    // Alternatively: after renounceRole, numProviders should decrease but it doesn't
+    // because renounceRole is inherited from AccessControl and doesn't override
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    Looking at Oracle.sol line 438-446: grantRole calls super.grantRole(role, account)
+    on line 439, which grants the role. Then line 442 checks !hasRole(PROVIDER_ROLE, account)
+    which is now TRUE (just granted), so the require fails. This is a clear bug —
+    the check should be BEFORE super.grantRole, or addProvider should be the only path.
+    Additionally, renounceRole (inherited, not overridden) allows a provider to
+    remove themselves without decrementing numProviders, desyncing the counter.
+  poc_sketch: |
+    // oracle.grantRole(PROVIDER_ROLE, newAddr) — will revert
+    // oracle.addProvider(newAddr) — works
+    // provider.renounceRole(PROVIDER_ROLE) — works, numProviders not decremented
+    // Now numProviders is wrong
+  call_stack: >
+    Oracle.grantRole(PROVIDER_ROLE, addr)
+    -> super.grantRole(PROVIDER_ROLE, addr) // GRANTS the role
+    -> if (role == PROVIDER_ROLE) { require(!hasRole(PROVIDER_ROLE, addr)) } // ALWAYS reverts!
+
+- id: SP-W-07
+  tier: 1
+  type: property
+  description: >
+    renounceRole is inherited from AccessControl and NOT overridden in Oracle.
+    A provider can call renounceRole(PROVIDER_ROLE, self) to remove their own role
+    WITHOUT decrementing numProviders. This desyncs the counter. After enough
+    renouncements, numProviders could be >1 while only 1 (or 0) real providers
+    exist. The removeProvider function requires numProviders > 1, so with a desynced
+    counter, even the last real provider could be removed, bricking the Oracle.
+  attack_scenario: >
+    1. Admin adds 3 providers via addProvider (numProviders=3).
+    2. Provider A calls renounceRole(PROVIDER_ROLE, A) — role removed, numProviders still 3.
+    3. Provider B calls renounceRole(PROVIDER_ROLE, B) — role removed, numProviders still 3.
+    4. Admin calls removeProvider(C) — requires numProviders > 1, passes (numProviders=3).
+       numProviders becomes 2, but C was the LAST real provider.
+    5. Oracle is now bricked — no providers, numProviders=2, all operations fail.
+    6. All funds in all settlement pools are frozen since only Oracle can call
+       withdrawUSDC, withdrawFees, etc.
+  impact: >
+    Complete Oracle brick. All settlement pools become inoperable — no deposits,
+    no withdrawals, no fee collection possible. Funds permanently locked until
+    admin adds new providers (if admin key still available).
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any role change, numProviders should match actual provider count
+    // This is hard to check without enumerating, but we can check:
+    // numProviders should never be 0 AND at least one address should have PROVIDER_ROLE
+    // If numProviders > 0 but no address has the role, it's desynced
+    // Alternatively: after renounceRole, we check numProviders decreased
+    uint256 providersBefore = ghost_numProvidersBefore;
+    uint256 providersAfter = ghost_numProvidersAfter;
+    // If a provider was removed (renounceRole), counter should decrease
+    if (ghost_providerRenounced) {
+        eq(providersAfter, providersBefore - 1, "SP-W-07: renounceRole didn't decrement numProviders");
+    }
+  ghost_vars:
+    - uint256 internal ghost_numProvidersBefore;
+    - uint256 internal ghost_numProvidersAfter;
+    - bool internal ghost_providerRenounced;
+  validated: false
+  priority: critical
+  confidence: 90
+  notes: >
+    This is a classic AccessControl override incompleteness bug. The contract
+    overrides grantRole and revokeRole but NOT renounceRole. OpenZeppelin's
+    renounceRole calls _revokeRole internally, which doesn't go through the
+    overridden revokeRole — it's a direct internal call. So numProviders is
+    never decremented on renounce. This is a real, exploitable bug.
+  poc_sketch: |
+    // Add 2 providers, have one renounce, check numProviders
+    oracle.addProvider(addr1);  // numProviders = 1
+    oracle.addProvider(addr2);  // numProviders = 2
+    vm.prank(addr1);
+    oracle.renounceRole(PROVIDER_ROLE, addr1);  // numProviders still 2!
+    // Now removeProvider(addr2) works even though addr2 is the last provider
+  call_stack: >
+    provider.renounceRole(PROVIDER_ROLE, self)
+    -> AccessControl.renounceRole (NOT overridden)
+    -> _revokeRole(PROVIDER_ROLE, self) // internal, bypasses Oracle.revokeRole override
+    -> role removed, numProviders unchanged
+
+- id: SP-W-08
+  tier: 2
+  type: property
+  description: >
+    The SettlementPool.initialize function can be front-run on the same transaction
+    as factory.createPool. Since the pool is deployed via Clones.clone (EIP-1167 minimal
+    proxy), the address is deterministic based on the implementation + salt/nonce. An
+    attacker who sees the createPool transaction in the mempool could potentially call
+    initialize directly on the newly deployed clone BEFORE the factory's initialize call
+    executes — BUT the factory checks msg.sender == address(factory), so this is mitigated.
+    However, the factory address is passed as a PARAMETER to initialize, not derived.
+    If an attacker deploys their own "factory" contract at a predictable address...
+  attack_scenario: >
+    This is mitigated by the require(msg.sender == address(ISettlementPoolFactory(_factory)))
+    check — the caller must BE the factory they're claiming. An attacker cannot spoof this
+    because msg.sender is unforgeable. FALSE POSITIVE for direct frontrunning.
+    However: Clones.clone uses CREATE opcode, not CREATE2. The address depends on
+    the factory's nonce, which is predictable. If someone could call initialize before
+    the factory does... but the factory deploys AND initializes in the same transaction,
+    so this is not exploitable.
+  impact: 'N/A — mitigated by msg.sender check'
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Pool can only be initialized once
+    // After initialization, factory should be set and non-zero
+    t(settlementPool.factory() != address(0), "SP-W-08: pool initialized");
+    // Calling initialize again should revert
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    Investigated and confirmed mitigated. The msg.sender == factory check prevents
+    unauthorized initialization. The "can only initialize once" check (factory == address(0))
+    provides defense-in-depth. Moving to false_positives.
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: WildcardHunter
+  id: SP-W-FP-01
+  reason: >
+    Initialize front-running is mitigated by require(msg.sender == address(ISettlementPoolFactory(_factory)))
+    which is unforgeable. Additionally, factory deploys and initializes in a single transaction.
+    The "can only initialize once" check provides defense-in-depth.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: reentrancy-patterns.md
+    content: >
+      EIP-1167 clone initialize frontrunning — check if initialize requires
+      msg.sender == factory. If yes, not exploitable even if clone address is predictable.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: SP-W-FP-02
+  reason: >
+    Reentrancy via USDC callbacks — USDC is a standard ERC20 without transfer hooks
+    (not ERC777). The try/catch pattern with transferFrom and transfer cannot trigger
+    reentrancy with standard USDC. Additionally, all external functions have nonReentrant.
+    If a non-standard USDC with hooks were used, this would be exploitable, but that's
+    outside the threat model for standard USDC deployments.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

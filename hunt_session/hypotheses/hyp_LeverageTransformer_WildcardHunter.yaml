@@ -1,0 +1,173 @@
+component: LeverageTransformer
+hunter: WildcardHunter
+date: "2026-03-21"
+
+invariants:
+  - id: LT-W-01
+    title: "leverageUp: dual-swap underflow — amountIn0 + amountIn1 > borrowAmount"
+    tier: 1
+    type: property
+    confidence: 75
+    description: >
+      In leverageUp when token==token0:
+        amount0 = borrowAmount (borrow in token0)
+        If amountIn1 > 0: swap token1 → token0, amount0 += amountOut
+        If amountIn0 > 0: swap token0 → token1, amount0 -= amountIn0
+      The subtraction `amount0 -= amountIn0` can underflow if amountIn0 > (borrowAmount + swapOut1).
+      Solidity 0.8 reverts on underflow. But the issue is: the user can accidentally craft
+      params where amountIn0 > borrowAmount (intending to leverage using more token0 than borrowed).
+      The tx reverts silently without clear error message, leaving user confused.
+      More critically: if there's a code path where overflow/underflow check is bypassed
+      (e.g., unchecked block), this becomes a real accounting bug.
+    affected_line: "LeverageTransformer.sol:65-82"
+    attack_scenario: >
+      User sets amountIn0 = borrowAmount + 1 with amountIn1 = 0.
+      Execution: amount0 = borrowAmount; amount0 -= amountIn0 = -1 → REVERT (0.8).
+      Not exploitable in current Solidity 0.8 code due to checked arithmetic.
+      BUT: verify there's no unchecked block wrapping these operations.
+    status: hypothesis
+    solidity: |
+      // INV-LT-W-01: amount0/amount1 never goes below zero during swap tracking
+      function invariant_leverageUp_amountNeverNegative() public {
+          // At no point during leverageUp does the running amount go negative
+          // Check for unchecked blocks: grep "unchecked" in LeverageTransformer.sol
+      }
+
+  - id: LT-W-02
+    title: "leverageDown: TOCTOU — position state between decreaseLiquidity and collect"
+    tier: 2
+    type: property
+    confidence: 70
+    description: >
+      leverageDown sequence: (1) nft.decreaseLiquidity() → reduces liquidity, credits
+      token amounts to position. (2) nft.collect() → transfers credited amounts to LeverageTransformer.
+      Between steps 1 and 2, another transaction could interact with the position
+      (if the vault allows concurrent transforms, which it doesn't due to transformedTokenId).
+      However if called directly by owner (not via vault.transform()), the transformedTokenId
+      is not set, so concurrent vault operations might be possible in theory.
+    affected_line: "LeverageTransformer.sol:130-155"
+    attack_scenario: >
+      Owner calls leverageDown directly. Between decreaseLiquidity (step 1) and collect (step 2),
+      another tx calls vault.transform() with a different transformer. This is blocked by
+      vault.transformedTokenId check. However: if owner calls leverageDown directly (not via vault),
+      vault state is not locked. Another actor could call vault.liquidate() on the position
+      between steps 1 and 2. The position now has reduced liquidity (step 1 removed it)
+      but fees/amounts haven't been collected yet. Liquidation accounting may be off.
+    status: hypothesis
+    solidity: |
+      // INV-LT-W-02: atomic decreaseLiquidity+collect sequence
+      function invariant_leverageDown_atomicSequence() public {
+          // No external state changes possible between steps 1 and 2
+          // Only protected if called via vault.transform() (transformedTokenId set)
+      }
+
+  - id: LT-W-03
+    title: "leverageDown: unchecked SafeCast toUint128 for collectParams (confirmed overlap with LT-D-01)"
+    tier: 1
+    type: property
+    confidence: 65
+    description: >
+      Same as LT-D-01 / LT-M-01: SafeCast.toUint128(amount0 + params.feeAmount0).
+      Cross-validation from WildcardHunter perspective: this is a REAL DoS vector.
+      The question is whether it's HIGH or MEDIUM severity. A position with very large
+      liquidity that cannot be deleveraged represents locked collateral and stuck debt.
+      If the vault cannot process leverageDown for such a position, it also cannot
+      liquidate it properly (liquidators would use direct vault.liquidate(), not LeverageTransformer).
+      So the impact is: user cannot voluntarily deleverage, but liquidation still works via vault.
+      This makes it MEDIUM rather than HIGH.
+    affected_line: "LeverageTransformer.sol:153-154"
+    attack_scenario: >
+      User with very large position (amount0 near 2^128) tries to call leverageDown with
+      feeAmount0 = 1. Revert. They must either:
+      (a) Use leverageDown with feeAmount0 = 0 (no extra fee collection)
+      (b) Use leverageDown with feeAmount0 = type(uint128).max (collect all fees)
+      The intended use case of specifying exact feeAmount is permanently broken.
+    status: confirmed_overlaps_LT_D_01
+    solidity: |
+      // Same invariant as LT-D-01 — confirmed by multiple hunters
+      // Severity: MEDIUM (DoS for leverageDown, not full liquidation block)
+
+  - id: LT-W-04
+    title: "leverageUp: unbounded swap slippage via zeroed amountOutMin"
+    tier: 2
+    type: property
+    confidence: 72
+    description: >
+      _routerSwap() in Swapper.sol validates amountOutDelta >= amountOutMin.
+      If params.swapData encodes amountOutMin=0 (or the swap type doesn't pass
+      amountOutMin to the router), there's no slippage protection on the swap.
+      In leverageUp, borrowed tokens are swapped to the other token for addLiquidity.
+      Zero slippage means a sandwicher can extract the borrow proceeds.
+      The vault's health check at the end is the only protection — if sandwich
+      causes < expected liquidity added, health check fails → revert.
+      But: sandwich extract value WITHIN the health check boundary (extract just
+      enough that health check still passes). Sophisticated attack vector.
+    affected_line: "Swapper.sol:_routerSwap(), LeverageTransformer.sol:65-82"
+    attack_scenario: >
+      1. Victim calls leverageUp with loose swap params (amountOutMin near 0)
+      2. Attacker sandwiches the swap: front-run moves price, back-run restores
+      3. Victim receives fewer tokens from swap → less liquidity added → more leftover
+      4. Leftover sent to params.recipient (victim) — but at worse exchange rate
+      5. Net value extracted by attacker via price impact
+      6. Health check passes because position value still > debt * collateral factor
+    status: hypothesis
+    solidity: |
+      // INV-LT-W-04: swap slippage protection enforced
+      function invariant_leverageUp_swapSlippage() public {
+          // amountOutMin > 0 for all swaps (or protocol-enforced minimum)
+      }
+
+  - id: LT-W-05
+    title: "leverageUp: borrowed funds partially leak as leftover to recipient"
+    tier: 2
+    type: property
+    confidence: 68
+    description: >
+      LT-M-03 cross-validation from WildcardHunter: borrowed funds that don't get
+      deposited as liquidity flow to params.recipient. This is by design but creates
+      an economic issue: the vault's collateral accounting depends on position value.
+      If user borrows 1000 USDC and only deposits 500 USDC worth of liquidity
+      (sending 500 USDC to recipient), the vault must hold collateral >= 1000 * CF.
+      The existing position liquidity + 500 USDC new liquidity must satisfy this.
+      Risk: enables "borrow and extract" if existing collateral is high enough.
+    affected_line: "LeverageTransformer.sol:97-105"
+    attack_scenario: >
+      1. Position has 10000 USDC collateral, 0 debt
+      2. Call leverageUp: borrow 5000 USDC (well within CF)
+      3. Set swap params to convert 0 USDC (no swap)
+      4. addLiquidity with amount0Min=0 → adds 0 liquidity (no token0 in position token)
+      5. 5000 USDC leftover sent to params.recipient
+      6. Health check: 10000 collateral vs 5000 debt × CF → PASSES
+      7. Effective result: extracted 5000 USDC from vault against collateral
+      This IS by design (leverage = borrow against collateral). But if CF allows this
+      scenario without actual leverage creation, it's a protocol economic risk.
+    status: hypothesis
+    solidity: |
+      // INV-LT-W-05: all borrowed funds must be deployed as collateral
+      function invariant_leverageUp_noExtraction() public {
+          // collateral value after >= collateral value before + borrowed amount
+          // (no net extraction of borrowed capital to recipient)
+      }
+
+  - id: LT-W-06
+    title: "leverageDown: repayedAmount could theoretically exceed amount (impossible check)"
+    tier: 3
+    type: property
+    confidence: 40
+    description: >
+      LT-M-04 cross-validation: vault.repay() returns repayedAmount <= amount by design.
+      The code at line 184 checks `if (amount > repayedAmount)` before sending leftover.
+      If repayedAmount > amount (impossible per vault logic), this line would NOT send
+      leftover (condition false) and the extra tokens would be stuck in LeverageTransformer.
+      Worth verifying that vault.repay() truly never returns repayedAmount > amount.
+    affected_line: "LeverageTransformer.sol:180-185"
+    attack_scenario: >
+      Not a real attack. Theoretical: vault.repay() with interest accrual in same block
+      could cause repayedAmount to slightly exceed amount due to rounding? Check vault
+      repay implementation for rounding direction.
+    status: low_priority
+    solidity: |
+      // INV-LT-W-06: repayedAmount <= amount always (vault guarantee)
+      function invariant_repayedLeqAmount() public {
+          // vault.repay() contract: repayedAmount <= amount provided
+      }

@@ -1,0 +1,482 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: AccessHunter
+generated_at: '2026-03-23T07:00:00Z'
+invariants:
+- id: CLPM-AC-01
+  tier: 1
+  type: property
+  description: >
+    _mint() no valida ownership del caller — cualquiera puede mint una posición
+    con owner=ADDRESS_THIS, depositando tokens al PositionManager y luego extrayendo
+    tokens de otras posiciones del contract via TAKE/SWEEP en la misma batch.
+    En _handleAction, CL_MINT_POSITION acepta un `owner` arbitrario del calldata.
+    Si owner = address(this), la posición se mintea al contrato. Luego, como nadie
+    controla esa posición (no hay tokenId approval), los tokens en delta quedan
+    accesibles via SWEEP en la misma multicall batch. Esto podría permitir a un
+    atacante crear posiciones "huérfanas" en el contrato y luego sweepear tokens
+    ERC20 residuales del contrato.
+  attack_scenario: >
+    1. Atacante llama modifyLiquidities con batch: [MINT(owner=address(2)), SETTLE_PAIR, SWEEP].
+    2. _mapRecipient(ADDRESS_THIS) convierte owner a address(this).
+    3. La posición se mintea al CLPositionManager. El atacante pagó los tokens.
+    4. Los tokens ahora están en el vault como delta del CLPositionManager.
+    5. El atacante no puede controlar esa posición (necesita ser owner/approved del NFT).
+    6. PERO: si hay tokens residuales en el contrato de llamadas previas (ETH enviado,
+       tokens transferidos directamente), SWEEP los toma todos.
+    Impacto real: depende de si hay fondos residuales en el contrato. En operaciones
+    normales el contrato no debería retener fondos, pero en edge cases (reverts parciales
+    en multicall, ETH excedente) podría haberlos.
+  impact: "Extracción de fondos residuales del contrato. En el peor caso, tokens ERC20
+    o ETH que quedaron atrapados por operaciones previas."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Pre: enviar tokens al CLPositionManager directamente
+    // Luego: cualquier usuario llama SWEEP y se los lleva
+    uint256 balanceBefore = token.balanceOf(attacker);
+    // attacker calls modifyLiquidities with [SWEEP(token, attacker)]
+    uint256 balanceAfter = token.balanceOf(attacker);
+    // Si el contrato tenia fondos residuales, el atacante los tomó
+    t(balanceAfter <= balanceBefore, "CLPM-AC-01: attacker extracted residual funds via SWEEP");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    SWEEP no tiene restricción de caller — cualquiera puede llamar SWEEP dentro de
+    modifyLiquidities. Esto es BY DESIGN en Uniswap V4 — el contrato no debería
+    retener fondos. Pero es un vector si hay bugs en otras partes que dejan fondos.
+    Marcado con confianza baja porque es probablemente by-design.
+
+- id: CLPM-AC-02
+  tier: 1
+  type: property
+  description: >
+    modifyLiquiditiesWithoutLock no tiene checkDeadline — las transacciones no tienen
+    protección contra stale execution. A diferencia de modifyLiquidities que tiene
+    checkDeadline(deadline), modifyLiquiditiesWithoutLock no exige un deadline.
+    Un atacante podría retener la transacción en el mempool y ejecutarla cuando las
+    condiciones de mercado sean desfavorables para el usuario.
+  attack_scenario: >
+    1. Usuario llama modifyLiquiditiesWithoutLock para agregar liquidez a una posición.
+    2. El tx queda pendiente en el mempool por horas/días.
+    3. El precio se mueve significativamente.
+    4. Un MEV bot ejecuta el tx cuando es rentable extraer valor del usuario.
+    5. El usuario recibe una posición con LP tokens que valen menos de lo esperado.
+    Nota: las slippage checks (amount0Max/amount1Max) parcialmente mitigan esto,
+    pero no protegen contra cambios graduales del precio donde los límites de
+    slippage aún se cumplen pero el precio es peor que cuando el usuario creó la tx.
+  impact: "Pérdida parcial de fondos por ejecución en condiciones desfavorables. El
+    usuario obtiene menos valor del esperado por su liquidez."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // No hay assertion directa — es un missing feature, no un invariant breakable
+    // La verificación es: modifyLiquiditiesWithoutLock NO valida deadline
+    // Mientras modifyLiquidities SÍ lo hace
+    // Test: llamar modifyLiquiditiesWithoutLock con block.timestamp = deadline + 1000
+    // Resultado esperado: la tx pasa (no hay check), mientras modifyLiquidities revierte
+    bool success;
+    try positionManager.modifyLiquiditiesWithoutLock(actions, params) {
+        success = true;
+    } catch {
+        success = false;
+    }
+    t(!success, "CLPM-AC-02: modifyLiquiditiesWithoutLock should have deadline protection");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    modifyLiquiditiesWithoutLock está diseñada para ser llamada por contratos que ya
+    tienen el vault lock (por ej, hooks). En ese contexto, el hook/contrato que llama
+    podría implementar su propio deadline check. Pero la función es external y pública,
+    cualquier contrato puede llamarla directamente. La pregunta es: ¿hay un escenario
+    legítimo donde un contrato externo llama esto sin deadline? Si los hooks del pool
+    ya tienen deadline, podría ser by-design. Requiere investigación del contexto de uso.
+
+- id: CLPM-AC-03
+  tier: 1
+  type: property
+  description: >
+    TAKE action no tiene restricción de ownership — cualquier caller dentro de un batch
+    puede llamar TAKE para extraer credit del CLPositionManager en el vault.
+    En _handleAction, TAKE envía tokens a un recipient arbitrario usando el credit
+    (positive delta) del CLPositionManager. Si dentro de un batch un paso genera credit
+    (ej: decrease liquidity), los pasos siguientes pueden usar TAKE para enviar esos
+    tokens a cualquier dirección.
+    La protección es que decrease/burn ya requieren onlyIfApproved(msgSender(), tokenId).
+    Pero en el path modifyLiquidities, msgSender() es el locker (set por isNotLocked
+    a msg.sender). Todos los pasos del batch comparten el mismo msgSender.
+  attack_scenario: >
+    1. Escenario normal: usuario legítimo decrease + take en una batch. Correcto.
+    2. Escenario atacante: el atacante no puede decrease una posición ajena porque
+       onlyIfApproved revierte.
+    3. PERO: si el atacante obtiene approval via permit (front-running), puede
+       decrease la posición del victim y TAKE a su propia dirección.
+    4. El vector real aquí es si permit() puede ser front-runned para aprobar al atacante.
+    5. En ERC721Permit, permit() usa signature verification contra el owner, así que
+       el atacante necesita la firma del owner. Esto es seguro.
+    Conclusión: TAKE sin restricción de recipient es seguro PORQUE las acciones que
+    generan credit (decrease, burn) ya verifican ownership. No hay path para generar
+    credit sin ser owner/approved.
+  impact: "Potencial extracción de fondos si se encuentra un bypass en el ownership check."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: solo el owner/approved puede extraer valor de una posición
+    // Test: atacante intenta decrease posición ajena + take
+    address attacker = address(0xBEEF);
+    uint256 victimTokenId = 1; // posición del victim
+    // El atacante NO es owner ni approved
+    bool isApproved = positionManager._isApprovedOrOwner(attacker, victimTokenId);
+    t(!isApproved, "CLPM-AC-03: attacker should not be approved");
+    // Intentar decrease debería revertir con NotApproved
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 30
+  notes: >
+    Tras análisis, este invariante parece sostenerse correctamente. Las acciones que
+    generan credit (decrease, burn) siempre pasan por onlyIfApproved. TAKE solo puede
+    mover credit que ya existe. Marcado como bajo confidence de ser un bug real.
+    Lo mantengo como invariante de seguridad a verificar con fuzzing.
+
+- id: CLPM-AC-04
+  tier: 1
+  type: property
+  description: >
+    Multicall + delegatecall usa msg.sender directamente para subscribe/unsubscribe,
+    NO msgSender(). En CLNotifier, subscribe() y unsubscribe() usan el modifier
+    onlyIfApproved(msg.sender, tokenId) — con msg.sender literal. Pero cuando estas
+    funciones se llaman via multicall(), el delegatecall preserva msg.sender del caller
+    original. Esto es correcto. Sin embargo, hay una inconsistencia: las funciones
+    internas (_increase, _decrease, _burn) usan onlyIfApproved(msgSender(), tokenId)
+    donde msgSender() = _getLocker() = transient storage. Subscribe/unsubscribe usan
+    msg.sender directamente. Bajo multicall, msg.sender se preserva, pero bajo
+    modifyLiquidities (que va por vault.lock → lockAcquired), msg.sender sería el vault,
+    NO el usuario. Por eso subscribe/unsubscribe no se pueden llamar dentro de
+    modifyLiquidities.
+  attack_scenario: >
+    1. En el path normal: usuario llama subscribe() directamente o via multicall().
+       msg.sender = usuario. onlyIfApproved(msg.sender=usuario, tokenId) verifica
+       correctamente.
+    2. Si alguien intenta llamar subscribe() dentro de un batch modifyLiquidities:
+       NO HAY action code para subscribe en _handleAction. Subscribe no es un action.
+       Solo se puede llamar como función external directa o via multicall.
+    3. PERO: multicall usa delegatecall, que preserva msg.sender y msg.value.
+       Un usuario podría en multicall: [permit(...), subscribe(tokenId, maliciousSubscriber, data)].
+       El permit front-running es handled (try/catch en Permit2Forwarder).
+    Conclusión: la separación msg.sender vs msgSender() es intencional y segura,
+    pero la inconsistencia podría confundir a integradores.
+  impact: "Bajo impacto directo. Un subscriber malicioso podría griefar al owner
+    bloqueando operaciones que triggean notifyModifyLiquidity (ya que revierte si
+    el subscriber revierte). Pero el owner siempre puede unsubscribe."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que subscribe usa msg.sender correctamente
+    // Test: atacante (no owner) intenta subscribe a posición ajena
+    address attacker = address(0xBEEF);
+    address maliciousSubscriber = address(0xDEAD);
+    vm.prank(attacker);
+    try positionManager.subscribe(victimTokenId, maliciousSubscriber, "") {
+        t(false, "CLPM-AC-04: non-owner should not subscribe");
+    } catch {
+        // Expected: NotApproved revert
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 25
+  notes: >
+    Tras análisis, el diseño es seguro. msg.sender en subscribe/unsubscribe es
+    correcto para funciones que se llaman externalmente. La inconsistencia con
+    msgSender() en las acciones internas es by-design — las acciones internas
+    corren dentro del vault lock donde msg.sender es el vault.
+
+- id: CLPM-AC-05
+  tier: 1
+  type: property
+  description: >
+    initializePool es completamente permissionless — no valida caller ni parámetros
+    del PoolKey. Cualquiera puede inicializar cualquier pool con cualquier sqrtPriceX96.
+    Además, swallows all errors (try/catch que retorna type(int24).max en error).
+    Un atacante podría front-run la inicialización de un pool con un precio manipulado
+    (sqrtPriceX96 extremo), causando que el primer LP deposite a un ratio
+    desfavorable y pierda fondos.
+  attack_scenario: >
+    1. Proyecto legítimo quiere crear pool TOKEN/WETH con precio 1 TOKEN = 0.001 ETH.
+    2. Atacante ve la tx en mempool y front-runs con initializePool() usando
+       sqrtPriceX96 = MAX (precio extremadamente alto para TOKEN).
+    3. La pool se inicializa con precio manipulado.
+    4. El proyecto llama mint (que no re-inicializa porque la pool ya existe).
+    5. El LP del proyecto deposita a un ratio extremo: casi todo en un token.
+    6. El atacante hace un swap para arbitragear la posición.
+    Mitigación parcial: el LP tiene slippage checks (amount0Max/amount1Max) que
+    limitarían pérdidas. Pero si el LP no pone límites ajustados, pierde.
+  impact: "Pérdida de fondos para el primer LP que deposita en un pool front-runneado.
+    La magnitud depende de los slippage parameters que use el LP."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: initializePool no debería permitir front-running destructivo
+    // Test: comparar precio inicializado vs precio esperado
+    // Pre: atacante inicializa pool con precio extremo
+    uint160 maliciousSqrtPrice = TickMath.MAX_SQRT_RATIO - 1;
+    int24 tick = positionManager.initializePool(poolKey, maliciousSqrtPrice);
+    // Si retorna un tick válido (no type(int24).max), la pool se inicializó con precio extremo
+    t(tick == type(int24).max, "CLPM-AC-05: pool initialized with extreme price");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Este es un patrón conocido (pool initialization front-running). La mitigación
+    estándar es que modifyLiquidities agrupa initializePool + mint en una sola tx
+    atómica, de modo que si la pool ya está inicializada con precio incorrecto,
+    el mint falla por slippage. PancakeSwap parece diseñar esto así: initializePool
+    swallows errors (try/catch) para que si la pool ya existe, el flow continúe y
+    el mint subsecuente use el precio existente. Aún así, si el batch no incluye
+    slippage checks ajustados, el primer LP puede perder. La confianza es 65% porque
+    es un finding conocido y depende del comportamiento del integrador.
+
+- id: CLPM-AC-06
+  tier: 1
+  type: property
+  description: >
+    Subscriber malicioso puede DOS burn/decrease de una posición via revert en
+    notifyModifyLiquidity o notifyBurn. En _modifyLiquidity (línea 463), si
+    info.hasSubscriber(), se llama _notifyModifyLiquidity() que hace un external
+    call al subscriber. Si el subscriber revierte, la tx entera revierte
+    (bubbleUpAndRevertWith). En _burn (línea 396), _removeSubscriberAndNotifyBurn
+    también revierte si el subscriber revierte. El owner siempre puede unsubscribe
+    primero, pero _unsubscribe usa try/catch para notifyUnsubscribe (no puede
+    griefear). Entonces: subscriber malicioso puede bloquear decrease/burn HASTA
+    que el owner llame unsubscribe() primero. Esto es un griefing vector.
+  attack_scenario: >
+    1. Victim owner aprueba al atacante (o atacante obtiene approval legítimamente).
+    2. Atacante llama subscribe(tokenId, maliciousContract, "").
+    3. maliciousContract.notifyModifyLiquidity() siempre revierte.
+    4. Victim intenta decrease liquidity → revierte por subscriber.
+    5. Victim intenta burn → revierte por subscriber.
+    6. Victim PUEDE llamar unsubscribe() (usa try/catch, no griefeable) y luego
+       decrease/burn normalmente.
+    Impacto real: griefing temporal. El owner siempre puede resolver con unsubscribe.
+    Pero un usuario no técnico podría no saber esto.
+    Nota importante: subscribe requiere onlyIfApproved(msg.sender), así que el
+    atacante necesita ser owner o tener approval. Esto limita severamente el vector
+    — el atacante tendría que engañar al owner para que le dé approval.
+  impact: "Griefing temporal — el owner no puede decrease/burn hasta que unsubscribe.
+    Requiere que el atacante tenga approval, lo que limita el vector a phishing."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: subscriber malicioso bloquea decrease
+    // Pre: position con subscriber malicioso que revierte en notifyModifyLiquidity
+    // Intentar decrease debería revertir
+    try positionManager.modifyLiquidities(decreasePayload, deadline) {
+        t(false, "CLPM-AC-06: decrease should revert with malicious subscriber");
+    } catch {
+        // Expected
+    }
+    // Pero unsubscribe debería funcionar
+    positionManager.unsubscribe(tokenId);
+    // Y ahora decrease debería pasar
+    positionManager.modifyLiquidities(decreasePayload, deadline);
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    Este es un finding conocido en Uniswap V4 position manager. El diseño es
+    intencional: subscribers pueden revert en modify/burn pero NOT en unsubscribe.
+    Esto garantiza que el owner siempre puede escapar. Es más un QA/informational
+    que un bug real. El pre-requisito (attacker needs approval) hace esto muy
+    difícil de explotar en la práctica.
+
+- id: CLPM-AC-07
+  tier: 2
+  type: property
+  description: >
+    nextTokenId usa unchecked increment — overflow en uint256. Tras 2^256 mints,
+    nextTokenId vuelve a 0 y puede colisionar con tokenIds existentes, permitiendo
+    overwrite de positionInfo de posiciones existentes. En la práctica, 2^256 mints
+    es imposible (costaría más gas que la energía del sol), pero es un defecto
+    teórico.
+  attack_scenario: >
+    Teórico: si nextTokenId overflow a un tokenId existente, _mint() de ERC721
+    probablemente revierte (solmate revierte si _ownerOf[id] != 0). Pero si el
+    tokenId previo fue burned, _ownerOf[id] == 0 y la mint pasa. Entonces
+    positionInfo[tokenId] se sobreescribe con nueva info, pero los datos del pool
+    manager (position storage con salt = tokenId) podrían conflictuar.
+    Impacto: puramente teórico, imposible en práctica.
+  impact: "Nulo en práctica — 2^256 operaciones es infeasible."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Puramente teórico — no testeable con fuzzing
+    // Invariante: nextTokenId siempre > todos los tokenIds existentes
+    uint256 currentNext = positionManager.nextTokenId();
+    t(currentNext > 0, "CLPM-AC-07: nextTokenId should never be 0 after minting");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 10
+  notes: >
+    Defecto teórico sin impacto práctico. Incluido por completitud. Solmate ERC721
+    revierte en mint si _ownerOf[id] != address(0), así que incluso en overflow el
+    daño es limitado a tokenIds que fueron burned. No reportable.
+
+- id: CLPM-AC-08
+  tier: 1
+  type: property
+  description: >
+    transferFrom auto-unsubscribe sin notificar al nuevo owner — cuando un NFT con
+    subscriber se transfiere, _unsubscribe se llama automáticamente. Esto elimina
+    el subscriber sin que el nuevo owner lo sepa. El subscriber puede perder estado
+    importante (rewards tracking, etc). Además, transferFrom requiere
+    onlyIfVaultUnlocked, pero safeTransferFrom (de ERC721 base) podría NO tener
+    este modifier si no está overridden.
+  attack_scenario: >
+    1. Owner tiene posición con subscriber (ej: staking rewards tracker).
+    2. Owner transfiere posición a nuevo owner via transferFrom.
+    3. _unsubscribe se llama: subscriber pierde tracking, rewards podrían perderse.
+    4. Nuevo owner no sabe que la posición estaba subscribed y no re-subscribe.
+    Vector adicional: ¿safeTransferFrom está overridden? Si no, podría bypassear
+    el onlyIfVaultUnlocked y el auto-unsubscribe.
+  impact: "Pérdida de subscriber state (rewards tracking, etc) en transferencia.
+    Si safeTransferFrom no está overridden, podría bypassear restricciones."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Check: safeTransferFrom bypasses onlyIfVaultUnlocked and auto-unsubscribe
+    // Si solmate ERC721 tiene safeTransferFrom que llama transferFrom internamente,
+    // entonces está protegido. Verificar la implementación de solmate.
+    // Pre: position con subscriber, vault locked
+    bool hasSubBefore = positionManager.positionInfo(tokenId).hasSubscriber();
+    t(hasSubBefore, "CLPM-AC-08: position should have subscriber before transfer");
+    // Transfer via safeTransferFrom
+    positionManager.safeTransferFrom(owner, newOwner, tokenId);
+    bool hasSubAfter = positionManager.positionInfo(tokenId).hasSubscriber();
+    t(!hasSubAfter, "CLPM-AC-08: subscriber should be removed after transfer");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    En Solmate ERC721, safeTransferFrom llama transferFrom internamente, así que
+    el override de transferFrom en CLPositionManager SÍ aplica. Esto significa
+    que onlyIfVaultUnlocked y auto-unsubscribe se aplican a safeTransferFrom también.
+    Sin embargo, necesito verificar que Solmate no tiene un path alternativo que
+    bypass el override. Si Solmate's safeTransferFrom es: transferFrom(...) +
+    onERC721Received check, entonces está protegido. Confidence 55% porque necesita
+    verificación del código de Solmate.
+
+- id: CLPM-AC-09
+  tier: 1
+  type: property
+  description: >
+    _pay() usa permit2.transferFrom con uint160 cast — si amount > type(uint160).max
+    (que es ~1.46e48), el cast trunca silently. SafeCast se usa en otros lugares
+    pero NO en _pay(). Un token con supply > 2^160 podría causar un underflow en
+    la cantidad transferida: el usuario paga menos de lo que debería al vault,
+    creando un deficit.
+  attack_scenario: >
+    1. Token con supply > 2^160 (extremadamente improbable pero teóricamente posible).
+    2. Usuario llama modifyLiquidities para add liquidity con amount = 2^160 + 1.
+    3. _pay() castea a uint160: amount = 1 (truncado).
+    4. Solo 1 wei se transfiere al vault, pero el pool manager registra el delta completo.
+    5. El vault tiene un deficit de (2^160) tokens.
+    6. Cuando otros usuarios intentan withdraw, no hay suficientes tokens.
+    Impacto: draining del vault. Pero el pre-requisito (token con supply > 2^160) es
+    extremadamente improbable — ERC20 standard usa uint256 para balances pero en
+    práctica ningún token tiene supply cercana a 2^160.
+  impact: "Potencial draining del vault si se usa token con supply > 2^160."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: amount pasado a permit2.transferFrom no pierde precisión
+    uint256 largeAmount = uint256(type(uint160).max) + 1;
+    uint160 truncated = uint160(largeAmount);
+    t(truncated == largeAmount, "CLPM-AC-09: amount truncated in _pay()");
+    // Esto SIEMPRE falla para amounts > type(uint160).max
+    // La pregunta es si el sistema permite llegar aquí con esos amounts
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    Permit2 usa uint160 para amounts por diseño (Uniswap's allowance architecture).
+    Esto significa que tokens con amounts > 2^160 no son soportados por el sistema
+    permit2 en general, no solo por CLPositionManager. Es una limitación conocida
+    del ecosistema Permit2. Probablemente informational/by-design, pero vale
+    documentar como limitación del sistema.
+
+false_positives:
+- hunter: AccessHunter
+  id: CLPM-FP-01
+  reason: >
+    _mint() internal acepta owner arbitrario del calldata, pero esto es by-design.
+    El caller es quien paga los tokens (via SETTLE). El owner del NFT recibe la
+    posición pero no extrae valor — solo tiene el derecho a modificar/quemar la
+    posición después. El caller decide a quién asignar la posición, similar a
+    ERC721.mint(to). No hay explotación posible porque el que paga elige quién
+    recibe, que es el flujo estándar.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      En position managers estilo Uniswap V4, _mint con owner arbitrario es
+      by-design — el caller paga y elige a quién asignar el NFT. No es un
+      access control bug.
+    briefing_update_applied: false
+
+- hunter: AccessHunter
+  id: CLPM-FP-02
+  reason: >
+    TAKE/TAKE_PAIR sin restricción de recipient parece peligroso, pero es seguro
+    porque TAKE solo mueve CREDIT positivo del CLPositionManager en el vault.
+    El credit solo se genera por acciones que requieren onlyIfApproved (decrease,
+    burn). Un atacante sin approval no puede generar credit para luego TAKE-arlo.
+    El recipient arbitrario es by-design — el owner decide a dónde van sus tokens.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      TAKE sin restricción de recipient en position managers es seguro si todas
+      las acciones que generan credit (decrease, burn) verifican ownership. El
+      credit-generation step es el gate, no el TAKE step.
+    briefing_update_applied: false
+
+- hunter: AccessHunter
+  id: CLPM-FP-03
+  reason: >
+    Permit2Forwarder.permit() acepta cualquier owner parameter y no verifica que
+    msg.sender == owner. Esto parece un bug pero es by-design: la firma del owner
+    en el signature parameter es la verificación. Permit2 internamente verifica
+    que la firma corresponde al owner. El front-running de permits es handled por
+    try/catch (DOS resistance).
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Permit2Forwarder.permit() con owner arbitrario es by-design — la firma
+      criptográfica ES la verificación, no el msg.sender. El try/catch protege
+      contra front-running DOS.
+    briefing_update_applied: false

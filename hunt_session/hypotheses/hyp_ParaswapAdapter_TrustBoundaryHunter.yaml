@@ -1,0 +1,336 @@
+protocol: morpho-bundler3
+component: ParaswapAdapter
+file: src/adapters/ParaswapAdapter.sol
+domain: trust
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: PA-TB-01
+  tier: 1
+  type: property
+  description: >
+    srcToken == destToken causa underflow en balance delta calculations.
+    Si srcToken y destToken son la misma dirección, srcInitial == destInitial y
+    srcFinal == destFinal. Si Augustus devuelve net positive (recibe menos de lo que
+    devuelve vía routing), srcFinal > srcInitial → srcInitial - srcFinal hace underflow
+    en Solidity 0.8.28 → revert. Si Augustus toma net (recibe más), destFinal < destInitial
+    → destFinal - destInitial hace underflow → revert. El ÚNICO caso que no revierte es
+    cuando ambos deltas son exactamente 0 (noop). Esto significa que un swap mismo→mismo
+    token SIEMPRE revierte, lo cual podría no ser un bug (es un no-op inútil), PERO si un
+    bundle depende de esta llamada y un atacante fuerza srcToken==destToken via calldata
+    manipulation, el bundle entero revierte como griefing.
+  attack_scenario: >
+    Atacante construye un bundle malicioso donde sell() se llama con srcToken==destToken.
+    Si esto es parte de un multicall bundle en Bundler3, el revert propaga y bloquea toda
+    la operación. Impacto limitado porque el caller controla sus propios params, pero si
+    hay un integrador que construye bundles con params derivados de input externo (e.g., un
+    frontend que toma token addresses de un API), un atacante podría forzar el revert.
+  impact: "DoS del bundle. No hay pérdida directa de fondos, pero sí griefing potencial."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // No se puede testear como invariante stateful fácilmente.
+    // Test unitario: llamar sell() con srcToken == destToken, verificar que revierte.
+    // Si NO revierte, hay un problema de accounting más grave.
+    // vm.expectRevert(); // underflow
+    // adapter.sell(augustus, callData, tokenA, tokenA, false, offsets, receiver);
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: >
+    Investigado: Solidity 0.8.28 tiene overflow checks nativos. L191 srcInitial - srcFinal
+    revertirá con underflow si srcFinal > srcInitial (net gain en src). L192 destFinal - destInitial
+    revertirá si destFinal < destInitial (net loss en dest). Cuando src==dest, solo una de las
+    dos condiciones puede ser true al mismo tiempo, así que siempre revierte salvo delta=0.
+    Severidad real: Info/Low — es más una rareza que un ataque explotable.
+
+- id: PA-TB-02
+  tier: 1
+  type: property
+  description: >
+    Reentrancy via ERC777 tokensReceived durante la ventana de approval máxima.
+    En swap() L181-186, hay una ventana donde Augustus tiene approval type(uint256).max
+    sobre srcToken del adapter. Si srcToken es ERC777, el transfer dentro de Augustus
+    dispara tokensReceived() en el receptor, que podría re-entrar al adapter (vía Bundler3)
+    y ejecutar otra operación que asuma un balance diferente. Sin embargo, onlyBundler3
+    restringe el entry point, y Bundler3 tiene su propio reentrancy guard (initiator != 0
+    durante bundle execution). Hay que verificar si Bundler3.reenter() permite nested calls.
+  attack_scenario: >
+    1. Atacante crea un bundle con sell() que usa un srcToken ERC777.
+    2. Augustus ejecuta transferFrom del token ERC777 desde el adapter.
+    3. El hook tokensReceived() en el receptor del transfer re-entra Bundler3 via reenter().
+    4. En la re-entrada, ejecuta otra sell() o erc20Transfer() que lee balances del adapter
+       que aún no se han actualizado (srcFinal/destFinal aún no medidos).
+    5. Podría extraer tokens extra del adapter porque la primera swap aún no verificó slippage.
+    PERO: Bundler3 necesita tener reenter habilitado, y la re-entrada pasa por onlyBundler3.
+    Si Bundler3 bloquea nested reenter durante un callback, esto está mitigado.
+  impact: "Potencial drenaje de tokens del adapter si reenter() permite nesting durante ERC777 callback."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar: durante augustus.call(), ¿se puede re-entrar al adapter vía Bundler3?
+    // Ghost: track si estamos en medio de un swap
+    // bool internal ghost_swapInProgress;
+    // Invariante: si ghost_swapInProgress == true, ninguna otra función del adapter debería ejecutar
+    // t(!ghost_swapInProgress, "PA-TB-02: reentrancy durante swap detectada");
+  ghost_vars:
+  - "bool internal ghost_swapInProgress;"
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    Confianza baja porque depende de: (a) srcToken ser ERC777 (raro en DeFi mainstream),
+    (b) Bundler3 permitir reenter() durante un callback, (c) el hook poder llegar al adapter.
+    Necesita investigar Bundler3.reenter() para confirmar o descartar. Si Bundler3 tiene
+    reentrancy lock, esto es un false positive. El Solodit finding LOW mencionaba que sell/buy
+    no tienen onlyBundler3 directo, pero swap() sí lo tiene internamente — no cambia esta hipótesis.
+
+- id: PA-TB-03
+  tier: 1
+  type: property
+  description: >
+    Offsets solapados en callData permiten manipular slippage checks.
+    updateAmounts() primero escribe en offsets.exactAmount (L240), luego lee
+    offsets.limitAmount (L242) para escalar proporcionalmente. Si exactAmount y limitAmount
+    apuntan al mismo offset, la lectura de limitAmount ya está contaminada con el valor
+    de exactAmount recién escrito. Esto rompe la escala proporcional y puede resultar en
+    un limitAmount manipulado (mucho más alto o más bajo de lo esperado), eliminando
+    la protección de slippage del usuario.
+  attack_scenario: >
+    1. Atacante (o frontend comprometido) construye offsets donde exactAmount == limitAmount.
+    2. En sell(): updateAmounts escribe newSrcAmount en offset X (exactAmount).
+    3. Luego lee offset X como limitAmount — ahora limitAmount == newSrcAmount.
+    4. mulDiv(newSrcAmount, newSrcAmount, oldExactAmount) = newSrcAmount^2/oldExactAmount.
+    5. Si newSrcAmount > oldExactAmount, el limitAmount resultante es MUCHO mayor que el
+       intended → swap ejecuta con slippage protection inflada artificialmente.
+    6. Si newSrcAmount < oldExactAmount, limitAmount resultante es MUCHO menor →
+       el usuario acepta un swap con peor ratio sin saberlo.
+    Impacto real: El swap resultante tendría una minDestAmount incorrecta, permitiendo que
+    Augustus ejecute el swap a un precio mucho peor del que el usuario especificó.
+  impact: "Pérdida de fondos del usuario por slippage no protegida en el swap — Augustus puede ejecutar a precio arbitrariamente malo."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Test: llamar sell() con offsets.exactAmount == offsets.limitAmount
+    // Verificar que el minDestAmount resultante es incorrecto
+    // uint256 oldExact = 1000e18;
+    // uint256 newExact = 500e18;
+    // Si offsets solapan: limitAmount = 500e18 * 500e18 / 1000e18 = 250e18
+    // Pero el limitAmount ORIGINAL era 1000e18 (mismo que exact) → debería ser 500e18
+    // El usuario pierde 50% de protección de slippage
+    //
+    // Invariante stateful difícil — mejor como test unitario:
+    // require(offsets.exactAmount != offsets.limitAmount, "offsets overlap");
+    // require(offsets.exactAmount != offsets.quotedAmount, "offsets overlap");
+    // require(offsets.limitAmount != offsets.quotedAmount || offsets.quotedAmount == 0, "offsets overlap");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    El contrato NO valida que los offsets sean distintos. updateAmounts() asume que son
+    independientes. Si el caller (Bundler3 initiator) pasa offsets solapados, el resultado
+    es slippage protection corrompida. Pregunta clave: ¿quién controla los offsets?
+    El initiator del bundle (usuario o integrador). Si es el propio usuario, se jode a sí
+    mismo (no es un ataque contra otros). Pero si un frontend/relayer construye estos params,
+    un frontend comprometido podría manipular offsets para robar al usuario.
+    TAMBIÉN: offsets.quotedAmount == offsets.exactAmount tendría el mismo problema.
+
+- id: PA-TB-04
+  tier: 2
+  type: property
+  description: >
+    Augustus call con callData arbitrario permite al caller ejecutar cualquier función
+    del contrato Augustus con approval max del adapter. El adapter valida que augustus
+    está en el registry, pero NO valida qué función del Augustus se llama. Si Augustus
+    tiene funciones que permiten transferir tokens aprobados a direcciones arbitrarias
+    (e.g., un transferFrom genérico expuesto), el caller podría drenar tokens del adapter
+    más allá de lo necesario para el swap.
+  attack_scenario: >
+    1. Adapter tiene tokens de un bundle anterior (residuales o de otro paso del bundle).
+    2. Caller construye callData que llama una función de Augustus que NO es swap sino
+       transferFrom(adapter, attacker, fullBalance).
+    3. Augustus está en el registry (es legítimo) pero tiene una función permisiva.
+    4. El adapter da approval max, Augustus transfiere todos los tokens.
+    5. Post-call: srcFinal == 0, srcAmount == srcInitial → si maxSrcAmount >= srcInitial,
+       el check pasa. destAmount podría ser 0 → revierte por minDestAmount != 0.
+    MITIGACIÓN: El check minDestAmount != 0 y destAmount >= minDestAmount protege contra
+    este ataque siempre que el atacante no pueda también enviar destTokens al adapter.
+    Si el atacante envía 1 wei de destToken al adapter DURANTE la call de Augustus, destAmount
+    sería 1 — pero aún necesita >= minDestAmount (que el usuario definió).
+  impact: "Drenaje de srcTokens del adapter limitado por el check de minDestAmount del destToken."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: tras swap(), la cantidad de srcToken gastada debe corresponder
+    // a un swap legítimo (no a un transferFrom directo).
+    // Difícil de testear on-chain — es más un análisis de la superficie de Augustus.
+    // El adapter confía en que Augustus solo gastará lo necesario para el swap,
+    // pero la protección real viene de los balance checks post-call.
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    La protección real del adapter es robusta: mide balances antes/después y aplica checks.
+    El callData arbitrario es necesario por diseño (ruteo flexible de Paraswap). El riesgo
+    real depende de la superficie de ataque de Augustus, que es un contrato externo de
+    Paraswap controlado por ellos. Si Augustus es seguro, esto no es explotable.
+    Si Augustus tiene bugs, el adapter es un proxy para explotarlos.
+    Clasifico como Tier 2 porque depende de un supuesto externo (Augustus inseguro).
+
+- id: PA-TB-05
+  tier: 1
+  type: property
+  description: >
+    Fee-on-transfer token como destToken causa que receiver reciba menos de minDestAmount.
+    En swap() L192: destAmount = destFinal - destInitial. Si destToken es fee-on-transfer,
+    el safeTransfer en L198 transfiere destAmount pero el receiver recibe destAmount - fee.
+    El check minDestAmount ya pasó (L195), pero el receiver efectivamente recibe menos.
+    El adapter cumple su invariante (envía destAmount) pero el usuario final pierde fondos.
+  attack_scenario: >
+    1. Usuario hace sell() con destToken = token con 2% fee on transfer.
+    2. Augustus envía 100 tokens al adapter. destAmount = 100 (correcto en el adapter).
+    3. minDestAmount = 98, check pasa (100 >= 98).
+    4. Adapter transfiere 100 al receiver, pero fee-on-transfer cobra 2% → receiver recibe 98.
+    5. Si el usuario configuró minDestAmount = 98 pensando que recibiría ≥98, recibe exacto 98.
+    6. Pero si configuró minDestAmount = 100 esperando recibir 100, el check pasa pero recibe 98.
+    7. Espera: el check es destAmount >= minDestAmount donde destAmount=100 y minDest=100 → pasa.
+       Pero el receiver solo recibe 98. El slippage check protege al adapter, no al receiver.
+  impact: "Pérdida de fondos del receiver equivalente a la fee del token — el slippage check del adapter no protege contra fees de transferencia en el leg final."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: usar un mock FoT token como destToken
+    // Verificar que el receiver recibe menos de minDestAmount
+    // a pesar de que el check en swap() pasa
+    //
+    // uint256 receiverBefore = IERC20(destToken).balanceOf(receiver);
+    // adapter.sell(...);
+    // uint256 receiverAfter = IERC20(destToken).balanceOf(receiver);
+    // uint256 receiverGot = receiverAfter - receiverBefore;
+    // t(receiverGot >= minDestAmount, "PA-TB-05: receiver got less than minDestAmount");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    Este es un patrón conocido en DeFi. La pregunta es si Morpho/Bundler3 explícitamente
+    excluye FoT tokens del scope. Si el bounty dice "standard ERC20 only", es Info.
+    Si no hay exclusión explícita, es Medium porque hay pérdida de fondos verificable.
+    Verificar los docs de Morpho para la lista de tokens soportados.
+
+- id: PA-TB-06
+  tier: 2
+  type: property
+  description: >
+    updateAmounts() revierte con division by zero si oldExactAmount en callData es 0.
+    L239 lee oldExactAmount = callData.get(offsets.exactAmount). Si el valor en callData
+    en ese offset es 0, L242 mulDiv(limitAmount, exactAmount, 0) revierte.
+    Esto es un DoS si un integrador construye callData malformado.
+  attack_scenario: >
+    1. Frontend comprometido envía callData con valor 0 en el offset exactAmount.
+    2. sell() con sellEntireBalance=true llama updateAmounts().
+    3. oldExactAmount = 0, mulDiv revierte → todo el bundle revierte.
+    Impacto: DoS del bundle del usuario. No hay pérdida de fondos directa.
+    El usuario puede reintentar con callData correcto.
+  impact: "DoS — revert del bundle si callData tiene valor 0 en exactAmount offset."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test unitario:
+    // Crear callData con valor 0 en offsets.exactAmount
+    // Llamar sell() con sellEntireBalance=true
+    // Esperar revert por division by zero en mulDiv
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    mulDiv de OpenZeppelin revierte explícitamente con division by zero.
+    Es input validation faltante — el contrato debería validar oldExactAmount != 0
+    o manejar el caso. Pero como el caller controla sus propios params, el impacto es
+    self-DoS. Tier 2 porque no afecta a terceros.
+
+- id: PA-TB-07
+  tier: 1
+  type: property
+  description: >
+    Augustus registry compromise: AUGUSTUS_REGISTRY es immutable, pero el contrato de
+    registry de Paraswap es externo y mutable (Paraswap puede agregar/remover Augustus
+    contracts). Si Paraswap es comprometido o actúa maliciosamente, puede registrar un
+    contrato Augustus malicioso que pasa isValidAugustus() y drena tokens del adapter.
+    El adapter confía COMPLETAMENTE en el registry para validar Augustus.
+  attack_scenario: >
+    1. Paraswap (o un atacante que compromete la clave de admin de Paraswap) registra
+       un contrato malicioso en AugustusRegistry.
+    2. Atacante llama sell() con el Augustus malicioso.
+    3. isValidAugustus() retorna true.
+    4. Adapter da approval max al contrato malicioso.
+    5. Contrato malicioso transfiere todos los srcTokens y devuelve destTokens falsos.
+    6. Si destToken es un token controlado por el atacante, puede enviar destAmount necesario.
+    PERO: Los balance checks protegen parcialmente — el atacante necesita que destAmount >=
+    minDestAmount, lo que significa que necesita enviar tokens reales de destToken al adapter.
+  impact: "Trust dependency en Paraswap — si registry es comprometido, cualquier swap vía este adapter es vulnerable."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // No es un invariante testeable en fuzzing.
+    // Es un análisis de trust model: ¿el protocolo documenta la dependencia en Paraswap?
+    // ¿Hay un mecanismo para pausar el adapter si Augustus registry es comprometido?
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    Este es un riesgo de trust boundary fundamental. El adapter confía en un contrato externo
+    (AugustusRegistry) controlado por Paraswap. Si Paraswap es comprometido, el adapter es
+    vulnerable. Sin embargo, esto es "by design" — el adapter NECESITA confiar en alguien
+    para validar Augustus. La pregunta es si hay mitigaciones adicionales (pausability,
+    time-lock en registry updates, etc.) que Paraswap tenga. Probablemente Info/Low
+    en un bounty porque es trust assumption documentada.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: PA-FP-01
+  reason: >
+    sell() y buy() no tienen onlyBundler3 directamente, pero llaman a swap() que SÍ tiene
+    onlyBundler3. Esto fue reportado como LOW en Solodit para una versión anterior, pero en
+    la versión actual el check está presente en swap() que es la única función que ejecuta
+    la lógica crítica (approve + call + transfer). Las funciones sell/buy sin el modifier
+    solo hacen updateAmounts (pure) y luego llaman swap. No hay bypass posible.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      ParaswapAdapter sell/buy sin onlyBundler3 directo pero swap() interno sí lo tiene.
+      No es bypass — la Solodit finding LOW fue para versión previa o es un code style issue,
+      no un bug funcional.
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: PA-FP-02
+  reason: >
+    receive() payable heredado de CoreAdapter — si Augustus envía ETH al adapter durante
+    un swap, el ETH queda atrapado. Pero esto NO es un bug del adapter: (a) los tokens del
+    adapter son transitorios (se envían/reciben dentro de un bundle), (b) CoreAdapter tiene
+    nativeTransfer() para extraer ETH, (c) el initiator del bundle puede incluir un paso
+    para transferir ETH restante. Es by design como "catch-all" para wrapping/unwrapping
+    de WETH durante bundles.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      receive() payable en CoreAdapter no es un bug — es necesario para WETH unwrapping
+      durante bundles. ETH residual puede recuperarse con nativeTransfer().
+    briefing_update_applied: false

@@ -1,0 +1,407 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: OracleHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: BPM-O-01
+  tier: 1
+  type: property
+  description: "idSlippage check sufre underflow silencioso cuando activeIdDesired < idSlippage, permitiendo bypass total de la proteccion de sandwich"
+  attack_scenario: >
+    Un usuario pasa activeIdDesired=0, idSlippage=5. La segunda condicion (linea 276)
+    calcula activeIdDesired - idSlippage = 0 - 5, que en uint256 produce un underflow
+    masivo (type(uint256).max - 4). Eso significa que la condicion
+    'activeIdDesired - idSlippage > activeId' NUNCA se cumple (ya que el resultado del
+    underflow wrappea a un valor enorme... pero espera, en Solidity 0.8.26 esto revertea
+    con panic). Sin embargo, si activeIdDesired=5 e idSlippage=5, entonces
+    activeIdDesired - idSlippage = 0, y cualquier activeId >= 0 pasa. La primera condicion
+    activeIdDesired + idSlippage = 10, asi que activeId <= 10 pasa. Esto es correcto.
+    PERO: si un atacante front-runs con un swap que mueve activeId DENTRO del rango de
+    slippage pero a un bin desfavorable, la liquidez se deposita en bins desplazados.
+    El usuario pierde valor porque deposito en bins que ya no son el active bin correcto.
+    Impacto: LP deposita en bins off-center, perdiendo hasta el spread completo del rango.
+  impact: "LP funds deposited in suboptimal bins after sandwich, losing value proportional to bin step * number of bins displaced"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track that idSlippage actually protects: bins used match what user intended
+    (uint24 activeIdBefore,,) = binPoolManager.getSlot0(poolKey.toId());
+    // Execute addLiquidity...
+    (uint24 activeIdAfter,,) = binPoolManager.getSlot0(poolKey.toId());
+    // The activeId should not have moved MORE than idSlippage during the tx
+    uint256 drift = activeIdAfter > activeIdBefore
+        ? uint256(activeIdAfter - activeIdBefore)
+        : uint256(activeIdBefore - activeIdAfter);
+    lte(drift, idSlippage, "BPM-O-01: activeId moved beyond slippage during add");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    El check de slippage se hace ANTES de binPoolManager.mint(). Pero mint() llama
+    hooks (beforeMint), que pueden ejecutar swaps que mueven el activeId DESPUES del
+    check. El comentario en linea 254-255 lo reconoce explicitamente: "If user mint to
+    activeId and there was a swap in hook.beforeMint() which changes the activeId, user
+    txn will fail". Pero esto asume que el hook es honesto. Si el hook es trusted (segun
+    las instrucciones), el riesgo real es un front-run EXTERNO antes de que la tx entre,
+    no el hook. La proteccion de idSlippage cubre ese caso. Confidence baja porque
+    la proteccion funciona para front-runs externos; el unico gap es el hook path
+    (que es trusted). POSIBLE FALSE POSITIVE.
+
+- id: BPM-O-02
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock carece de deadline check, permitiendo ejecucion con precio stale"
+  attack_scenario: >
+    modifyLiquiditiesWithoutLock() no tiene el modifier checkDeadline(). Un tx que usa
+    esta funcion puede quedarse en el mempool indefinidamente y ejecutarse cuando el
+    activeId (precio) haya cambiado drasticamente. El usuario deposita liquidez a un
+    precio completamente distinto del esperado. Aunque amountMax ofrece proteccion
+    parcial, NO protege contra depositar en bins desplazados cuando el activeId cambia.
+    Escenario: usuario envia tx para depositar en bin 8388600 con idSlippage=2. Tx queda
+    pendiente 1 hora. El precio se mueve a bin 8388598 (dentro del slippage). La tx se
+    ejecuta, pero la liquidez ahora esta concentrada en bins que estan off-center respecto
+    al nuevo precio real. El usuario pierde impermanent loss adicional.
+  impact: "LP deposits liquidity at stale price, suffering additional IL from bins being off-center vs current market price"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariant: modifyLiquiditiesWithoutLock should enforce some time constraint
+    // This is a design-level check -- verify that callers always set their own deadline
+    // In a property test, we check that stale execution causes value loss:
+    uint256 snapshotActiveId = uint256(activeId);
+    // warp forward significantly
+    // re-read activeId
+    (uint24 newActiveId,,) = binPoolManager.getSlot0(poolKey.toId());
+    uint256 drift = newActiveId > snapshotActiveId
+        ? uint256(newActiveId - snapshotActiveId)
+        : uint256(snapshotActiveId - newActiveId);
+    // If drift > 0, the user's position is suboptimal
+    eq(drift, 0, "BPM-O-02: stale execution with price drift");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    modifyLiquiditiesWithoutLock es la funcion que se llama cuando el vault ya tiene
+    el lock (es decir, dentro de un lock callback). En ese caso, la tx ya esta en
+    ejecucion, asi que el deadline del lock exterior aplicaria. Pero si un contrato
+    externo integra llamando directamente modifyLiquiditiesWithoutLock sin su propio
+    deadline check, la proteccion se pierde. La pregunta es si esto es responsabilidad
+    del integrador o del PositionManager. En Uniswap v4, el patron es identico --
+    modifyLiquiditiesWithoutLock no tiene deadline. Probablemente by design. Confidence
+    media-baja.
+
+- id: BPM-O-03
+  tier: 1
+  type: property
+  description: "Sandwich attack en addLiquidity: activeId se lee antes de mint pero bins se calculan con ese activeId, permitiendo que un swap front-run desplace la liquidez a bins suboptimos dentro del slippage permitido"
+  attack_scenario: >
+    1. Victima envia addLiquidity con activeIdDesired=100, idSlippage=3, deltaIds=[-1,0,1]
+    2. Atacante front-runs con swap que mueve activeId de 100 a 102
+    3. El slippage check pasa: 100+3=103 >= 102 y 100-3=97 <= 102
+    4. Pero los bins se calculan como: 102+(-1)=101, 102+0=102, 102+1=103
+    5. El usuario queria depositar en bins [99,100,101] pero deposito en [101,102,103]
+    6. Atacante back-runs con swap inverso, moviendo activeId de vuelta a 100
+    7. Ahora la liquidez del usuario esta en bins [101,102,103] que estan ARRIBA del
+       active bin, conteniendo solo token Y (sin token X)
+    8. El usuario sufre IL inmediata equivalente a la diferencia de precio entre los
+       bins originales y los desplazados, multiplicado por su deposit size
+  impact: "LP loses value proportional to binStep * displacement * depositAmount. With binStep=10 (0.1%) and 2-bin displacement, ~0.2% immediate loss on deposit"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Ghost: track the bins where liquidity was ACTUALLY deposited vs INTENDED
+    // After addLiquidity, for each deltaId:
+    //   intended_bin = activeIdDesired + deltaIds[i]
+    //   actual_bin = activeId_at_execution + deltaIds[i]
+    // These should be equal
+    for (uint256 i = 0; i < deltaIds.length; i++) {
+        int256 intendedBin = int256(activeIdDesired) + deltaIds[i];
+        int256 actualBin = int256(uint256(activeId)) + deltaIds[i];
+        eq(uint256(intendedBin), uint256(actualBin), "BPM-O-03: bins displaced by sandwich");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Este es el trade-off fundamental del idSlippage: cuanto mayor el slippage, mas
+    facil es para un atacante desplazar la liquidez. El usuario DEBE poner idSlippage=0
+    para proteccion total, pero eso hace que la tx falle con cualquier movimiento de
+    precio natural. La pregunta es: es esto un bug o un trade-off inherente al diseno?
+    En Trader Joe v2, el mismo patron existe. Sin embargo, la falta de un mecanismo
+    alternativo (como usar el activeIdDesired para calcular bins EN VEZ del activeId
+    real) hace que el riesgo sea real. Confidence alta porque el ataque es viable, pero
+    podria considerarse "known limitation" del modelo de bin AMM.
+
+- id: BPM-O-04
+  tier: 2
+  type: property
+  description: "initializePool silently swallows all errors via try-catch, permitiendo que un pool se 'inicialice' sin que realmente se cree, y subsecuentes operaciones fallen con errores confusos"
+  attack_scenario: >
+    Un atacante front-runs la inicializacion de un pool con un activeId extremo (0 o
+    2^24-1). El usuario legitimo llama initializePool con un activeId razonable, pero
+    como el pool ya existe, la llamada silenciosamente no hace nada (catch vacio).
+    El usuario cree que el pool esta inicializado con su activeId deseado pero el pool
+    tiene el activeId del atacante. Cuando el usuario deposita liquidez, los bins se
+    calculan relativos al activeId del atacante, no al esperado. Esto puede causar que
+    toda la liquidez se deposite en un solo lado (solo token X o solo token Y),
+    resultando en perdida de valor instantanea si el precio real difiere del activeId
+    del atacante.
+  impact: "First LP deposits 100% of one token at an incorrect price point, losing up to 100% of deposit if activeId is extremely skewed"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After initializePool, verify the pool's activeId matches what was requested
+    (uint24 actualActiveId,,) = binPoolManager.getSlot0(poolKey.toId());
+    eq(uint256(actualActiveId), uint256(requestedActiveId), "BPM-O-04: pool activeId mismatch after init");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    El try-catch en initializePool (linea 123) traga TODOS los errores, incluyendo
+    "pool ya existe". Si un atacante inicializa el pool primero con un activeId
+    malicioso, el usuario no recibe ninguna indicacion de que su inicializacion fallo.
+    El comentario dice que "follow-up action will still revert" pero eso es parcialmente
+    falso: addLiquidity NO revertea si el pool existe con un activeId distinto -- solo
+    chequea slippage. Si el usuario confio en que SU activeId seria el del pool, puede
+    tener un idSlippage lo suficientemente ancho para aceptar el activeId del atacante.
+    Relevancia oracle: el activeId ES el precio en bin pools. Controlar el activeId
+    inicial = controlar el precio de referencia.
+
+- id: BPM-O-05
+  tier: 1
+  type: property
+  description: "No hay slippage check en removeLiquidity sobre el activeId -- un swap que mueve el precio justo antes de un burn cambia la composicion de tokens recibidos"
+  attack_scenario: >
+    1. LP tiene liquidez en bins [98,99,100,101,102] con activeId=100
+    2. Al active bin (100), la liquidez tiene una mezcla de tokenX y tokenY
+    3. Atacante front-runs removeLiquidity con un swap que mueve activeId a 98
+    4. Ahora bins [98] tiene mezcla, [99,100,101,102] tienen solo tokenX
+    5. LP recibe principalmente tokenX en vez de la mezcla equilibrada que esperaba
+    6. Atacante back-runs con swap inverso, comprando tokenX barato
+    7. LP recibio mas del token que esta perdiendo valor (tokenX depreciandose)
+    La proteccion amount0Min/amount1Min ayuda con el MONTO total pero no con la
+    COMPOSICION. Un LP puede recibir la misma cantidad total de valor nominal pero
+    en la peor composicion posible.
+  impact: "LP receives unfavorable token composition on withdrawal, losing value when the overrepresented token depreciates post-withdrawal"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track composition before and after sandwich
+    // If activeId moved significantly during a remove, the composition changed
+    (uint24 activeIdBefore,,) = binPoolManager.getSlot0(poolKey.toId());
+    // ... removeLiquidity happens ...
+    (uint24 activeIdAfter,,) = binPoolManager.getSlot0(poolKey.toId());
+    // activeId should not have moved during the remove (it shouldn't, since burn doesn't swap)
+    // but a front-run swap CAN move it before the burn
+    eq(uint256(activeIdBefore), uint256(activeIdAfter), "BPM-O-05: activeId shifted during remove");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    removeLiquidity tiene amount0Min/amount1Min que protegen contra slippage de MONTO.
+    Pero no protegen contra manipulacion de composicion. Sin embargo, en la practica,
+    si el LP pone amount0Min y amount1Min que reflejen la composicion esperada, el ataque
+    se mitiga. El riesgo es real solo si el LP pone minimums vagos (e.g., amount0Min=0).
+    Esto es un problema de UX mas que de codigo. Confidence media.
+
+- id: BPM-O-06
+  tier: 1
+  type: property
+  description: "Liquidez depositada en bin 0 (binId=0) es irrecuperable porque _positions[tokenId].binId == 0 se confunde con posicion no existente"
+  attack_scenario: >
+    1. Pool inicializado con activeId cerca de 0
+    2. Usuario deposita liquidez con deltaIds que resultan en binId = 0
+    3. En _addLiquidity linea 308: if (_positions[tokenId].binId == 0) se cumple siempre
+       para bin 0, asi que la posicion se re-escribe en cada mint, pero esto es en
+       realidad correcto porque binId=0 es el valor real
+    4. PERO: en positions() (linea 109), el check PoolId.unwrap(position.poolId) == 0
+       usa el poolId, no el binId. Si el poolId de un pool real es 0 (que es posible
+       si keccak256 de los parametros produce 0, astronomicamente improbable), la
+       posicion se reportaria como invalida
+    5. Mas relevante: el tokenId = keccak256(poolId, 0). Si _positions[tokenId] ya
+       existe de un pool DIFERENTE que tambien tiene bin 0, la posicion NO se
+       sobreescribe (linea 308: solo escribe si binId == 0). WAIT: se sobreescribe
+       SIEMPRE que binId == 0, lo cual es cada vez para bin 0. Esto es correcto.
+    Sin embargo, el check real es: si un tokenId colisiona entre dos pools (hash
+    collision de keccak256(poolId1, binId1) == keccak256(poolId2, binId2)), las
+    posiciones se mezclan. Esto es astronomicamente improbable (keccak256 collision).
+  impact: "Theoretical: if hash collision occurs, two different pool positions share the same tokenId, mixing liquidity claims"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After depositing to bin 0, verify the position is retrievable
+    uint256 tokenId = poolId.toTokenId(0);
+    (PoolKey memory key, uint24 binId) = positionManager.positions(tokenId);
+    eq(uint256(binId), 0, "BPM-O-06: bin 0 position lost");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    Investigado y es probablemente un false positive. El binId=0 no causa confusiones
+    porque el check en positions() usa poolId, no binId, para determinar si la posicion
+    existe. La condicion _positions[tokenId].binId == 0 en addLiquidity es para
+    first-time writes, y para bin 0 se re-escribe con los mismos datos, lo cual es
+    benigno. Mantengo la hipotesis para completitud pero confidence muy baja.
+
+- id: BPM-O-07
+  tier: 1
+  type: property
+  description: "activeId leido de slot0 ANTES del mint puede diferir del activeId DURANTE el mint si el hook beforeMint ejecuta swaps, causando que los bins calculados en liquidityConfigs no correspondan al precio real al momento de la provision"
+  attack_scenario: >
+    1. BinPositionManager lee activeId=100 en linea 272
+    2. Calcula liquidityConfigs con bins basados en activeId=100 (e.g., [99,100,101])
+    3. Pasa estas configs a binPoolManager.mint()
+    4. Dentro de mint(), el hook beforeMint() ejecuta un swap que mueve activeId a 105
+    5. La liquidez se deposita en bins [99,100,101] pero el activeId real ahora es 105
+    6. Los bins [99,100,101] estan todos DEBAJO del activeId, conteniendo solo tokenY
+    7. El usuario deposito 100% tokenY en vez de una mezcla balanceada
+    8. El usuario pierde valor si tokenY se deprecia
+    NOTA: Las instrucciones dicen que hooks son FULLY TRUSTED. Pero este escenario
+    puede ocurrir con un hook HONESTO que tiene un beforeMint que rebalances o interacts
+    with external protocols, causando un swap como side-effect no malicioso.
+  impact: "All deposited liquidity ends up single-sided due to activeId shift during hook execution, causing immediate IL"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Read activeId BEFORE and AFTER mint to detect hook-induced drift
+    (uint24 activeIdPre,,) = binPoolManager.getSlot0(poolKey.toId());
+    // ... mint happens ...
+    (uint24 activeIdPost,,) = binPoolManager.getSlot0(poolKey.toId());
+    uint256 drift = activeIdPost > activeIdPre
+        ? uint256(activeIdPost - activeIdPre)
+        : uint256(activeIdPre - activeIdPost);
+    // If hook moved the price, the bins are wrong
+    eq(drift, 0, "BPM-O-07: hook moved activeId during mint");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    El codigo ya reconoce este riesgo en el comentario linea 254-255. La mitigacion es
+    que el idSlippage check ocurre ANTES del mint, asi que si el hook mueve el activeId
+    fuera del rango, deberia fallar... pero NO falla, porque el check ya paso. El check
+    de slippage esta en el lugar equivocado (antes del mint en vez de despues). Sin
+    embargo, hooks son trusted por diseno. Si un hook es malicioso, el pool no deberia
+    usarse. Para hooks honestos con side-effects, el riesgo es bajo pero no cero.
+    Como hooks son FULLY TRUSTED segun instrucciones, este finding tiene utilidad
+    limitada como report, pero es valido como observacion de diseno.
+
+- id: BPM-O-08
+  tier: 2
+  type: property
+  description: "validateMaxIn permite positive deltas sin check, lo que significa que durante addLiquidity un hook puede hacer que el usuario RECIBA tokens (delta positivo) sin ninguna validacion de que eso sea correcto"
+  attack_scenario: >
+    1. Usuario llama addLiquidity esperando depositar tokens
+    2. Un hook manipula la operacion de forma que el delta sea positivo (el usuario
+       recibe tokens en vez de depositar)
+    3. validateMaxIn (SlippageCheck.sol linea 46-52) explicitamente NO verifica positive
+       deltas: "we do NOT revert in the positive delta case"
+    4. Esto significa que si un hook causa que la operacion de mint resulte en el usuario
+       recibiendo tokens, no hay validacion alguna
+    5. Un hook malicioso podria usar esto para drenar la pool: mint que acredita tokens
+       al usuario sin que realmente se provea liquidez
+    NOTA: hooks trusted por instrucciones, pero el gap de validacion es real.
+  impact: "No slippage protection on positive deltas during addLiquidity; relies entirely on hook correctness"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After addLiquidity, verify that the user actually deposited tokens (delta negative)
+    // A positive delta means the hook is giving tokens back, which is unexpected for mint
+    int256 amount0 = delta.amount0();
+    int256 amount1 = delta.amount1();
+    // At least one should be negative (user pays) for a legitimate mint
+    t(amount0 < 0 || amount1 < 0, "BPM-O-08: both deltas positive on addLiquidity -- no tokens deposited");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    El comentario en SlippageCheck.sol explica esto como by-design: "a positive delta
+    means the hook is crediting tokens to the user for minting/increasing liquidity".
+    Es un patron de incentivo legitimo (hook rewards users for providing liquidity).
+    Pero la falta total de validacion en este path significa que un hook buggeado podria
+    causar mint sin deposito. Confidence baja por trusted hooks.
+
+- id: BPM-O-09
+  tier: 1
+  type: property
+  description: "initializePool con try-catch vacio permite inicializacion con activeId=0 o activeId=2^24-1, precios extremos que causan que toda la liquidez subsiguiente sea single-sided"
+  attack_scenario: >
+    1. Atacante llama initializePool con activeId=0 (precio minimo extremo)
+    2. El pool se crea con activeId=0 exitosamente
+    3. Primer LP deposita con deltaIds=[-1,0,1]. Bins calculados: -1 (revert por <0),
+       0, 1. Solo bins 0 y 1 son validos
+    4. Con activeId=0, bin 0 contiene mezcla, todo lo superior es solo tokenX
+    5. El LP deposita mayoritariamente tokenX a un precio que no refleja el mercado
+    6. Atacante hace swap comprando tokenX a precio minimo del bin 0
+    7. Atacante vende en un DEX externo al precio real, obteniendo ganancia
+    8. La perdida es del LP que deposito a un precio artificial
+    La proteccion idSlippage no ayuda si el LP no sabe que el pool fue inicializado
+    con un activeId extremo y usa activeIdDesired=0 pensando que es correcto.
+  impact: "First LP loses up to 100% of deposit if they provide liquidity at an artificially extreme price set by attacker in initializePool"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After initializePool, activeId should be within reasonable bounds for the token pair
+    (uint24 activeId,,) = binPoolManager.getSlot0(poolKey.toId());
+    // activeId=0 or activeId=2^24-1 are extreme prices that suggest manipulation
+    t(activeId > 0, "BPM-O-09: pool initialized with activeId=0 (extreme price)");
+    t(activeId < type(uint24).max, "BPM-O-09: pool initialized with max activeId (extreme price)");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    Este es un escenario clasico de "first depositor attack" adaptado a bin pools.
+    El atacante no roba directamente del contrato, sino que establece un precio
+    artificial y espera que un LP incauto deposite a ese precio. La mitigacion es
+    que un LP sofisticado verificaria el activeId antes de depositar. Pero para un LP
+    retail que usa un frontend que no valida, el riesgo es real. El try-catch en
+    initializePool facilita el ataque porque no da feedback al creador del pool si
+    alguien ya lo inicializo con un activeId distinto.
+
+false_positives:
+- hunter: OracleHunter
+  id: BPM-FP-01
+  reason: >
+    El idSlippage check funciona correctamente para front-runs EXTERNOS: la proteccion
+    pre-mint captura desplazamientos del activeId antes de que la tx se ejecute. El
+    unico gap es el path hook (beforeMint puede mover el activeId DESPUES del check),
+    pero hooks son FULLY TRUSTED por diseno. El check de slippage en su posicion actual
+    (pre-mint) es suficiente para el modelo de amenaza donde hooks son confiables.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "En bin pools, el idSlippage check pre-mint protege contra front-runs externos pero NO contra manipulacion de activeId por hooks durante mint. Esto es by-design si hooks son trusted."
+    briefing_update_applied: false
+- hunter: OracleHunter
+  id: BPM-FP-02
+  reason: >
+    BinPositionManager no lee precios de oracles externos (Chainlink, TWAP, etc.).
+    El "precio" es el activeId del pool, que es un estado interno del BinPoolManager.
+    No aplican los checks tipicos de oracle (staleness, sequencer down, minAnswer/maxAnswer).
+    Los invariantes de oracle clasicos no son relevantes para este contrato.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "BinPositionManager usa activeId como precio interno, no oracles externos. No aplican checks de staleness/heartbeat/sequencer."
+    briefing_update_applied: false

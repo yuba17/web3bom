@@ -1,0 +1,233 @@
+protocol: pancakeswap-infinity
+component: Dispatcher
+file: src/base/Dispatcher.sol
+domain: dex
+hunter: OracleHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: D-O-01
+  tier: 1
+  type: property
+  description: "Multi-command sandwich via ALLOW_REVERT: un atacante puede estructurar una tx con un swap que falla silenciosamente (FLAG_ALLOW_REVERT=0x80) seguido de un segundo swap que se beneficia del estado post-intento. El primer comando modifica el estado del pool (envia tokens al pair V2) pero revierte el swap — los tokens quedan en el pair y el segundo comando los consume a precio manipulado."
+  attack_scenario: "Atacante construye execute([V2_SWAP_EXACT_IN | FLAG_ALLOW_REVERT, V2_SWAP_EXACT_IN], [inputs_que_manipulan_reserves, inputs_que_extraen_valor]). El primer swap con payerIsUser=false y ALREADY_PAID=0 podria intentar explotar tokens residuales en el pair. Si el primer comando revierte pero deja estado parcial en un contrato externo (pair V2 con tokens ya transferidos via TRANSFER previo), el segundo comando opera sobre reserves manipuladas."
+  impact: "Extraccion de valor del pool V2 al operar sobre reserves desincronizadas entre balanceOf y getReserves"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // En un test multi-command: track balance antes y despues
+    uint256 attackerBefore = ERC20(tokenOut).balanceOf(attacker);
+    // execute con FLAG_ALLOW_REVERT en primer comando + segundo swap
+    router.execute(commands, inputs);
+    uint256 attackerAfter = ERC20(tokenOut).balanceOf(attacker);
+    // El atacante no deberia obtener mas de lo que pagó (ajustado por fees)
+    uint256 fairOutput = getExpectedOutput(amountIn);
+    lte(attackerAfter - attackerBefore, fairOutput * 101 / 100, "D-O-01: excess profit from multi-command");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: "Requiere que el primer comando deje estado parcial en el pair antes de revertir. En V2SwapRouter._v2Swap, el swap llama pair.swap() que tiene check k — es poco probable que quede estado inconsistente. Pero si se usa TRANSFER para enviar tokens al pair + ALLOW_REVERT swap, los tokens quedan en el pair y el segundo swap los consume via ALREADY_PAID. Investigar si TRANSFER al pair address es posible y si _v2Swap calcula amountInput basado en balanceOf(pair) - reserveInput (linea 31 de V2SwapRouter)."
+
+- id: D-O-02
+  tier: 1
+  type: property
+  description: "TRANSFER + V2_SWAP con ALREADY_PAID permite manipular el precio implícito del swap V2. V2SwapRouter._v2Swap calcula amountInput = ERC20(input).balanceOf(pair) - reserveInput (linea 31). Si un comando TRANSFER previo envia tokens al pair, el swap posterior usa esos tokens como input sin verificar que el payer sea el usuario. Combinado con un sandwich externo, el atacante puede manipular reserves entre TRANSFER y SWAP."
+  attack_scenario: "Paso 1: Atacante front-runs la tx del usuario. Paso 2: Usuario ejecuta execute([TRANSFER(tokenA, pairAddress, amount), V2_SWAP_EXACT_IN(recipient, ALREADY_PAID, amountOutMin, path, false)]). Paso 3: Entre el TRANSFER y el SWAP (imposible dentro de la misma tx, pero entre el calculo de reserves y el swap real podria haber manipulacion si hay otro actor en el mismo bloque que haga sync). El riesgo real: el patron TRANSFER→SWAP expone la tx a sandwich porque el amountOutMin lo elige el usuario y puede ser demasiado permisivo."
+  impact: "Perdida por slippage para el usuario — el patron TRANSFER→SWAP obliga a confiar en amountOutMin del usuario"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: output del swap >= amountOutMin siempre
+    // V2SwapRouter ya lo chequea (linea 74), pero verificar que no se bypasea
+    uint256 balanceBefore = ERC20(tokenOut).balanceOf(recipient);
+    router.execute(commands, inputs);
+    uint256 balanceAfter = ERC20(tokenOut).balanceOf(recipient);
+    gte(balanceAfter - balanceBefore, amountOutMin, "D-O-02: slippage check bypassed");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: "V2SwapRouter SI tiene el check en linea 74. El riesgo no es bypass del check sino que el usuario ponga amountOutMin=0 y el frontend/SDK no proteja. Esto es mas un issue de integracion que del Dispatcher. Bajar prioridad si se confirma que el check es solido."
+
+- id: D-O-03
+  tier: 1
+  type: property
+  description: "EXECUTE_SUB_PLAN recursivo permite re-entrar execute() via self-call. El sub-plan llama address(this).call(abi.encodeCall(Dispatcher.execute, ...)), y el modifier isNotLocked permite self-reentrancy (msg.sender == address(this) bypasea el lock). Un sub-plan malicioso podria ejecutar swaps en un orden que manipula el estado del pool entre swaps anidados, creando una sandwich intra-transaccion."
+  attack_scenario: "Atacante ejecuta: execute([INFI_CL_INITIALIZE_POOL(poolKey, sqrtPriceManipulado), EXECUTE_SUB_PLAN([INFI_SWAP(swap en el pool recien inicializado)])]).  El atacante inicializa un pool con un precio arbitrario y luego swapea contra el en la misma tx. Si otro usuario tiene ordenes pendientes en ese pool (improbable en pool nuevo), extraer valor. Mas realista: sub-plan anidado permite construir secuencias complejas que manipulan precio entre niveles de anidamiento."
+  impact: "Manipulacion de precio intra-tx para pools recien inicializados o pools con baja liquidez"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track: precio del pool antes y despues de execute con sub-plan
+    // El precio no deberia poder ser manipulado y consumido en la misma tx
+    // a menos que el atacante sea el unico actor
+    uint160 sqrtPriceBefore = getPoolSqrtPrice(poolKey);
+    router.execute(commands, inputs); // con sub-plan anidado
+    uint160 sqrtPriceAfter = getPoolSqrtPrice(poolKey);
+    // Si el atacante obtuvo profit Y movio el precio significativamente, es sospechoso
+    uint256 priceDeviation = sqrtPriceBefore > sqrtPriceAfter
+      ? sqrtPriceBefore - sqrtPriceAfter
+      : sqrtPriceAfter - sqrtPriceBefore;
+    // Deviation > 10% con profit > 0 = probable manipulacion
+    t(!(priceDeviation > sqrtPriceBefore / 10 && attackerProfit > 0), "D-O-03: intra-tx price manipulation via sub-plan");
+  ghost_vars:
+  - "uint256 internal ghost_attackerBalancePre;"
+  validated: false
+  priority: high
+  confidence: 40
+  notes: "El sub-plan permite recursion sin limite de profundidad (solo gas limit). Esto amplifica la superficie de ataque pero el pool manager deberia tener sus propios checks. Investigar si hay limite de profundidad en sub-plans y si los pool managers protegen contra manipulacion atomica."
+
+- id: D-O-04
+  tier: 2
+  type: property
+  description: "BALANCE_CHECK_ERC20 con FLAG_ALLOW_REVERT crea un oracle de precio on-chain explotable. Un atacante puede usar BALANCE_CHECK_ERC20 como check condicional: si el balance es suficiente (precio favorable), ejecutar swap; si no, el comando falla silenciosamente y el swap posterior no se ejecuta. Esto permite routing condicional basado en estado del pool — un MEV bot sofisticado puede usar esto para ejecutar swaps solo cuando el precio es favorable."
+  attack_scenario: "Bot MEV ejecuta: execute([BALANCE_CHECK_ERC20 | FLAG_ALLOW_REVERT (check si pool tiene liquidez suficiente), V2_SWAP_EXACT_IN (swap real)]). Si el balance check falla, la tx no revierte (FLAG_ALLOW_REVERT) y el swap tampoco se ejecuta... PERO el swap SI se ejecuta porque es un comando separado. El BALANCE_CHECK solo reporta success=false y no detiene la ejecucion de los siguientes comandos. El patron correcto requiere sub-plan."
+  impact: "Bajo impacto directo — pero permite a MEV bots construir transacciones condicionales mas eficientes que extraen valor de LPs"
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Verificar: si BALANCE_CHECK_ERC20 falla con ALLOW_REVERT, los comandos siguientes
+    // siguen ejecutandose
+    bytes memory commands = abi.encodePacked(
+      bytes1(uint8(Commands.BALANCE_CHECK_ERC20) | uint8(Commands.FLAG_ALLOW_REVERT)),
+      bytes1(uint8(Commands.V2_SWAP_EXACT_IN))
+    );
+    // El swap se ejecuta independientemente del balance check — por diseño
+    // Pero dentro de un SUB_PLAN, el revert del check SI cancela el sub-plan entero
+    t(true, "D-O-04: conditional execution analysis");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: "Este es fundamentalmente by-design: FLAG_ALLOW_REVERT es para que un comando falle sin revertir toda la tx. Sin embargo, la combinacion con SUB_PLAN permite ejecucion condicional verdadera: SUB_PLAN(BALANCE_CHECK + SWAP) con ALLOW_REVERT en el sub-plan — si el check falla, todo el sub-plan falla silenciosamente. Verificar si esto crea vectores de MEV nuevos."
+
+- id: D-O-05
+  tier: 1
+  type: property
+  description: "V2 swap usa spot price (getReserves) para calcular amountOut, sin TWAP ni oracle externo. El Dispatcher despacha a V2SwapRouter que lee reserves instantaneas (linea 28-30 de V2SwapRouter). Esto es manipulable via flash loan: flash loan → deposit en el pair → manipular reserves → ejecutar swap via router → restaurar."
+  attack_scenario: "Paso 1: Flash loan de tokenA. Paso 2: Swap grande en el V2 pair para mover reserves. Paso 3: Otra cuenta ejecuta execute([V2_SWAP_EXACT_IN]) contra el pair manipulado — obtiene peor precio. Paso 4: Reverse swap y repay flash loan. Esto es un sandwich clasico, pero la pregunta es: hay alguna proteccion adicional en el router que lo mitigue? Respuesta: solo amountOutMin del usuario."
+  impact: "Sandwich attack clasico — la proteccion es SOLO amountOutMin del usuario"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Invariante: el usuario recibe al menos amountOutMin
+    // Este check ya existe en V2SwapRouter.v2SwapExactInput (linea 74)
+    // Pero verificar que no se puede bypasear
+    uint256 balBefore = ERC20(path[path.length-1]).balanceOf(recipient);
+    v2SwapExactInput(recipient, amountIn, amountOutMin, path, payer);
+    uint256 balAfter = ERC20(path[path.length-1]).balanceOf(recipient);
+    gte(balAfter - balBefore, amountOutMin, "D-O-05: V2 slippage protection holds");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: "El check de slippage en V2SwapRouter es solido (balance diff >= amountOutMin). El riesgo real es para usuarios que ponen amountOutMin bajo. Esto es by-design del modelo de slippage basado en usuario. Probablemente false positive como finding pero importante documentar. 4 auditorias previas (Zellic, OtterSec, Hexens, Cyfrin) ya lo revisaron."
+
+- id: D-O-06
+  tier: 1
+  type: property
+  description: "INFI_CL_INITIALIZE_POOL permite a cualquiera inicializar un pool CL con sqrtPriceX96 arbitrario. No hay validacion en el Dispatcher del precio inicial — se delega completamente a clPoolManager.initialize(). Si el pool manager no valida que el precio sea razonable, un atacante puede crear pools con precios extremos y atraer LPs desinformados."
+  attack_scenario: "Atacante ejecuta INFI_CL_INITIALIZE_POOL con sqrtPriceX96 = 1 (precio extremadamente bajo para token0 vs token1). Si un LP agrega liquidez confiando en que el pool tiene un precio de mercado, el atacante puede swapear contra esa liquidez a precio favorable. El Dispatcher no tiene ningun check — confia en que el pool manager valide. Si el pool manager tampoco valida (solo verifica que el pool no exista), el ataque es viable."
+  impact: "LPs pierden fondos al proveer liquidez a un pool con precio manipulado"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que sqrtPriceX96 esta dentro de rangos razonables
+    // MIN_SQRT_RATIO = 4295128739, MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342
+    uint160 sqrtPriceX96 = extractSqrtPriceFromInputs(inputs);
+    // El pool manager deberia rechazar precios fuera de rango
+    // Pero precios DENTRO del rango tecnico pueden ser economicamente irracionales
+    t(sqrtPriceX96 > 4295128739 && sqrtPriceX96 < 1461446703485210103287273052203988822378723970342,
+      "D-O-06: sqrtPriceX96 within valid range");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 50
+  notes: "El pool manager de Infinity (CLPoolManager) probablemente tiene validacion de rango como Uniswap V4 (TickMath.MIN_SQRT_RATIO/MAX_SQRT_RATIO). El riesgo real es precios tecnicamente validos pero economicamente manipulados. Esto es mas un issue del pool manager que del Dispatcher. Verificar si CLPoolManager.initialize tiene checks adicionales."
+
+- id: D-O-07
+  tier: 1
+  type: property
+  description: "INFI_BIN_INITIALIZE_POOL permite inicializar un pool bin con activeId arbitrario. Similar a D-O-06 pero para bin pools. El activeId determina el precio inicial del pool. Un activeId manipulado puede crear un pool donde el precio no refleja el mercado."
+  attack_scenario: "Atacante crea pool bin con activeId = 0 o activeId = 2^24-1 (extremos). LPs que agregan liquidez alrededor del activeId proveen liquidez a un precio irreal. Atacante swapea para extraer la liquidez a precio favorable. Mismo vector que D-O-06 pero en el contexto de bin pools donde la granularidad de precio es diferente."
+  impact: "LPs pierden fondos en pool bin con precio inicial manipulado"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint24 activeId = extractActiveIdFromInputs(inputs);
+    // activeId debe estar en un rango razonable para el par de tokens
+    // Verificar que binPoolManager valida el activeId
+    t(activeId > 0 && activeId < type(uint24).max, "D-O-07: activeId within bounds");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: "Mismo analisis que D-O-06 — el Dispatcher no valida, delega al pool manager. Investigar BinPoolManager.initialize para ver si hay validacion de activeId. Si no hay, es un finding real en el pool manager, no en el Dispatcher."
+
+- id: D-O-08
+  tier: 2
+  type: property
+  description: "StableSwap exact output calcula amountIn via stableSwapExactOutputAmountIn() y luego ejecuta el swap en dos pasos separados (lineas 365-366). Si el precio del stable pool cambia entre el calculo y la ejecucion (en la misma tx via otro comando previo o sub-plan), el amountIn calculado puede ser insuficiente o excesivo. Dentro de la misma tx, un comando previo podria manipular las reserves del stable pool."
+  attack_scenario: "Atacante ejecuta: execute([STABLE_SWAP_EXACT_IN (manipula reserves del stable pool), STABLE_SWAP_EXACT_OUT (calcula amountIn sobre reserves ya manipuladas)]). El primer swap mueve el precio del stable pool. El segundo swap calcula amountIn basandose en el nuevo estado. Si el atacante es quien ejecuta ambos comandos, puede beneficiarse de la discrepancia. Pero ambos son en la misma tx del mismo usuario — el atacante se sandwichea a si mismo? Solo tiene sentido si el recipient del primer swap es diferente."
+  impact: "Precio distorsionado en stable swap si se combinan comandos que manipulan el mismo pool"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // El amountIn calculado debe ser <= amountInMax
+    // Este check ya esta en stableSwapExactOutputAmountIn (asumiendo que valida)
+    // Verificar que el calculo y la ejecucion son atomicos
+    uint256 calculatedAmountIn = stableSwapExactOutputAmountIn(amountOut, amountInMax, path, flag);
+    lte(calculatedAmountIn, amountInMax, "D-O-08: stable swap amountIn within max");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: "Los dos pasos (calculo + ejecucion) son en la misma tx interna, sin posibilidad de intervencion externa entre ellos. El riesgo es que un comando ANTERIOR en la misma execute() manipule el stable pool. Pero eso requiere que el atacante controle la secuencia de comandos, lo cual significa que es su propia tx — dificil argumentar como finding."
+
+- id: D-O-09
+  tier: 1
+  type: property
+  description: "INFI_CL_POSITION_CALL y INFI_BIN_POSITION_CALL envian address(this).balance como value (lineas 312, 316). Si un comando previo deposita ETH en el router (via receive() o WRAP_ETH parcial), el position call consumiria ese ETH. Un atacante podria combinar esto con manipulacion de precio del pool para que la provision de liquidez se haga a un precio desfavorable."
+  attack_scenario: "Paso 1: Usuario envia ETH al router via msg.value. Paso 2: Primer comando WRAP_ETH parcial (wrap solo una parte). Paso 3: Segundo comando es un swap que manipula el precio del pool. Paso 4: INFI_CL_POSITION_CALL envia TODO el balance ETH restante al position manager. Si el precio fue manipulado en el paso 3, la provision de liquidez se hace a un precio peor. El usuario pierde por impermanent loss inmediato."
+  impact: "ETH del usuario se usa para provision de liquidez a precio manipulado"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track: ETH balance del router antes y despues de cada comando
+    uint256 ethBefore = address(router).balance;
+    // Despues de INFI_CL_POSITION_CALL, todo el ETH se envia
+    // Verificar que el usuario consintio el monto de ETH enviado
+    uint256 ethSent = ethBefore; // se envia TODO
+    // El usuario podria no haber querido enviar todo su ETH restante al position manager
+    t(ethSent <= expectedEthForPosition, "D-O-09: unexpected ETH sent to position manager");
+  ghost_vars:
+  - "uint256 internal ghost_expectedEthForPosition;"
+  validated: false
+  priority: high
+  confidence: 50
+  notes: "El value: address(this).balance en las lineas 312 y 316 es un patron que envia TODO el ETH del router al position manager. Si el usuario envio mas ETH del necesario (o si otro comando no consumio todo el ETH esperado), el excedente se va al position manager. Esto no es directamente manipulacion de oracle/precio pero interactua con la provision de liquidez a un precio potencialmente manipulado. Clave: los checks estan en _checkInfiClPositionManagerCall — investigar que valida."
+
+false_positives:
+- hunter: OracleHunter
+  id: D-O-FP-01
+  reason: "Los swaps V2/V3/StableSwap todos tienen checks de slippage (amountOutMin / amountInMax) en los routers subyacentes. El Dispatcher NO bypasea estos checks — los propaga fielmente. El riesgo de sandwich existe pero es mitigado por slippage del usuario. Esto es by-design en TODOS los DEX routers (Uniswap, Sushiswap, PancakeSwap). 4 auditorias previas lo han revisado."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "El Dispatcher de PancakeSwap Infinity delega completamente la proteccion de slippage a los sub-routers (V2/V3/Stable/Infinity). No intenta enforcer slippage a nivel de Dispatcher — esto es by-design y consistente con Uniswap Universal Router."
+    briefing_update_applied: false
+- hunter: OracleHunter
+  id: D-O-FP-02
+  reason: "EXECUTE_SUB_PLAN permite recursion pero no crea nuevas oportunidades de manipulacion de precio que no existirian con comandos planos. Cada swap individual tiene sus propios checks. La recursion solo permite agrupacion logica con revert atomico — no cambia la semantica de precio de ningun swap."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

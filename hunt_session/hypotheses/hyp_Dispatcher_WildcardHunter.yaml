@@ -1,0 +1,473 @@
+protocol: pancakeswap-infinity
+component: Dispatcher
+file: src/base/Dispatcher.sol
+domain: dex
+hunter: WildcardHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: D-W-01
+  tier: 1
+  type: property
+  description: >
+    INFI_CL_POSITION_CALL and INFI_BIN_POSITION_CALL forward address(this).balance as msg.value.
+    If a user sends ETH with execute() but an earlier command (e.g. WRAP_ETH) does NOT consume
+    all of it, or if ETH is left over from a previous user's partial execution, the position
+    manager call forwards ALL remaining ETH — potentially donating user A's ETH to user B's
+    position mint, or sending it to a position manager that returns surplus to the router
+    (where it can be swept by an attacker in a later command).
+  attack_scenario: >
+    Attacker crafts a multi-command tx: [WRAP_ETH(recipient=ADDRESS_THIS, amount=1 wei),
+    INFI_CL_POSITION_CALL(mint with msg.value forwarded)]. The WRAP_ETH only wraps 1 wei,
+    but INFI_CL_POSITION_CALL forwards address(this).balance (all remaining ETH minus 1 wei)
+    to the position manager. If there is leftover ETH from other users (dust from failed sweeps,
+    or ETH sent directly to router), attacker captures it in their position. Even without other
+    users' ETH, if the position manager returns surplus ETH to the router, a second call with
+    SWEEP(ETH) would capture it.
+  impact: "Theft of residual ETH sitting in the router contract"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before INFI_CL_POSITION_CALL: record balance
+    uint256 balBefore = address(router).balance;
+    // After full execute: router should have 0 ETH (all consumed or returned to sender)
+    uint256 balAfter = address(router).balance;
+    // Invariant: no ETH permanently lost or donated unintentionally
+    eq(balAfter, 0, "D-W-01: ETH left in router after execution");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The pattern `call{value: address(this).balance}` is extremely aggressive — it sends
+    EVERYTHING, not just what the user deposited. This is a known anti-pattern in Universal
+    Router designs. Check if position managers return surplus to msg.sender (the router) or
+    to the original caller.
+
+- id: D-W-02
+  tier: 1
+  type: property
+  description: >
+    Incomplete action blocklist in _checkInfiClPositionManagerCall: the check blocks
+    CL_INCREASE_LIQUIDITY (0x00), CL_DECREASE_LIQUIDITY (0x01), and CL_BURN_POSITION (0x03)
+    but does NOT block CL_INCREASE_LIQUIDITY_FROM_DELTAS (0x04), CL_MINT_POSITION_FROM_DELTAS (0x05),
+    TAKE (0x0e), TAKE_ALL (0x0f), TAKE_PORTION (0x10), SETTLE (0x0b), SWEEP (0x14), or
+    CLOSE_CURRENCY (0x12). If an attacker tricks a user into approving the router for their
+    position (e.g., via phishing or a deceptive dApp), these unblocklisted actions could allow
+    fee extraction or fund drainage through TAKE/TAKE_ALL.
+  attack_scenario: >
+    1. User approves UniversalRouter on INFI_CL_POSITION_MANAGER (common for migration flows).
+    2. Attacker crafts INFI_CL_POSITION_CALL with actions = [TAKE_ALL(currency, attacker_address)].
+    3. _checkInfiClPositionManagerCall iterates actions but TAKE_ALL (0x0f) is not in the blocklist.
+    4. The call executes on the position manager, taking tokens owed to the router/user.
+    However: TAKE_ALL acts on deltas in the vault, not on positions directly. The attack
+    requires an existing positive delta — less likely but possible if combined with other actions
+    in the same modifyLiquidities call (e.g., CL_MINT_POSITION_FROM_DELTAS then TAKE_ALL).
+  impact: "Potential theft of position fees or tokens via unblocklisted actions if router is approved"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that ALL position-altering and token-extracting actions are blocked
+    // The following actions should be blocked in addition to INCREASE/DECREASE/BURN:
+    // CL_INCREASE_LIQUIDITY_FROM_DELTAS (0x04), CL_MINT_POSITION_FROM_DELTAS (0x05)
+    // TAKE (0x0e), TAKE_ALL (0x0f), TAKE_PORTION (0x10)
+    // For each action in the allowed set:
+    bytes memory actions = new bytes(1);
+    actions[0] = bytes1(uint8(0x0f)); // TAKE_ALL
+    // Build inputs that embed this action and call INFI_CL_POSITION_CALL
+    // If it does NOT revert -> blocklist is incomplete
+    t(!success, "D-W-02: TAKE_ALL should be blocked in CL position call");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The blocklist approach (block known-bad) is inherently weaker than an allowlist approach
+    (allow known-good). The code comment says "we only allow Actions.MINT" but the implementation
+    uses a blocklist of 3 specific actions, not an allowlist. Any new action added to the Actions
+    library would be allowed by default. Need to verify if TAKE/TAKE_ALL actually works in this
+    context — depends on whether position manager enforces its own auth checks.
+
+- id: D-W-03
+  tier: 1
+  type: property
+  description: >
+    EXECUTE_SUB_PLAN with FLAG_ALLOW_REVERT enables silent failure of entire sub-plans. Combined
+    with BALANCE_CHECK_ERC20 (also allow-revert), an attacker can build conditional execution
+    flows: "if balance condition met, execute swap; otherwise skip silently." This creates a
+    gas-griefing vector and a MEV extraction tool — a searcher can craft a tx that only executes
+    profitably (the losing path silently reverts) at the expense of other users' gas.
+  attack_scenario: >
+    1. Attacker submits tx: [BALANCE_CHECK_ERC20(token, pool, targetBalance) with allowRevert,
+       V3_SWAP_EXACT_IN(profitable params)].
+    2. If pool balance is at expected level (post-victim-swap), BALANCE_CHECK succeeds, swap executes.
+    3. If conditions aren't met, BALANCE_CHECK fails (allowRevert), but swap still runs.
+    4. Better: wrap in SUB_PLAN with allowRevert: [SUB_PLAN(allowRevert=true, [CHECK, SWAP])].
+       Sub-plan failure = no swap happens, tx succeeds, attacker pays minimal gas.
+    This is a toolbox for sophisticated sandwich attacks — probe-then-execute atomically.
+  impact: "Enhanced MEV extraction capability; gas-efficient sandwich attacks"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Invariant: if a sub-plan with allowRevert fails, no state changes from that sub-plan persist
+    // (this should be guaranteed by the EVM call semantics, but verify)
+    uint256 balBefore = ERC20(token).balanceOf(address(router));
+    // Execute SUB_PLAN with allowRevert=true, containing a swap that should fail
+    // After execution:
+    uint256 balAfter = ERC20(token).balanceOf(address(router));
+    eq(balBefore, balAfter, "D-W-03: sub-plan revert did not roll back state");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    The EVM guarantees that a failed CALL reverts all state changes in the sub-context. So the
+    state-change concern is likely unfounded (EVM-level protection). But the MEV concern is real:
+    this design is a building block for advanced sandwich bots. This is likely "by design" for
+    the Universal Router — similar to Uniswap's design. Low confidence as a reportable finding
+    but worth investigating the conditional-execution angle.
+
+- id: D-W-04
+  tier: 1
+  type: property
+  description: >
+    COMMAND_TYPE_MASK = 0x3f masks 6 bits, FLAG_ALLOW_REVERT = 0x80 uses bit 7. Bit 6 (0x40)
+    is silently masked away. A command byte of 0x40 | actualCommand would produce the same
+    command dispatch as actualCommand alone but with bit 6 set. If any off-chain system or
+    indexer uses the full byte (not masked) to determine command type, it would misinterpret
+    the command. More critically: if a future upgrade uses bit 6 for a new flag but doesn't
+    update the mask, existing commands could have unintended behavior.
+  attack_scenario: >
+    Current state: bit 6 is wasted — setting it changes nothing because the mask strips it.
+    A user sending command 0x40 gets V3_SWAP_EXACT_IN (0x00) executed. If an off-chain monitoring
+    system doesn't apply the mask, it might not detect a V3 swap was executed. This is more of
+    an integrity/monitoring concern than a direct exploit. However: if the protocol adds a second
+    flag on bit 6 in a future upgrade without updating all existing command handlers, it could
+    create dual-flag ambiguity.
+  impact: "Low — off-chain monitoring bypass, potential future upgrade hazard"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that bit 6 has no effect on command execution
+    bytes1 cmdNormal = bytes1(uint8(0x00)); // V3_SWAP_EXACT_IN
+    bytes1 cmdBit6 = bytes1(uint8(0x40));   // Same after masking
+    uint256 masked1 = uint8(cmdNormal & Commands.COMMAND_TYPE_MASK);
+    uint256 masked2 = uint8(cmdBit6 & Commands.COMMAND_TYPE_MASK);
+    eq(masked1, masked2, "D-W-04: bit 6 should not affect command routing");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    This is likely by design — the Uniswap Universal Router uses the same pattern. Bit 6 is
+    reserved/unused. Low confidence as a finding but flagging for completeness.
+
+- id: D-W-05
+  tier: 1
+  type: property
+  description: >
+    payerIsUser=false in swap commands (V3_SWAP_EXACT_IN, V2_SWAP_EXACT_IN, etc.) causes the
+    router to pay from its own balance. Combined with PERMIT2_TRANSFER_FROM (which transfers
+    tokens from user to router) in a multi-command sequence, an attacker can cause the router
+    to spend tokens that were deposited by a PREVIOUS command from another user's permit. The
+    attack requires tokens to be sitting in the router between commands within the same tx —
+    but since EXECUTE_SUB_PLAN creates a self-call that re-enters execute(), tokens deposited
+    in an outer command are available to an inner sub-plan's swap with payerIsUser=false.
+  attack_scenario: >
+    1. Victim creates a multi-command tx: [PERMIT2_TRANSFER_FROM(tokenA, ADDRESS_THIS, 1000),
+       V3_SWAP_EXACT_IN(recipient=MSG_SENDER, amountIn=1000, payerIsUser=false)].
+    2. Between these commands, if the router can be reentered (it can't from external, but
+       SUB_PLAN allows self-reentrancy), another command sequence could drain the deposited tokens.
+    3. More realistically: a single-tx attack where attacker crafts commands that route through
+       the router's balance to redirect tokens. E.g., [PERMIT2_TRANSFER_FROM(tokenA, ADDRESS_THIS, X),
+       V3_SWAP_EXACT_IN(recipient=ATTACKER, amountIn=X, payerIsUser=false)] — this is just the
+       normal flow, but if the attacker can somehow inject commands mid-execution...
+    The real risk: leftover tokens from a previous user's failed/partial execution sitting in the
+    router. Next user's payerIsUser=false would spend them.
+  impact: "Theft of residual tokens left in router from previous executions"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any execute() call, router should not hold any ERC20 tokens
+    uint256 routerBal = ERC20(token).balanceOf(address(router));
+    eq(routerBal, 0, "D-W-05: tokens left in router after execute");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    Universal Router design assumes atomic execution — tokens should never persist across
+    transactions. But if a command fails with allowRevert, tokens from earlier commands stay
+    in the router for remaining commands. This is the intended "pipe" pattern. The real question
+    is whether cross-transaction residual tokens can be stolen. Since execute() is atomic,
+    this is safe unless someone sends tokens directly to the router.
+
+- id: D-W-06
+  tier: 1
+  type: property
+  description: >
+    _checkInfiBinPositionManagerCall only blocks BIN_REMOVE_LIQUIDITY (0x1a) but does NOT
+    block BIN_ADD_LIQUIDITY_FROM_DELTAS (0x1b). The code comment says "we only allow
+    Actions.BIN_ADD_LIQUIDITY" but the implementation is a blocklist that only blocks
+    BIN_REMOVE_LIQUIDITY. Furthermore, TAKE, TAKE_ALL, SETTLE, SWEEP are also not blocked.
+    This is the same incomplete-blocklist pattern as D-W-02 but for bin pools.
+  attack_scenario: >
+    Same as D-W-02 but for bin pools. If a user has approved the router on BIN_POSITION_MANAGER,
+    an attacker could craft INFI_BIN_POSITION_CALL with actions that include BIN_SWAP_EXACT_IN
+    (0x1c), BIN_DONATE (0x20), or TAKE_ALL — none of which are blocked. BIN_DONATE could be
+    used to donate the user's tokens to a pool where the attacker has concentrated liquidity,
+    effectively stealing them. BIN_SWAP actions could swap tokens at unfavorable rates.
+  impact: "Potential theft via unblocklisted bin pool actions if router is approved for user's position"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Actions that should be blocked but aren't:
+    // BIN_ADD_LIQUIDITY_FROM_DELTAS (0x1b), BIN_SWAP_EXACT_IN_SINGLE (0x1c),
+    // BIN_SWAP_EXACT_IN (0x1d), BIN_SWAP_EXACT_OUT_SINGLE (0x1e),
+    // BIN_SWAP_EXACT_OUT (0x1f), BIN_DONATE (0x20)
+    bytes memory actions = new bytes(1);
+    actions[0] = bytes1(uint8(0x20)); // BIN_DONATE
+    // Attempt INFI_BIN_POSITION_CALL with BIN_DONATE action
+    t(!success, "D-W-06: BIN_DONATE should be blocked in bin position call");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    The comment says "we only allow BIN_ADD_LIQUIDITY" but the code only blocks REMOVE.
+    This is a stronger finding than D-W-02 because BIN_DONATE is explicitly a fund-loss action.
+    Verify if position manager enforces additional auth checks that mitigate this.
+
+- id: D-W-07
+  tier: 2
+  type: property
+  description: >
+    PERMIT2_PERMIT and PERMIT2_PERMIT_BATCH with FLAG_ALLOW_REVERT can silently fail. A user
+    might send a multi-command tx: [PERMIT2_PERMIT(allowRevert=true), SWAP(payerIsUser=true)].
+    If the permit has already been used (nonce consumed) or is expired, it fails silently.
+    The swap then tries to use the EXISTING (possibly stale) Permit2 allowance, which might
+    be from a previous interaction with a different protocol or have different parameters
+    (higher amount, longer expiration).
+  attack_scenario: >
+    1. User previously approved tokenA on Permit2 with allowance = 10,000 to some spender.
+    2. User sends tx to UniversalRouter: [PERMIT2_PERMIT(allowRevert=true, allowance=100),
+       V3_SWAP_EXACT_IN(amountIn=100, payerIsUser=true)].
+    3. If PERMIT2_PERMIT fails silently (expired/replayed), the swap uses the OLD allowance
+       of 10,000. The user intended to limit to 100, but the old 10,000 allowance is used.
+    4. An attacker front-runs with a tx that consumes the new permit's nonce (by submitting
+       the same permit data to Permit2 directly), forcing the router's permit to fail silently.
+    5. Then the attacker sandwiches the swap, which now has 100x the intended allowance exposed.
+  impact: "User exposed to higher-than-intended Permit2 allowance due to silent permit failure"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before execute with PERMIT2_PERMIT(allowRevert=true) + SWAP:
+    // Record allowance BEFORE
+    (uint160 allowanceBefore,,) = PERMIT2.allowance(user, token, address(router));
+    // Execute the multi-command
+    // After execute:
+    // The swap should have used the NEW allowance, not the old one
+    // If permit failed, allowance is unchanged = old allowance was used
+    (uint160 allowanceAfter,,) = PERMIT2.allowance(user, token, address(router));
+    // If permit succeeded, allowanceAfter should reflect new value
+    // If permit failed silently, allowanceBefore == allowanceAfter AND swap still executed
+    t(permitSucceeded || !swapExecuted, "D-W-07: swap executed with stale permit allowance");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is a subtle interaction between allowRevert on permits and subsequent commands.
+    The user's intent is "set allowance to X, then swap X" but the outcome can be
+    "fail to set allowance, swap with old (potentially larger) allowance." The front-end
+    should not use allowRevert for permits, but the contract doesn't prevent it.
+
+- id: D-W-08
+  tier: 1
+  type: property
+  description: >
+    The `map()` function uses sentinel values address(1) = MSG_SENDER and address(2) = ADDRESS_THIS.
+    If a user specifies a recipient as the literal address 0x0000...0001 or 0x0000...0002
+    (actual addresses, not sentinels), tokens would be sent to msgSender() or address(this)
+    instead. While these addresses are unlikely to be used by normal users, they ARE valid
+    Ethereum addresses. If any ERC20 or protocol uses address(1) or address(2) as a special
+    address (e.g., burn address, fee collector), the mapping would redirect tokens incorrectly.
+  attack_scenario: >
+    1. A token protocol uses address(1) as a fee collector or burn address.
+    2. User calls TRANSFER(token, address(1), amount) intending to send to that address.
+    3. map(address(1)) returns msgSender() — tokens go back to the user instead of the
+       intended fee collector. Not a direct exploit, but a potential fund misdirection.
+    More critically: SWEEP with recipient=address(2) maps to address(this), creating a no-op
+    that leaves tokens in the router. A subsequent SWEEP or TRANSFER from another user could
+    then claim those tokens.
+  impact: "Token misdirection if sentinel address values are used as real recipients"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    address sentinel1 = address(1); // ActionConstants.MSG_SENDER
+    address sentinel2 = address(2); // ActionConstants.ADDRESS_THIS
+    address mapped1 = router.map(sentinel1);
+    address mapped2 = router.map(sentinel2);
+    // mapped1 should be msg.sender, mapped2 should be address(router)
+    // This is by design, but verify no real protocol uses these addresses
+    t(mapped1 != sentinel1, "D-W-08: sentinel address(1) is remapped (expected)");
+    t(mapped2 != sentinel2, "D-W-08: sentinel address(2) is remapped (expected)");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 25
+  notes: >
+    This is the standard Uniswap Universal Router pattern. Very low probability of real-world
+    impact since address(1) and address(2) are precompile addresses (ecrecover and SHA256)
+    and cannot receive tokens. Marking as low priority but noting for completeness.
+
+- id: D-W-09
+  tier: 1
+  type: property
+  description: >
+    V3_POSITION_MANAGER_CALL forwards raw calldata to V3_POSITION_MANAGER via low-level call.
+    The _checkV3PositionManagerCall validates the selector (must be decreaseLiquidity, collect,
+    or burn) and the tokenId ownership. However, the remaining calldata parameters are NOT
+    validated. For decreaseLiquidity, the attacker-controlled params include `liquidity`,
+    `amount0Min`, `amount1Min`, and `deadline`. For collect, the `recipient` field is attacker-
+    controlled and not validated against msgSender(). An attacker who has approval on a victim's
+    position could call collect() with recipient=attacker_address, directing collected fees to
+    themselves.
+  attack_scenario: >
+    1. Victim approves UniversalRouter as operator on V3_POSITION_MANAGER (required for migration).
+    2. Attacker crafts V3_POSITION_MANAGER_CALL with: selector=collect, tokenId=victim's token,
+       recipient=attacker, amount0Max=type(uint128).max, amount1Max=type(uint128).max.
+    3. _checkV3PositionManagerCall checks: selector is `collect` (valid), tokenId ownership
+       requires caller to be owner/approved — but the attacker is NOT the caller, msgSender() is
+       the ATTACKER's address. So _isAuthorizedForToken(attacker, tokenId) would fail because
+       attacker is not approved for victim's token.
+    4. HOWEVER: if the attacker IS approved for ALL of the victim's tokens (isApprovedForAll),
+       and the router is approved for the specific token, then both checks pass.
+    Result: attacker collects victim's accumulated fees to their own address.
+  impact: "Theft of accumulated V3 position fees via collect() recipient manipulation"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Craft a collect call with arbitrary recipient
+    bytes memory collectCall = abi.encodeWithSelector(
+        IV3NonfungiblePositionManager.collect.selector,
+        IV3NonfungiblePositionManager.CollectParams({
+            tokenId: victimTokenId,
+            recipient: attacker,
+            amount0Max: type(uint128).max,
+            amount1Max: type(uint128).max
+        })
+    );
+    // If _checkV3PositionManagerCall passes AND recipient != msgSender(), fees are stolen
+    // The check only validates tokenId ownership, not the recipient parameter
+    t(collectRecipient == msgSender() || collectRecipient == address(router),
+      "D-W-09: collect recipient must be caller or router");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 40
+  notes: >
+    The auth check in _isAuthorizedForToken uses msgSender() (which is _getLocker(), i.e., the
+    original external caller). So the attacker would need to be approved for the victim's tokens
+    AND call through the router. The V3_POSITION_MANAGER itself may enforce recipient==msg.sender
+    for collect — need to verify. If V3 PM doesn't enforce this, the Dispatcher's check is
+    insufficient because it validates WHO calls but not WHERE tokens go.
+
+- id: D-W-10
+  tier: 1
+  type: property
+  description: >
+    EXECUTE_SUB_PLAN performs address(this).call(abi.encodeCall(Dispatcher.execute, ...)).
+    This is a self-CALL (not delegatecall), which means msg.sender becomes address(this).
+    The Lock modifier's isNotLocked check has a special branch: if msg.sender == address(this),
+    skip the lock entirely. This means sub-plans run without any reentrancy protection.
+    If a sub-plan contains an INFI_SWAP command that triggers a callback to the router
+    (e.g., via a malicious hook), the callback could call execute() again, and the lock
+    would be bypassed because msg.sender == address(this) during the sub-plan execution.
+    Wait — the callback would come from the hook, not from address(this). So msg.sender would
+    be the hook address, not address(this), and the lock WOULD apply. The self-reentrancy
+    bypass is specifically for SUB_PLAN's self-call pattern. But: what if a malicious
+    Infinity pool hook calls back to the router? The lock is checked (hook != address(this)),
+    so it's protected. The actual risk is: during sub-plan execution, the locker is still set
+    to the original caller. msgSender() returns the correct user. No bypass possible from
+    external callbacks. This is likely safe by design.
+    REVISED HYPOTHESIS: The actual risk is NESTED sub-plans. A sub-plan can contain another
+    EXECUTE_SUB_PLAN. Each nesting level creates a new CALL context. With deep nesting
+    (e.g., 100+ levels), this could cause stack overflow / out-of-gas, which with allowRevert
+    on outer sub-plans, could cause partial execution where early commands succeed but
+    later commands (like slippage checks) fail silently.
+  attack_scenario: >
+    1. Attacker creates deeply nested sub-plans: SUB_PLAN(SUB_PLAN(SUB_PLAN(...SWAP...))).
+    2. The swap executes at the deepest nesting level, consuming most gas.
+    3. The final BALANCE_CHECK_ERC20 (slippage protection) at an outer level runs out of gas.
+    4. If the outer SUB_PLAN has allowRevert=true, the balance check failure is swallowed.
+    5. The swap executed but slippage protection did not — user gets sandwiched.
+    The key insight: commands within a sub-plan either ALL succeed or ALL revert (call semantics).
+    But commands OUTSIDE the sub-plan are independent. So the pattern
+    [SUB_PLAN(allowRevert=true, [SWAP]), BALANCE_CHECK] — if sub-plan succeeds but CHECK fails,
+    the swap already happened. The allowRevert flag is on the COMMAND level, not the sub-plan.
+  impact: "Slippage protection bypass via gas manipulation in nested sub-plans"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that nested sub-plans cannot bypass slippage checks
+    // After a swap within a sub-plan:
+    uint256 received = ERC20(tokenOut).balanceOf(user);
+    gte(received, amountOutMin, "D-W-10: slippage check must be enforced even with sub-plans");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    The EVM call stack limit is 1024. Each SUB_PLAN nesting uses one level. Gas forwarding
+    follows the 63/64 rule — each nesting level retains 1/64 of gas. After ~30 nesting levels,
+    available gas drops significantly. Need to verify if the gas retained at outer levels is
+    sufficient for balance check operations. The actual risk depends on whether frontends/SDKs
+    ever place slippage checks OUTSIDE a sub-plan containing the swap.
+
+false_positives:
+- hunter: WildcardHunter
+  id: D-W-FP-01
+  reason: >
+    Considered whether the COMMAND_TYPE_MASK (0x3f) could allow command injection via the upper
+    2 bits (0x40 and 0x80). Bit 7 (0x80) is FLAG_ALLOW_REVERT — well documented and intentional.
+    Bit 6 (0x40) is masked away and has no effect. This is identical to Uniswap's Universal
+    Router design and is by design. No command injection possible because the mask is applied
+    before the switch/case logic.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Universal Router COMMAND_TYPE_MASK 0x3f strips upper 2 bits. Bit 7 = allowRevert flag,
+      bit 6 = unused/reserved. No command injection possible. Same pattern as Uniswap v4.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: D-W-FP-02
+  reason: >
+    Considered reentrancy via INFI_SWAP → Infinity pool hook callback → router.execute().
+    The Lock uses transient storage (tstore/tload) and checks isLocked() for external callers.
+    A hook callback would have msg.sender = hook_address (not address(this)), so the lock
+    IS enforced. The Locker is already set (to the original user), so the callback would
+    revert with ContractLocked(). Transient storage also resets after the transaction, so
+    no cross-tx state leakage. Safe by design.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      PancakeSwap Infinity Universal Router uses transient storage for reentrancy lock.
+      Self-calls (SUB_PLAN) bypass the lock intentionally. External callbacks (hooks) are
+      blocked by the lock. Safe pattern.
+    briefing_update_applied: false

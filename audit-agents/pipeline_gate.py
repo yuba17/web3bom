@@ -279,6 +279,8 @@ def check_merge(component: str, repo_path: str = "") -> tuple[bool, list[str], l
 
     for base in search_paths:
         for props in base.rglob("Properties.sol"):
+            if not props.is_file():
+                continue
             if "chimera" in str(props) or "test" in str(props):
                 props_found = True
                 # Check it has content related to this component
@@ -296,6 +298,8 @@ def check_merge(component: str, repo_path: str = "") -> tuple[bool, list[str], l
     target_found = False
     for base in search_paths:
         for tf in base.rglob("TargetFunctions.sol"):
+            if not tf.is_file():
+                continue
             if "chimera" in str(tf) or "test" in str(tf):
                 target_found = True
                 tf_text = tf.read_text()
@@ -462,7 +466,7 @@ def check_phase2(component: str, repo_path: str = "") -> tuple[bool, list[str], 
 
 
 def check_phase3(component: str, repo_path: str = "") -> tuple[bool, list[str], list[str]]:
-    """Check Fork test evidence (Phase 3 — required if bounty >= $50K or broken invariant)."""
+    """Check Fork test evidence (Phase 3 — required if bounty >= $2K)."""
     state = load_state()
     bounty_value = 0
     payout_str = state.get("payout", "")
@@ -526,6 +530,8 @@ def check_phase4(component: str, repo_path: str = "") -> tuple[bool, list[str], 
     # Phase 4 is mandatory if optimize_* functions exist in Properties.sol
     if repo.exists():
         for props in repo.rglob("Properties.sol"):
+            if not props.is_file():
+                continue
             text = props.read_text()
             if "optimize_" in text:
                 return False, [], [
@@ -841,8 +847,9 @@ def check_finding_poc(finding_id: str) -> tuple[bool, list[str], list[str]]:
     poc_files = list(WEB3_DIR.rglob(f"*{finding_id}*"))
     poc_files += list(WEB3_DIR.rglob("*PoCFindings*"))
     poc_files += list(WEB3_DIR.rglob("*PoC*Finding*"))
-    # Filter to .sol/.t.sol only
-    poc_files = [f for f in poc_files if f.suffix == ".sol" and "lib/" not in str(f)]
+    # Filter to .sol/.t.sol only, exclude build artifacts
+    skip_dirs = {"out", "forge-cache", "dependencies", "artifacts", "node_modules"}
+    poc_files = [f for f in poc_files if f.is_file() and f.suffix == ".sol" and "lib/" not in str(f) and not any(part in skip_dirs for part in f.parts)]
     if poc_files:
         passed.append(f"OK: PoC files found — {[f.name for f in poc_files[:3]]}")
     elif not poc:

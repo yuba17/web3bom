@@ -1,0 +1,685 @@
+protocol: pancakeswap-infinity
+component: CLPoolManager
+file: src/pool-cl/CLPoolManager.sol
+domain: dex
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+# ============================================================================
+# CLPM-D01: Hook-as-msg.sender bypasses its own hook callbacks
+# ============================================================================
+# KEY FINDING: Hooks.shouldCall() returns false when msg.sender == hook address.
+# This means a hook contract calling CLPoolManager.swap/modifyLiquidity/donate
+# directly SKIPS its own before/after callbacks. This is a PancakeSwap-specific
+# design choice (Uniswap v4 does NOT have this bypass). A malicious or buggy hook
+# that calls pool operations on itself can operate without its own safety checks.
+- id: CLPM-D01
+  tier: 1
+  type: property
+  description: >
+    Hook contract acting as msg.sender bypasses all its own hook callbacks.
+    Hooks.shouldCall() at line 72 of Hooks.sol returns false when
+    address(hook) == msg.sender. If a hook calls CLPoolManager.swap() directly,
+    beforeSwap/afterSwap are NEVER invoked for that hook. A hook that relies on
+    its own callbacks for invariant enforcement (e.g., TWAP check in beforeSwap,
+    fee accounting in afterSwap) can be completely bypassed when it is the caller.
+    This is a PancakeSwap-specific divergence from Uniswap v4.
+  attack_scenario: >
+    1. Hook contract H is designed with a beforeSwap that enforces a max price
+       impact check and an afterSwap that updates an internal accounting variable.
+    2. H also has a function that calls CLPoolManager.swap() directly (e.g., for
+       rebalancing, compounding, or arbitrage).
+    3. When H calls swap, shouldCall returns false for H's own hooks.
+    4. The beforeSwap price impact check is SKIPPED entirely.
+    5. The afterSwap accounting update is SKIPPED entirely.
+    6. H's internal state becomes inconsistent. Attacker triggers H's rebalance
+       function with carefully crafted parameters to move price without limit checks,
+       then profits from the price distortion on the other side.
+    Impact: Complete bypass of hook-enforced safety invariants when hook is the caller.
+    For hooks that manage user funds (vault-like hooks), this can mean direct fund loss.
+  impact: "High - hook safety invariants bypassed, potential fund extraction via price manipulation through hook's own call path"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Ghost tracking: record if hook callbacks were actually invoked
+    // This invariant checks that ANY swap that changes price also triggered hook callbacks
+    // Test: deploy a hook that calls swap() on itself and verify callbacks are skipped
+    uint160 priceBefore = poolManager.getSlot0(poolId).sqrtPriceX96;
+    // Trigger swap via hook contract (msg.sender = hook)
+    hookContract.executeSwapDirectly(key, swapParams, "");
+    uint160 priceAfter = poolManager.getSlot0(poolId).sqrtPriceX96;
+    // If price changed, hook callbacks SHOULD have been called
+    // but they weren't because shouldCall returned false
+    t(priceBefore == priceAfter || ghost_hookBeforeSwapCalled, "CLPM-D01: swap changed price without hook callback");
+  ghost_vars:
+  - bool internal ghost_hookBeforeSwapCalled;
+  - bool internal ghost_hookAfterSwapCalled;
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    Confirmed by reading Hooks.sol line 72: `return hasOffsetEnabled(parameters, offset) && address(hook) != msg.sender`.
+    This is intentional design to prevent infinite recursion, but creates a class of
+    vulnerabilities for any hook that assumes its callbacks are always called. Uniswap v4
+    does not have this same bypass. Need to check if PancakeSwap documentation warns
+    hook developers about this. If not, it's a systemic risk for the entire hook ecosystem.
+
+# ============================================================================
+# CLPM-D02: Donate to self-inflate feeGrowthGlobal atomically
+# ============================================================================
+# The CLPool.State struct comment explicitly warns about this at line 52-54:
+# "For pools with a single liquidity position, actors can donate to themselves
+# to freely inflate feeGrowthGlobal. Atomically donating and collecting fees
+# in the same lockAcquired callback may make the inflated value more extreme."
+- id: CLPM-D02
+  tier: 1
+  type: property
+  description: >
+    A sole LP in a pool can donate tokens to themselves via donate(), then
+    immediately collect the donated amount as fees via modifyLiquidity (removing
+    and re-adding liquidity to collect accrued fees). The feeGrowthGlobal value
+    is inflated but the LP recovers the donated tokens minus rounding.
+    If ANY external contract reads feeGrowthGlobal as a proxy for pool volume,
+    TVL quality, or reward distribution, the inflated value causes incorrect
+    calculations. This is acknowledged in code comments but NOT mitigated.
+  attack_scenario: >
+    1. Attacker is the sole LP in a pool (or has overwhelming majority of liquidity
+       in the active tick range).
+    2. Within a single vault.lock() callback, attacker:
+       a) Calls donate(key, 1e18, 0) - pays 1e18 token0 to the pool
+       b) feeGrowthGlobal0X128 increases by (1e18 * Q128) / liquidity
+       c) Calls modifyLiquidity with liquidityDelta = -currentLiquidity (remove all)
+       d) Collects feesOwed0 = ~1e18 (minus dust from rounding)
+       e) Calls modifyLiquidity with liquidityDelta = +currentLiquidity (re-add)
+    3. Net cost: ~0 (rounding dust only). Net effect: feeGrowthGlobal0X128 is
+       permanently inflated by an arbitrary amount.
+    4. Repeat N times in one transaction to inflate feeGrowthGlobal0X128 to any value.
+    5. External reward distributor, farming contract, or UI that uses feeGrowthGlobal
+       as input will distribute incorrect rewards or display false volume metrics.
+  impact: "Medium - feeGrowthGlobal inflation is free for sole LPs, breaks external integrations that trust this value"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Track net token balance of attacker across donate + collect cycle
+    uint256 attackerToken0Before = token0.balanceOf(attacker);
+    uint256 feeGrowthBefore = poolManager.getFeeGrowthGlobals(poolId);
+    // Attacker executes: donate -> remove liquidity (collect fees) -> re-add liquidity
+    // all within one lock callback
+    attackerContract.executeDonateAndCollectCycle(key, donateAmount);
+    uint256 attackerToken0After = token0.balanceOf(attacker);
+    uint256 feeGrowthAfter = poolManager.getFeeGrowthGlobals(poolId);
+    // Invariant: feeGrowthGlobal should not increase without real external swap volume
+    // If attacker's balance is roughly unchanged but feeGrowth increased massively, it's inflation
+    uint256 balanceDelta = attackerToken0Before > attackerToken0After ?
+      attackerToken0Before - attackerToken0After : 0;
+    uint256 feeGrowthDelta = feeGrowthAfter - feeGrowthBefore;
+    // The cost to inflate should be proportional to the inflation, not dust
+    t(feeGrowthDelta == 0 || balanceDelta > donateAmount / 2, "CLPM-D02: feeGrowthGlobal inflated for free");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    Code explicitly acknowledges this in CLPool.sol line 52-54. The question is whether
+    any PancakeSwap ecosystem contract (farming, gauge, or third-party) reads
+    feeGrowthGlobal to make economic decisions. If so, that's the real vulnerability.
+    The donate function itself works correctly - the issue is downstream consumers.
+
+# ============================================================================
+# CLPM-D03: Tick boundary precision loss (KyberSwap-style, $48M class)
+# ============================================================================
+# KyberSwap's $48M exploit was caused by precision loss at tick boundaries in
+# concentrated liquidity math. The critical question: does PancakeSwap's implementation
+# of getTickAtSqrtRatio and getSqrtRatioAtTick maintain the round-trip invariant
+# sqrtPrice -> tick -> sqrtPrice' where sqrtPrice' <= sqrtPrice?
+- id: CLPM-D03
+  tier: 1
+  type: property
+  description: >
+    Tick-to-sqrtPrice and sqrtPrice-to-tick conversions must be monotonic and
+    consistent. getTickAtSqrtRatio returns the GREATEST tick where
+    getSqrtRatioAtTick(tick) <= sqrtPriceX96. If this invariant breaks for any
+    sqrtPriceX96 value (especially at tick boundaries where sqrtPrice exactly equals
+    getSqrtRatioAtTick(N)), the swap loop can miscalculate which liquidity ranges
+    are active, leading to the KyberSwap-class vulnerability where liquidity is
+    double-counted or skipped.
+  attack_scenario: >
+    1. Attacker crafts a swap that lands the price exactly at a tick boundary
+       sqrtPriceX96 = getSqrtRatioAtTick(tickN).
+    2. If getTickAtSqrtRatio(sqrtPriceX96) returns tickN instead of tickN-1
+       (for zeroForOne), the swap loop's tick state is off by one.
+    3. In the next swap step, the wrong liquidity is used because the current
+       tick is misclassified relative to initialized tick boundaries.
+    4. With carefully positioned liquidity, the attacker extracts more output
+       tokens than mathematically possible, draining the pool.
+    5. In PancakeSwap's swap loop (CLPool.sol line 336): for zeroForOne swaps
+       reaching a tick boundary, tick is set to tickNext - 1. This preemptive
+       decrement is critical. If it interacts incorrectly with getTickAtSqrtRatio
+       on the boundary, the state becomes inconsistent.
+  impact: "Critical - KyberSwap-class exploit, potential complete pool drain via tick boundary precision error"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For every tick in range, verify round-trip consistency
+    // tick -> sqrtPrice -> tick' must satisfy tick' == tick
+    int24 tick = ghost_randomTick;
+    uint160 sqrtPrice = TickMath.getSqrtRatioAtTick(tick);
+    int24 tickBack = TickMath.getTickAtSqrtRatio(sqrtPrice);
+    eq(int256(tick), int256(tickBack), "CLPM-D03a: tick round-trip inconsistency");
+
+    // Also verify: for sqrtPrice at boundary, zeroForOne swap sets tick = boundary - 1
+    // This is the KyberSwap-critical check
+    uint160 boundaryPrice = TickMath.getSqrtRatioAtTick(tick);
+    int24 expectedTick = tick; // getTickAtSqrtRatio returns greatest tick <= price
+    int24 actualTick = TickMath.getTickAtSqrtRatio(boundaryPrice);
+    eq(int256(expectedTick), int256(actualTick), "CLPM-D03b: boundary tick mismatch");
+  ghost_vars:
+  - int24 internal ghost_randomTick;
+  validated: false
+  priority: critical
+  confidence: 70
+  notes: >
+    PancakeSwap's TickMath appears to be a direct copy of Uniswap v4's implementation.
+    Uniswap v4 fixed the tick boundary issues that affected earlier versions. However,
+    KyberSwap's bug was in their CUSTOM modification to the tick math, not in the
+    vanilla Uniswap code. Need to diff PancakeSwap's TickMath against Uniswap v4's
+    to identify any deviations. The swap loop's preemptive decrement at line 336
+    (state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext) follows the same
+    pattern as Uniswap v4, which is correct. Confidence is 70% because the code
+    LOOKS correct but the $48M precedent demands thorough fuzzing.
+
+# ============================================================================
+# CLPM-D04: Liquidity = 1 wei extreme edge case in fee calculation
+# ============================================================================
+- id: CLPM-D04
+  tier: 1
+  type: property
+  description: >
+    When pool liquidity is exactly 1 wei, the feeGrowthGlobal update uses
+    UnsafeMath.simpleMulDiv(feeAmount, Q128, 1) which is just feeAmount * Q128.
+    For any non-trivial feeAmount, this value can overflow uint256 silently
+    because simpleMulDiv uses assembly `div(mul(a, b), c)` which wraps on
+    overflow. The feeGrowthGlobal would be set to a truncated (wrong) value,
+    causing LPs to receive incorrect fees. Similarly in donate(), the same
+    UnsafeMath.simpleMulDiv is used with state.liquidity as denominator.
+  attack_scenario: >
+    1. Attacker creates a position with liquidity = 1 at a very narrow tick range.
+    2. Attacker executes a swap with a large enough amount that feeAmount > 0.
+    3. feeGrowthGlobal update: simpleMulDiv(feeAmount, Q128, 1) = feeAmount * Q128.
+       If feeAmount >= 2^128, the mul overflows in assembly, producing a truncated value.
+    4. Actually, feeAmount is capped by the swap input amount which is int256,
+       so feeAmount < 2^255. With Q128 = 2^128, the product is < 2^383 which
+       DOES overflow uint256 (max 2^256). The result is silently truncated.
+    5. feeGrowthGlobal is now wrong. Future fee calculations for this and other
+       positions in the same tick range will be incorrect.
+    6. Note: This also applies to donate() at CLPool.sol line 458.
+  impact: "High - silent overflow in fee accumulation when liquidity is extremely low, leading to incorrect fee distribution"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test with liquidity = 1 and a swap that generates fees
+    // Verify that feeGrowthGlobal is calculated correctly (no overflow truncation)
+    uint128 liquidity = poolManager.getLiquidity(poolId);
+    if (liquidity > 0 && liquidity <= 10) {
+      // Get feeGrowthGlobals before swap
+      (uint256 fg0Before, uint256 fg1Before) = poolManager.getFeeGrowthGlobals(poolId);
+      // Execute a swap
+      // ... swap execution ...
+      (uint256 fg0After, uint256 fg1After) = poolManager.getFeeGrowthGlobals(poolId);
+      // The feeGrowthGlobal delta should be feeAmount * Q128 / liquidity
+      // If this overflowed, fg0After might be LESS than fg0Before (wrapping)
+      // For liquidity=1, any feeAmount > 2^128 causes overflow
+      // feeAmount is bounded by swap size, so check if swap was large enough
+      t(fg0After >= fg0Before, "CLPM-D04: feeGrowthGlobal decreased (overflow)");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    UnsafeMath.simpleMulDiv uses `div(mul(a, b), denominator)` in assembly.
+    The `mul(a, b)` wraps silently if a*b > 2^256. With liquidity=1 and Q128=2^128,
+    feeAmount * 2^128 overflows when feeAmount > 2^128. In practice, a single swap's
+    feeAmount is limited by the swap input (max int256), so feeAmount < 2^255.
+    feeAmount * Q128 = up to 2^383 which DEFINITELY overflows. The question is
+    whether liquidity=1 is practically achievable given the position math. With
+    tickSpacing=1, a single-tick position can have liquidity=1. This is a real
+    edge case. Uniswap v4 has the same code pattern - check if they have a
+    minimum liquidity requirement.
+
+# ============================================================================
+# CLPM-D05: Asymmetric pause — modifyLiquidity(add) blocked but donate/swap
+#           have different pause behavior
+# ============================================================================
+- id: CLPM-D05
+  tier: 2
+  type: property
+  description: >
+    Symmetric inspection reveals an asymmetry in pause behavior:
+    - modifyLiquidity: blocks ADDING liquidity when paused (line 148), but
+      ALLOWS removing liquidity when paused (correct - users should be able to exit)
+    - swap: uses whenNotPaused modifier (line 165) - completely blocked when paused
+    - donate: uses whenNotPaused modifier (line 182) - completely blocked when paused
+    - initialize: NO pause check at all - can initialize new pools when paused
+
+    The asymmetry of interest: initialize has no pause check. If the system is
+    paused due to a discovered vulnerability, an attacker can still initialize
+    new pools. If the vulnerability is in the initialization path itself, pausing
+    provides no protection.
+  attack_scenario: >
+    1. A vulnerability is discovered in CLPoolManager (e.g., in hook validation).
+    2. Owner pauses the system to prevent exploitation.
+    3. Attacker can still call initialize() because it has no pause check.
+    4. If the vulnerability is in the initialize path or in hook deployment,
+       the attacker can still exploit it despite the pause.
+    5. For the modifyLiquidity asymmetry: when paused, users CAN remove liquidity
+       (good), but cannot add. This is correct behavior for emergency situations.
+       The initialize gap is the real concern.
+  impact: "Low - initialize callable during pause, limited direct impact but reduces pause effectiveness"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that initialize is blocked when paused
+    // (Currently it is NOT - this is the finding)
+    bool isPaused = poolManager.paused();
+    if (isPaused) {
+      // Try to initialize a new pool - should this revert?
+      // Currently it does NOT revert
+      try poolManager.initialize(newPoolKey, sqrtPriceX96) returns (int24) {
+        // If we get here during pause, the invariant is violated
+        t(false, "CLPM-D05: initialize succeeded while system is paused");
+      } catch {
+        // Expected behavior if pause should block initialize
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    This is a design question more than a definitive bug. The argument for allowing
+    initialize during pause is that initialization doesn't move funds. The argument
+    against is that a compromised hook could be deployed via initialize during an
+    emergency pause. Need to check if PancakeSwap considers this intentional.
+    Symmetric pairs analyzed: modifyLiquidity(add/remove), swap/donate (both whenNotPaused),
+    initialize (no check). The add/remove asymmetry is CORRECT (users can exit during pause).
+
+# ============================================================================
+# CLPM-D06: Protocol fee accumulation in unchecked block - potential overflow
+# ============================================================================
+- id: CLPM-D06
+  tier: 2
+  type: property
+  description: >
+    In CLPoolManager.swap() lines 203-206, protocolFeesAccrued is updated inside
+    an unchecked block: `protocolFeesAccrued[currency] += state.feeAmountToProtocol`.
+    The comment says "cannot overflow due to limits on the size of protocolFee and
+    params.amountSpecified". protocolFeesAccrued is a mapping(Currency => uint256).
+    Over time, if protocolFeesAccrued is never collected (or collected infrequently),
+    this value accumulates across ALL swaps. For a high-volume pool, the cumulative
+    protocol fees could theoretically approach uint256 max over the pool's lifetime.
+    However, since protocol fee per swap is limited to 0.4% of amountSpecified
+    (which is int256, max ~1.15e77), each swap adds at most ~4.6e74. To overflow
+    uint256 (~1.16e77), you'd need ~252 swaps at maximum size - extremely unlikely
+    but the unchecked block removes the safety net.
+  attack_scenario: >
+    Extremely unlikely in practice. Would require ~252 maximum-size swaps without
+    any protocol fee collection. More of a theoretical concern. The real risk is
+    if a malicious protocolFeeController never collects, allowing accumulation.
+    But even then, 252 swaps of type(int256).max each is unrealistic.
+  impact: "Info - theoretical overflow in protocol fee accumulation, practically unreachable"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track protocolFeesAccrued growth and verify no overflow
+    uint256 feesBefore = poolManager.protocolFeesAccrued(currency0);
+    // Execute swap
+    poolManager.swap(key, swapParams, "");
+    uint256 feesAfter = poolManager.protocolFeesAccrued(currency0);
+    // Fees should only increase (no overflow wrapping)
+    gte(feesAfter, feesBefore, "CLPM-D06: protocolFeesAccrued decreased (overflow)");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    The comment in the code addresses this: "cannot overflow due to limits on the
+    size of protocolFee and params.amountSpecified". This is correct for any
+    reasonable number of swaps. Marking as tier 2 / low priority. Would need
+    formal verification (Halmos) to prove the upper bound definitively.
+
+# ============================================================================
+# CLPM-D07: beforeSwap hook can modify amountSpecified to 0, causing early return
+#           with no swap but delta still settled
+# ============================================================================
+- id: CLPM-D07
+  tier: 1
+  type: property
+  description: >
+    In CLHooks.beforeSwap(), the hook can return a hookDeltaSpecified that modifies
+    amountToSwap. At line 157: `amountToSwap += hookDeltaSpecified`. If the hook
+    returns hookDeltaSpecified = -amountToSwap (exactly canceling the original),
+    amountToSwap becomes 0. Back in CLPool.swap() line 247:
+    `if (params.amountSpecified == 0) return (ZERO_DELTA, state)` - early return.
+    BUT this check uses params.amountSpecified (the MODIFIED value from beforeSwap),
+    not the original. So the swap returns ZERO_DELTA, but the hookDelta from
+    beforeSwap is still processed in afterSwap. The hook has effectively consumed
+    the user's input without executing any swap.
+  attack_scenario: >
+    1. User initiates swap with amountSpecified = -100e18 (exact input, 100 tokens).
+    2. Malicious hook's beforeSwap returns hookDeltaSpecified = +100e18.
+    3. amountToSwap = -100e18 + 100e18 = 0.
+    4. CLPool.swap returns early with ZERO_DELTA.
+    5. In CLPoolManager.swap, afterSwap is called. The beforeSwapDelta is processed.
+    6. hookDelta includes the +100e18 specified delta.
+    7. Via accountAppDeltaWithHookDelta, the user is charged for the hook's delta
+       but receives zero output from the swap.
+    8. The hook effectively stole the user's 100 tokens.
+    NOTE: This requires a malicious hook, which users choose to interact with.
+    But if the hook is upgradeable or its behavior is not transparent, users may
+    not realize the risk. The check at line 158 prevents TYPE change
+    (exact input becoming exact output) but not reduction to zero.
+  impact: "Medium - malicious hook can consume user's swap input without executing swap. Requires user to use a pool with malicious hook."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a swap, verify that if delta is non-zero, the swap actually executed
+    // (price moved or output was generated)
+    (uint160 sqrtPriceBefore,,,) = poolManager.getSlot0(poolId);
+    BalanceDelta delta = poolManager.swap(key, params, hookData);
+    (uint160 sqrtPriceAfter,,,) = poolManager.getSlot0(poolId);
+    int128 amount0 = delta.amount0();
+    int128 amount1 = delta.amount1();
+    // If user paid something (amount0 > 0 or amount1 > 0), price should have moved
+    // OR output should be non-zero
+    bool userPaid = (amount0 > 0 || amount1 > 0);
+    bool userReceived = (amount0 < 0 || amount1 < 0);
+    bool priceMoved = (sqrtPriceBefore != sqrtPriceAfter);
+    t(!userPaid || userReceived || priceMoved, "CLPM-D07: user paid but got nothing and price unchanged");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The key insight is that beforeSwap can reduce amountSpecified to 0 (but not flip sign,
+    line 158 prevents that). A 0 amountSpecified causes early return with ZERO_DELTA from
+    the pool, but the hook's delta is still settled. This is by design for hooks that want
+    to handle swaps differently (e.g., a TWAMM hook). However, it creates a trust assumption
+    that users must understand: the hook can redirect their entire swap input.
+    The original CLPoolManager.swap checks amountSpecified != 0 at line 168, but this is
+    the ORIGINAL amount, before hook modification. The pool.swap check at line 247 uses the
+    MODIFIED amount. So the flow is: (1) original != 0 check passes, (2) hook modifies to 0,
+    (3) pool returns early with zero, (4) hook delta still applies.
+
+# ============================================================================
+# CLPM-D08: donate() has no hook return delta, unlike swap/modifyLiquidity
+# ============================================================================
+- id: CLPM-D08
+  tier: 2
+  type: property
+  description: >
+    Constraint inference across functions: swap() and modifyLiquidity() both call
+    vault.accountAppDeltaWithHookDelta() which handles hook return deltas.
+    donate() calls vault.accountAppBalanceDelta() directly (line 229), with NO
+    hook delta handling. This means donate() hooks (beforeDonate/afterDonate)
+    cannot return deltas to modify the caller's obligation.
+    Additionally, donate() settles delta to msg.sender directly, not through the
+    hook delta path. This is an intentional simplification but creates an asymmetry:
+    a hook that wants to subsidize donations or modify donation amounts cannot do so
+    through the standard return delta mechanism.
+  attack_scenario: >
+    Limited direct attack. The asymmetry means hooks have less control over donate
+    operations than over swaps or liquidity modifications. A hook designed to
+    redistribute or modify donations cannot use the return delta mechanism.
+    However, a hook could still revert in beforeDonate to block unwanted donations.
+    The risk is more about unexpected behavior for hook developers who assume
+    consistent delta-return capabilities across all operations.
+  impact: "Info - design asymmetry, donate hooks cannot return deltas unlike swap/modifyLiquidity hooks"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that donate settles to msg.sender directly (not through hook delta path)
+    // This is more of a documentation/design invariant than a fuzz target
+    // The concrete test: after donate, the hook's balance should be unchanged
+    // (donate delta goes entirely to the caller, not split with hook)
+    uint256 hookBalance0Before = vault.balanceOf(address(hook), currency0);
+    poolManager.donate(key, amount0, amount1, "");
+    uint256 hookBalance0After = vault.balanceOf(address(hook), currency0);
+    eq(hookBalance0Before, hookBalance0After, "CLPM-D08: donate affected hook balance");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    This is a design observation from constraint inference. All three external
+    state-changing functions (swap, modifyLiquidity, donate) call hooks but only
+    swap and modifyLiquidity support hook return deltas. donate is the outlier.
+    Confirmed by comparing lines 227-229 (donate) vs 224-228 (swap) and 170-174
+    (modifyLiquidity).
+
+# ============================================================================
+# CLPM-D09: Active liquidity invariant across tick crossings
+# ============================================================================
+- id: CLPM-D09
+  tier: 1
+  type: property
+  description: >
+    DEX-INV-010 adapted for PancakeSwap: pool.liquidity must equal the sum of
+    liquidityNet values for all initialized ticks from MIN_TICK up to and including
+    the current tick. After any swap that crosses ticks, the liquidity must be
+    updated correctly by adding/subtracting liquidityNet at each crossed tick.
+    This is the fundamental invariant of concentrated liquidity pools.
+  attack_scenario: >
+    If the liquidity tracking diverges from the actual sum of position liquidities
+    in the active range, swaps will use the wrong liquidity for price calculation.
+    This means either: (1) too much output for a given input (pool drained), or
+    (2) too little output (LPs extract value from swappers). The swap loop at
+    CLPool.sol line 318-337 handles tick crossing. If state.liquidity is not
+    updated correctly after crossing, all subsequent swap steps in the same
+    transaction use wrong liquidity. Critical for multi-tick swaps.
+  impact: "Critical - incorrect liquidity after tick crossing means wrong price calculation, potential pool drain"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any swap, verify that pool.liquidity matches the sum of liquidityNet
+    // for all initialized ticks <= current tick
+    (uint160 sqrtPrice, int24 currentTick,,) = poolManager.getSlot0(poolId);
+    uint128 reportedLiquidity = poolManager.getLiquidity(poolId);
+    // Calculate expected liquidity by traversing all initialized ticks up to currentTick
+    // (This requires iterating the tick bitmap - expensive but correct)
+    int128 cumulativeLiquidityNet = 0;
+    // Traverse from MIN_TICK to currentTick, summing liquidityNet at each initialized tick
+    // ... bitmap traversal ...
+    uint128 expectedLiquidity = uint128(int128(cumulativeLiquidityNet));
+    eq(uint256(reportedLiquidity), uint256(expectedLiquidity),
+       "CLPM-D09: active liquidity != sum of liquidityNet up to current tick");
+  ghost_vars:
+  - int128 internal ghost_cumulativeLiquidityNet;
+  validated: false
+  priority: critical
+  confidence: 85
+  notes: >
+    This is the most fundamental invariant of any concentrated liquidity AMM.
+    The swap loop at CLPool.sol lines 318-337 handles tick crossing. Key line:
+    state.liquidity = state.liquidity.addDelta(liquidityNet) (line 332).
+    For zeroForOne, liquidityNet is negated (line 329). This matches Uniswap v4.
+    The invariant should be fuzzed with multi-tick swaps across many initialized
+    ticks to catch off-by-one errors in tick crossing logic.
+
+# ============================================================================
+# CLPM-D10: Swap fee conservation - fees collected must not exceed input
+# ============================================================================
+- id: CLPM-D10
+  tier: 1
+  type: property
+  description: >
+    DEX-INV-008 adapted: for every swap step, feeAmount + amountIn <= original
+    amountSpecified (for exact input swaps). The total fees (LP fees + protocol fees)
+    must never exceed the total input. SwapMath.computeSwapStep guarantees this
+    per step, but the accumulation across multiple steps in the swap loop must also
+    maintain this invariant. In CLPool.swap at line 279:
+    `state.amountSpecifiedRemaining += (step.amountIn + step.feeAmount).toInt256()`
+    (for exactInput). The remaining amount should never go positive (would mean
+    we've consumed more than specified).
+  attack_scenario: >
+    If the fee calculation in SwapMath.computeSwapStep has a rounding error that
+    causes amountIn + feeAmount to exceed the remaining amount, the unchecked
+    addition at line 278-279 would cause amountSpecifiedRemaining to become
+    positive (for exact input, it starts negative). The SafeCast.toInt256 on
+    step.amountIn + step.feeAmount could also overflow if both are large uint256.
+    However, SwapMath explicitly guarantees amountIn + feeAmount <= abs(amountRemaining)
+    per the natspec at line 40-41. Need to verify this guarantee holds at tick
+    boundaries and with extreme fee values (100% fee is allowed for CL pools).
+  impact: "High - fee overcharge means user pays more than specified, breaking exact input guarantee"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For exact input swaps, verify total consumed <= abs(amountSpecified)
+    int256 amountSpecified = params.amountSpecified; // negative for exact input
+    BalanceDelta delta = poolManager.swap(key, params, "");
+    int128 amount0 = delta.amount0();
+    int128 amount1 = delta.amount1();
+    if (amountSpecified < 0) {
+      // exact input: user pays (positive delta on input side)
+      int128 inputConsumed = params.zeroForOne ? amount0 : amount1;
+      // inputConsumed should be <= abs(amountSpecified)
+      lte(uint256(uint128(inputConsumed)), uint256(uint128(int128(-amountSpecified))),
+          "CLPM-D10: swap consumed more input than specified");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    SwapMath.computeSwapStep is designed to guarantee this per step. The concern
+    is accumulation across steps and interaction with the unchecked block at
+    line 278-279. With 100% fee (allowed for CL pools), exactInput swaps consume
+    the entire input as fee with zero output. This is valid behavior. The fuzz
+    target should use various fee levels including 100% and near-100%.
+
+# ============================================================================
+# CLPM-D11: UnsafeMath.simpleMulDiv truncation in feeGrowthGlobal update
+# ============================================================================
+- id: CLPM-D11
+  tier: 1
+  type: property
+  description: >
+    In CLPool.swap() line 309-310 and CLPool.donate() line 458, feeGrowthGlobal
+    is updated using UnsafeMath.simpleMulDiv(feeAmount, Q128, liquidity).
+    UnsafeMath.simpleMulDiv uses assembly `div(mul(a, b), c)` which SILENTLY
+    TRUNCATES on overflow of mul(a, b). This is a critical difference from
+    FullMath.mulDiv which handles 512-bit intermediates correctly.
+
+    The overflow happens when: feeAmount * Q128 > 2^256.
+    Q128 = 2^128, so feeAmount > 2^128 causes overflow.
+
+    Is feeAmount > 2^128 possible? feeAmount per step is bounded by the swap
+    input for that step. For an exact input swap with amountSpecified close to
+    type(int256).max, and a 100% fee, feeAmount for a single step could be
+    close to 2^255. This ABSOLUTELY overflows when multiplied by Q128.
+
+    However, with LOW liquidity, the swap step might not consume that much.
+    The critical path: large exactInput swap + high fee + low liquidity in one
+    tick range.
+  attack_scenario: >
+    1. Pool has tickSpacing=1, a narrow position with liquidity = small value.
+    2. Attacker submits exact input swap with very large amountSpecified.
+    3. In a single swap step, amountIn could be large (up to the full range of
+       the tick). feeAmount is proportional to amountIn.
+    4. If feeAmount * Q128 > 2^256, simpleMulDiv silently truncates.
+    5. feeGrowthGlobal gets a WRONG (smaller than correct) increment.
+    6. LPs receive LESS fees than they're owed. The "missing" fees are permanently
+       lost (not tracked anywhere).
+    7. With FullMath.mulDiv this wouldn't happen - it handles 512-bit intermediates.
+    8. NOTE: Uniswap v4 uses the same UnsafeMath pattern. This may be intentional
+       with the reasoning that the truncation amount is dust relative to the actual
+       value. But with extreme parameters, the truncation could be significant.
+  impact: "Medium - fee underaccounting due to silent overflow truncation in feeGrowthGlobal, LPs lose fees"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Compare UnsafeMath.simpleMulDiv result with FullMath.mulDiv for same inputs
+    // If they differ, simpleMulDiv has overflowed and truncated
+    uint256 feeAmount = ghost_lastFeeAmount;
+    uint128 liquidity = ghost_lastLiquidity;
+    if (feeAmount > 0 && liquidity > 0) {
+      uint256 unsafeResult = UnsafeMath.simpleMulDiv(feeAmount, FixedPoint128.Q128, liquidity);
+      uint256 safeResult = FullMath.mulDiv(feeAmount, FixedPoint128.Q128, liquidity);
+      eq(unsafeResult, safeResult,
+         "CLPM-D11: simpleMulDiv truncated vs FullMath.mulDiv - fee underaccounting");
+    }
+  ghost_vars:
+  - uint256 internal ghost_lastFeeAmount;
+  - uint128 internal ghost_lastLiquidity;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The code comments at CLPool.State struct (lines 52-54) mention that
+    feeGrowthGlobal "can be artificially inflated" but doesn't mention the
+    truncation issue. UnsafeMath.simpleMulDiv is intentionally unsafe for gas
+    savings. The question is whether the inputs are bounded tightly enough that
+    overflow never happens in practice. With maxFee = 100% and large swaps,
+    feeAmount can be very large. A Halmos proof would definitively answer whether
+    overflow is reachable given the input constraints.
+
+false_positives:
+- hunter: DomainHunter
+  id: CLPM-FP-01
+  reason: >
+    modifyLiquidity allowing liquidityDelta=0 with no liquidity change is NOT a bug.
+    CLPosition.update() reverts with CannotUpdateEmptyPosition if liquidity==0 AND
+    liquidityDelta==0 (line 83 of CLPosition.sol). For positions with existing liquidity,
+    liquidityDelta=0 is a valid "poke" operation that collects accumulated fees without
+    changing liquidity. This is by design in Uniswap v3/v4 and PancakeSwap.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "liquidityDelta=0 in modifyLiquidity is a valid poke to collect fees for existing positions. NOT a bug."
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: CLPM-FP-02
+  reason: >
+    The preemptive tick decrement for zeroForOne swaps (CLPool.sol line 336:
+    `state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext`) is NOT a bug.
+    This is the standard Uniswap v3/v4 pattern. When price moves left (zeroForOne),
+    reaching the exact price of a tick boundary means the current tick should be
+    one below that boundary (since tick represents the range [tick, tick+1)).
+    The comment at lines 314-317 explains this correctly. This is critical for
+    correct fee accounting and liquidity tracking but is implemented correctly here.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Preemptive tick decrement for zeroForOne swaps (tick = tickNext - 1) is correct behavior, not an off-by-one error."
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: CLPM-FP-03
+  reason: >
+    The feeGrowthGlobal inflation via donate (CLPM-D02) is ACKNOWLEDGED in the
+    code comments (CLPool.sol lines 52-54). PancakeSwap is aware of this behavior.
+    The donate function itself works correctly. The risk is ONLY in downstream
+    consumers that trust feeGrowthGlobal as a measure of organic swap volume.
+    Kept as an invariant (CLPM-D02) because downstream risk is real, but marked
+    here to document that the core contract behavior is intentional.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "feeGrowthGlobal can be artificially inflated by sole LPs via donate+collect. Acknowledged by PancakeSwap in code comments. Risk is in downstream consumers."
+    briefing_update_applied: false

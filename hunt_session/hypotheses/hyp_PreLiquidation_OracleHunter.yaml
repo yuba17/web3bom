@@ -1,0 +1,656 @@
+protocol: morpho-pre-liquidation
+component: PreLiquidation
+file: src/PreLiquidation.sol
+domain: liquidation-mechanics
+hunter: OracleHunter
+generated_at: '2026-03-23T00:00:00Z'
+
+# ============================================================
+# ANALYSIS SUMMARY (v2 — refined from v1)
+# ============================================================
+# ARQUITECTURA DUAL ORACLE:
+#
+#   PRE_LIQUIDATION_ORACLE (immutable, L48, L143):
+#     - Determina eligibilidad de pre-liquidación (L148-L150)
+#     - Calcula LTV, quotient, preLIF, preLCF
+#     - Calcula seizedAssets ↔ repaidShares conversión
+#     - NO tiene validación en constructor (ni address(0) ni tipo)
+#
+#   ORACLE (immutable, L38, L55 via marketParams()):
+#     - Usado por Morpho Blue en _isHealthy() dentro de withdrawCollateral()
+#     - Es el oracle del market, elegido por el market creator
+#     - Actúa como SAFETY NET: si after-seizure position es unhealthy → revert
+#
+# FLUJO COMPLETO de preLiquidate():
+#   1. collateralPrice = PRE_LIQUIDATION_ORACLE.price()     [L143]
+#   2. collateralQuoted = collateral * collateralPrice / 1e36 [L144]
+#   3. borrowed = borrowShares → assets                       [L145]
+#   4. require borrowed <= collateralQuoted * LLTV             [L148] ← not liquidatable
+#   5. require borrowed > collateralQuoted * PRE_LLTV          [L150] ← is pre-liquidatable
+#   6. compute LTV, quotient, preLIF                           [L152-154]
+#   7. compute seizedAssets or repaidShares                    [L156-165]
+#   8. compute preLCF, check close factor                      [L169-172]
+#   9. MORPHO.repay() → callback onMorphoRepay()              [L175]
+#  10. onMorphoRepay: MORPHO.withdrawCollateral() ← uses ORACLE via _isHealthy [L190]
+#  11. onMorphoRepay: optional callback to liquidator           [L192-194]
+#  12. onMorphoRepay: safeTransferFrom liquidator → this        [L196]
+#
+# KEY INSIGHT: Steps 1-8 use PRE_LIQUIDATION_ORACLE.
+#              Step 10 uses market ORACLE (inside Morpho Blue).
+#              Divergence between these two creates the attack surface.
+#
+# AUTHORIZATION REQUIREMENT (CRITICAL SAFETY):
+#   Morpho.withdrawCollateral requires _isSenderAuthorized(onBehalf).
+#   PreLiquidation calls withdrawCollateral(borrower, liquidator).
+#   Therefore, borrower MUST have called Morpho.setAuthorization(preLiqContract, true).
+#   This means:
+#   - Borrower explicitly trusts this specific PreLiquidation instance
+#   - Malicious PreLiquidation with bad oracle = only hurts borrowers who opted in
+#   - This is the primary trust boundary
+# ============================================================
+
+invariants:
+
+- id: PL-O-01
+  tier: 1
+  type: property
+  description: >
+    DUAL ORACLE DOS — When PRE_LIQUIDATION_ORACLE returns a significantly LOWER
+    price than the market ORACLE, PreLiquidation computes a higher LTV → higher
+    preLIF → more collateral to seize. But when Morpho.withdrawCollateral()
+    checks _isHealthy using the MARKET oracle, the remaining collateral (valued
+    higher by market oracle) may still cover remaining debt. HOWEVER, in the
+    OPPOSITE case: if PRE_LIQUIDATION_ORACLE reports HIGHER price than reality,
+    positions that should be pre-liquidatable appear healthy → pre-liquidation
+    is DOSed. The borrower sits in the danger zone without the benefit of
+    soft pre-liquidation terms. Since PreLiquidation contracts are immutable
+    (oracle cannot be updated), this DOS is permanent for that instance.
+  attack_scenario: >
+    Case A — PRE_LIQ_ORACLE price too HIGH (DOS vector):
+    1. PRE_LIQUIDATION_ORACLE returns 2000e36 but real market price is 1000e36.
+    2. Borrower: 1 unit collateral, 750 USD debt. PRE_LLTV = 70%, LLTV = 80%.
+    3. By PRE_LIQ_ORACLE: LTV = 750/2000 = 37.5% < PRE_LLTV (70%) → NOT pre-liquidatable.
+    4. By market ORACLE: LTV = 750/1000 = 75% > PRE_LLTV (70%) → SHOULD be pre-liquidatable.
+    5. Pre-liquidation is blocked. Position deteriorates until full Morpho liquidation.
+
+    Case B — PRE_LIQ_ORACLE price too LOW (revert at Morpho):
+    1. PRE_LIQUIDATION_ORACLE returns 500e36 but real market price is 1000e36.
+    2. By PRE_LIQ_ORACLE: LTV = 750/500 = 150% > LLTV → L148 reverts "LiquidatablePosition".
+    3. Pre-liquidation blocked again, but by a different check.
+
+    Both cases: pre-liquidation mechanism fails when oracles diverge significantly.
+  impact: >
+    DOS of pre-liquidation mechanism for affected PreLiquidation instances.
+    No direct fund loss, but borrowers lose access to softer pre-liquidation
+    terms and face full Morpho liquidation with harsher penalties.
+    Immutability of PreLiquidation contracts means a new instance must be
+    deployed with corrected oracle. This is documented behavior (NatSpec L125-127)
+    but the permanence makes it noteworthy.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Check divergence between the two oracles
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    uint256 marketPrice = IOracle(ORACLE).price();
+    if (marketPrice > 0 && preLiqPrice > 0) {
+        uint256 ratio = preLiqPrice * WAD / marketPrice;
+        // Flag if divergence exceeds 50% in either direction
+        t(ratio <= 1.5e18, "PL-O-01: preLiqOracle overvalues collateral >50%");
+        t(ratio >= 0.5e18, "PL-O-01: preLiqOracle undervalues collateral >50%");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: >
+    This is by-design (NatSpec documents it). But the PERMANENCE of the issue
+    (immutable contract, no oracle update mechanism) elevates it from "known
+    limitation" to "design concern". The factory has no validation on oracle
+    quality. Confidence is moderate because this might be classified as
+    "user responsibility" per Morpho's design philosophy.
+
+- id: PL-O-02
+  tier: 1
+  type: property
+  description: >
+    FLASH LOAN ORACLE MANIPULATION — If PRE_LIQUIDATION_ORACLE reads from a
+    manipulable source (spot AMM, low-liquidity TWAP), an attacker can:
+    (a) Flash-crash the oracle price → healthy position appears pre-liquidatable.
+    (b) Call preLiquidate with maximum seizedAssets (inflated preLIF from high LTV).
+    (c) Morpho.withdrawCollateral health check uses MARKET oracle which is NOT
+        manipulated → the position may still pass health check if the seized
+        amount doesn't push it below LLTV by market oracle.
+    (d) Attacker profits: receives collateral at preLIF discount vs debt repaid.
+    The preLIF incentive (1x to 1/LLTV, max ~1.25x for 80% LLTV) is the
+    attacker's profit margin after subtracting flash loan + manipulation costs.
+  attack_scenario: >
+    Prerequisites: PRE_LIQUIDATION_ORACLE is a spot price from a DEX pool.
+    1. Borrower has healthy position: 1000 collateral, 600 debt, PRE_LLTV=70%.
+       By real price: LTV = 60% < PRE_LLTV → not pre-liquidatable.
+    2. Attacker flash-borrows collateral token, dumps on DEX.
+    3. PRE_LIQUIDATION_ORACLE now reports 50% of real price.
+    4. By manipulated price: collateralQuoted = 1000 * 0.5 = 500.
+       LTV = 600/500 = 120% > LLTV (80%) → L148 reverts "LiquidatablePosition"!
+    WAIT — this FAILS. If the manipulated price makes LTV > LLTV, L148 reverts.
+    The attacker needs to manipulate to the sweet spot: PRE_LLTV < LTV < LLTV.
+    5. Attacker manipulates price to ~75% of real: collateralQuoted = 750.
+       LTV = 600/750 = 80% — exactly at LLTV boundary.
+    6. But L148: borrowed(600) <= collateralQuoted(750)*LLTV(0.8)=600. Passes (barely).
+       L150: borrowed(600) > collateralQuoted(750)*PRE_LLTV(0.7)=525. Passes.
+    7. quotient = (0.8 - 0.7) / (0.8 - 0.7) = 1.0 → preLIF = PRE_LIF_2 (maximum).
+    8. Attacker seizes collateral at PRE_LIF_2 discount.
+    9. Morpho health check uses REAL market oracle: remaining collateral still
+       covers remaining debt → tx succeeds.
+    10. Attacker restores DEX price, repays flash loan, keeps profit.
+    CONSTRAINT: The attacker must hit the narrow window PRE_LLTV < manipulated_LTV < LLTV.
+  impact: >
+    Direct theft of borrower collateral. The preLIF bonus (up to 1/LLTV = 1.25x
+    for 80% LLTV) means attacker receives 25% more collateral than debt repaid.
+    Bounded by: PRE_LCF (max close factor), and manipulation precision needed.
+    Realistically: only exploitable if PRE_LIQUIDATION_ORACLE is a spot/short-TWAP
+    oracle, which would be a deployment configuration error.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: if position is healthy by market oracle (LTV < PRE_LLTV),
+    // it should not be pre-liquidatable
+    uint256 marketPrice = IOracle(ORACLE).price();
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    Position memory pos = MORPHO.position(ID, borrower);
+    Market memory mkt = MORPHO.market(ID);
+    uint256 borrowed = uint256(pos.borrowShares).toAssetsUp(mkt.totalBorrowAssets, mkt.totalBorrowShares);
+    if (marketPrice > 0 && borrowed > 0) {
+        uint256 collateralByMarket = uint256(pos.collateral).mulDivDown(marketPrice, ORACLE_PRICE_SCALE);
+        uint256 ltvByMarket = borrowed.wDivUp(collateralByMarket);
+        uint256 collateralByPreLiq = uint256(pos.collateral).mulDivDown(preLiqPrice, ORACLE_PRICE_SCALE);
+        // If healthy by market oracle, should also be healthy by pre-liq oracle
+        if (ltvByMarket <= PRE_LLTV) {
+            t(borrowed <= collateralByPreLiq.wMulDown(PRE_LLTV),
+              "PL-O-02: healthy position pre-liquidatable via oracle divergence");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: critical
+  confidence: 55
+  notes: >
+    Confidence is moderate because exploitability depends entirely on what oracle
+    is deployed as PRE_LIQUIDATION_ORACLE. The IOracle interface has no safety
+    guarantees. The IOracle.sol NatSpec says "It is the user's responsibility
+    to select markets with safe oracles" — same philosophy applies here.
+    The CRITICAL nuance: the market oracle is chosen by market creator (presumably
+    careful), but PRE_LIQUIDATION_ORACLE is chosen by ANYONE calling the factory.
+    A borrower wouldn't authorize a bad PreLiquidation, but they might not verify
+    the oracle quality of a PreLiquidation they're asked to authorize.
+
+- id: PL-O-03
+  tier: 2
+  type: property
+  description: >
+    PRE_LIQUIDATION_ORACLE = address(0) — No validation in constructor. The
+    factory and constructor validate preLltv, preLCF, preLIF parameters but
+    NOT the preLiquidationOracle address. If address(0) is passed, the contract
+    deploys successfully but every call to preLiquidate() reverts when trying
+    to call IOracle(address(0)).price() — a call to the zero address always
+    reverts. This is a permanent DOS of that PreLiquidation instance.
+  attack_scenario: >
+    1. Anyone calls factory.createPreLiquidation(id, params) with
+       preLiquidationOracle = address(0).
+    2. Contract deploys successfully (no revert in constructor).
+    3. Any call to preLiquidate() reverts at L143: IOracle(address(0)).price().
+    4. Since PreLiquidation is immutable, there's no fix — the contract is bricked.
+    5. Not a direct attack vector since it only affects that specific instance.
+       But: if a frontend or integration defaults to address(0), it creates
+       a permanently broken PreLiquidation that wastes gas for anyone trying
+       to use it.
+  impact: >
+    Permanent DOS of one PreLiquidation instance. No fund loss. Users need to
+    deploy a new instance with correct oracle. Low impact because the
+    permissionless factory allows unlimited new deployments.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Constructor should validate oracle address
+    address preLiqOracle = PRE_LIQUIDATION_ORACLE;
+    t(preLiqOracle != address(0), "PL-O-03: PRE_LIQUIDATION_ORACLE is zero address");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Confirmed by reading constructor (L84-L134): no check on preLiquidationOracle.
+    The 6 require statements validate preLltv, preLCF1<=preLCF2, preLCF1<=WAD,
+    WAD<=preLIF1, preLIF1<=preLIF2, preLIF2<=WAD/LLTV. Oracle address is NOT
+    validated. This is consistent with Morpho's permissionless design philosophy
+    but a missing input validation. Likely QA/Low severity.
+
+- id: PL-O-04
+  tier: 2
+  type: property
+  description: >
+    ORACLE PRICE = 0 — Implicit protection analysis. If PRE_LIQUIDATION_ORACLE
+    returns 0, the contract behavior is:
+    L144: collateralQuoted = collateral * 0 / 1e36 = 0.
+    L148: require(borrowed <= 0 * LLTV) = require(borrowed <= 0).
+          For any borrower with debt > 0, this REVERTS with LiquidatablePosition.
+    If somehow borrowed = 0: L150: require(0 > 0 * PRE_LLTV) = require(0 > 0) → REVERTS.
+    In the repaidShares > 0 path (L162-164): mulDivDown(ORACLE_PRICE_SCALE, 0) →
+    Solidity 0.8.x automatic revert on division by zero.
+    Conclusion: price=0 is implicitly handled. All paths revert safely.
+  attack_scenario: >
+    No attack — all paths revert safely when price=0. The require statements
+    at L148 and L150 act as guards before any division-by-zero can occur in
+    the seizedAssets computation. This is a FALSE POSITIVE but documenting
+    the analysis for completeness.
+  impact: >
+    No impact — implicit protection works correctly. Price=0 causes revert
+    before any fund-moving operation. The contract is safe.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify price=0 is handled safely
+    uint256 collateralPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    if (collateralPrice == 0) {
+        // Should never reach computation code — require statements revert first
+        t(false, "PL-O-04: unreachable code reached with price=0");
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Line-by-line analysis confirms implicit safety. The comment at L147
+    "The two following require-statements ensure that collateralQuoted is
+    different from zero" is accurate — they also handle price=0 by extension.
+    Marking as investigated-and-safe.
+
+- id: PL-O-05
+  tier: 1
+  type: property
+  description: >
+    STALE ORACLE — IOracle interface exposes ONLY price() with no metadata
+    (no updatedAt, no roundId, no heartbeat). PreLiquidation has ZERO staleness
+    checks. If PRE_LIQUIDATION_ORACLE becomes stale (underlying Chainlink feed
+    stops updating), the stale price is used for all eligibility and incentive
+    calculations. Unlike Morpho Blue (which has the same limitation for its
+    market oracle), PreLiquidation's DUAL oracle architecture means staleness
+    in one oracle while the other is fresh creates asymmetric mispricing.
+  attack_scenario: >
+    1. PRE_LIQUIDATION_ORACLE goes stale — returns price from 24h ago.
+    2. Market has dropped 15% since then. Market ORACLE (fresh) reflects current price.
+    3. By stale PRE_LIQ_ORACLE: position looks healthier (higher collateral value).
+       Positions that SHOULD be pre-liquidatable are NOT detected.
+    4. These positions deteriorate past LLTV → full Morpho liquidation.
+    5. Borrowers lose the pre-liquidation benefit (softer terms, lower LIF).
+    Reverse scenario: price has RISEN 15% since staleness.
+    6. By stale PRE_LIQ_ORACLE: positions appear more leveraged than they are.
+    7. Pre-liquidations triggered on actually-healthy positions.
+    8. BUT: Morpho's withdrawCollateral health check with FRESH market oracle
+       acts as safety net — if position is truly healthy, seizure might still
+       pass if preLIF-adjusted seizure doesn't breach LLTV by market oracle.
+    9. Bounded by: preLIF <= 1/LLTV constraint from constructor.
+  impact: >
+    Stale-high oracle: healthy positions incorrectly pre-liquidated (bounded by
+    Morpho health check safety net). Stale-low oracle: DOS on pre-liquidation,
+    borrowers face harsher full liquidation. The IOracle interface makes it
+    impossible to add staleness checks at the PreLiquidation level — it must
+    be handled by the oracle implementation itself.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Cannot directly check staleness with IOracle — use divergence as proxy
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    uint256 marketPrice = IOracle(ORACLE).price();
+    if (marketPrice > 0 && preLiqPrice > 0) {
+        uint256 divergence;
+        if (preLiqPrice > marketPrice) {
+            divergence = (preLiqPrice - marketPrice) * WAD / marketPrice;
+        } else {
+            divergence = (marketPrice - preLiqPrice) * WAD / marketPrice;
+        }
+        t(divergence <= 0.10e18, "PL-O-05: oracle divergence >10% — possible staleness");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 60
+  notes: >
+    The IOracle interface is INTENTIONALLY minimal — Morpho's philosophy is
+    that oracle safety is delegated to the oracle implementation. This means
+    PreLiquidation inherits ALL oracle risks of whatever is deployed as
+    PRE_LIQUIDATION_ORACLE. The staleness risk is real but is the same risk
+    that exists in Morpho Blue itself. Likely classified as "known limitation"
+    rather than a bug. The DUAL oracle aspect makes it slightly worse because
+    one can be stale while the other is fresh.
+
+- id: PL-O-06
+  tier: 2
+  type: property
+  description: >
+    ROUNDING DIRECTION ANALYSIS — The contract uses directional rounding:
+    L144: collateralQuoted = mulDivDown (rounds DOWN → less collateral value → harder to pre-liquidate but conservative)
+    L152: ltv = wDivUp (rounds UP → higher LTV → more aggressive pre-liquidation → favors liquidator)
+    L157: seizedAssetsQuoted = mulDivUp (rounds UP → more quoted value → more debt repaid → favors borrower)
+    L159: repaidShares = wDivUp + toSharesUp (rounds UP → more shares repaid → favors borrower)
+    L162-164: seizedAssets = toAssetsDown + wMulDown + mulDivDown (all round DOWN → fewer assets seized → favors borrower)
+    Overall: rounding favors the BORROWER in seizure calculations, which is the
+    correct direction. But at dust amounts, the rounding stack could zero out
+    seizedAssets while repaidShares > 0 (liquidator pays debt, gets nothing).
+  attack_scenario: >
+    1. With 1 wei of repaidShares and high collateralPrice:
+       repaidAssets = toAssetsDown(1, ...) → could be 0 if totalBorrowAssets < totalBorrowShares.
+       seizedAssets = 0.wMulDown(preLIF).mulDivDown(SCALE, price) = 0.
+    2. Liquidator repays 1 share of debt but seizes 0 collateral.
+    3. Not economically exploitable (gas >> 1 share of debt), but the invariant
+       that seized > 0 when repaid > 0 may not hold at dust amounts.
+  impact: >
+    Dust-level only. No economic exploit possible because gas cost exceeds
+    any potential gain from the rounding mismatch. Informational finding.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: in repaidShares path, if repaidShares > 0 then seizedAssets should be > 0
+    Market memory mkt = MORPHO.market(ID);
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    if (preLiqPrice > 0 && mkt.totalBorrowShares > 0) {
+        uint256 testShares = 1;
+        uint256 repaidAssets = testShares.toAssetsDown(mkt.totalBorrowAssets, mkt.totalBorrowShares);
+        uint256 seized = repaidAssets.wMulDown(PRE_LIF_1).mulDivDown(ORACLE_PRICE_SCALE, preLiqPrice);
+        if (repaidAssets > 0) {
+            t(seized > 0, "PL-O-06: rounding zeroed out seizure for nonzero repayment");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    Rounding directions are intentional and favor the borrower, which is correct
+    for a liquidation mechanism. The dust edge case is theoretical and not
+    economically exploitable.
+
+- id: PL-O-07
+  tier: 1
+  type: optimize
+  description: >
+    OPTIMIZATION: Maximize attacker profit from oracle divergence.
+    If PRE_LIQUIDATION_ORACLE and ORACLE differ, the attacker can exploit
+    the price gap to extract more collateral than the debt is worth at
+    real market prices. This optimize function measures the maximum
+    extractable value from a single preLiquidate call.
+  attack_scenario: >
+    Attacker finds a PreLiquidation instance where PRE_LIQUIDATION_ORACLE
+    underprices collateral vs market ORACLE. This means PreLiquidation
+    computes higher LTV → higher preLIF → more collateral per unit of
+    debt. The attacker calls preLiquidate, repays debt at market rate
+    but receives collateral valued higher by market oracle. Profit =
+    (seizedCollateral * marketPrice) - (repaidDebt).
+  impact: >
+    If profit is positive, there's an arbitrage between the two oracle
+    prices that harms borrowers. The preLIF amplifies the extraction.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Echidna optimization: maximize profit from oracle divergence
+    // Assumes attacker can trigger preLiquidate on a victim
+    uint256 marketPrice = IOracle(ORACLE).price();
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    // If preLiqPrice < marketPrice: collateral undervalued by preLiq oracle
+    // → higher LTV → higher preLIF → more collateral seized
+    if (preLiqPrice > 0 && marketPrice > 0 && preLiqPrice < marketPrice) {
+        // Seized collateral at market value vs debt repaid
+        // profit_ratio = (seizedAssets * marketPrice) / (repaidAssets * ORACLE_PRICE_SCALE) - 1
+        uint256 divergenceRatio = (marketPrice - preLiqPrice) * WAD / marketPrice;
+        return int256(divergenceRatio); // maximize divergence = maximize profit
+    }
+    return int256(0);
+  ghost_vars:
+    - uint256 internal ghost_maxProfit;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This optimization function is a proxy — real profitability depends on
+    the specific preLIF/preLCF parameters, position size, and whether
+    Morpho's health check blocks the withdrawal. Needs fork testing with
+    real oracle divergence scenarios.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FLASH LOAN HYPOTHESIS — preLiquidate() (L132-180)
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. ¿Lee estado manipulable?
+#    SÍ — IOracle(PRE_LIQUIDATION_ORACLE).price() en L143.
+#    Si el oracle lee de un AMM pool, el pool state es manipulable.
+#
+# 2. ¿Ese estado afecta movimiento de fondos?
+#    SÍ — collateralPrice determina: eligibility (L148-150), LTV (L152),
+#    preLIF (L154), seizedAssets/repaidShares conversion (L156-165).
+#    Directly controls how much collateral the liquidator receives.
+#
+# 3. ¿Se puede leer y consumir en la misma tx?
+#    SÍ — no hay timelock, delay, or multi-block requirement.
+#    price() is read and used immediately in the same call.
+#
+# 4. ¿Verificación post-acción?
+#    SÍ (PARCIAL) — Morpho._isHealthy in withdrawCollateral uses MARKET oracle.
+#    This is a safety net but uses a DIFFERENT oracle than PreLiquidation.
+#    If market oracle is not manipulated, it catches over-seizure.
+#    If BOTH oracles read from same source → both manipulated → no safety net.
+#
+# 5. ¿Tiene reentrancy guard?
+#    NO explicit guard. But state changes happen inside Morpho (which has its own
+#    protection). The callback onMorphoRepay is called by Morpho during repay().
+#    The onPreLiquidate callback to the liquidator (L193) happens BEFORE the
+#    safeTransferFrom (L196) — this is the classic callback-before-transfer pattern.
+#    BUT: PreLiquidation has no state to re-enter. It's stateless (all immutables).
+#
+# 6. ¿Si es callback, verifica initiator?
+#    onMorphoRepay checks msg.sender == MORPHO (L186). Correct.
+#    But the onPreLiquidate callback (L193) goes to msg.sender of preLiquidate —
+#    this is the liquidator, who controls the callback code. This is by design.
+#
+# 7. ¿Usa spot price o TWAP?
+#    DEPENDS on PRE_LIQUIDATION_ORACLE implementation. IOracle is abstract.
+#    If spot → manipulable. If long TWAP → resistant. No way to verify at
+#    PreLiquidation contract level.
+#
+# 8. ¿Reward/share por balance instantáneo?
+#    NO — not a reward mechanism.
+#
+# 9. ¿Hay cap/threshold cruzable atómicamente?
+#    SÍ — PRE_LLTV threshold. If oracle price drops atomically (manipulation),
+#    a position can cross from healthy → pre-liquidatable in one tx.
+#    The LLTV cap also matters: position must stay BELOW LLTV to be
+#    pre-liquidatable (above = LiquidatablePosition revert).
+#
+# 10. ¿Permite self-liquidation con bonus > flash fee?
+#     TECHNICALLY YES — borrower can be the liquidator (msg.sender).
+#     Borrower repays own debt and receives own collateral back.
+#     With preLIF > 1.0, borrower gets more collateral back than debt repaid
+#     (in collateral terms). But this is circular — borrower pays debt with
+#     loan tokens, receives collateral tokens. The "bonus" is paid from their
+#     own collateral. Net effect: borrower deleverages at slight collateral cost.
+#     Not exploitable because the borrower was already at risk.
+#
+# 11. ¿Fee rounding a zero?
+#     Possible at dust amounts (see PL-O-06). Not economically significant.
+#
+# 12. ¿Checkpoint usa storage o memory?
+#     Memory — all computation in preLiquidate() is in memory.
+#     No persistent state in PreLiquidation (stateless contract, all immutables).
+#
+# VERDICT: Questions 1+2+3 = ALL YES → strong flash loan candidate.
+# Primary vector: PL-O-02 (oracle manipulation via flash loan).
+# Mitigation: Morpho's _isHealthy check with market oracle (question 4).
+# If PRE_LIQUIDATION_ORACLE == ORACLE (same feed) → mitigation is ZERO
+# because both would be manipulated together.
+# If PRE_LIQUIDATION_ORACLE != ORACLE → mitigation exists but divergence
+# creates its own issues (PL-O-01).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORACLE DEEP CHECK — PRE_LIQUIDATION_ORACLE
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. updatedAt vs heartbeat?
+#    NO CHECK — IOracle.price() returns only uint256. No timestamp metadata.
+#    Staleness detection is impossible at PreLiquidation level.
+#
+# 2. answeredInRound >= roundId?
+#    NOT APPLICABLE — IOracle is not Chainlink AggregatorV3Interface.
+#    No round concept exposed.
+#
+# 3. price > 0?
+#    NO EXPLICIT CHECK — but implicitly handled by L148/L150 require
+#    statements that revert before any division-by-zero (see PL-O-04).
+#
+# 4. L2 sequencer down check?
+#    NO — must be implemented in the oracle itself. PreLiquidation has
+#    no awareness of L2 sequencer status.
+#
+# 5. minAnswer/maxAnswer clamp?
+#    NO — IOracle has no bounds. If underlying Chainlink has circuit breakers,
+#    it's in the oracle adapter, not in PreLiquidation.
+#
+# 6. Sandwichable?
+#    DEPENDS ON ORACLE IMPLEMENTATION.
+#    If PRE_LIQUIDATION_ORACLE is Chainlink: price updates are infrequent
+#    and triggered by deviation threshold — sandwichable at update boundaries
+#    but hard to predict timing.
+#    If PRE_LIQUIDATION_ORACLE is AMM spot: directly sandwichable via flash loan.
+#    If PRE_LIQUIDATION_ORACLE == ORACLE: sandwich affects both equally,
+#    eliminating the safety net of Morpho's health check.
+#
+# CONCLUSION: PreLiquidation adds ZERO oracle safety. All protection is
+# delegated to the oracle implementation. This is consistent with Morpho Blue
+# but the DUAL oracle architecture creates a new attack surface not present
+# in Morpho Blue itself: the divergence between PRE_LIQUIDATION_ORACLE and
+# the market ORACLE.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+false_positives:
+- hunter: OracleHunter
+  id: PL-O-FP-01
+  reason: >
+    Price=0 from PRE_LIQUIDATION_ORACLE does NOT allow attacks. The require
+    statements at L148 and L150 act as implicit guards: if price=0 then
+    collateralQuoted=0, and borrowed <= 0*LLTV reverts with LiquidatablePosition
+    for any borrower with debt > 0. For borrowed=0: 0 > 0*PRE_LLTV fails with
+    NotPreLiquidatablePosition. In the repaidShares path, division by zero
+    in L164 causes automatic Solidity 0.8.x revert. All paths are safe.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      In Morpho PreLiquidation, oracle price=0 is implicitly protected by
+      require statements before computation code. LiquidatablePosition reverts
+      when collateralQuoted=0 and borrowed>0. No explicit require(price>0)
+      needed — the existing checks cover this case.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: PL-O-FP-02
+  reason: >
+    Intra-transaction oracle race condition is NOT exploitable due to
+    Ethereum transaction atomicity. PRE_LIQUIDATION_ORACLE.price() is read
+    once at L143 and the value is used consistently throughout preLiquidate().
+    There is no callback or external call that could modify the oracle between
+    the price read and the Morpho operations. The onPreLiquidate callback (L193)
+    happens inside onMorphoRepay, but by that point all price-dependent
+    calculations are complete and encoded in callbackData.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Transaction atomicity prevents intra-tx oracle price changes.
+      The callback order in PreLiquidation (price read → compute → repay →
+      callback → transfer) is safe because price-dependent values are
+      computed before any external calls.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: PL-O-FP-03
+  reason: >
+    Malicious oracle deployed by borrower to block pre-liquidation is
+    equivalent to not authorizing any PreLiquidation contract. The mechanism
+    is permissionless by design — borrower authorization (Morpho.setAuthorization)
+    is required for any PreLiquidation to withdraw collateral. A borrower who
+    doesn't want pre-liquidation simply doesn't authorize any. Deploying a
+    malicious oracle is unnecessarily complex — the same result is achieved by
+    not authorizing. Per IOracle.sol L8: "It is the user's responsibility to
+    select markets with safe oracles."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      In permissionless protocols like Morpho, "borrower deploys malicious oracle
+      to block pre-liquidation" is NOT a bug — equivalent to not authorizing any
+      PreLiquidation. Authorization requirement (Morpho.setAuthorization) is the
+      trust boundary. Liquidators must verify PRE_LIQUIDATION_ORACLE quality.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: PL-O-FP-04
+  reason: >
+    Oracle sandwich MEV (front-running Chainlink updates to trigger
+    pre-liquidation) is standard liquidation MEV behavior present in ALL
+    lending protocols (Aave, Compound, Morpho Blue). The preLIF bonus
+    amplifies extraction slightly but this is inherent to any liquidation
+    incentive mechanism. Not a smart contract bug — it's a known property
+    of on-chain oracle-dependent liquidation systems.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Oracle-update sandwich on pre-liquidation is standard MEV, not a bug.
+      The preLIF bonus (1x to 1/LLTV) is bounded and comparable to standard
+      liquidation incentives. All oracle-dependent liquidation systems have
+      this property.
+    briefing_update_applied: false
+
+# ============================================================
+# RESUMEN EJECUTIVO (v2)
+# ============================================================
+# FINDINGS POR PRIORIDAD:
+#
+# PL-O-02 (High impact, Low likelihood): Flash loan oracle manipulation.
+#   Si PRE_LIQUIDATION_ORACLE es un spot price AMM, un atacante puede manipular
+#   el precio para forzar pre-liquidaciones con preLIF inflado. La viabilidad
+#   depende ENTERAMENTE del tipo de oracle deployado. El contrato no tiene
+#   ninguna protección contra oracles manipulables — delega al deployer.
+#   REQUIERE: fork testing con oracle manipulable para confirmar/descartar.
+#
+# PL-O-01 (Medium impact, Medium likelihood): DOS por divergencia de oracles.
+#   Cuando PRE_LIQUIDATION_ORACLE y ORACLE divergen significativamente,
+#   pre-liquidación queda bloqueada (DOS). Documentado en NatSpec pero la
+#   inmutabilidad del contrato hace el DOS permanente para esa instancia.
+#
+# PL-O-05 (Medium impact, Low likelihood): Staleness sin protección.
+#   IOracle interface no expone metadata de frescura. Si PRE_LIQUIDATION_ORACLE
+#   se vuelve stale, no hay forma de detectarlo a nivel de contrato.
+#   Misma limitación que Morpho Blue, pero la dualidad amplifica el riesgo.
+#
+# PL-O-03 (Low): address(0) oracle sin validación en constructor.
+# PL-O-06 (Low): Rounding dust en seizure calculations.
+#
+# FALSE POSITIVES CONFIRMADOS (4):
+# - Price=0 manejado implícitamente ✓
+# - Race condition intratx no existe ✓
+# - Malicious oracle = equivalente a no autorizar ✓
+# - Oracle sandwich = MEV estándar ✓
+#
+# PRÓXIMA ACCIÓN:
+# 1. Verificar qué oracles se usan realmente en deployments existentes
+# 2. Fork test con oracle manipulable (AMM spot) para PL-O-02
+# 3. Si PL-O-02 confirmado → RedTeam + ReportWriter
+# ============================================================

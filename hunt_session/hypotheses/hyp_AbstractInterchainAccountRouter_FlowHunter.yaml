@@ -1,0 +1,256 @@
+protocol: hyperlane
+component: AbstractInterchainAccountRouter
+file: solidity/contracts/middleware/AbstractInterchainAccountRouter.sol
+domain: trust
+hunter: FlowHunter
+generated_at: '2026-03-24T00:00:00Z'
+
+state_machine:
+  states: [UNINITIALIZED, ROUTE_ENROLLED, DISPATCHING, ICA_DEPLOYED, ICA_NOT_DEPLOYED]
+  transitions:
+    - from: UNINITIALIZED, to: ROUTE_ENROLLED, via: "enrollRemoteRouterAndIsm()", guard: "onlyOwner + route not already set"
+    - from: ROUTE_ENROLLED, to: DISPATCHING, via: "callRemoteWithOverrides()", guard: "_router != bytes32(0)"
+    - from: DISPATCHING, to: ROUTE_ENROLLED, via: "dispatch completes (mailbox.dispatch returns)", guard: "none"
+    - from: ICA_NOT_DEPLOYED, to: ICA_DEPLOYED, via: "getDeployedInterchainAccount()", guard: "Create2.deploy succeeds"
+    - from: ICA_DEPLOYED, to: ICA_DEPLOYED, via: "getDeployedInterchainAccount() -- idempotent", guard: "isContract check"
+  anomalies:
+    - type: stuck_state, state: ROUTE_ENROLLED, description: "Once enrolled, router+ism are immutable (line 323-327). If wrong values are set, the domain is permanently bricked with no unenroll path in this contract."
+    - type: missing_transition, from: ROUTE_ENROLLED, to: UNINITIALIZED, description: "No way to correct a misconfigured router/ism enrollment. _enrollRemoteRouterAndIsm requires both to be EMPTY_SALT."
+    - type: fund_trap, state: ANY, description: "receive() accepts ETH with no withdrawal mechanism. ETH is permanently locked."
+
+invariants:
+- id: AIAR-F-01
+  tier: 1
+  type: property
+  description: "callRemoteWithOverrides forwards msg.value to mailbox but also pulls ERC20 fee -- double-charging if user sends both"
+  attack_scenario: >
+    A user calls callRemoteWithOverrides with msg.value > 0 AND hookMetadata containing a
+    non-zero feeToken. The function forwards ALL msg.value to mailbox.dispatch AND also
+    pulls ERC20 fee tokens via safeTransferFrom. If the hook only expects one fee type,
+    the user is double-charged: once in ETH (forwarded to mailbox) and once in ERC20.
+    The ETH is consumed by the mailbox/hook, the ERC20 sits in the router.
+    The user loses msg.value worth of ETH that was unnecessary.
+  impact: "User double-pays fees: ETH forwarded to mailbox + ERC20 pulled from user"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // If a feeToken dispatch happened with msg.value > 0, user was double-charged
+    // After dispatch, check that either ETH or ERC20 was used, not both
+    // ghost_totalMsgValueSent tracks cumulative msg.value sent via callRemote
+    // If feeToken path was taken, msg.value should have been 0
+    uint256 routerEthBal = address(originRouter).balance;
+    uint256 routerTokenBal = feeToken.balanceOf(address(originRouter));
+    // If both ghost_totalMsgValueSent > 0 and routerTokenBal > 0 (residual from ERC20 fee),
+    // it means both payment methods were used
+    if (ghost_totalMsgValueSent > 0 && ghost_callRemoteCount > 0) {
+        // At least verify router is not accumulating both types
+        t(routerTokenBal == 0 || routerEthBal == 0, "AIAR-F-01: router holds both ETH and fee tokens -- double-charge likely");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The StandardHookMetadata doc says "Mixing fee denominations within a single dispatch is NOT
+    supported." But the code does not enforce this -- it happily forwards msg.value AND pulls
+    ERC20 in the same call. The user must know to send msg.value=0 when using feeToken.
+    No validation prevents the double-charge.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-F-02
+  tier: 1
+  type: property
+  description: "callRemoteWithOverrides accepts arbitrary _router param -- user can dispatch to non-enrolled router, bypassing ISM validation on destination"
+  attack_scenario: >
+    callRemoteWithOverrides takes _router as parameter (line 219) and passes it directly to
+    _dispatchMessageWithValue. The only check is `_router != bytes32(0)` (line 255). The user
+    can specify ANY bytes32 as the router target. On the destination chain, the message arrives
+    at the specified _router address, NOT necessarily the enrolled router. If the destination
+    has a different ISM expectation for messages from the enrolled router, a message sent to
+    an arbitrary address bypasses the Router.handle() check (which verifies _sender == enrolled
+    router). This means the message is delivered to an arbitrary address but never processed
+    by the destination InterchainAccountRouter.
+  impact: "User wastes gas/fees dispatching to wrong address; could be used to grief other contracts on destination"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that callRemoteWithOverrides with a non-enrolled router still succeeds
+    // This means users can waste money dispatching to arbitrary addresses
+    bytes32 fakeRouter = bytes32(uint256(0xdeadbeef));
+    // The dispatch will succeed as long as fakeRouter != bytes32(0)
+    // The message will be sent to a random address on destination
+    t(fakeRouter != bytes32(0), "AIAR-F-02: non-zero fake router passes validation");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The "override" design is intentional -- allowing users to target non-default routers.
+    But there is no validation that the target is actually an ICA router. Combined with
+    msg.value forwarding, a user could accidentally or intentionally send ETH to any address.
+    This is by design but risky -- marking tier 1 for review.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-F-03
+  tier: 1
+  type: property
+  description: "ERC20 fee path: safeTransferFrom then forceApprove creates a race with approveFeeTokenForHook"
+  attack_scenario: >
+    In _dispatchMessageWithValue (line 266-267): the router pulls fee tokens from user via
+    safeTransferFrom, then does forceApprove(hook, type(uint256).max). Meanwhile,
+    approveFeeTokenForHook (line 134-135) is permissionless and can approve ANY address as
+    "hook" for ANY token. Attack: (1) Attacker calls approveFeeTokenForHook(feeToken, attackerContract)
+    giving attackerContract max approval. (2) Legitimate user dispatches with feeToken, tokens
+    arrive at router. (3) Before/after the dispatch, attackerContract uses the approval to
+    transferFrom the router's token balance. NOTE: IAR-DD-01 already covers the permissionless
+    approval drain. This hypothesis focuses on the FLOW: the token arrives at router BEFORE
+    it is consumed by the hook, creating a window.
+  impact: "Attacker drains fee tokens from router between safeTransferFrom and hook consumption"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Check that after a feeToken dispatch, no unauthorized approval exists
+    // approveFeeTokenForHook is permissionless so anyone can create approvals
+    uint256 attackerAllowance = feeToken.allowance(address(originRouter), ATTACKER);
+    // If attacker has allowance AND router has tokens, funds are at risk
+    uint256 routerTokenBal = feeToken.balanceOf(address(originRouter));
+    if (routerTokenBal > 0) {
+        eq(attackerAllowance, 0, "AIAR-F-03: attacker has approval on router with non-zero token balance");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    This is closely related to IAR-DD-01 (permissionless approval drain) but from the FLOW
+    perspective: the CEI pattern in _dispatchMessageWithValue creates a window where tokens
+    are in the router but not yet consumed. Cross-reference with IAR-DD-01 -- may be same
+    root cause expressed differently.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-F-04
+  tier: 2
+  type: property
+  description: "getDeployedInterchainAccount is permissionless -- anyone can front-run ICA creation with wrong ISM"
+  attack_scenario: >
+    getDeployedInterchainAccount (line 154-182) is a public function with no access control.
+    Anyone can call it with arbitrary (origin, owner, router, ism, userSalt) to deploy an
+    ICA proxy. The ICA address is deterministic via Create2, so the address is the same
+    regardless of who calls it. However, the OwnableMulticall constructor sets owner = the
+    router (the deployer), so the ICA is always owned by the router contract. The concern is:
+    an attacker deploys the ICA with a specific ISM before the legitimate handle() processes
+    the message. Since the ICA is already deployed, the handle() skips deployment and proceeds.
+    The ISM parameter only affects the Create2 salt (hence the address), not the actual ISM
+    configuration of the ICA. So front-running deployment is benign -- the ICA ends up at
+    the same address. FALSE POSITIVE for front-running, but the ISM parameter confusion is
+    worth documenting.
+  impact: "Minimal -- ICA address is deterministic and owner is always the router"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify ICA deployed by anyone has same address as ICA deployed by router
+    OwnableMulticall ica1 = destRouter.getDeployedInterchainAccount(ORIGIN, USER1, address(destRouter), address(0));
+    // Call again -- should return same address (idempotent)
+    OwnableMulticall ica2 = destRouter.getDeployedInterchainAccount(ORIGIN, USER1, address(destRouter), address(0));
+    eq(uint256(uint160(address(ica1))), uint256(uint160(address(ica2))), "AIAR-F-04: ICA deployment not idempotent");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Investigated: Create2 deployment is deterministic. The same parameters always produce the
+    same address. OwnableMulticall sets immutable owner = msg.sender (the router). Front-running
+    the deployment does not change the outcome. This is safe by design.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-F-05
+  tier: 1
+  type: property
+  description: "receive() payable with no sweep -- ETH permanently locked in router"
+  attack_scenario: >
+    The router has receive() external payable {} (line 132) accepting ETH from any source.
+    There is no function to withdraw ETH from the router. ETH can arrive via: (1) direct
+    sends, (2) failed refunds from hooks/mailbox, (3) selfdestruct/coinbase. This ETH is
+    permanently locked. For a critical infrastructure contract like the ICA router, accumulated
+    locked ETH could be significant over time.
+  impact: "ETH permanently locked in router contract with no recovery mechanism"
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // After all operations, check if router accumulated ETH that cannot be recovered
+    uint256 routerEthBalance = address(originRouter).balance;
+    // If router has ETH and there's no way to get it out, it's stuck
+    // The only way ETH leaves is via mailbox.dispatch{value}, but that requires a user tx
+    // Any ETH beyond what's needed for pending dispatches is permanently stuck
+    eq(routerEthBalance, 0, "AIAR-F-05: router holds ETH with no withdrawal mechanism");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    This is a well-known pattern. The receive() is likely needed for refunds from the mailbox
+    or hooks, but without a sweep function, any excess is permanently locked. The owner should
+    have a rescueETH function.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-F-06
+  tier: 2
+  type: property
+  description: "_enrollRemoteRouter override passes EMPTY_SALT as ISM -- parent Router.enrollRemoteRouter sets ISM to zero"
+  attack_scenario: >
+    _enrollRemoteRouter (line 302-311) is called by the parent Router.enrollRemoteRouter(domain, address)
+    which is onlyOwner. This override calls _enrollRemoteRouterAndIsm with EMPTY_SALT (bytes32(0))
+    as the ISM. Once set, the ISM for that domain is permanently bytes32(0). If the owner later
+    wants to set a non-zero ISM for that domain, they cannot -- the immutability check at line
+    323-326 prevents it. The owner must use enrollRemoteRouterAndIsm() directly to set both.
+    If they accidentally use the parent's enrollRemoteRouter first, the domain is stuck with
+    ISM = bytes32(0) forever.
+  impact: "Domain permanently configured with zero ISM if owner uses wrong enrollment function"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Check that enrolled domains have consistent router and ISM values
+    // If ISM is EMPTY_SALT (bytes32(0)) but router is set, it might be a misconfiguration
+    bytes32 enrolledRouter = originRouter.routers(DESTINATION);
+    bytes32 enrolledIsm = originRouter.isms(DESTINATION);
+    if (enrolledRouter != bytes32(0)) {
+        // If router is set, ISM should also be explicitly set (not zero by accident)
+        // This checks the owner used the correct enrollment function
+        t(enrolledIsm != bytes32(0) || enrolledRouter == bytes32(0), "AIAR-F-06: domain has router but zero ISM -- possible misconfiguration");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The parent Router contract exposes enrollRemoteRouter(domain, address) which calls
+    _enrollRemoteRouter which is overridden here to set ISM=EMPTY_SALT. This is a footgun:
+    using the parent API permanently locks ISM to zero for that domain. However, ISM=0 might
+    be valid (use default ISM). Needs protocol context to determine if this is a real issue.
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: FlowHunter
+  id: AIAR-F-FP-01
+  reason: >
+    getDeployedInterchainAccount front-running: investigated and confirmed benign. Create2
+    deployment is deterministic -- same params always produce same address. OwnableMulticall
+    owner is always the router (deployer), not the caller. Front-running does not change outcome.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Create2 ICA deployment is idempotent and owner-safe -- front-running deploy is benign"
+    briefing_update_applied: false

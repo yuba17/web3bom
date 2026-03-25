@@ -1,0 +1,708 @@
+protocol: morpho-vault-v2
+component: VaultV2
+file: src/VaultV2.sol
+domain: vault
+hunter: WildcardHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-01: Donation via direct transfer inflates share price beyond maxRate
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-01
+  tier: 1
+  type: property
+  title: "Donation via direct transfer inflates share price beyond maxRate cap"
+  description: >
+    accrueInterestView() reads IERC20(asset).balanceOf(address(this)) at L683
+    to compute realAssets. A direct ERC20 transfer to the vault increases this
+    balance. While maxRate caps the rate of increase per elapsed time, the
+    newTotalAssets is min(realAssets, maxTotalAssets). If maxRate is set high by
+    allocator (up to 200% APR = ~6.34e-8 per second), a large donation combined
+    with even 1 second of elapsed time can spike the share price. Front-runners
+    deposit before donation, then redeem after accrual for profit. The maxRate is
+    set by allocators without timelock, so a compromised allocator can set it to
+    MAX_MAX_RATE then donate.
+  attack_scenario: >
+    1. Allocator sets maxRate to MAX_MAX_RATE (200% APR).
+    2. Attacker deposits large amount to get shares.
+    3. Attacker (or accomplice) donates assets directly to vault via ERC20 transfer.
+    4. 1 block passes (12s). maxTotalAssets = _totalAssets + _totalAssets * 12 * maxRate / WAD.
+    5. If donation < maxTotalAssets - _totalAssets, the full donation is absorbed.
+    6. Attacker redeems shares at the inflated price, extracting value from other depositors.
+  impact: >
+    Existing depositors lose value proportional to the donation absorbed. An attacker
+    who front-runs the donation can steal a portion. At max rate with 12s elapsed,
+    a vault with 1M assets absorbs ~761 assets of donation per second.
+  severity: high
+  confidence: 70
+  affected_functions:
+    - accrueInterestView
+    - setMaxRate
+    - deposit
+    - redeem
+  solidity: |
+    // Track share price before and after a direct donation + accrual
+    uint256 totalAssetsBefore = vault._totalAssets();
+    uint256 totalSupplyBefore = vault.totalSupply();
+    uint256 maxRateVal = vault.maxRate();
+
+    // After accrueInterest, the price increase should be bounded
+    (uint256 newTotalAssets,,) = vault.accrueInterestView();
+    uint256 elapsed = block.timestamp - vault.lastUpdate();
+
+    // maxTotalAssets = _totalAssets + (_totalAssets * elapsed * maxRate / WAD)
+    uint256 maxIncrease = (totalAssetsBefore * elapsed * maxRateVal) / 1e18;
+
+    // The actual increase must not exceed maxRate bound
+    uint256 actualIncrease = newTotalAssets > totalAssetsBefore ? newTotalAssets - totalAssetsBefore : 0;
+    lte(actualIncrease, maxIncrease + 1, "VV-W-01: donation exceeded maxRate bound");
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-02: firstTotalAssets transient storage resets across tx — flashloan cap bypass
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-02
+  tier: 1
+  type: property
+  title: "Transient firstTotalAssets resets to 0 each tx enabling relative cap bypass"
+  description: >
+    firstTotalAssets is declared as `uint256 public transient` (L246). It resets
+    to 0 at the start of every transaction. In accrueInterest() L668:
+    `if (firstTotalAssets == 0) firstTotalAssets = newTotalAssets`. The relative
+    cap check in allocateInternal uses firstTotalAssets (L612). This means: if an
+    allocator deposits a huge amount in tx1, the firstTotalAssets in tx2 is
+    recalculated from scratch based on current total assets. A sequence of
+    deposit-in-one-tx then allocate-in-next-tx could allow relative cap to be
+    computed on inflated totalAssets, bypassing the intended cap protection.
+    The docs say "Relative caps can still be manipulated by allocators with
+    short-term deposits" — this confirms the vector exists by design but may
+    have edge cases the team didn't consider.
+  attack_scenario: >
+    1. Attacker flash-loans large amount, deposits into vault in tx1. firstTotalAssets
+       is set high in tx1 but resets to 0 at end of tx.
+    2. In tx2, accrueInterest sets firstTotalAssets = newTotalAssets (which now
+       includes the large deposit).
+    3. Allocator calls allocate() — relative cap is checked against the inflated
+       firstTotalAssets, allowing over-allocation.
+    4. Attacker withdraws the deposited amount. But the allocation persists at
+       levels exceeding the intended cap.
+  impact: >
+    Relative caps can be bypassed, allowing concentration risk in a single
+    adapter/market beyond what the curator intended. Could lead to fund loss if
+    the over-allocated market has issues.
+  severity: medium
+  confidence: 65
+  affected_functions:
+    - accrueInterest
+    - allocateInternal
+    - enter
+  solidity: |
+    // After any allocate, the allocation must respect relative cap vs firstTotalAssets
+    // Track ghost: allocation vs what firstTotalAssets was when relative cap was checked
+    uint256 fta = vault.firstTotalAssets();
+    if (fta > 0) {
+      // For each id, check allocation <= firstTotalAssets * relativeCap / WAD
+      // This is already checked in code, but the question is whether fta can be manipulated
+      // Ghost tracks if fta was artificially inflated by a same-block deposit
+      t(fta <= ghost_totalAssetsBeforeDeposit * 120 / 100, "VV-W-02: firstTotalAssets inflated >20% by single deposit");
+    }
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-03: multicall delegatecall preserves msg.sender — composability risk
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-03
+  tier: 2
+  type: property
+  title: "multicall uses delegatecall preserving msg.sender — atomic batch attack surface"
+  description: >
+    multicall() at L308 uses `address(this).delegatecall(data[i])`. With delegatecall,
+    msg.sender is preserved as the external caller. This allows batching of
+    multiple vault operations atomically. The key risk: multicall + transient
+    storage interaction. firstTotalAssets is set on first accrueInterest() call
+    and persists for all subsequent operations in the multicall batch. An allocator
+    could batch: setMaxRate(MAX) + allocate() + setMaxRate(0) in a single tx,
+    temporarily enabling high rate for one operation. Also: deposit + allocate in
+    one multicall means firstTotalAssets includes the just-deposited amount,
+    allowing higher relative cap allocations.
+  attack_scenario: >
+    1. Allocator calls multicall([setMaxRate(MAX), deposit(X, self), allocate(adapter, data, X), setMaxRate(0)]).
+    2. setMaxRate sets high rate, deposit increases totalAssets, allocate uses inflated
+       firstTotalAssets for relative cap check, then maxRate is reset.
+    3. The high maxRate was only active for one atomic batch.
+    4. External observers see maxRate=0 before and after, but during the batch it was MAX.
+  impact: >
+    Allocator can temporarily inflate maxRate for atomic operations. Since allocators
+    are trusted, this is within the trust model but creates non-obvious attack surfaces.
+  severity: low
+  confidence: 55
+  affected_functions:
+    - multicall
+    - setMaxRate
+    - allocateInternal
+  solidity: |
+    // Verify multicall doesn't allow transient maxRate manipulation
+    uint256 maxRateBefore = vault.maxRate();
+    // After multicall completes, maxRate should not have changed if no legitimate setMaxRate
+    uint256 maxRateAfter = vault.maxRate();
+    eq(maxRateAfter, maxRateBefore, "VV-W-03: maxRate changed during multicall batch");
+  validated: true
+  priority: medium
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-04: Management fee can exceed total assets over long periods
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-04
+  tier: 1
+  type: property
+  title: "Management fee accumulation over long elapsed time causes underflow in newTotalAssetsWithoutFees"
+  description: >
+    In accrueInterestView() L702: `newTotalAssetsWithoutFees = newTotalAssets -
+    performanceFeeAssets - managementFeeAssets`. The managementFeeAssets at L698
+    is `(newTotalAssets * elapsed).mulDivDown(managementFee, WAD)`. If elapsed is
+    very large (e.g., vault not pinged for years), managementFeeAssets can exceed
+    newTotalAssets, causing an underflow revert at L702. The docs say "interest
+    should be accrued at least every 10 years" — but there's no enforcement.
+    This creates a permanent DoS: if nobody interacts with the vault for ~20 years,
+    ALL functions that call accrueInterest() will revert, permanently locking funds.
+    MAX_MANAGEMENT_FEE = 0.05e18 / 365 days ≈ 1.585e9 per second.
+    For elapsed = 20 years: managementFeeAssets ≈ newTotalAssets * 1.0 → underflow.
+  attack_scenario: >
+    1. Vault deployed with managementFee = MAX_MANAGEMENT_FEE (5% annual).
+    2. All users deposit, then nobody interacts for 20+ years.
+    3. After 20 years, any call to deposit/withdraw/redeem/mint calls accrueInterest()
+       which calls accrueInterestView(). managementFeeAssets > newTotalAssets → revert.
+    4. Funds are permanently locked because all exit functions revert.
+    5. Even forceDeallocate reverts because it calls withdraw which calls accrueInterest.
+  impact: >
+    Permanent fund lockup if vault is not interacted with for ~20 years at max
+    management fee. Unlikely but theoretically possible for long-term vaults.
+  severity: medium
+  confidence: 75
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - deposit
+    - withdraw
+    - redeem
+  solidity: |
+    // Management fee assets must never exceed newTotalAssets
+    (uint256 newTotalAssets,,) = vault.accrueInterestView();
+    uint256 elapsed = block.timestamp - vault.lastUpdate();
+    uint256 mgmtFee = vault.managementFee();
+
+    uint256 mgmtFeeAssets = (newTotalAssets * elapsed * mgmtFee) / 1e18;
+    uint256 perfFee = vault.performanceFee();
+    uint256 interest = newTotalAssets > uint256(vault._totalAssets()) ? newTotalAssets - uint256(vault._totalAssets()) : 0;
+    uint256 perfFeeAssets = (interest * perfFee) / 1e18;
+
+    // This must hold or accrueInterest will revert
+    t(newTotalAssets >= perfFeeAssets + mgmtFeeAssets, "VV-W-04: fees exceed totalAssets, vault will brick");
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-05: forceDeallocate penalty sent to address(this) — phantom interest
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-05
+  tier: 1
+  type: property
+  title: "forceDeallocate calls withdraw to address(this) creating phantom interest gap"
+  description: >
+    forceDeallocate() at L856: `withdraw(penaltyAssets, address(this), onBehalf)`.
+    This withdraws penaltyAssets to the vault itself. In exit() L836:
+    `_totalAssets -= assets.toUint128()` and L837: `safeTransfer(asset, receiver, assets)`
+    where receiver = address(this). So the vault sends assets to itself —
+    _totalAssets decreases by penaltyAssets but the vault's actual balance doesn't
+    decrease. On next accrueInterest, realAssets (from balanceOf + adapter.realAssets)
+    will be higher than _totalAssets. This difference is treated as interest,
+    bounded by maxRate. A majority shareholder who triggers forceDeallocate
+    recovers the penalty through this phantom interest over time.
+  attack_scenario: >
+    1. User owns 90% of vault shares.
+    2. User calls forceDeallocate with large assets amount.
+    3. Penalty is withdrawn to address(this) — _totalAssets drops but actual balance doesn't.
+    4. On next accrueInterest, the gap is recognized as interest (up to maxRate).
+    5. User receives 90% of this phantom interest through share price appreciation.
+    6. Effective penalty is only 10% of the nominal penalty amount.
+  impact: >
+    The forceDeallocate penalty is partially recaptured by majority shareholders
+    through phantom interest distribution. This undermines the allocation
+    manipulation deterrent for majority shareholders.
+  severity: high
+  confidence: 80
+  affected_functions:
+    - forceDeallocate
+    - withdraw
+    - exit
+    - accrueInterestView
+  solidity: |
+    // After forceDeallocate, track the accounting gap
+    uint256 totalAssetsBefore = uint256(vault._totalAssets());
+    uint256 realBalanceBefore = IERC20(vault.asset()).balanceOf(address(vault));
+
+    // ... forceDeallocate happens ...
+
+    uint256 totalAssetsAfter = uint256(vault._totalAssets());
+    uint256 realBalanceAfter = IERC20(vault.asset()).balanceOf(address(vault));
+
+    // The penalty assets remain in vault balance but _totalAssets decreased
+    // This gap becomes phantom interest on next accrueInterest
+    (uint256 viewTotal,,) = vault.accrueInterestView();
+    uint256 gap = viewTotal > totalAssetsAfter ? viewTotal - totalAssetsAfter : 0;
+    eq(gap, 0, "VV-W-05: forceDeallocate created phantom interest gap");
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-06: Zero-share deposit triggers allocateInternal with 0 assets
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-06
+  tier: 2
+  type: property
+  title: "Deposit of 0 assets mints 0 shares but still triggers liquidity adapter allocate"
+  description: >
+    deposit() calls enter() which at L801 calls allocateInternal if
+    liquidityAdapter != address(0). If assets=0, shares=0 (mulDivDown with 0).
+    createShares(onBehalf, 0) succeeds (adding 0 to balance). Then
+    allocateInternal is called with assets=0, which transfers 0 tokens to adapter,
+    calls adapter.allocate(data, 0, ...). The adapter's behavior with 0 assets
+    is undefined — it may return ids that update cap allocations incorrectly,
+    or revert, or have side effects.
+  attack_scenario: >
+    1. Attacker calls deposit(0, someAddress) repeatedly.
+    2. Each call triggers accrueInterest() (gas cost to protocol/users).
+    3. Each call triggers allocateInternal with 0 assets to the liquidity adapter.
+    4. If adapter has side effects on 0-amount calls (e.g., entering new markets,
+       updating internal state), this could manipulate adapter state for free.
+    5. Also: canReceiveShares(onBehalf) and canSendAssets(msg.sender) are checked
+       — this can be used as a free gate oracle query.
+  impact: >
+    Gas griefing through repeated zero-deposits triggering accrueInterest.
+    Potential adapter state manipulation depending on adapter implementation.
+  severity: low
+  confidence: 70
+  affected_functions:
+    - deposit
+    - enter
+    - allocateInternal
+  solidity: |
+    // Zero deposit should not change any meaningful state
+    uint256 supplyBefore = vault.totalSupply();
+    uint256 totalAssetsBefore = uint256(vault._totalAssets());
+
+    try vault.deposit(0, address(this)) returns (uint256 shares) {
+      eq(shares, 0, "VV-W-06a: zero deposit minted non-zero shares");
+      eq(vault.totalSupply(), supplyBefore, "VV-W-06b: totalSupply changed on zero deposit");
+      eq(uint256(vault._totalAssets()), totalAssetsBefore, "VV-W-06c: totalAssets changed on zero deposit");
+    } catch {}
+  validated: true
+  priority: low
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-07: Malicious adapter.realAssets() inflates totalAssets via composability
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-07
+  tier: 1
+  type: property
+  title: "Adapter wrapping manipulable protocol inflates totalAssets via realAssets()"
+  description: >
+    accrueInterestView() L684-686 sums realAssets from all adapters in a loop.
+    The vault trusts adapter.realAssets() return values. If an adapter wraps a
+    protocol with a manipulable price feed (e.g., Uniswap V2 LP reserves, a
+    lending protocol with manipulable exchange rate), an attacker can flash-manipulate
+    the underlying and trigger accrueInterest to record inflated totalAssets.
+    The maxRate bounds per-second increase, but sustained manipulation across
+    multiple blocks accumulates. The adapter itself may be non-malicious but the
+    underlying protocol state is externally manipulable.
+  attack_scenario: >
+    1. Adapter wraps a Uniswap V2 LP position. realAssets() uses getReserves().
+    2. Attacker flash-loans to skew reserves in block N, triggers accrueInterest.
+    3. maxRate allows partial increase. In block N+1, attacker skews again.
+    4. Over many blocks, _totalAssets ratchets up beyond real value.
+    5. Attacker deposits at some point, then allows price to correct, and redeems
+       at a time when _totalAssets is still inflated (before loss realization).
+  impact: >
+    Share price inflation leading to value extraction. Bounded by maxRate per
+    second but accumulates. Requires sustained manipulation capital.
+  severity: high
+  confidence: 60
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+  solidity: |
+    // After accrueInterest, newTotalAssets must be <= maxTotalAssets
+    uint256 oldTotalAssets = uint256(vault._totalAssets());
+    uint256 elapsed = block.timestamp - vault.lastUpdate();
+    uint256 maxRateVal = vault.maxRate();
+
+    (uint256 newTotalAssets,,) = vault.accrueInterestView();
+
+    uint256 maxTotalAssets = oldTotalAssets + (oldTotalAssets * elapsed * maxRateVal) / 1e18;
+    lte(newTotalAssets, maxTotalAssets, "VV-W-07: totalAssets exceeded maxRate cap");
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-08: Gate contract DoS permanently locks user funds
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-08
+  tier: 1
+  type: property
+  title: "Reverting gate contract blocks all withdrawals including forceDeallocate"
+  description: >
+    exit() at L822-823 checks canSendShares(onBehalf) and canReceiveAssets(receiver).
+    These call external gate contracts. If sendSharesGate reverts, ALL exits are
+    blocked. forceDeallocate() at L856 calls withdraw() which calls exit() which
+    checks canSendShares(onBehalf). So forceDeallocate is ALSO blocked for the
+    user. The only mitigation is curator/sentinel changing the gate, but this
+    requires a timelock. If the gate-setting function is abdicated, funds are
+    permanently locked. canReceiveAssets has `account == address(this)` bypass
+    but canSendShares has no such bypass.
+  attack_scenario: >
+    1. Compromised curator sets sendSharesGate to a contract that always reverts.
+    2. All users' shares are frozen — cannot transfer, withdraw, or redeem.
+    3. forceDeallocate also fails because it calls withdraw → exit → canSendShares → revert.
+    4. If setSendSharesGate is abdicated, funds are PERMANENTLY locked.
+    5. Even if not abdicated, users must wait for timelock to replace the gate.
+  impact: >
+    Temporary or permanent fund lockup for all vault depositors depending on
+    whether the gate-setting function has been abdicated.
+  severity: high
+  confidence: 75
+  affected_functions:
+    - exit
+    - canSendShares
+    - canReceiveAssets
+    - forceDeallocate
+    - transfer
+    - transferFrom
+  solidity: |
+    // If user has shares, they must be able to exit (no gate DoS)
+    if (vault.balanceOf(address(this)) > 0) {
+      // Verify canSendShares doesn't revert
+      try vault.canSendShares(address(this)) returns (bool result) {
+        t(true, "VV-W-08: canSendShares did not revert");
+      } catch {
+        t(false, "VV-W-08: canSendShares reverted — gate DoS detected");
+      }
+      // Verify canReceiveAssets doesn't revert
+      try vault.canReceiveAssets(address(this)) returns (bool result) {
+        t(true, "VV-W-08: canReceiveAssets did not revert");
+      } catch {
+        t(false, "VV-W-08: canReceiveAssets reverted — gate DoS detected");
+      }
+    }
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-09: deallocateInternal external call before state update — reentrancy
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-09
+  tier: 1
+  type: property
+  title: "deallocateInternal calls adapter.deallocate before safeTransferFrom — reentrancy window"
+  description: >
+    deallocateInternal() at L630 calls IAdapter(adapter).deallocate() FIRST, then
+    at L638 calls safeTransferFrom(asset, adapter, address(this), assets). The
+    adapter.deallocate() is an external call to an adapter that could re-enter the
+    vault. No reentrancy guard exists. If a malicious adapter re-enters during
+    deallocate(), it could call deposit/withdraw/allocate while the vault's
+    allocation state is partially updated (ids' allocations changed at L635 but
+    assets not yet transferred). The transient firstTotalAssets provides some
+    protection but doesn't prevent all re-entry vectors.
+  attack_scenario: >
+    1. Malicious adapter's deallocate() re-enters vault via deposit().
+    2. Inside deposit, accrueInterest() returns cached (firstTotalAssets != 0).
+    3. previewDeposit uses _totalAssets which hasn't been updated by the outer call.
+    4. Re-entrant deposit creates shares at potentially incorrect exchange rate.
+    5. After return, original deallocateInternal completes transferring assets.
+  impact: >
+    If adapter re-enters, share minting could happen at stale rate. Requires
+    compromised curator to add malicious adapter. Defense-in-depth concern.
+  severity: medium
+  confidence: 55
+  affected_functions:
+    - deallocateInternal
+    - exit
+  solidity: |
+    // Track that no re-entrant state changes occur during deallocateInternal
+    // Ghost variable: set to true if re-entry detected
+    uint256 supplyBefore = vault.totalSupply();
+    uint256 totalBefore = uint256(vault._totalAssets());
+
+    // After a deallocate call, verify consistency
+    uint256 supplyAfter = vault.totalSupply();
+    uint256 totalAfter = uint256(vault._totalAssets());
+
+    // If re-entry occurred via deposit during deallocate, supply would have changed
+    // unexpectedly relative to totalAssets
+    t(!ghost_reentrancyDetected, "VV-W-09: reentrancy detected during deallocateInternal");
+  validated: true
+  priority: medium
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-10: allocateInternal sends assets before adapter.allocate — theft vector
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-10
+  tier: 1
+  type: property
+  title: "allocateInternal sends assets before adapter.allocate — adapter can report zero change"
+  description: >
+    allocateInternal() at L602 calls safeTransfer(asset, adapter, assets) FIRST,
+    then at L603 calls IAdapter(adapter).allocate(data, assets, ...). If the
+    adapter is malicious and returns change=0, the vault sends assets to the
+    adapter but records no allocation increase. The cap checks pass because
+    allocations don't change. The assets sit at the adapter untracked. On next
+    accrueInterest, if adapter.realAssets() reports them, they appear as interest
+    (bounded by maxRate). If adapter.realAssets() doesn't report them, the vault
+    realizes a "loss".
+  attack_scenario: >
+    1. Curator adds adapter. Allocator calls allocate(adapter, data, 1000e18).
+    2. Vault sends 1000e18 to adapter.
+    3. Adapter returns (ids, 0) — change=0.
+    4. No allocation recorded. Assets are at adapter but untracked by vault caps.
+    5. Adapter can refuse to return assets on deallocate or report incorrect realAssets.
+  impact: >
+    Fund loss if malicious adapter is added. Within curator trust model but
+    the transfer-first pattern amplifies the damage.
+  severity: medium
+  confidence: 60
+  affected_functions:
+    - allocateInternal
+  solidity: |
+    // After allocate, if assets > 0, change must be > 0
+    // Ghost: track last allocate call parameters
+    uint256 assetsSent = ghost_lastAllocateAssets;
+    int256 changeReported = ghost_lastAllocateChange;
+
+    if (assetsSent > 0) {
+      t(changeReported > 0, "VV-W-10: allocate sent assets but adapter reported zero change");
+    }
+  validated: true
+  priority: medium
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-11: Roundtrip deposit-redeem extraction via JIT liquidity
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-11
+  tier: 1
+  type: property
+  title: "Same-block deposit-redeem roundtrip must not extract profit"
+  description: >
+    An attacker who deposits and redeems in the same transaction (or block) should
+    not profit. deposit() calls accrueInterest() first, which sets firstTotalAssets.
+    previewDeposit uses mulDivDown (rounds down shares for depositor), and
+    previewRedeem uses mulDivDown (rounds down assets for redeemer). So the
+    roundtrip should be non-profitable due to rounding against the user.
+    However, if interest accrues between deposit and redeem (different tx in same
+    block), and the depositor captures a share of that interest, they profit.
+    The firstTotalAssets transient var prevents double-accrual in same tx.
+    But in different transactions within the same block (same timestamp), the
+    second accrueInterest returns early because firstTotalAssets != 0 (wait —
+    it's transient, so it resets between transactions). In Solidity 0.8.28 with
+    EIP-1153 transient storage, each transaction starts with transient vars = 0.
+    So in tx2 of the same block, firstTotalAssets = 0 again, and accrueInterest
+    would re-run. But elapsed = 0 (same block.timestamp), so no interest accrues.
+    Safe. Cross-block deposit-redeem: elapsed > 0, interest accrues, depositor
+    captures proportional share. This is the JIT liquidity attack.
+  attack_scenario: >
+    1. Attacker deposits X assets right before a high-interest accrual block.
+    2. In the next block, interest is distributed to all shareholders proportionally.
+    3. Attacker redeems immediately, capturing yield without bearing long-term risk.
+    4. The maxRate limits per-second yield extraction.
+  impact: >
+    Yield dilution for long-term depositors. Profit bounded by maxRate * elapsed * share.
+  severity: medium
+  confidence: 65
+  affected_functions:
+    - deposit
+    - redeem
+    - accrueInterest
+  solidity: |
+    // Roundtrip: deposit X assets, immediately redeem all shares, should get back <= X
+    uint256 depositAmount = 1000e18;
+    uint256 balBefore = IERC20(vault.asset()).balanceOf(address(this));
+    uint256 shares = vault.deposit(depositAmount, address(this));
+    uint256 assetsBack = vault.redeem(shares, address(this), address(this));
+    uint256 balAfter = IERC20(vault.asset()).balanceOf(address(this));
+
+    lte(assetsBack, depositAmount, "VV-W-11: roundtrip extracted profit");
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-12: abdicate + gate interaction — irreversible fund lockout
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-12
+  tier: 1
+  type: property
+  title: "Abdicating gate-setting functions after setting malicious gate locks funds forever"
+  description: >
+    abdicate() at L493-497 sets abdicated[selector] = true permanently. If curator
+    abdicates setSendSharesGate after setting a buggy gate, the gate can NEVER be
+    changed. Combined with VV-W-08 (gate DoS), this means permanent fund lockout.
+    Even the owner cannot override abdication. This is documented as a risk but
+    the cascading effect with gate DoS creates a critical composability issue.
+  attack_scenario: >
+    1. Curator sets sendSharesGate to a gate that works initially.
+    2. Curator abdicates setSendSharesGate for "security" (prevent future changes).
+    3. Gate contract has a latent bug or the gate owner upgrades it to revert.
+    4. All vault share transfers and exits are permanently blocked.
+    5. No recovery mechanism exists.
+  impact: >
+    Permanent fund lockup for all depositors. Irreversible by design.
+  severity: high
+  confidence: 70
+  affected_functions:
+    - abdicate
+    - timelocked
+    - setSendSharesGate
+    - setReceiveSharesGate
+    - setReceiveAssetsGate
+  solidity: |
+    // If any gate-setting function is abdicated, verify current gate is non-reverting
+    bytes4 setSendGateSel = bytes4(keccak256("setSendSharesGate(address)"));
+    if (vault.abdicated(setSendGateSel)) {
+      address gate = vault.sendSharesGate();
+      if (gate != address(0)) {
+        try vault.canSendShares(address(this)) returns (bool) {
+          t(true, "VV-W-12: abdicated sendSharesGate is non-reverting");
+        } catch {
+          t(false, "VV-W-12: CRITICAL — abdicated gate reverts, funds locked forever");
+        }
+      }
+    }
+  validated: true
+  priority: high
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-13: Loss recovery front-running via predictable maxRate trajectory
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-13
+  tier: 2
+  type: property
+  title: "After loss + recovery, front-runners dilute original depositors via maxRate trajectory"
+  description: >
+    After a loss event (adapter realAssets drops), _totalAssets drops immediately.
+    If the underlying recovers, realAssets increases but newTotalAssets is capped
+    by maxRate. The recovery follows a predictable linear trajectory:
+    _totalAssets grows by at most _totalAssets * maxRate per second. Front-runners
+    can deposit when share price is low (post-loss) and redeem when it recovers
+    (maxRate gradually restores price). This dilutes original depositors who bore
+    the risk. The maxRate trajectory is fully predictable, enabling MEV.
+  attack_scenario: >
+    1. Adapter protocol is exploited. Vault realizes total loss.
+    2. Protocol patches exploit and assets are restored.
+    3. Vault's maxRate limits recovery to ~200% APR maximum.
+    4. MEV bot deposits immediately post-loss at near-zero share price.
+    5. Over days/weeks, maxRate gradually restores _totalAssets.
+    6. Bot redeems, capturing recovery that belongs to original depositors.
+  impact: >
+    Original depositors' recovery is diluted by front-runners. The predictable
+    maxRate makes this a deterministic MEV opportunity.
+  severity: medium
+  confidence: 60
+  affected_functions:
+    - accrueInterestView
+    - deposit
+    - redeem
+  solidity: |
+    // Track that share price monotonically relates to actual assets
+    uint256 totalAssets1 = uint256(vault._totalAssets());
+    uint256 totalSupply1 = vault.totalSupply();
+
+    if (totalSupply1 > 0 && totalAssets1 > 0) {
+      uint256 pricePerShare = (totalAssets1 * 1e18) / totalSupply1;
+      // Track min price and ensure deposits during low price don't create excess profit
+      if (pricePerShare < ghost_minPricePerShare) {
+        ghost_minPricePerShare = pricePerShare;
+      }
+      gte(pricePerShare, 1, "VV-W-13: share price collapsed to dust");
+    }
+  validated: true
+  priority: medium
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV-W-14: Fee share minting to address(0) recipient — totalSupply inflation
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV-W-14
+  tier: 2
+  type: property
+  title: "Fee shares minted to address(0) would be permanently locked if fee invariant broken"
+  description: >
+    accrueInterest() L669-670 mints shares via createShares(performanceFeeRecipient, ...).
+    createShares at L923 requires `to != address(0)`. The fee invariant enforces
+    `fee != 0 => recipient != address(0)` at set-time (L502, L525). But what if
+    the recipient is a contract that self-destructs? After EIP-6780 (Dencun),
+    selfdestruct only works in the creating transaction, so this is unlikely.
+    However, if canReceiveShares(recipient) returns false, the fee shares are
+    NOT minted (L692, L697 check canReceiveShares). This means: if the gate
+    blocks the fee recipient, fees are silently skipped. Setting a gate that
+    blocks the fee recipient effectively disables fees without going through
+    the fee-setting timelock.
+  attack_scenario: >
+    1. Curator sets a receiveSharesGate that blocks performanceFeeRecipient.
+    2. canReceiveShares(performanceFeeRecipient) returns false.
+    3. In accrueInterestView L692: the ternary condition includes
+       canReceiveShares(performanceFeeRecipient) — if false, performanceFeeAssets = 0.
+    4. Performance fees are silently disabled without changing performanceFee.
+    5. Curator bypasses fee governance through gate manipulation.
+  impact: >
+    Fee recipient loses expected fees. Could be used by malicious curator to
+    redirect value (skip fees = higher share price = benefit to connected parties).
+  severity: medium
+  confidence: 72
+  affected_functions:
+    - accrueInterestView
+    - canReceiveShares
+    - setReceiveSharesGate
+  solidity: |
+    // If fees are configured, fee recipients must be able to receive shares
+    uint256 perfFee = vault.performanceFee();
+    address perfRecipient = vault.performanceFeeRecipient();
+    uint256 mgmtFee = vault.managementFee();
+    address mgmtRecipient = vault.managementFeeRecipient();
+
+    if (perfFee > 0 && perfRecipient != address(0)) {
+      t(vault.canReceiveShares(perfRecipient), "VV-W-14a: perf fee recipient blocked by gate");
+    }
+    if (mgmtFee > 0 && mgmtRecipient != address(0)) {
+      t(vault.canReceiveShares(mgmtRecipient), "VV-W-14b: mgmt fee recipient blocked by gate");
+    }
+  validated: true
+  priority: medium
+
+false_positives:
+  - id: VV-W-FP-01
+    title: "multicall msg.value reuse"
+    reason: >
+      VaultV2 has no payable functions. multicall uses delegatecall but since
+      there are no payable functions, msg.value is irrelevant. The SushiSwap MISO
+      pattern does not apply here.
+
+  - id: VV-W-FP-02
+    title: "permit signature malleability"
+    reason: >
+      The docs explicitly note "Signature malleability is not explicitly prevented
+      but it is not a problem thanks to the nonce." Since nonce is incremented per
+      use, replay of malleable signatures fails. Not a vulnerability.
+
+  - id: VV-W-FP-03
+    title: "max functions return 0"
+    reason: >
+      maxDeposit/maxMint/maxWithdraw/maxRedeem all return 0. This is intentional
+      and documented: "Gross underestimation because being revert-free cannot be
+      guaranteed when calling the gate." Not a bug, just non-standard ERC4626
+      behavior. Integrators must be aware.
+
+  - id: VV-W-FP-04
+    title: "ecrecover address(0) in permit"
+    reason: >
+      permit() at L914-915 correctly checks `recoveredAddress != address(0) &&
+      recoveredAddress == _owner`. The nonce increment at L911 is reverted if the
+      require fails (Solidity 0.8 revert behavior). No exploit possible.

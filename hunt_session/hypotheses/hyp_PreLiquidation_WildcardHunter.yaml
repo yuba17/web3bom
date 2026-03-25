@@ -1,0 +1,553 @@
+protocol: morpho-pre-liquidation
+component: PreLiquidation
+file: src/PreLiquidation.sol
+domain: liquidation-mechanics
+hunter: WildcardHunter
+generated_at: '2026-03-23T12:00:00Z'
+
+# =============================================================================
+# ANÁLISIS PREVIO — razonamiento antes de los invariantes (v2 — revisión profunda)
+# =============================================================================
+# REIMPLEMENTACIÓN MENTAL (cmichel technique):
+# Si reimplemento desde cero: preLiquidate() debería:
+#   1. Verificar que la posición está en zona pre-liquidable (PRE_LLTV < LTV < LLTV)
+#   2. Calcular incentivo y close factor linealmente según posición en la zona
+#   3. Ejecutar la pre-liquidación atómicamente: repagar deuda + seizar colateral
+#   4. El liquidador provee loan tokens, recibe colateral
+#
+# Diferencias detectadas con el código real:
+#   - El código usa DOS oracles: PRE_LIQUIDATION_ORACLE para la zona pre-liq,
+#     pero Morpho usa su propio ORACLE para el health check en withdrawCollateral.
+#     → Divergencia de oracles es un vector fundamental.
+#   - La autorización del borrower es un pre-requisito implícito (withdrawCollateral
+#     verifica isAuthorized) — no hay check explícito en preLiquidate().
+#   - El flujo es repay PRIMERO, luego withdrawCollateral en el callback.
+#     Morpho repay() reduce borrowShares ANTES de llamar al callback.
+#     withdrawCollateral reduce collateral DESPUÉS (dentro del callback).
+#     Esto crea una ventana donde la deuda está reducida pero el colateral no.
+#
+# COMPOSABILITY ANALYSIS (samczsun "Two Rights Make A Wrong"):
+#   - PreLiquidation ASUME que PRE_LIQUIDATION_ORACLE y ORACLE reportan precios
+#     consistentes. Si no, los dos health checks (preLiquidate zone check vs
+#     Morpho's _isHealthy en withdrawCollateral) se contradicen.
+#   - PreLiquidation ASUME que el borrower mantiene su autorización durante toda
+#     la tx. Si revoca via frontrun MEV, la pre-liq falla.
+#   - Morpho ASUME que el callback caller (PreLiquidation) es benigno. Pero
+#     PreLiquidation da callback al liquidador ANTES de cobrar — flash capital.
+#
+# DEADLOCK ANALYSIS:
+#   - ¿Puede la pre-liquidación bloquear una salida de emergencia? No directamente.
+#     La pre-liquidación es un EXTRA (opt-in); las liquidaciones normales de Morpho
+#     siguen funcionando independientemente.
+#   - ¿Puede un safety check bloquear la pre-liquidación cuando es necesaria?
+#     SÍ: si los oracles divergen (PL-W-06), la pre-liq revierte en withdrawCollateral
+#     → la posición no puede ser pre-liquidada → salta directamente a liquidación normal
+#     con peores condiciones para el borrower. Esto es un DEADLOCK funcional.
+# =============================================================================
+
+invariants:
+
+- id: PL-W-01
+  tier: 1
+  type: property
+  description: >
+    Reentrancia en la ventana callback: el liquidador recibe colateral en
+    withdrawCollateral (L190), luego recibe callback en onPreLiquidate (L193),
+    ANTES de pagar loan tokens (L196). En esta ventana puede llamar preLiquidate()
+    de nuevo sobre el MISMO borrower. Morpho no tiene reentrancy guard global.
+    El estado de la posición durante la ventana: borrowShares REDUCIDOS (Morpho
+    repay() L286 ya restó), collateral REDUCIDO (withdrawCollateral L335 ya restó).
+    La segunda preLiquidate() lee este estado mutado y puede ejecutar una segunda
+    seizure. La pregunta clave: ¿la suma de ambas seizures excede lo que el preLCF
+    original permitiría? Si el preLCF se recalcula sobre la posición POST-primera-seizure
+    (con LTV diferente), la cuota de close factor cambia.
+  attack_scenario: >
+    1. Posición del borrower: borrowShares=1000, collateral=1000, LTV cerca de LLTV.
+    2. preLCF al LTV actual ≈ 80% → repayableShares = 800.
+    3. Liquidador llama preLiquidate(borrower, 0, 400, data) — primera ronda.
+    4. Morpho repay() reduce borrowShares a 600. Callback invocado.
+    5. withdrawCollateral retira colateral proporcional al liquidador.
+    6. onPreLiquidate callback: liquidador re-entra preLiquidate(borrower, 0, 400, "").
+    7. Segunda ronda: borrowShares ahora es 600, collateral reducido.
+       Nuevo LTV calculado con el nuevo state. Si LTV sigue > PRE_LLTV:
+       - nuevo preLCF ≈ X% de 600 shares → repayableShares2 = 600 * X%.
+       - Si X% * 600 >= 400, la segunda pre-liquidación pasa el check.
+    8. Total repaid: 400 + 400 = 800 shares. Pero ¿corresponden al preLCF original?
+       El check en la primera ronda era repaidShares(400) <= 800 → OK.
+       El check en la segunda ronda es repaidShares(400) <= 600*X% → depende de X%.
+    9. Si el nuevo LTV es MAYOR (porque se removió colateral proporcionalmente más
+       que deuda), X% podría ser más alto → se permite MÁS en la segunda ronda.
+    CLAVE: ¿collateral_removed/debt_removed ratio > 1? Sí, porque preLIF > 1.
+    Cada pre-liquidación remueve más colateral que deuda (en valor). Esto SUBE el
+    LTV post-seizure. LTV más alto → preLCF más alto → más se puede pre-liquidar.
+    Esto crea un ciclo amplificante vía reentrancia.
+  impact: >
+    El liquidador puede drenar más colateral del borrower del que el preLCF original
+    permitía, fragmentando la pre-liquidación en múltiples rondas reentrantes donde
+    cada ronda tiene un preLCF más alto por el LTV creciente. El borrower pierde
+    colateral en exceso. Severidad potencial: High si el exceso es significativo.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track total seized per borrower per tx
+    // In handler: before first preLiquidate, snapshot collateral
+    uint256 collBefore = ghost_collateral_snapshot[borrower];
+    if (collBefore == 0) {
+        ghost_collateral_snapshot[borrower] = MORPHO.position(ID, borrower).collateral;
+        collBefore = ghost_collateral_snapshot[borrower];
+    }
+    // After preLiquidate:
+    ghost_total_seized[borrower] += seizedAssets;
+    // Invariant: total seized should not exceed original preLCF * original collateral
+    // scaled by preLIF (max extractable from original position state)
+    uint256 maxSeizable = collBefore; // absolute max = 100% of collateral
+    lte(ghost_total_seized[borrower], maxSeizable, "PL-W-01: over-seizure via reentrant pre-liquidation");
+  ghost_vars:
+    - "mapping(address => uint256) internal ghost_collateral_snapshot;"
+    - "mapping(address => uint256) internal ghost_total_seized;"
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    La reentrancia ES posible (Morpho no tiene reentrancy guard). La pregunta es si
+    el efecto amplificante (LTV sube tras cada seizure → preLCF sube → más seizure
+    permitida) permite extraer SIGNIFICATIVAMENTE más que el preLCF original.
+    Cada ronda reentrante SÍ paga su deuda (el liquidador debe transferir loan tokens
+    al final de cada callback). No hay "free seizure". Pero el RATIO puede ser
+    desfavorable para el borrower si el preLCF sube con cada ronda.
+    Counter: Morpho's _isHealthy check en withdrawCollateral LIMITA cuánto colateral
+    se puede remover — si la posición se vuelve unhealthy (LTV > LLTV), la
+    withdrawCollateral revierte. Esto actúa como freno natural.
+    Requiere fuzzing stateful para cuantificar el exceso real.
+
+- id: PL-W-02
+  tier: 1
+  type: property
+  description: >
+    Divergencia entre PRE_LIQUIDATION_ORACLE y ORACLE del mercado de Morpho causa
+    deadlock funcional: la pre-liquidación pasa los checks internos (zona pre-liq)
+    pero Morpho's withdrawCollateral revierte porque _isHealthy usa ORACLE diferente.
+    O inversamente: el oracle de pre-liq dice "posición sana" mientras el oracle de
+    Morpho dice "posición liquidable" → la posición salta la ventana de pre-liquidación
+    completamente, causando mayor pérdida al borrower (liquidación normal tiene peores
+    condiciones que pre-liquidación).
+  attack_scenario: >
+    Escenario A — Pre-liquidación bloqueada (deadlock):
+    1. PRE_LIQUIDATION_ORACLE muestra precio P1 (colateral barato → LTV alto → pre-liquidable).
+    2. ORACLE de Morpho muestra precio P2 > P1 (colateral caro → posición sana).
+    3. preLiquidate() pasa checks: borrowed > collateralQuoted(P1) * PRE_LLTV ✓
+    4. MORPHO.withdrawCollateral() verifica _isHealthy con ORACLE(P2):
+       - Con P2 más alto, la posición parece MÁS sana.
+       - Pero estamos removiendo colateral, lo que REDUCE la salud.
+       - Si la reducción es suficiente: _isHealthy = false → revert INSUFFICIENT_COLLATERAL.
+    5. Resultado: pre-liquidación IMPOSIBLE. Posición atrapada.
+
+    Escenario B — Pre-liquidación con oracle manipulado:
+    1. PRE_LIQUIDATION_ORACLE es manipulable (spot price, DEX-based).
+    2. Attacker flash-loan baja el precio en PRE_LIQUIDATION_ORACLE.
+    3. LTV calculado es artificialmente alto → quotient ≈ 1 → preLIF ≈ preLIF2 (máximo).
+    4. Attacker seiza colateral con el máximo factor de incentivo.
+    5. ORACLE de Morpho (TWAP, Chainlink) muestra precio real → withdrawCollateral pasa
+       porque la posición con precio real sigue siendo "sana" tras remover colateral.
+    6. Borrower pierde más colateral del que correspondería con pricing justo.
+  impact: >
+    Escenario A: DoS de la funcionalidad de pre-liquidación → borrowers llegan a
+    liquidación normal perdiendo más colateral. Impacto indirecto en borrowers.
+    Escenario B: Robo parcial de colateral del borrower por manipulación de oracle.
+    Cuantía: (preLIF2 - preLIF_real) * repaidAssets en valor de colateral extra.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track oracle divergence and verify pre-liquidation feasibility
+    uint256 pricePre = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    uint256 priceMarket = IOracle(ORACLE).price();
+    // Divergence should be bounded
+    uint256 maxPrice = pricePre > priceMarket ? pricePre : priceMarket;
+    uint256 minPrice = pricePre < priceMarket ? pricePre : priceMarket;
+    if (maxPrice > 0) {
+        uint256 divergencePct = (maxPrice - minPrice) * WAD / maxPrice;
+        lte(divergencePct, WAD / 10, "PL-W-02: oracle divergence > 10%");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    El Escenario A es un riesgo REAL de configuración. El constructor no valida
+    nada sobre la relación entre PRE_LIQUIDATION_ORACLE y ORACLE. Si se usan
+    oracles fundamentalmente diferentes (ej. Chainlink vs DEX spot), la divergencia
+    es frecuente. El Escenario B requiere un oracle manipulable, pero el constructor
+    tampoco valida la seguridad del oracle.
+    La pregunta fundamental: ¿quién elige el oracle de pre-liquidación? Si es el
+    deployer del PreLiquidation contract (cualquiera puede deployar via factory),
+    un actor malicioso puede deployar con un oracle controlado por él.
+    El borrower DEBE autorizar el contrato, pero puede no verificar el oracle.
+
+- id: PL-W-03
+  tier: 1
+  type: property
+  description: >
+    Fee-on-transfer loan tokens causan discrepancia en el flujo de repago.
+    En onMorphoRepay (L196): safeTransferFrom(liquidator, PreLiquidation, repaidAssets).
+    Si el token cobra fee on transfer, PreLiquidation recibe repaidAssets - fee.
+    Luego Morpho ejecuta safeTransferFrom(PreLiquidation, Morpho, repaidAssets) usando
+    el approve max (puesto en constructor). Morpho espera el monto completo.
+    Si PreLiquidation no tiene balance residual suficiente para cubrir el gap, la tx
+    revierte → pre-liquidación imposible para tokens con fee-on-transfer.
+    Si PreLiquidation SÍ tiene balance residual (de tokens stuck previos o donaciones),
+    ese balance se drena silenciosamente para cubrir el gap.
+  attack_scenario: >
+    1. Mercado de Morpho con loan token = token con fee-on-transfer (ej. STA, PAXG con
+       fee activado, o USDT si Tether activa el fee).
+    2. PreLiquidation deployado para este mercado. Constructor approve max → OK.
+    3. Liquidador llama preLiquidate(). Morpho calcula repaidAssets = 1000.
+    4. En onMorphoRepay: safeTransferFrom(liquidator, PreLiq, 1000).
+       Fee = 1% → PreLiq recibe 990.
+    5. Después del callback, Morpho: safeTransferFrom(PreLiq, Morpho, 1000).
+       PreLiq solo tiene 990 → REVERT (insufficient balance).
+    6. Pre-liquidación PERMANENTEMENTE bloqueada para este mercado.
+    Alternativa: si alguien ha donado/enviado 10+ tokens al contrato previamente,
+    esos tokens cubren el gap y se pierden.
+  impact: >
+    DoS permanente de pre-liquidación para mercados con fee-on-transfer tokens.
+    O drenaje silencioso de tokens stuck en el contrato. Ambos son problemas reales.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: PreLiquidation balance debe ser 0 antes y después de preLiquidate
+    // Si el balance disminuye durante una pre-liquidación, hay drenaje
+    uint256 balBefore = ERC20(LOAN_TOKEN).balanceOf(address(preLiquidation));
+    // ... execute preLiquidate ...
+    uint256 balAfter = ERC20(LOAN_TOKEN).balanceOf(address(preLiquidation));
+    // Balance should not decrease (no funds should be drained from contract)
+    gte(balAfter, balBefore, "PL-W-03: PreLiquidation balance decreased - fund drainage");
+    // Ideally both should be 0
+    eq(balAfter, 0, "PL-W-03: residual tokens in PreLiquidation");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Morpho Blue tiene la misma limitación — no soporta fee-on-transfer tokens
+    oficialmente. La documentación de Morpho lista esto como una limitación conocida.
+    Sin embargo, PreLiquidation añade un HOP EXTRA (liquidator→PreLiq→Morpho = 2
+    transferencias), duplicando el impacto del fee. Incluso si Morpho's repay()
+    funciona con fee-on-transfer, PreLiquidation lo rompe por el hop intermedio.
+    Likely out of scope si Morpho excluye estos tokens, pero vale documentar.
+
+- id: PL-W-04
+  tier: 2
+  type: property
+  description: >
+    El borrower puede evadir pre-liquidación revocando autorización via MEV frontrun.
+    Cuando su posición entra en zona pre-liquidable, el borrower puede monitorear
+    el mempool y frontrunear cualquier preLiquidate() con una tx que revoque
+    authorization: morpho.setAuthorization(preLiquidation, false). La pre-liquidación
+    falla en withdrawCollateral (UNAUTHORIZED). El borrower puede re-autorizar
+    inmediatamente después para mantener la apariencia de cooperación.
+  attack_scenario: >
+    1. Borrower tiene posición con LTV > PRE_LLTV pero < LLTV.
+    2. Liquidador detecta la posición y envía preLiquidate() tx al mempool.
+    3. Borrower (o su bot MEV) ve la tx pendiente.
+    4. Borrower frontrunea con morpho.setAuthorization(preLiquidation, false).
+    5. preLiquidate() → onMorphoRepay → withdrawCollateral → UNAUTHORIZED → revert.
+    6. Borrower re-autoriza en la siguiente tx (o en un bundled Flashbots tx).
+    7. Resultado: el borrower evade cada intento de pre-liquidación.
+    8. Si el mercado se deteriora: posición llega a LLTV → liquidación normal.
+       El borrower pierde MÁS colateral porque la liquidación normal tiene mayor
+       incentive factor que la pre-liquidación.
+    Nota: este ataque es auto-destructivo para el borrower si el mercado no se
+    recupera. Pero podría ser racional si el borrower espera una recuperación del
+    precio (gambling).
+  impact: >
+    Liveness de pre-liquidación comprometida. El mecanismo de protección gradual
+    se vuelve inútil si borrowers pueden evadir selectivamente. Impacto sistémico:
+    más bad debt si posiciones saltan de pre-liq a liquidación normal.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // This is an architectural observation, not a fuzzable invariant.
+    // Test: verify that authorization revocation blocks preLiquidate
+    bool wasAuthorized = MORPHO.isAuthorized(borrower, address(preLiquidation));
+    // Simulate revocation
+    vm.prank(borrower);
+    MORPHO.setAuthorization(address(preLiquidation), false);
+    // preLiquidate should now revert
+    try preLiquidation.preLiquidate(borrower, 0, 1, "") {
+        t(false, "PL-W-04: preLiquidate should revert without auth");
+    } catch {}
+    // Restore state
+    if (wasAuthorized) {
+        vm.prank(borrower);
+        MORPHO.setAuthorization(address(preLiquidation), true);
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    By design — la autorización es el mecanismo de opt-in. La evasión es un efecto
+    secundario inherente. Esto es más un riesgo de protocolo-design que un bug del
+    código. Podría ser QA/Informational. Sin embargo, si la documentación promete
+    "pre-liquidación automática una vez autorizada", la evasión via frontrun contradice
+    esa promesa.
+
+- id: PL-W-05
+  tier: 1
+  type: property
+  description: >
+    Tokens ERC20 enviados directamente al contrato PreLiquidation quedan
+    permanentemente stuck. No hay función sweep/rescue. El contrato tiene approve
+    max hacia Morpho para loan tokens, lo que significa que si loan tokens se
+    acumulan en el contrato, Morpho puede extraerlos en la siguiente pre-liquidación
+    (el liquidador paga menos efectivamente). Para collateral tokens u otros ERC20,
+    están perdidos para siempre.
+  attack_scenario: >
+    1. Liquidador A envía loan tokens directamente a PreLiquidation por error (transfer
+       en lugar de approve para el callback).
+    2. Balance del contrato: 100 tokens.
+    3. Liquidador B ejecuta preLiquidate() normalmente. repaidAssets = 500.
+    4. En onMorphoRepay: safeTransferFrom(B, PreLiq, 500) → PreLiq tiene 600 tokens.
+    5. Morpho: safeTransferFrom(PreLiq, Morpho, 500) → PreLiq tiene 100 tokens.
+    6. Los 100 tokens de A siguen stuck. Ni A ni B se benefician.
+    7. Si alguien hace una donación de exactamente repaidAssets tokens al contrato,
+       el siguiente liquidador puede ejecutar preLiquidate sin enviar loan tokens
+       en el callback (usar los donados). El liquidador se ahorra el costo.
+       Pero el donante pierde los tokens.
+  impact: >
+    Pérdida permanente de tokens enviados por error. No hay mecanismo de recuperación.
+    Impacto: bajo (requiere error del usuario), pero la ausencia de rescue es notable.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: PreLiquidation loan token balance should always be 0 in steady state
+    uint256 balance = ERC20(LOAN_TOKEN).balanceOf(address(preLiquidation));
+    eq(balance, 0, "PL-W-05: loan tokens stuck in PreLiquidation contract");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 85
+  notes: >
+    Confirmable por inspección estática: no hay función withdraw/sweep/rescue.
+    El flujo normal es flash-through (tokens entran y salen en la misma tx).
+    Cualquier balance residual es anómalo. Patrón común en contratos minimal.
+    Probablemente "by design" — Morpho prioriza la simplicidad del contrato.
+
+- id: PL-W-06
+  tier: 1
+  type: property
+  description: >
+    Cualquier persona puede deployar un PreLiquidation directamente (sin factory)
+    con un oracle malicioso, luego engañar a un borrower para que lo autorice.
+    El contrato NO verifica que el oracle sea seguro o consistente con el oracle
+    del mercado de Morpho. Un actor malicioso puede crear un contrato con un oracle
+    que él controla, presentarlo como legítimo, y pre-liquidar posiciones sanas
+    una vez que el borrower autoriza el contrato.
+  attack_scenario: >
+    1. Attacker deploya PreLiquidation(morpho, id, params) con preLiquidationOracle =
+       contrato propio que implementa IOracle.price().
+    2. El contrato es válido (pasa todas las validaciones del constructor).
+    3. Attacker crea una UI falsa / documentación que dice "autoriza este contrato
+       de pre-liquidación para mejores condiciones".
+    4. Borrower ingenuo autoriza el contrato: morpho.setAuthorization(attackerPreLiq, true).
+    5. Attacker manipula su oracle para reportar precio bajo del colateral.
+    6. preLiquidate() pasa: posición aparece pre-liquidable con LTV artificialmente alto.
+    7. preLIF calculado es alto (cerca de preLIF2, el máximo incentivo).
+    8. withdrawCollateral en Morpho usa el ORACLE REAL del mercado. Si el precio real
+       es suficientemente alto, la posición sigue "sana" tras remover colateral →
+       withdrawCollateral pasa.
+    9. Borrower pierde colateral a precio de descuento artificial.
+  impact: >
+    Pérdida directa de colateral del borrower. El attacker compra colateral con
+    un descuento artificial (preLIF inflado por oracle manipulation). Cuantía:
+    (preLIF_manipulado - preLIF_real) / preLIF_manipulado * seizedAssets en valor.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: Pre-liquidation oracle should return prices consistent with market oracle
+    // WARNING: this is a configuration risk, not a code bug per se
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    uint256 marketPrice = IOracle(ORACLE).price();
+    // Prices should be within 10% of each other
+    uint256 maxP = preLiqPrice > marketPrice ? preLiqPrice : marketPrice;
+    uint256 minP = preLiqPrice < marketPrice ? preLiqPrice : marketPrice;
+    if (maxP > 0) {
+        uint256 ratio = (maxP - minP) * WAD / maxP;
+        lte(ratio, WAD / 10, "PL-W-06: oracles diverge > 10%");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Este ataque requiere social engineering (convencer al borrower de autorizar un
+    contrato malicioso). El código NO es vulnerable per se — es un riesgo de
+    configuración/deployment. Sin embargo, la ausencia de validación del oracle en
+    el constructor y la permissionless nature del deployment (cualquiera puede crear
+    PreLiquidation contracts) amplifica el riesgo.
+    Counter: el borrower debe activamente autorizar el contrato. Si se documenta
+    claramente que los borrowers deben verificar el oracle antes de autorizar, el
+    riesgo se mitiga. Pero la experiencia muestra que los usuarios no verifican.
+
+- id: PL-W-07
+  tier: 2
+  type: optimize
+  description: >
+    Maximizar el profit de un liquidador que explota la reentrancia en el callback
+    onPreLiquidate para ejecutar múltiples pre-liquidaciones anidadas sobre el mismo
+    borrower. El objetivo es cuantificar si la fragmentación reentrante permite
+    seizar más colateral que una sola pre-liquidación al preLCF máximo.
+  attack_scenario: >
+    Liquidador con contrato malicioso que en onPreLiquidate re-entra preLiquidate
+    recursivamente mientras la posición siga siendo pre-liquidable. Cada ronda
+    tiene un LTV más alto (porque preLIF > 1 remueve más valor en colateral que
+    en deuda), lo que da preLCF más alto, permitiendo más seizure.
+  impact: >
+    Si el profit es positivo: over-seizure reentrante es explotable.
+    Si neutral o negativo: la reentrancia no da ventaja (diseño correcto).
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Echidna optimization function
+    // Compare seized collateral: reentrant vs sequential (separate txs)
+    function optimize_pl_w_07_reentrant_profit() public returns (int256) {
+        uint256 seizedReentrant = ghost_seized_reentrant;
+        uint256 seizedSequential = ghost_seized_sequential;
+        if (seizedSequential == 0) return 0;
+        return int256(seizedReentrant) - int256(seizedSequential);
+    }
+  ghost_vars:
+    - "uint256 internal ghost_seized_reentrant;"
+    - "uint256 internal ghost_seized_sequential;"
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    La hipótesis es que la reentrancia permite explotar el efecto amplificante
+    del LTV creciente (cada seizure sube el LTV → preLCF sube → más seizure).
+    Pero cada ronda requiere pagar loan tokens, así que el "profit" es la diferencia
+    en colateral obtenido por la misma cantidad de deuda repagada.
+    Requiere setup complejo con Echidna optimization mode.
+
+- id: PL-W-08
+  tier: 2
+  type: property
+  description: >
+    Un PreLiquidation contract creado fuera de la factory (deployment directo con
+    `new PreLiquidation(morpho, id, params)`) es completamente funcional pero NO
+    registrado en `factory.isPreLiquidation`. Si hay integraciones que verifican
+    isPreLiquidation como gate de confianza, un contrato no registrado bypasea
+    ese check. Inversamente, si la factory es el ÚNICO mecanismo de trust, los
+    contratos deployed directamente son "rogue" pero indistinguibles del legítimo.
+  attack_scenario: >
+    1. Factory deployed con Morpho A. isPreLiquidation es el registro de confianza.
+    2. Attacker deploya PreLiquidation(morphoA, id, maliciousParams) directamente.
+    3. Este contrato NO está en isPreLiquidation de ninguna factory.
+    4. Si un frontend solo muestra contratos registrados en la factory, el contrato
+       rogue no aparece — protección funciona.
+    5. Pero si el borrower interactúa directamente (ej. via Etherscan/script) y no
+       verifica isPreLiquidation, puede autorizar un contrato con oracle malicioso.
+    6. Impacto: bypass del registry como mecanismo de confianza. No es un bug del
+       código sino una limitación de la arquitectura permissionless.
+  impact: >
+    Riesgo de que borrowers autoricen contratos PreLiquidation no verificados
+    (no registrados en la factory). Impacto depende de las integraciones.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: any functional PreLiquidation should be registered in factory
+    // This is NOT enforceable on-chain — it's an off-chain trust assumption
+    bool registered = factory.isPreLiquidation(address(preLiquidation));
+    t(registered, "PL-W-08: PreLiquidation not registered in factory");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: >
+    Limitación inherente de la arquitectura permissionless. El factory.isPreLiquidation
+    es un convenience registry, no un enforcement mechanism. No se puede prevenir
+    el deployment directo de PreLiquidation contracts.
+    Likely informational / "by design" del modelo permissionless de Morpho.
+
+false_positives:
+
+- hunter: WildcardHunter
+  id: PL-FP-01
+  reason: >
+    safeApprove con tokens sin return value (USDT-like): solmate SafeTransferLib
+    maneja correctamente tokens que no retornan valor. Success = true si
+    returndatasize==0 OR returndatavalue==1. Un token que retorna false haría
+    revertir el constructor, impidiendo el deployment — no es fund loss post-deploy.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      solmate SafeTransferLib.safeApprove() maneja correctamente tokens USDT-like
+      (sin return value). No es un vector para PreLiquidation — el constructor
+      revertería si el approve falla, previniendo deployment con tokens incompatibles.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: PL-FP-02
+  reason: >
+    CREATE2 frontrun deploy con bytecode DIFERENTE en la misma dirección: IMPOSIBLE.
+    El initCodeHash incluye los constructor args. Un contrato malicioso con args
+    diferentes produce dirección diferente. El único "ataque" posible es deployar el
+    MISMO contrato legítimo antes (gas grief, no fund loss). Moved from initial
+    hypothesis to false positive after deeper analysis.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      CREATE2 con initCodeHash que incluye constructor args: el attacker NO puede
+      deployar bytecode diferente en la misma dirección. Frontrun = deploy the same
+      legitimate contract, which is a gas grief at worst.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: PL-FP-03
+  reason: >
+    "El liquidador puede evadir pago porque recibe colateral antes de pagar":
+    INCORRECTO. El safeTransferFrom(liquidator, PreLiq, repaidAssets) al final de
+    onMorphoRepay es la ÚLTIMA operación. Si falla, TODA la tx revierte (incluyendo
+    withdrawCollateral, repay, y todo). La atomicidad de la tx garantiza que el
+    liquidador SIEMPRE paga. La ventana collateral-antes-de-pago es el patrón de
+    flash-liquidación by design — permite liquidar sin capital previo.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Flash-liquidation pattern (collateral before payment): NOT a bug. The tx
+      atomicity guarantees payment. If the final safeTransferFrom fails, the entire
+      tx reverts including the collateral withdrawal. The callback window is for
+      the liquidator to source loan tokens using the seized collateral.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: PL-FP-04
+  reason: >
+    "preLCF > WAD (100%) es un bug": INCORRECTO. El código explícitamente documenta
+    en lines 167-168 que "the pre-liquidation close factor can be greater than WAD
+    (100%). In this case the position can be fully pre-liquidated." El constructor
+    validates preLCF1 <= WAD pero intentionally allows preLCF2 > WAD. This is by
+    design for positions very close to LLTV where full pre-liquidation is desirable.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      PreLiquidation close factor (preLCF) can exceed 100% by design — allows full
+      position closure when LTV is very close to LLTV. Documented in code comments.
+      Do not flag as bug.
+    briefing_update_applied: false

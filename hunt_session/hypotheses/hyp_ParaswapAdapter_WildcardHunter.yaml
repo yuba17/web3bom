@@ -1,0 +1,342 @@
+protocol: morpho-bundler3
+component: ParaswapAdapter
+file: src/adapters/ParaswapAdapter.sol
+domain: trust
+hunter: WildcardHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: PA-W-01
+  tier: 1
+  type: property
+  description: >
+    Overlapping offsets in sell()/buy() corrupt callData — if exactAmount offset == limitAmount offset,
+    updateAmounts() first writes exactAmount, then reads it back as the "old" limitAmount, computing
+    limitAmount as newExact^2/oldExact instead of the correct proportional value. This corrupts
+    the slippage protection: minDestAmount (sell) or maxSrcAmount (buy) becomes wrong.
+  attack_scenario: >
+    Attacker crafts a bundle with sell() where offsets.exactAmount == offsets.limitAmount.
+    sellEntireBalance=true triggers updateAmounts(). The first set() writes newSrcAmount at the
+    offset. The second get() reads newSrcAmount (not the original limit). mulDiv computes
+    newSrcAmount * newSrcAmount / oldSrcAmount — quadratically inflated or deflated.
+    For sell(): minDestAmount is derived from callData.get(offsets.limitAmount), which is now
+    the corrupted value. If the corrupted value is very small (newSrc < oldSrc), the slippage
+    check passes with a much worse rate, and Augustus can return very few destTokens.
+    Combined with a sandwiched pool, attacker steals the difference.
+    For buy(): maxSrcAmount is read from the corrupted limitAmount — if inflated, the adapter
+    allows spending much more srcToken than intended.
+  impact: "Loss of funds via slippage bypass — user receives far fewer tokens than expected or spends far more"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Test: overlapping offsets corrupt slippage protection
+    // Setup: callData with known values at position P
+    // offsets.exactAmount = P, offsets.limitAmount = P (same!)
+    bytes memory testData = new bytes(100);
+    uint256 offset = 4; // after selector
+    // Set initial value at offset
+    BytesLib.set(testData, offset, 1000e18); // oldExact = 1000
+    Offsets memory ovlp = Offsets({exactAmount: offset, limitAmount: offset, quotedAmount: 0});
+    // If balance is 500e18, updateAmounts sets exact=500, then reads limit=500 (corrupted)
+    // limitAmount = 500 * 500 / 1000 = 250 (should be 500 * originalLimit / 1000)
+    // This means minDestAmount = 250 instead of the correct proportional value
+    // The invariant: after updateAmounts, limitAmount should equal originalLimit * newExact / oldExact
+    uint256 originalLimit = testData.get(offset); // before call
+    uint256 newExact = 500e18;
+    // Call updateAmounts
+    // adapter.updateAmounts(testData, ovlp, newExact, Math.Rounding.Ceil);
+    // Check: limitAmount at offset should be originalLimit * newExact / oldExact
+    uint256 resultLimit = testData.get(offset);
+    // If overlapping: resultLimit = newExact (from first set) * newExact / oldExact = corrupted
+    // t(resultLimit == (originalLimit * newExact) / 1000e18, "PA-W-01: overlapping offsets corrupted limit");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The key question is whether the bundler or frontend enforces non-overlapping offsets.
+    If offsets come directly from user-supplied calldata in the bundle, this is exploitable.
+    The contract does NOT validate that offsets are distinct. BytesLib only checks bounds,
+    not overlap. This is a novel vector because most auditors check individual offset bounds
+    but not the relationship between offsets.
+
+- id: PA-W-02
+  tier: 1
+  type: property
+  description: >
+    sell() with sellEntireBalance=false skips updateAmounts but reads maxSrcAmount and minDestAmount
+    directly from callData at user-supplied offsets. If offsets point to crafted positions within
+    callData (e.g., inside routing data that contains attacker-controlled values), the slippage
+    parameters are attacker-controlled despite appearing to come from "the swap parameters".
+  attack_scenario: >
+    Attacker constructs callData for Augustus where legitimate swap parameters are at standard
+    positions, but sets offsets.exactAmount to point at a position within the routing data that
+    contains a very large value (e.g., a pool address interpreted as uint256). This makes
+    maxSrcAmount huge, allowing the adapter to spend more srcToken than the user intended.
+    Similarly, offsets.limitAmount could point to a position containing a very small value,
+    making minDestAmount trivially small — bypassing slippage protection entirely.
+    The attacker sandwiches the pool to extract maximum value from the swap.
+  impact: "Complete bypass of slippage protection — user gets sandwiched for maximum MEV extraction"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: maxSrcAmount should never exceed the adapter's srcToken balance
+    // (selling more than you have makes no economic sense)
+    uint256 maxSrc = callData.get(offsets.exactAmount); // for sell()
+    uint256 adapterBalance = IERC20(srcToken).balanceOf(address(adapter));
+    t(maxSrc <= adapterBalance, "PA-W-02: maxSrcAmount exceeds adapter balance");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    This is mitigated by the fact that swap() checks srcAmount = srcInitial - srcFinal <= maxSrcAmount
+    AFTER the swap. So even if maxSrcAmount is huge, the adapter can only lose what it has.
+    However, the user may have sent more tokens than intended to be swapped (e.g., for a partial sell),
+    and the inflated maxSrcAmount allows Augustus to take all of them.
+    Additionally, the bundle initiator controls offsets, so this is self-inflicted unless
+    the bundle is constructed by a third party (relayer, frontend). Downgrading confidence.
+
+- id: PA-W-03
+  tier: 1
+  type: property
+  description: >
+    srcToken == destToken in swap() makes balance accounting degenerate. srcAmount and destAmount
+    measure the same token balance changes. If Augustus routes through a path that temporarily
+    decreases then increases the balance (net positive), both srcAmount (loss) and destAmount (gain)
+    reflect the same underlying balance changes but measured against the same initial value.
+    The srcAmount = srcInitial - srcFinal could underflow if Augustus returns MORE srcToken than it took
+    (e.g., via a rebasing token or a fee-on-transfer token that has negative fees on certain routes).
+  attack_scenario: >
+    With srcToken == destToken and a token that gives bonuses on certain transfers (promotional tokens),
+    Augustus could execute a "swap" where the adapter ends with MORE tokens than it started.
+    srcFinal > srcInitial causes srcInitial - srcFinal to underflow (revert in Solidity 0.8).
+    This is a DoS vector for same-token scenarios. More critically, if destFinal - destInitial
+    is measured on the same balance, the "destAmount" that gets transferred out could be wrong.
+    With srcToken == destToken: if Augustus takes 100 and returns 95 via a different path,
+    srcAmount = 100 - 95 = 5 (net loss of 5), destAmount = 95 - 100 = underflow revert.
+    Wait — destInitial == srcInitial. After swap where Augustus takes 100 and returns 95:
+    srcFinal = destFinal = initial - 100 + 95 = initial - 5.
+    srcAmount = initial - (initial - 5) = 5. destAmount = (initial - 5) - initial = underflow REVERT.
+    This means ANY swap where srcToken == destToken and Augustus takes a fee will REVERT.
+    But if Augustus takes 100 and returns 105: srcAmount = -5 → underflow REVERT.
+    Conclusion: srcToken == destToken always reverts unless net change is exactly 0.
+    This is a DoS but probably by design (no point in swapping same token).
+  impact: "DoS — any swap with srcToken == destToken reverts due to underflow. Low practical impact since same-token swaps are nonsensical."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: srcToken == destToken always reverts
+    // This is a property that should hold: the function should either revert or
+    // handle same-token gracefully
+    // In practice, it always reverts due to underflow on either srcAmount or destAmount
+    // This is informational — no economic loss, just unexpected behavior
+    // t(srcToken != destToken, "PA-W-03: same token swap attempted");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    After deep analysis: srcToken == destToken means srcInitial == destInitial and
+    srcFinal == destFinal. If Augustus takes N tokens: srcAmount = N, destAmount = -N → revert.
+    If Augustus gives N tokens: srcAmount = -N → revert. Only if net effect is 0 does it not
+    revert, but then destAmount = 0 < minDestAmount → revert. So it ALWAYS reverts.
+    This is by-design protection but worth documenting as it's not explicitly checked.
+
+- id: PA-W-04
+  tier: 1
+  type: property
+  description: >
+    buyMorphoDebt() reads debt via expectedBorrowAssets() which includes accrued interest up to
+    the current block. But the callData was crafted off-chain with a quoted amount from a previous
+    block. updateAmounts() scales limitAmount (maxSrcAmount for buy) proportionally:
+    newLimit = oldLimit * debtAmount / oldExactAmount. If debtAmount > oldExactAmount (interest
+    accrued since quote), the maxSrcAmount INCREASES proportionally. An attacker can manipulate
+    the interest rate (e.g., by borrowing/repaying in the same block to spike utilization) to inflate
+    the debt amount, causing the user to approve spending more srcToken than intended.
+  attack_scenario: >
+    1. User has 1000 USDC debt, quotes a buy for 1000 USDC with maxSrcAmount = 1050 WETH (5% slippage).
+    2. Attacker front-runs: borrows heavily from the same market → utilization spikes → interest
+       rate jumps → user's debt becomes 1100 USDC in the same block via accrueInterest.
+    3. buyMorphoDebt calculates debtAmount = 1100. updateAmounts scales:
+       newLimit = 1050 * 1100 / 1000 = 1155 WETH maxSrcAmount.
+    4. Attacker sandwiches the Augustus swap. User can now lose up to 1155 WETH instead of 1050.
+    5. Difference: 105 WETH of additional slippage exposure created by the interest manipulation.
+    Note: the proportional scaling is the ROOT CAUSE. The limit should arguably be capped,
+    not scaled, when the debt changes.
+  impact: "User pays up to ~10% more srcToken than intended due to interest manipulation inflating the proportional limit scaling"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariant: maxSrcAmount after buyMorphoDebt should not exceed a reasonable bound
+    // relative to the original quoted limit
+    // This requires tracking the original callData before updateAmounts
+    uint256 originalLimit = ghost_originalLimit;
+    uint256 originalExact = ghost_originalExact;
+    uint256 actualDebt = MorphoBalancesLib.expectedBorrowAssets(MORPHO, marketParams, onBehalf);
+    uint256 scaledLimit = (originalLimit * actualDebt) / originalExact;
+    // If debt grew by more than 1% due to interest manipulation, the limit grows proportionally
+    // This is the vulnerability: limit should be capped, not proportionally scaled
+    uint256 maxAcceptableGrowth = originalLimit * 101 / 100; // 1% tolerance
+    t(scaledLimit <= maxAcceptableGrowth, "PA-W-04: buyMorphoDebt limit scaled beyond 1% of original");
+  ghost_vars:
+  - uint256 internal ghost_originalLimit;
+  - uint256 internal ghost_originalExact;
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The economic viability depends on the cost of interest rate manipulation vs the extra
+    slippage extracted. On Morpho Blue, interest rates are determined by IRM and utilization,
+    which can be spiked by flash-borrowing. However, the profit must exceed the cost of the
+    flash loan + gas. This is marginal but possible on large positions.
+    Key question: can the IRM be spiked enough in a single block to make this worthwhile?
+
+- id: PA-W-05
+  tier: 2
+  type: property
+  description: >
+    Augustus callback reentrancy during swap(). Between forceApprove(max) and forceApprove(0),
+    Augustus executes arbitrary callData. A compromised or malicious Augustus (that is still
+    in the registry) could call back into the adapter via the Bundler3 reenter mechanism.
+    Since the adapter has max approval to Augustus during this window, a reentrant call
+    could approve Augustus for a DIFFERENT token, or perform another swap that drains tokens.
+  attack_scenario: >
+    1. Augustus is compromised (or a new version is added to registry with a backdoor).
+    2. During the augustus.call(callData), Augustus calls back to Bundler3 which calls
+       adapter.sell() for a different srcToken that the adapter holds.
+    3. This second sell() calls swap() → forceApprove(max) for the second token → Augustus
+       now has approval for both tokens.
+    4. Augustus drains both tokens before the outer swap()'s forceApprove(0) executes.
+    Note: This requires Augustus to be in the registry AND be malicious — a very high bar.
+    But the registry is controlled by Paraswap governance, not Morpho. Trust assumption.
+  impact: "Total drain of all tokens in the adapter if Augustus is compromised. Depends on trust in Paraswap registry governance."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // This is an architectural concern, not easily testable via invariant
+    // The key question: can Augustus reenter via Bundler3?
+    // swap() has onlyBundler3, so Augustus can only reenter if it calls Bundler3.reenter()
+    // which requires Augustus to have the reenter callback capability
+    // Practically: Augustus is a swap router, not designed to call Bundler3
+    // But the CODE allows it if Augustus is malicious
+    // t(!ghost_inSwap, "PA-W-05: reentrancy detected during swap");
+  ghost_vars:
+  - bool internal ghost_inSwap;
+  validated: false
+  priority: medium
+  confidence: 30
+  notes: >
+    Very low confidence because it requires Augustus compromise AND reentrancy path through
+    Bundler3. The real question is: does Bundler3.reenter() check reentrancy guards?
+    If Bundler3 has reentrancy protection, this is completely mitigated. Need to check
+    Bundler3 implementation. Marking as tier 2 for further investigation.
+
+- id: PA-W-06
+  tier: 1
+  type: property
+  description: >
+    updateAmounts() divides by oldExactAmount (read from callData). If a malicious or buggy
+    callData has 0 at the exactAmount offset, mulDiv reverts with division by zero.
+    More subtly: if oldExactAmount is very small (e.g., 1 wei), the proportional scaling
+    can overflow or produce extremely large limitAmount values. For sell() with
+    sellEntireBalance=true: limitAmount = oldLimit * newBalance / 1 = oldLimit * newBalance.
+    If oldLimit = 1e18 and newBalance = 1e18, limitAmount = 1e36 which overflows uint256? No,
+    but it makes minDestAmount = 1e36 which is unreachable → guaranteed revert.
+    Conversely for buy(): limitAmount = oldLimit * debtAmount / 1 → maxSrcAmount = huge →
+    all slippage protection gone.
+  attack_scenario: >
+    For buy/buyMorphoDebt: Attacker crafts callData with exactAmount=1 wei at the offset.
+    User's real debt is 1000e18. updateAmounts scales: limitAmount = oldLimit * 1000e18 / 1 =
+    oldLimit * 1e21. This makes maxSrcAmount astronomically large → Augustus can drain
+    all srcToken from the adapter. Combined with a sandwich attack, attacker profits the
+    difference between fair swap rate and the awful rate Augustus gives.
+    Key: the attacker must be the one crafting the callData, which in a relayer/meta-tx
+    scenario could be a third party.
+  impact: "Complete slippage bypass via tiny oldExactAmount — attacker can drain srcTokens. Requires attacker-controlled callData."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: oldExactAmount should be reasonably close to the actual amount being traded
+    uint256 oldExact = callData.get(offsets.exactAmount);
+    t(oldExact > 1e6, "PA-W-06: oldExactAmount suspiciously small — slippage scaling vulnerable");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    This is partially self-inflicted (user crafts their own callData). But in scenarios
+    where a relayer, frontend, or aggregator constructs the bundle, a malicious intermediary
+    could inject tiny oldExactAmount to amplify slippage exposure. The contract does not
+    validate that oldExactAmount is sane. For buyMorphoDebt specifically, the debtAmount
+    comes from Morpho (trusted), but oldExactAmount comes from callData (user-supplied).
+
+- id: PA-W-07
+  tier: 2
+  type: property
+  description: >
+    swap() transfers only destAmount = destFinal - destInitial to receiver, not the full
+    destFinal balance. If the adapter held pre-existing destToken from a previous operation
+    in the same bundle, those tokens are STRANDED. They can only be recovered via a separate
+    erc20Transfer call. If the bundle doesn't include this cleanup step, tokens are left
+    in the adapter and can be stolen by anyone who calls erc20Transfer in the next bundle.
+  attack_scenario: >
+    1. User's bundle: (a) transfer WETH to adapter, (b) sell WETH→USDC, (c) supply USDC to Morpho.
+    2. Step (b) leaves 5 USDC of dust in the adapter (positive slippage from Augustus).
+    3. User's bundle doesn't include a cleanup erc20Transfer for USDC dust.
+    4. Attacker's next bundle: erc20Transfer(USDC, attacker, type(uint256).max) → steals 5 USDC.
+    This is a well-known "leftover token" pattern, but worth checking if the adapter docs
+    adequately warn about it. The NatSpec says "should be skimmed separately" — acknowledged.
+  impact: "Dust/surplus tokens left in adapter between bundles can be stolen. Low value per incident but systematic."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a bundle completes, adapter balance of any token should be 0
+    // This is an external invariant (post-bundle check)
+    uint256 remainingDest = IERC20(destToken).balanceOf(address(adapter));
+    uint256 remainingSrc = IERC20(srcToken).balanceOf(address(adapter));
+    t(remainingDest == 0, "PA-W-07: destToken dust left in adapter");
+    t(remainingSrc == 0, "PA-W-07: srcToken dust left in adapter");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    The NatSpec explicitly warns about this ("should be skimmed separately"), so it's
+    acknowledged by design. However, the REAL risk is that bundle constructors (frontends,
+    SDKs) don't always include the skim step. This is more of an integration risk than
+    a contract bug. Downgrading to tier 2.
+
+false_positives:
+- hunter: WildcardHunter
+  id: PA-FP-01
+  reason: >
+    sell() and buy() are external/public without onlyBundler3, but they call swap() which
+    has onlyBundler3. Direct calls revert. This was a known finding (Solodit LOW) but has
+    been mitigated by the design — the modifier is on the internal function that does all
+    the dangerous work (approvals, transfers). The external functions only do callData
+    manipulation which is harmless without the swap execution. NOT a vulnerability.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      ParaswapAdapter sell()/buy() sin modifier — no es bug si la función interna swap()
+      tiene onlyBundler3. Patrón válido: modifier en el chokepoint interno, no en cada
+      función externa. Solodit LOW ya reportado y mitigado.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: PA-FP-02
+  reason: >
+    srcToken == destToken causing reverts — this is by-design self-protection. There is no
+    legitimate reason to swap a token for itself, and the underflow revert prevents any
+    weird accounting. Not exploitable, not a loss of functionality. Informational at best.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

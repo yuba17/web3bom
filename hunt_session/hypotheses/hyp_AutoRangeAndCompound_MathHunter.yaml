@@ -1,0 +1,140 @@
+component: AutoRangeAndCompound
+hunter: MathHunter
+date: "2026-03-21"
+
+invariants:
+  - id: ARC-M-01
+    title: "autoCompound: reward underflow when compoundFees deducted before swap"
+    tier: 2
+    type: property
+    confidence: 70
+    description: >
+      autoCompound() collects fees (amount0, amount1), then optionally swaps.
+      The compoundFees are deducted from the collected amounts BEFORE adding liquidity.
+      If the fee deduction makes amount0 or amount1 go negative (impossible in Solidity 0.8
+      checked arithmetic), revert. But if the fee is calculated as % of collected and the
+      % rounds up, the deduction could exceed the collected amount.
+      Root cause: fee = totalFees * COMPOUND_FEE_X64 / 2^64. Division rounds down, so
+      compoundFees <= collected is always guaranteed. Invariant holds.
+    affected_line: "AutoRangeAndCompound.sol:490-510 (fee deduction logic)"
+    status: low_priority
+    solidity: |
+      // INV-ARC-M-01: compoundFees0 <= amount0 && compoundFees1 <= amount1
+      // Holds by design: compoundFee = amount * COMPOUND_FEE_X64 / Q64 ≤ amount
+
+  - id: ARC-M-02
+    title: "execute: SafeCast.toInt24 reverts for extreme tick configs"
+    tier: 1
+    type: property
+    confidence: 80
+    description: >
+      execute() line 245: baseTick = currentTick - (((currentTick % tickSpacing) + tickSpacing) % tickSpacing)
+      Line 262: SafeCast.toInt24(baseTick + config.lowerTickDelta) — if lowerTickDelta is large negative
+      and baseTick is near MIN_TICK, sum could underflow int256 or exceed int24 range.
+      Similarly for upperTickDelta near MAX_TICK.
+      Attack: position configured with extreme deltas triggers permanent revert in execute().
+      configToken() doesn't validate that baseTick + delta stays within int24 bounds.
+      This is a DoS finding — operator-set config can permanently block range adjustment.
+    affected_line: "AutoRangeAndCompound.sol:262-263 SafeCast.toInt24"
+    status: hypothesis
+    solidity: |
+      // INV-ARC-M-02: toInt24 never reverts during normal operation
+      // Attack: lowerTickDelta so large that baseTick + delta > type(int24).max
+      function invariant_execute_noSafeCastOverflow(int24 currentTick, int24 lowerTickDelta) internal {
+          // If lowerTickDelta is configured as 2^23 (max int24), any tick would overflow
+          int256 sum = int256(currentTick) + int256(lowerTickDelta);
+          t(sum >= type(int24).min && sum <= type(int24).max, "ARC-M-02: tick SafeCast overflow");
+      }
+
+  - id: ARC-M-03
+    title: "autoCompound: total amount added as liquidity + fees must equal collected"
+    tier: 2
+    type: property
+    confidence: 75
+    description: >
+      Fund conservation invariant: amounts collected from fees = amounts added as liquidity + compoundFees + leftover.
+      If there's a discrepancy, tokens are either lost or duplicated.
+      Swap path: collected → swap some → addLiquidity with swapped amounts → compound fees → leftover to owner.
+      The leftover is sent to params.rewardConversion or position owner.
+      Verify: amount0_collected = amount0_added_to_liq + compoundFee0 + leftover0.
+    affected_line: "AutoRangeAndCompound.sol:460-530"
+    status: hypothesis
+    solidity: |
+      // INV-ARC-M-03: amount_collected = amount_in_liq + fee + leftover
+      function invariant_autoCompound_fundConservation(
+          uint256 collected0, uint256 added0, uint256 fee0, uint256 leftover0
+      ) internal {
+          eq(collected0, added0 + fee0 + leftover0, "ARC-M-03: fund conservation broken");
+      }
+
+  - id: ARC-M-04
+    title: "execute: reward amount calculation inconsistency between onlyFees and full range"
+    tier: 2
+    type: property
+    confidence: 65
+    description: >
+      execute() calculates reward differently based on onlyFees:
+      - onlyFees=true: reward from feeAmount0/feeAmount1 only (line ~310)
+      - onlyFees=false: reward from amountAdded0/amountAdded1 (line ~315)
+      When onlyFees=false, the reward is calculated from addLiquidity amounts,
+      but the execute caller (keeper) could receive a disproportionate reward
+      if the amountAdded values are manipulated via slippage to be higher/lower than fair.
+      This is an economic attack on keeper rewards, not fund theft.
+    affected_line: "AutoRangeAndCompound.sol:295-320 (reward calculation)"
+    status: low_priority
+    solidity: |
+      // INV-ARC-M-04: reward <= max(REWARD_X64) * totalValue
+      // Holds by design as long as addLiquidity amounts are real
+
+  - id: ARC-M-05
+    title: "execute: tick floor arithmetic could underflow for negative ticks"
+    tier: 2
+    type: property
+    confidence: 72
+    description: >
+      Line 245: baseTick = currentTick - (((currentTick % tickSpacing) + tickSpacing) % tickSpacing)
+      For negative currentTick, Solidity's % operator returns negative results.
+      Example: currentTick = -100, tickSpacing = 60
+        currentTick % tickSpacing = -100 % 60 = -40 (Solidity rounds toward zero)
+        (-40 + 60) % 60 = 20 % 60 = 20
+        baseTick = -100 - 20 = -120 ✓ (correct floor)
+      The arithmetic handles negative ticks correctly. Lower risk than initially suspected.
+      But: if tickSpacing = 0 (edge case, shouldn't happen), division by zero.
+      tickSpacing comes from pool.tickSpacing() — should always be > 0 for valid pools.
+    affected_line: "AutoRangeAndCompound.sol:245"
+    status: confirmed_safe
+    solidity: |
+      // INV-ARC-M-05: baseTick is always a valid tick floor
+      // Correctly handles negative ticks via modular arithmetic
+
+  - id: ARC-M-06
+    title: "autoCompound: zero amountIn to _poolSwap skips but feeAmount charged on zero-value swap"
+    tier: 3
+    type: property
+    confidence: 50
+    description: >
+      If the fee collection yields amount0 and amount1 but no swap is needed (amounts already
+      in correct ratio), autoCompound proceeds directly to addLiquidity.
+      However, if a very small amountIn is passed to _poolSwap, the amountOut could be 0
+      due to rounding, and compoundFees would still be charged on the original amounts.
+      Net result: keeper earns fee, position owner loses collected fees, no liquidity added.
+      The `if (params.amountIn > 0)` guard at line ~466 prevents this for the zero case.
+    affected_line: "AutoRangeAndCompound.sol:466-472"
+    status: low_priority
+    solidity: |
+      // INV-ARC-M-06: if amountIn == 0, no swap executed, no fee charged for swap
+
+  - id: ARC-M-07
+    title: "execute: decreaseLiquidity amounts could be zero but reward still charged"
+    tier: 3
+    type: property
+    confidence: 45
+    description: >
+      When execute() with onlyFees=false removes liquidity first, then re-adds to new range.
+      If the pool is highly imbalanced and decreaseLiquidity returns 0 for one token,
+      and the reward is charged as % of feeAmount (onlyFees=true case),
+      the position owner could pay a keeper fee on a dust-value rerange.
+    affected_line: "AutoRangeAndCompound.sol:280-295"
+    status: low_priority
+    solidity: |
+      // INV-ARC-M-07: reward is proportional to value provided

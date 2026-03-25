@@ -1,0 +1,643 @@
+protocol: morpho-vault-v2
+component: VaultV2
+file: src/VaultV2.sol
+domain: vault
+hunter: DoSHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-01: Adapter loop in accrueInterestView causes gas DoS on all user ops
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-01
+  tier: 1
+  type: property
+  title: Unbounded adapter loop in accrueInterestView blocks deposits/withdrawals
+  description: >
+    accrueInterestView() (L652-681) loops through ALL adapters calling
+    IAdapter(adapters[i]).realAssets(). This is called by accrueInterest(),
+    which is called by deposit(), mint(), withdraw(), redeem(), and all fee
+    setters. If the adapters array grows large enough, or if any adapter's
+    realAssets() consumes significant gas, the total gas cost can exceed the
+    block gas limit, permanently DoS-ing ALL vault operations. The curator
+    controls addAdapter via timelock, so a malicious or careless curator can
+    add many adapters over time. There is no hard cap on adapters.length.
+  attack_scenario: >
+    1. Curator submits addAdapter for adapter_1 through adapter_N over time.
+    2. Each adapter's realAssets() costs ~50K gas (external call overhead + storage reads).
+    3. With 600+ adapters, accrueInterestView exceeds 30M gas block limit.
+    4. All calls to deposit(), withdraw(), redeem(), mint() revert with OOG.
+    5. User funds are permanently locked — no exit path works since even
+       forceDeallocate calls deallocateInternal which doesn't call accrueInterest,
+       but withdraw() inside forceDeallocate does.
+    6. Only forceDeallocate with penalty=0 adapter + direct token rescue could help,
+       but that requires allocator cooperation.
+  impact: >
+    Complete vault DoS. All user deposits locked. No deposits or withdrawals
+    possible. Severity depends on how many adapters are realistic — protocol
+    comments acknowledge this risk ("If there are too many adapters... even DOS").
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  confidence: 70
+  solidity: |
+    // Track gas cost of accrueInterestView to detect DoS threshold
+    uint256 internal ghost_maxAccrueGas;
+
+    function property_dos_01() public {
+      uint256 gasBefore = gasleft();
+      try vault.accrueInterest() {
+        uint256 gasUsed = gasBefore - gasleft();
+        if (gasUsed > ghost_maxAccrueGas) ghost_maxAccrueGas = gasUsed;
+        // accrueInterest should never consume more than 50% of block gas limit
+        t(gasUsed < 15_000_000, "DOS-01: accrueInterest exceeds 50% block gas limit");
+      } catch {
+        // If accrueInterest reverts, vault is DoS'd
+        t(false, "DOS-01: accrueInterest reverted — vault is DoS'd");
+      }
+    }
+  ghost_vars:
+    - uint256 internal ghost_maxAccrueGas;
+  affected_functions:
+    - accrueInterest
+    - accrueInterestView
+    - deposit
+    - mint
+    - withdraw
+    - redeem
+  validated: false
+  priority: high
+  notes: >
+    Protocol NatSpec at L27 explicitly acknowledges: "If there are too many adapters
+    and/or they consume too much gas on realAssets(), it could cause issues such as
+    expensive interactions, even DOS." This is a known design concern. The question
+    is whether the timelock on addAdapter is sufficient mitigation or if a hard cap
+    is needed. Liveness requirement at L120 says "Adapters should not revert on
+    realAssets" but doesn't bound gas.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-02: Malicious gate contract can block all withdrawals permanently
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-02
+  tier: 1
+  type: property
+  title: sendSharesGate or receiveAssetsGate revert blocks all exits
+  description: >
+    exit() (L793) calls canSendShares(onBehalf) and canReceiveAssets(receiver).
+    These call external gate contracts (L914-925). If the sendSharesGate or
+    receiveAssetsGate contract reverts (malicious, buggy, or self-destructed),
+    ALL withdrawals and redemptions are permanently blocked. The gate contracts
+    are set by the curator via timelock. transfer() also checks canSendShares
+    and canReceiveShares, so share transfers would also be blocked. The NatSpec
+    at L148 says "Gates must never revert, nor consume too much gas" but this
+    is not enforced on-chain.
+  attack_scenario: >
+    1. Curator sets sendSharesGate to a contract that initially works.
+    2. Gate contract has an owner-controlled kill switch or upgradeable proxy.
+    3. Gate owner activates the kill switch — canSendShares() now always reverts.
+    4. All withdraw(), redeem(), transfer(), transferFrom() calls revert.
+    5. Users cannot exit. forceDeallocate also calls withdraw() internally (L828),
+       so it's also blocked.
+    6. Changing the gate requires going through timelock (setSendSharesGate is
+       timelocked), so there's a delay before the fix.
+    7. If setSendSharesGate is abdicated, users are permanently locked.
+  impact: >
+    Complete fund lockup for all depositors. No exit mechanism bypasses the gate
+    check. Even forceDeallocate is blocked because it calls withdraw() internally.
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  confidence: 65
+  solidity: |
+    // Verify gate calls don't revert and don't consume excessive gas
+    function property_dos_02() public {
+      address user = address(this);
+      uint256 gasBefore;
+      // Test sendSharesGate doesn't revert
+      gasBefore = gasleft();
+      try vault.canSendShares(user) returns (bool) {
+        uint256 gasUsed = gasBefore - gasleft();
+        t(gasUsed < 500_000, "DOS-02: canSendShares consumes excessive gas");
+      } catch {
+        t(false, "DOS-02: canSendShares reverts — withdrawals blocked");
+      }
+      // Test receiveAssetsGate doesn't revert
+      gasBefore = gasleft();
+      try vault.canReceiveAssets(user) returns (bool) {
+        uint256 gasUsed = gasBefore - gasleft();
+        t(gasUsed < 500_000, "DOS-02: canReceiveAssets consumes excessive gas");
+      } catch {
+        t(false, "DOS-02: canReceiveAssets reverts — withdrawals blocked");
+      }
+    }
+  affected_functions:
+    - withdraw
+    - redeem
+    - exit
+    - transfer
+    - transferFrom
+    - forceDeallocate
+    - canSendShares
+    - canReceiveAssets
+  validated: false
+  priority: critical
+  notes: >
+    The NatSpec warns "Gates must never revert, nor consume too much gas" (L148)
+    and "Can lock users out of exiting the vault" (L153-154, L158). This is
+    acknowledged by design but there's no on-chain enforcement. The severity
+    depends on trust assumptions around the curator role. If curator is a
+    multisig/DAO, lower likelihood. If curator is an EOA, higher risk.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-03: Reverting adapter.realAssets() blocks entire vault
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-03
+  tier: 1
+  type: property
+  title: Single reverting adapter.realAssets() DoS-es all vault operations
+  description: >
+    accrueInterestView() (L656-658) calls IAdapter(adapters[i]).realAssets()
+    in a loop WITHOUT try/catch. If ANY single adapter's realAssets() reverts,
+    the entire accrueInterestView() reverts, which cascades to accrueInterest(),
+    and then ALL of deposit/mint/withdraw/redeem/allocate/deallocate revert.
+    A single malicious or broken adapter can freeze the entire vault. The liveness
+    requirement at L120 says "Adapters should not revert on realAssets" but this
+    is an assumption, not an enforcement.
+  attack_scenario: >
+    1. Curator adds a legitimate adapter that wraps an external protocol.
+    2. The external protocol gets paused, upgraded, or self-destructed.
+    3. adapter.realAssets() now reverts (calls into paused/dead protocol).
+    4. accrueInterestView() reverts → accrueInterest() reverts.
+    5. ALL vault operations revert: deposit, mint, withdraw, redeem.
+    6. removeAdapter requires timelock, so there's a delay before fix.
+    7. If the adapter was added long ago and timelock is high, users are
+       locked for the full timelock duration.
+  impact: >
+    Temporary to permanent vault DoS depending on whether removeAdapter can
+    execute. All user funds locked until the broken adapter is removed.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  confidence: 80
+  solidity: |
+    // Verify that accrueInterest doesn't revert due to adapter failures
+    function property_dos_03() public {
+      // accrueInterest must always succeed for vault liveness
+      try vault.accrueInterest() {
+        // OK — vault is live
+        t(true, "DOS-03: pass");
+      } catch {
+        // Vault is DoS'd — no operations possible
+        t(false, "DOS-03: accrueInterest reverts — vault DoS");
+      }
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - deposit
+    - mint
+    - withdraw
+    - redeem
+    - allocate
+    - deallocate
+  validated: false
+  priority: high
+  notes: >
+    This is the most practical DoS vector. Unlike DOS-01 (needs many adapters),
+    this only requires ONE broken adapter. The protocol explicitly assumes adapters
+    won't revert (L120) but external protocols can be paused/upgraded. A try/catch
+    wrapper in the loop would mitigate this.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-04: liquidityAdapter revert blocks deposits and withdrawals
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-04
+  tier: 1
+  type: property
+  title: Reverting liquidityAdapter blocks enter/exit paths
+  description: >
+    enter() (L773) calls allocateInternal(liquidityAdapter, liquidityData, assets)
+    if liquidityAdapter != address(0). This calls IAdapter(adapter).allocate()
+    (L575). If the liquidityAdapter reverts on allocate(), ALL deposits and mints
+    fail. Similarly, exit() (L798-800) calls deallocateInternal on the
+    liquidityAdapter if idle assets are insufficient. If deallocate() reverts,
+    withdrawals exceeding idle balance fail. The allocator can change the
+    liquidityAdapter, but only allocators have this power — not curator or owner.
+  attack_scenario: >
+    1. Allocator sets liquidityAdapter to a Morpho market adapter.
+    2. The underlying Morpho market gets paused or reaches supply cap.
+    3. adapter.allocate() reverts on deposit attempts.
+    4. ALL deposits to the vault revert because enter() always tries to allocate.
+    5. For withdrawals: if idle assets < requested, deallocate also reverts if
+       the underlying market is illiquid or paused.
+    6. Only the allocator can change liquidityAdapterAndData — this is NOT
+       timelocked, so response can be fast IF the allocator is responsive.
+  impact: >
+    Deposits completely blocked. Withdrawals blocked if idle < requested.
+    forceDeallocate may work as an alternative exit if penalty is set.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  confidence: 75
+  solidity: |
+    // Track whether deposit/withdraw paths are available
+    function property_dos_04() public {
+      uint256 testAmount = 1e18;
+      address liquidityAdp = vault.liquidityAdapter();
+      if (liquidityAdp == address(0)) return; // No liquidity adapter, skip
+
+      // Test that allocateInternal won't revert
+      // We can't call internal, so test via deposit
+      // If deposit with minimal amount reverts, liquidity adapter may be broken
+      uint256 vaultBalance = IERC20(vault.asset()).balanceOf(address(vault));
+      t(vaultBalance > 0 || liquidityAdp == address(0),
+        "DOS-04: vault has no idle assets and liquidity adapter may block exits");
+    }
+  affected_functions:
+    - enter
+    - exit
+    - deposit
+    - mint
+    - withdraw
+    - redeem
+    - allocateInternal
+    - deallocateInternal
+  validated: false
+  priority: high
+  notes: >
+    The protocol notes at L125 say "Adapters must not revert on deallocate if
+    the underlying markets are liquid." But if markets become illiquid, the
+    deallocate WILL revert. This is somewhat mitigated by forceDeallocate
+    existing as an alternative exit.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-05: Cap check in allocateInternal reverts deposits when caps are near limit
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-05
+  tier: 1
+  type: property
+  title: Relative cap check on near-empty vault blocks deposits
+  description: >
+    allocateInternal() (L577-587) checks absoluteCap and relativeCap. The relative
+    cap check (L583-586) uses firstTotalAssets.mulDivDown(_caps.relativeCap, WAD).
+    firstTotalAssets is set in accrueInterest (L640) and is transient storage,
+    meaning it resets to 0 every transaction. When firstTotalAssets == 0 (first
+    call in transaction), accrueInterest sets it to newTotalAssets. But if the
+    vault is nearly empty (small totalAssets), the relative cap
+    (firstTotalAssets * relativeCap / WAD) can be very small, causing the
+    allocation check to fail even for small deposits. The NatSpec at L107-108
+    acknowledges: "when the vault is empty or almost empty, the relative cap
+    check is likely to make deposits revert."
+  attack_scenario: >
+    1. Vault has totalAssets = 100 (near empty after withdrawals).
+    2. Relative cap for the liquidity adapter's id is 0.5e18 (50%).
+    3. Max allocation = 100 * 0.5e18 / 1e18 = 50.
+    4. If current allocation is already 50, ANY deposit reverts because
+       enter() calls allocateInternal which would push allocation > 50.
+    5. Attacker can strategically withdraw to make vault nearly empty,
+       then the relative cap blocks subsequent deposits.
+    6. This creates a "deposit freeze" where the vault can't accept funds.
+  impact: >
+    Deposits blocked when vault is near empty. This is acknowledged by protocol
+    but could be weaponized: attacker withdraws most funds → vault nearly empty →
+    relative cap blocks new deposits → attacker has monopoly on re-entry timing.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  confidence: 70
+  solidity: |
+    // When vault is not empty, deposits should not revert due to cap checks
+    function property_dos_05() public {
+      uint256 totalAssets;
+      try vault.totalAssets() returns (uint256 ta) {
+        totalAssets = ta;
+      } catch {
+        return; // Can't check if totalAssets reverts
+      }
+      uint256 supply = vault.totalSupply();
+      // If vault has meaningful assets and supply, deposits should work
+      if (totalAssets > 1e6 && supply > 0) {
+        // Try a small deposit — should not revert from cap issues
+        uint256 smallDeposit = totalAssets / 1000; // 0.1% of vault
+        uint256 preview;
+        try vault.previewDeposit(smallDeposit) returns (uint256 p) {
+          preview = p;
+          t(preview > 0, "DOS-05: preview returns 0 for non-zero deposit on funded vault");
+        } catch {
+          t(false, "DOS-05: previewDeposit reverts on funded vault");
+        }
+      }
+    }
+  affected_functions:
+    - allocateInternal
+    - enter
+    - deposit
+    - mint
+  validated: false
+  priority: medium
+  notes: >
+    Acknowledged in NatSpec L107-108. The question is whether this can be
+    weaponized by an attacker to grief other depositors. The transient storage
+    for firstTotalAssets means each tx gets a fresh snapshot, which limits
+    cross-tx manipulation. Within a single tx, the first accrueInterest()
+    sets the baseline.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-06: removeAdapter O(n) loop + timelock creates extended DoS window
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-06
+  tier: 1
+  type: property
+  title: Removing a broken adapter requires timelock delay, extending DoS duration
+  description: >
+    If an adapter's realAssets() starts reverting (DOS-03), the fix is to call
+    removeAdapter(). But removeAdapter() is timelocked — the curator must first
+    submit() the data, wait for the timelock to expire, then call removeAdapter().
+    During this entire timelock period, the vault remains completely DoS'd.
+    Furthermore, removeAdapter (L432-438) uses an O(n) scan of the adapters array,
+    which itself could consume significant gas if many adapters exist. If the
+    timelock for removeAdapter was set high (e.g., 7 days) for safety, the vault
+    is frozen for 7 days.
+  attack_scenario: >
+    1. Vault has 50 adapters. Timelock for removeAdapter is set to 7 days.
+    2. Adapter #23 starts reverting on realAssets() (underlying protocol issue).
+    3. ALL vault operations fail immediately (DOS-03).
+    4. Curator calls submit(abi.encodeCall(removeAdapter, adapter23)).
+    5. Must wait 7 days for timelock to expire.
+    6. During these 7 days, no deposits, withdrawals, or any vault ops work.
+    7. After 7 days, curator calls removeAdapter(adapter23) — vault recovers.
+    8. Total downtime: 7 days of frozen user funds.
+  impact: >
+    Extended vault freeze (duration = timelock of removeAdapter). All user funds
+    locked for the timelock duration. No emergency override exists for removing
+    a broken adapter.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  confidence: 75
+  solidity: |
+    // removeAdapter timelock should be reasonable for emergency scenarios
+    function property_dos_06() public {
+      bytes4 removeAdapterSel = bytes4(keccak256("removeAdapter(address)"));
+      uint256 removeTimelock = vault.timelock(removeAdapterSel);
+      // If removeAdapter timelock > 3 days, broken adapter creates extended DoS
+      t(removeTimelock <= 3 days,
+        "DOS-06: removeAdapter timelock too high — extended DoS risk on adapter failure");
+    }
+  affected_functions:
+    - removeAdapter
+    - accrueInterestView
+    - accrueInterest
+  validated: false
+  priority: high
+  notes: >
+    The sentinel can call revoke() to cancel pending data, but cannot call
+    removeAdapter directly (it's timelocked, not sentinel-callable).
+    A sentinel-accessible emergency removeAdapter would mitigate this.
+    decreaseAbsoluteCap IS sentinel-callable, but that doesn't help with
+    a reverting realAssets().
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-07: abdicate(setSendSharesGate) permanently locks user funds
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-07
+  tier: 1
+  type: property
+  title: Abdicating gate setters with malicious gate permanently locks funds
+  description: >
+    If the curator calls abdicate(setSendSharesGate.selector), the
+    setSendSharesGate function can NEVER be called again (L465-469, L355).
+    If the current sendSharesGate is malicious or buggy (always returns false
+    or reverts), ALL withdrawals, redemptions, and transfers are permanently
+    blocked with NO recovery path. Similarly, abdicate(setReceiveAssetsGate)
+    with a blocking gate. The abdicate function is itself timelocked, but if
+    approved, it's irreversible.
+  attack_scenario: >
+    1. Malicious curator sets sendSharesGate to a blocking contract.
+    2. Curator then calls abdicate(setSendSharesGate.selector).
+    3. setSendSharesGate can never be called again.
+    4. canSendShares() always returns false → exit() always reverts.
+    5. Users' funds are permanently locked with no recovery mechanism.
+    6. Even owner cannot override — abdication is permanent and takes
+       precedence over timelocks (L355: require(!abdicated[selector])).
+  impact: >
+    Permanent, irrecoverable fund lockup for ALL vault depositors.
+    No governance mechanism can undo abdication.
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  confidence: 60
+  solidity: |
+    // Critical gate setters should never be abdicated
+    function property_dos_07() public {
+      bytes4 setSendSharesGateSel = bytes4(keccak256("setSendSharesGate(address)"));
+      bytes4 setReceiveAssetsGateSel = bytes4(keccak256("setReceiveAssetsGate(address)"));
+      bytes4 setSendAssetsGateSel = bytes4(keccak256("setSendAssetsGate(address)"));
+      bytes4 setReceiveSharesGateSel = bytes4(keccak256("setReceiveSharesGate(address)"));
+
+      // If a gate is set (non-zero), its setter must not be abdicated
+      if (vault.sendSharesGate() != address(0)) {
+        t(!vault.abdicated(setSendSharesGateSel),
+          "DOS-07: setSendSharesGate abdicated with active gate — permanent lock risk");
+      }
+      if (vault.receiveAssetsGate() != address(0)) {
+        t(!vault.abdicated(setReceiveAssetsGateSel),
+          "DOS-07: setReceiveAssetsGate abdicated with active gate — permanent lock risk");
+      }
+    }
+  affected_functions:
+    - abdicate
+    - setSendSharesGate
+    - setReceiveAssetsGate
+    - exit
+    - withdraw
+    - redeem
+    - transfer
+    - transferFrom
+  validated: false
+  priority: critical
+  notes: >
+    Abdication is a powerful and irreversible action. The protocol documents it
+    clearly but does not prevent abdicating critical gate setters. This is likely
+    by design (trust the curator), but creates a permanent DoS vector if curator
+    governance is compromised.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-08: Donation attack inflates newTotalAssets beyond maxRate, capping interest
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-08
+  tier: 1
+  type: property
+  title: Direct token donation griefs fee recipients by triggering maxRate cap
+  description: >
+    accrueInterestView() (L655) reads IERC20(asset).balanceOf(address(this))
+    directly. An attacker can donate tokens to inflate realAssets. However,
+    L659-660 applies maxRate: newTotalAssets = min(realAssets, maxTotalAssets)
+    where maxTotalAssets = _totalAssets + (_totalAssets * elapsed * maxRate / WAD).
+    The maxRate caps how fast totalAssets can grow. But the donated tokens sit
+    in the vault as idle assets, inflating balanceOf permanently. On the next
+    accrueInterest call, these tokens are included in realAssets but capped.
+    Over time, the maxRate slowly allows _totalAssets to catch up to realAssets.
+    During this catch-up period, the share price lags behind reality, allowing
+    the attacker to deposit at a discount (shares are cheap relative to real
+    assets). This is the HIGH finding from Solodit context.
+  attack_scenario: >
+    1. Vault has _totalAssets = 1M, maxRate = low value.
+    2. Attacker donates 1M tokens directly to vault contract.
+    3. realAssets = 2M but maxTotalAssets = ~1M + small increment.
+    4. newTotalAssets stays near 1M due to maxRate cap.
+    5. Share price is based on newTotalAssets (~1M), not real balance (2M).
+    6. Attacker deposits and gets shares priced at ~1M valuation.
+    7. Over time, as accrueInterest is called, _totalAssets slowly approaches 2M.
+    8. Attacker's shares appreciate as _totalAssets catches up to real balance.
+    9. Attacker profits from the discount, fee recipients lose their cut.
+  impact: >
+    Share price manipulation through donation. Depositors get discounted entry.
+    Fee recipients lose fees on the capped interest period. Known finding from
+    audit context.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  confidence: 80
+  solidity: |
+    // _totalAssets should track actual balance within maxRate bounds
+    uint256 internal ghost_lastRealBalance;
+
+    function property_dos_08() public {
+      uint256 realBalance = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 totalAssets;
+      try vault.totalAssets() returns (uint256 ta) {
+        totalAssets = ta;
+      } catch {
+        return;
+      }
+      // If realBalance significantly exceeds totalAssets, donation may have occurred
+      // This is bounded by maxRate, but the gap represents DoS of proper accounting
+      if (totalAssets > 0) {
+        uint256 gap = realBalance > totalAssets ? realBalance - totalAssets : 0;
+        // Gap should not exceed 100% of totalAssets (extreme donation)
+        t(gap <= totalAssets,
+          "DOS-08: realBalance exceeds 2x totalAssets — extreme donation detected");
+      }
+    }
+  ghost_vars:
+    - uint256 internal ghost_lastRealBalance;
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - deposit
+    - previewDeposit
+  validated: false
+  priority: high
+  notes: >
+    This directly maps to the HIGH finding from Solodit: "Side effects of
+    underlying directly donated to the VaultV2 or adapters positions."
+    The maxRate is the mitigation but it doesn't prevent the donation, it
+    just delays the impact. The accounting gap is the DoS vector.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-09: setAdapterRegistry O(n) validation loop can revert or OOG
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-09
+  tier: 1
+  type: property
+  title: setAdapterRegistry loops all adapters and can OOG with many adapters
+  description: >
+    setAdapterRegistry() (L401-414) loops through ALL adapters and calls
+    IAdapterRegistry(newAdapterRegistry).isInRegistry(adapters[i]) for each.
+    This is O(n) in adapters.length with external calls. If the adapters array
+    is large, this call can exceed the block gas limit, making it impossible
+    to change the adapter registry. Additionally, if the new registry's
+    isInRegistry() function is gas-expensive or reverts for any adapter, the
+    entire setAdapterRegistry call fails. This means a curator cannot migrate
+    to a new registry if any single adapter isn't registered there.
+  attack_scenario: >
+    1. Vault accumulates 200 adapters over time.
+    2. Curator needs to change adapter registry (e.g., migration, security fix).
+    3. setAdapterRegistry loops 200 times with external calls.
+    4. Gas cost: 200 * ~30K gas per isInRegistry call = 6M gas minimum.
+    5. If each isInRegistry is more complex, the call can OOG.
+    6. Even if it doesn't OOG, a single adapter not in the new registry
+       causes the entire transaction to revert.
+    7. Curator must first removeAdapter for non-registered adapters, but
+       removeAdapter is also timelocked and O(n).
+  impact: >
+    Inability to update adapter registry. Blocks protocol migration/upgrade
+    path. Low direct fund impact but high operational/governance DoS.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  confidence: 65
+  solidity: |
+    // setAdapterRegistry should be callable without OOG
+    function property_dos_09() public {
+      uint256 numAdapters = vault.adaptersLength();
+      // With many adapters, setAdapterRegistry becomes expensive
+      // Each iteration costs ~30K gas for external call
+      // 30M limit / 30K per adapter = ~1000 max adapters
+      t(numAdapters <= 500,
+        "DOS-09: too many adapters — setAdapterRegistry may OOG");
+    }
+  affected_functions:
+    - setAdapterRegistry
+    - addAdapter
+  validated: false
+  priority: low
+  notes: >
+    This is a governance-level DoS, not direct fund loss. The practical
+    likelihood depends on how many adapters are typically used. In practice,
+    vaults probably use <20 adapters, making this theoretical.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOS-10: multicall delegatecall revert propagation blocks batched operations
+# ═══════════════════════════════════════════════════════════════════════════
+- id: DOS-10
+  tier: 1
+  type: property
+  title: multicall has no partial-failure mode — single revert kills entire batch
+  description: >
+    multicall() (L280-289) uses delegatecall in a loop and propagates any
+    revert to the entire call. There is no try/catch or "allow partial failure"
+    mode. If a curator batches N operations via multicall and any single one
+    reverts (e.g., one submit fails because data is already pending, or a
+    timelock hasn't expired yet), ALL operations in the batch fail. This can
+    be particularly problematic during emergency scenarios where a curator
+    needs to make multiple changes quickly (revoke pending ops, set new gates,
+    change allocator) and one failure blocks all others.
+  attack_scenario: >
+    1. Curator discovers a compromised allocator and needs to:
+       a) revoke pending addAdapter
+       b) setSendSharesGate to block transfers
+       c) removeAdapter for the compromised adapter
+    2. Curator batches all 3 via multicall for atomicity.
+    3. Operation (a) fails because the data wasn't pending (already executed).
+    4. The entire multicall reverts — operations (b) and (c) also fail.
+    5. Curator must debug which operation failed and re-submit individually.
+    6. During this delay, the compromised allocator continues operating.
+  impact: >
+    Delayed emergency response. No direct fund loss from multicall itself,
+    but the delay in applying fixes can lead to fund loss from the underlying
+    issue being addressed.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  confidence: 55
+  solidity: |
+    // multicall should succeed for valid individual operations
+    function property_dos_10() public {
+      // Multicall with empty array should always succeed
+      bytes[] memory empty = new bytes[](0);
+      try vault.multicall(empty) {
+        t(true, "DOS-10: empty multicall works");
+      } catch {
+        t(false, "DOS-10: even empty multicall fails");
+      }
+    }
+  affected_functions:
+    - multicall
+  validated: false
+  priority: low
+  notes: >
+    This is a design choice — atomic batching. The alternative (try/catch per
+    call) would lose atomicity guarantees. Low severity because the curator can
+    always make individual calls. The risk is only in emergency time-sensitivity.

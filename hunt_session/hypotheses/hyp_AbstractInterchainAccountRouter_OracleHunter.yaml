@@ -1,0 +1,143 @@
+protocol: hyperlane
+component: AbstractInterchainAccountRouter
+file: solidity/contracts/middleware/AbstractInterchainAccountRouter.sol
+domain: trust
+hunter: OracleHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: AIAR-O-01
+  tier: 1
+  type: property
+  description: "quoteGasPayment uses empty body (new bytes(0)) for quote but actual dispatch sends non-empty body -- fee quote may be inaccurate if hook prices based on message size"
+  attack_scenario: "1. User calls quoteGasPayment(dest, gasLimit) to estimate fee. Quote uses new bytes(0) as message body. 2. User calls callRemoteWithOverrides with msg.value = quoted amount. 3. Actual message body includes encoded InterchainAccountMessage (owner + ism + calls array) which can be large. 4. If the hook's quoteDispatch() prices based on message body size, the actual fee is higher than the quote. 5. dispatch() reverts with insufficient fee, or the hook silently undercharges. If hook uses msg.value and user sent quoted amount, the dispatch could fail or succeed with underpayment."
+  impact: "Users systematically underpay for cross-chain messages. If hook reverts on underpayment -- DoS. If hook accepts underpayment -- relayer subsidy drain."
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Quote should be >= actual cost for the same parameters
+    // quoteGasPayment uses empty body, but real dispatch uses encoded message
+    // We compare the two quotes
+    uint256 quoteEmpty = originRouter.quoteGasPayment(DESTINATION, 200000);
+    // The quote with empty body should be a lower bound -- if actual message is larger,
+    // the real cost could be higher. We just verify the quote is non-zero as a sanity check.
+    gte(quoteEmpty, 0, "AIAR-O-01: quote should be non-negative");
+    // The real test: ghost tracks if any dispatch failed due to insufficient value
+    t(!ghost_dispatchFailedInsufficientFee, "AIAR-O-01: dispatch failed due to fee mismatch from quote");
+  ghost_vars:
+  - bool internal ghost_dispatchFailedInsufficientFee;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "quoteGasPayment (line 204-215) passes new bytes(0) as messageBody to _Router_quoteDispatch. But the actual dispatch in _dispatchMessageWithValue passes the full encoded body. If the hook (e.g., InterchainGasPaymaster) quotes based on message size, there is a discrepancy. Most Hyperlane hooks quote based on gas limit metadata only, not body size -- so this may be a non-issue for current hooks. But future hooks or custom hooks could break."
+  poc_sketch: ''
+  call_stack: 'quoteGasPayment -> _Router_quoteDispatch(dest, new bytes(0), gasLimitMetadata, hook) vs _dispatchMessageWithValue -> mailbox.dispatch(dest, router, fullBody, metadata, hook)'
+
+- id: AIAR-O-02
+  tier: 1
+  type: property
+  description: "_dispatchMessageWithValue quotes fee then transfers exact amount, but fee could change between quote and dispatch in same tx if hook state is mutable"
+  attack_scenario: "1. _dispatchMessageWithValue calls _Router_quoteDispatch to get _fee. 2. Transfers _fee from msg.sender to router. 3. Approves hook for type(uint256).max. 4. Calls mailbox.dispatch which calls hook.postDispatch. 5. If between steps 1 and 4, the hook's internal state changes (e.g., via reentrancy from safeTransferFrom on a malicious feeToken, or concurrent tx), the actual fee charged by hook could differ from _fee. 6. If actual fee > _fee, dispatch reverts. If actual fee < _fee, excess tokens stuck in router."
+  impact: "Excess fee tokens permanently stuck in router contract if actual fee < quoted fee. No sweep mechanism exists."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any dispatch with feeToken, the router should not accumulate excess fee tokens
+    uint256 routerFeeBalance = feeToken.balanceOf(address(originRouter));
+    lte(routerFeeBalance, ghost_maxAcceptableDust, "AIAR-O-02: excess fee tokens stuck in router");
+  ghost_vars:
+  - uint256 internal ghost_maxAcceptableDust;
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: "The forceApprove is type(uint256).max so hook can take any amount. But only _fee was transferred in. If hook takes less than _fee, the remainder stays in router. If hook takes more, it reverts (no balance). The real issue: forceApprove(hook, max) persists after the call -- any leftover tokens from this or previous dispatches can be drained by the hook at any time. See AIAR-O-03."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-O-03
+  tier: 1
+  type: property
+  description: "forceApprove(hook, type(uint256).max) in _dispatchMessageWithValue is persistent -- hook retains unlimited allowance to drain any feeToken balance from router forever"
+  attack_scenario: "1. User dispatches message with feeToken=USDC, hook=H1. Router calls forceApprove(H1, max) for USDC. 2. Later, someone sends USDC to router (e.g., via another dispatch that overpays, or direct transfer). 3. Hook H1 can call USDC.transferFrom(router, attacker, entireBalance) at any time since approval is max. 4. This is compounded by receive() which accepts ETH, and the fact that approveFeeTokenForHook is permissionless -- anyone can grant max approval to any address for any token held by the router."
+  impact: "Permanent unlimited token approvals to hooks. Combined with permissionless approveFeeTokenForHook (already IAR-DD-01), any token balance in router is drainable."
+  impact_rating: High
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // After dispatch, the router should NOT have persistent max approval to the hook
+    // Check: feeToken allowance from router to any hook should be 0 after dispatch completes
+    uint256 allowance = feeToken.allowance(address(originRouter), address(igp));
+    // If there is an allowance AND router has balance, tokens are at risk
+    uint256 routerBal = feeToken.balanceOf(address(originRouter));
+    t(allowance == 0 || routerBal == 0, "AIAR-O-03: persistent approval with non-zero balance -- drain risk");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Line 267: forceApprove(address(_hook), type(uint256).max) is called every time a feeToken dispatch happens. This approval is never revoked. Combined with the permissionless receive() (line 132), any ETH/tokens that accumulate in the router are at risk. Note: approveFeeTokenForHook (IAR-DD-01) covers the explicit approval path. This finding covers the IMPLICIT approval in _dispatchMessageWithValue which happens on every fee-token dispatch. Different root cause, same effect."
+  poc_sketch: ''
+  call_stack: '_dispatchMessageWithValue -> IERC20(_feeToken).forceApprove(address(_hook), type(uint256).max) [line 267, never revoked]'
+
+- id: AIAR-O-04
+  tier: 2
+  type: property
+  description: "quoteGasPayment passes bytes('') to _Router_quoteDispatch but _dispatchMessageWithValue also passes bytes('') for the body parameter -- quote body and dispatch body are BOTH empty for fee calculation, but actual body passed to mailbox.dispatch is non-empty"
+  attack_scenario: "In _dispatchMessageWithValue (line 259), _Router_quoteDispatch is called with bytes('') as message body. Then mailbox.dispatch is called with the actual _body. If the mailbox or hook internally re-quotes and checks that msg.value covers the real body size, the dispatch could revert. If it does not, relayers bear the cost difference."
+  impact: "Systematic underpayment of interchain gas fees, relayer subsidy drain over time"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Sanity: quoteGasPayment should return a reasonable value
+    uint256 quote = originRouter.quoteGasPayment(DESTINATION, 100000);
+    gte(quote, 0, "AIAR-O-04: quote is non-negative");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: "Duplicate concern with AIAR-O-01. The key question is whether Hyperlane hooks price on body size. Current IGP prices on gas limit from metadata, not body size. Low confidence this matters in practice."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-O-05
+  tier: 2
+  type: property
+  description: "Fee token transfer uses safeTransferFrom but quote may return 0 for some hooks -- zero-value safeTransferFrom still executes, wasting gas and potentially reverting on tokens that reject zero transfers"
+  attack_scenario: "1. User sets hookMetadata with feeToken=USDT. 2. _Router_quoteDispatch returns 0 (hook is free). 3. safeTransferFrom(msg.sender, router, 0) is called -- USDT reverts on zero-value transfers. 4. User cannot dispatch cross-chain message via this path even though the hook is free."
+  impact: "DoS for certain fee tokens (USDT) when hook quote is zero. Users must use native ETH path instead."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // If fee is 0, safeTransferFrom should not be called (or should handle gracefully)
+    // This is a static analysis finding -- the code always calls safeTransferFrom when feeToken != address(0)
+    // even if fee is 0
+    t(true, "AIAR-O-05: static analysis -- check _dispatchMessageWithValue for zero-fee handling");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 55
+  notes: "Line 258-268: if _feeToken != address(0), it quotes and transfers. If quote returns 0, it still calls safeTransferFrom(sender, router, 0). Most ERC20s accept zero transfers. USDT does NOT. But USDT is unlikely to be used as a Hyperlane fee token. Low practical impact."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: OracleHunter
+  id: AIAR-O-FP-01
+  reason: "No traditional oracle (Chainlink, TWAP, etc.) in this contract. The 'oracle' surface is limited to fee quoting via hooks. Reframed analysis to focus on fee pricing accuracy and token handling."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Interchain routers often have fee quoting that uses simplified params (empty body) vs actual dispatch -- check for quote/reality mismatch"
+    briefing_update_applied: false
+- hunter: OracleHunter
+  id: AIAR-O-FP-02
+  reason: "Considered whether gas price oracle manipulation could affect quoteGasPayment. But the quote comes from the hook (IGP), which is a trusted contract set by owner. No external oracle manipulation vector in this contract itself."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

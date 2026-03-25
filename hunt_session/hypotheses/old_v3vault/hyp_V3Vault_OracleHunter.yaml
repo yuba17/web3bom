@@ -1,0 +1,440 @@
+hunter: OracleHunter
+component: V3Vault
+contract_file: /home/kali/Documents/Web3/revert-lend/src/V3Vault.sol
+date: 2026-03-24
+status: complete
+
+summary: |
+  V3Vault delegates ALL price computation to V3Oracle (immutable). The oracle uses Chainlink + TWAP
+  with cross-verification and pool price manipulation checks. Key oracle touchpoints in V3Vault:
+  1. _checkLoanIsHealthy() -> oracle.getValue() for health checks (borrow, transform, liquidate, stake, withdrawCollateral)
+  2. _sendPositionValue() -> oracle.getLiquidityAndFees() for partial liquidation proportioning
+  3. _calculateTokenCollateralFactorX32() uses min(factor0, factor1) -- no oracle call but affects collateral value
+
+  The ignoreFees flag for staked positions is a critical oracle-adjacent behavior: staked positions
+  exclude fee value from collateral, creating different health outcomes pre/post stake.
+
+  Oracle manipulation in V3Vault context means: manipulate the VALUES returned by oracle.getValue()
+  to either (a) borrow more than collateral supports, (b) prevent liquidation, or (c) extract value
+  during liquidation via distorted proportioning.
+
+hypotheses:
+  - id: VV-O-01
+    tier: 1
+    type: property
+    description: "Oracle-derived fullValue must always be >= collateralValue (collateralFactor <= 90%)"
+    attack_scenario: |
+      If collateralValue > fullValue, a borrower could borrow more than 100% of position value.
+      This could happen if _calculateTokenCollateralFactorX32 returns a value > Q32 (impossible
+      due to MAX_COLLATERAL_FACTOR_X32 cap) or if oracle returns manipulated values. Verify the
+      invariant holds across all oracle calls.
+    solidity: |
+      // VV-O-01: collateralValue <= fullValue for every active loan
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256, uint256) {
+                  lte(collateralValue, fullValue, "VV-O-01: collateralValue exceeds fullValue");
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 90
+
+  - id: VV-O-02
+    tier: 1
+    type: property
+    description: "Staked positions must have feeValue=0 in health checks (ignoreFees=true path)"
+    attack_scenario: |
+      When a position is staked, _checkLoanIsHealthy passes ignoreFees=true to oracle.getValue().
+      If the oracle still returns non-zero feeValue for staked positions, the collateral would be
+      overvalued, allowing overborrowing. This is the staked-fee-exclusion invariant -- critical
+      because staked positions have their fees collected by the gauge, not the vault.
+    solidity: |
+      // VV-O-02: staked positions should report feeValue=0 from oracle
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              // Check if position is staked via gaugeManager
+              address gm = vault.gaugeManager();
+              if (gm != address(0)) {
+                  try IGaugeManager(gm).tokenIdToGauge(tokenId) returns (address gauge) {
+                      if (gauge != address(0)) {
+                          // Position is staked -- oracle should ignore fees
+                          (uint256 fullValue, uint256 feeValue,,) = oracle.getValue(tokenId, vault.asset(), true);
+                          eq(feeValue, 0, "VV-O-02: staked position has non-zero feeValue with ignoreFees");
+                      }
+                  } catch {}
+              }
+          }
+      }
+    validated: true
+    priority: critical
+    confidence: 85
+
+  - id: VV-O-03
+    tier: 1
+    type: property
+    description: "Liquidation fullValue used in _calculateLiquidation must match oracle.getValue() at same block"
+    attack_scenario: |
+      In liquidate(), _checkLoanIsHealthy fetches fullValue from oracle, then _calculateLiquidation
+      uses that value. If an attacker can manipulate the pool price BETWEEN the health check and
+      the _sendPositionValue call (same tx, so unlikely but check for reentrancy paths), they could
+      get more collateral than the liquidation math intended. In practice this is single-tx so
+      oracle values are consistent, but verify no state change between reads.
+    solidity: |
+      // VV-O-03: fullValue from loanInfo is consistent -- non-negative and bounded
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liqCost, uint256 liqValue) {
+                  // If liquidatable, liquidationValue <= fullValue
+                  if (liqCost > 0) {
+                      lte(liqValue, fullValue, "VV-O-03: liquidationValue exceeds fullValue");
+                  }
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 80
+
+  - id: VV-O-04
+    tier: 1
+    type: property
+    description: "Health check with BORROW_SAFETY_BUFFER must be strictly harder than without buffer"
+    attack_scenario: |
+      _requireLoanIsHealthy uses withBuffer=true (95% of collateralValue >= debt), while
+      _checkLoanIsHealthy in liquidate() uses withBuffer=false. If the buffer math is wrong
+      (e.g., overflow, truncation), a position could pass the buffered check but fail the
+      unbuffered check, or vice versa. This would mean positions can borrow but immediately
+      become liquidatable.
+    solidity: |
+      // VV-O-04: buffered health is stricter -- if healthy with buffer, must be healthy without
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liqCost, uint256 liqValue) {
+                  // BORROW_SAFETY_BUFFER_X32 = 95% of Q32
+                  uint256 bufferedCollateral = collateralValue * 4080218931 / (2**32);
+                  bool healthyWithBuffer = bufferedCollateral >= debt;
+                  bool healthyWithout = collateralValue >= debt;
+                  // If healthy with buffer, must be healthy without (buffer is stricter)
+                  if (healthyWithBuffer) {
+                      t(healthyWithout, "VV-O-04: healthy with buffer but not without -- impossible");
+                  }
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 95
+
+  - id: VV-O-05
+    tier: 1
+    type: property
+    description: "Partial liquidation proportioning via oracle.getLiquidityAndFees must not exceed position value"
+    attack_scenario: |
+      In _sendPositionValue, when liquidationValue < fullValue, the code calls
+      oracle.getLiquidityAndFees() and proportions liquidity/fees. If feeValue is manipulated
+      to be larger than fullValue (e.g., via fee donation to the pool), the proportioning math
+      could overflow or give the liquidator more than intended. Specifically:
+      liquidity = (liquidationValue - feeValue) * liquidity / (fullValue - feeValue)
+      If feeValue >= fullValue, division by zero. If feeValue > liquidationValue but < fullValue,
+      negative numerator wraps in uint256.
+    solidity: |
+      // VV-O-05: for active loans, feeValue should not exceed fullValue
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try oracle.getValue(tokenId, vault.asset(), false) returns (uint256 fullValue, uint256 feeValue, uint256, uint256) {
+                  lte(feeValue, fullValue, "VV-O-05: feeValue exceeds fullValue -- liquidation math unsafe");
+              } catch {}
+          }
+      }
+    validated: true
+    priority: critical
+    confidence: 75
+
+  - id: VV-O-06
+    tier: 2
+    type: property
+    description: "Oracle pool price manipulation check (maxPoolPriceDifference) blocks divergent spot prices"
+    attack_scenario: |
+      V3Oracle._populatePrices checks that current pool sqrtPriceX96 doesn't diverge from
+      oracle-derived price by more than maxPoolPriceDifference. An attacker who manipulates the
+      Uniswap pool spot price (e.g., via flash loan swap) would cause oracle.getValue() to revert,
+      blocking liquidations. This is a known DoS vector -- attacker manipulates pool to prevent
+      their own liquidation. The oracle comments acknowledge this: "liquidations will be disabled
+      but arbitrageurs will move price back". Verify the invariant that oracle calls don't
+      silently succeed with manipulated prices.
+    solidity: |
+      // VV-O-06: oracle.getValue should be callable for all active positions (no permanent DoS)
+      uint256 callableCount = 0;
+      uint256 totalPositions = 0;
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              totalPositions++;
+              try oracle.getValue(tokenId, vault.asset(), false) returns (uint256, uint256, uint256, uint256) {
+                  callableCount++;
+              } catch {}
+          }
+      }
+      // At least some positions should be queryable (not all oracle calls failing)
+      if (totalPositions > 0) {
+          gt(callableCount, 0, "VV-O-06: ALL oracle calls failing -- possible manipulation or misconfiguration");
+      }
+    validated: true
+    priority: medium
+    confidence: 70
+
+  - id: VV-O-07
+    tier: 1
+    type: property
+    description: "collateralFactorX32 is min(token0Factor, token1Factor) -- always bounded by MAX_COLLATERAL_FACTOR_X32"
+    attack_scenario: |
+      _calculateTokenCollateralFactorX32 takes min of both token factors. If a token is not
+      configured (factor=0), collateralValue=0 and the position cannot borrow. If both tokens
+      have max factor (90%), collateral = 90% of fullValue. Verify the factor never exceeds
+      MAX_COLLATERAL_FACTOR_X32 (3_865_470_566 ~ 90%).
+    solidity: |
+      // VV-O-07: collateralFactor bounded by MAX (90%)
+      uint32 maxFactor = 3865470566; // MAX_COLLATERAL_FACTOR_X32
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256, uint256) {
+                  if (fullValue > 0) {
+                      // collateralValue / fullValue <= 90% (with rounding tolerance)
+                      // collateralValue * Q32 <= fullValue * maxFactor + 1 (rounding)
+                      lte(collateralValue * (2**32), fullValue * uint256(maxFactor) + fullValue, "VV-O-07: collateral factor exceeds 90%");
+                  }
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 90
+
+  - id: VV-O-08
+    tier: 1
+    type: property
+    description: "Liquidation requires position to be unhealthy -- healthy positions must never be liquidatable"
+    attack_scenario: |
+      If oracle returns stale/manipulated prices, a healthy position could appear unhealthy
+      and get liquidated. The oracle has staleness checks (maxFeedAge) and TWAP verification,
+      but if these are misconfigured (large maxFeedAge), an attacker could exploit stale prices.
+      Verify: if loanInfo shows liquidationCost=0, position is healthy.
+    solidity: |
+      // VV-O-08: positions with zero liquidation cost are healthy
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liqCost, uint256 liqValue) {
+                  if (liqCost == 0 && liqValue == 0) {
+                      // Position is healthy -- collateralValue >= debt
+                      gte(collateralValue, debt, "VV-O-08: non-liquidatable but undercollateralized");
+                  }
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 85
+
+  - id: VV-O-09
+    tier: 2
+    type: property
+    description: "Exchange rate monotonicity -- lendExchangeRateX96 and debtExchangeRateX96 never decrease (except socialization haircut)"
+    attack_scenario: |
+      Exchange rates should only increase over time (interest accrual). If they decrease without
+      a socialization event (_handleReserveLiquidation), it means lenders lost value improperly.
+      The debtExchangeRate drives debt valuation; if it decreased, borrowers would owe less than
+      they should. An oracle attack on the interest rate model inputs (balance, debt) could
+      cause incorrect rate calculation.
+    solidity: |
+      // VV-O-09: exchange rates monotonically increase
+      uint256 currentDebtRate = vault.lastDebtExchangeRateX96();
+      uint256 currentLendRate = vault.lastLendExchangeRateX96();
+      if (ghost_lastDebtExchangeRateX96 > 0) {
+          gte(currentDebtRate, ghost_lastDebtExchangeRateX96, "VV-O-09: debt exchange rate decreased");
+      }
+      // Lend rate can decrease during socialization -- only check if no liquidation happened
+      if (ghost_lastLendExchangeRateX96 > 0 && !ghost_liquidationInProgress) {
+          gte(currentLendRate, ghost_lastLendExchangeRateX96, "VV-O-09: lend exchange rate decreased without socialization");
+      }
+    validated: true
+    priority: high
+    confidence: 80
+
+  - id: VV-O-10
+    tier: 1
+    type: property
+    description: "Debt exchange rate always >= lend exchange rate (borrowers pay more than lenders receive due to reserves)"
+    attack_scenario: |
+      The reserve factor means lenders receive less interest than borrowers pay. Therefore
+      debtExchangeRateX96 >= lendExchangeRateX96 must always hold (both start at Q96).
+      If this is violated, the vault accounting is broken -- debt < lent which means insolvency.
+      This could happen if _calculateGlobalInterest has a math error or if reserveFactorX32
+      is set incorrectly (but it is bounded by uint32 < Q32).
+    solidity: |
+      // VV-O-10: debt rate >= lend rate (reserve factor makes lend rate grow slower)
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      gte(debtRate, lendRate, "VV-O-10: debt exchange rate below lend exchange rate -- solvency risk");
+    validated: true
+    priority: critical
+    confidence: 90
+
+  - id: VV-O-11
+    tier: 2
+    type: property
+    description: "Liquidation penalty is bounded between MIN (2%) and MAX (10%) for standard liquidations"
+    attack_scenario: |
+      _calculateLiquidation computes a sliding penalty between MIN_LIQUIDATION_PENALTY_X32 (2%)
+      and MAX_LIQUIDATION_PENALTY_X32 (10%). If oracle-derived fullValue is manipulated, the
+      penalty fraction calculation could produce values outside this range. Specifically:
+      penaltyFractionX96 uses (fullValue - maxPenaltyValue) / (startLiquidationValue - maxPenaltyValue)
+      which could underflow if startLiquidationValue < maxPenaltyValue (when collateralValue is near zero).
+    solidity: |
+      // VV-O-11: liquidation cost is bounded by position value and penalty range
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liqCost, uint256 liqValue) {
+                  if (liqValue > 0) {
+                      // liquidationValue should be >= debt * 1.02 (min penalty) when fullValue allows it
+                      // and <= debt * 1.10 (max penalty)
+                      // But when fullValue < debt * 1.10, liquidationValue = fullValue
+                      lte(liqValue, fullValue, "VV-O-11: liquidationValue exceeds fullValue");
+                      // liquidatorCost should not exceed debt
+                      lte(liqCost, debt, "VV-O-11: liquidatorCost exceeds debt");
+                  }
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 85
+
+  - id: VV-O-12
+    tier: 1
+    type: property
+    description: "Position value consistency: fullValue from getValue with ignoreFees=false >= fullValue with ignoreFees=true"
+    attack_scenario: |
+      When ignoreFees=true, fees are excluded from the position value. So fullValue(ignoreFees=false)
+      should always be >= fullValue(ignoreFees=true). If this is violated, it means fees are
+      somehow reducing position value (negative fees?), which would be an oracle bug.
+      This is relevant because staked positions use ignoreFees=true for health checks -- if this
+      invariant breaks, staked positions could appear healthier than they really are.
+    solidity: |
+      // VV-O-12: fullValue with fees >= fullValue without fees
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try oracle.getValue(tokenId, vault.asset(), false) returns (uint256 fullWithFees, uint256, uint256, uint256) {
+                  try oracle.getValue(tokenId, vault.asset(), true) returns (uint256 fullNoFees, uint256, uint256, uint256) {
+                      gte(fullWithFees, fullNoFees, "VV-O-12: fees make value lower -- oracle inconsistency");
+                  } catch {}
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 85
+
+  - id: VV-O-13
+    tier: 2
+    type: property
+    description: "Staking/unstaking a position should not create an arbitrage on health check (fee exclusion transition)"
+    attack_scenario: |
+      When a user stakes a position, fees are excluded from collateral value. When they unstake,
+      fees are included again. An attacker could:
+      1. Have a position with large uncollected fees making it appear healthy
+      2. Borrow up to the fee-inclusive health limit
+      3. Stake the position -- now fees excluded, position becomes unhealthy
+      The code handles this by checking health AFTER staking in stakePosition().
+      But the reverse path (unstake then borrow using fee value as collateral, then
+      fees get collected by someone else) is also worth checking.
+    solidity: |
+      // VV-O-13: after any stake operation, loan must remain healthy (vault enforces this)
+      // We verify by checking that no staked position is currently in an unhealthy state
+      // (which would mean the health check after staking was bypassed)
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares > 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liqCost, uint256 liqValue) {
+                  // Note: loanInfo uses current oracle state, which may differ from when staking happened
+                  // But no position should be deeply underwater right after an operation
+                  if (fullValue > 0 && debt > 0) {
+                      // fullValue should be at least some fraction of debt (not 100x underwater)
+                      gt(fullValue, debt / 10, "VV-O-13: position value catastrophically below debt");
+                  }
+              } catch {}
+          }
+      }
+    validated: true
+    priority: medium
+    confidence: 65
+
+  - id: VV-O-14
+    tier: 1
+    type: property
+    description: "Zero-debt positions should have zero liquidation parameters"
+    attack_scenario: |
+      If a position has no debt (debtShares=0), it should never be liquidatable. The oracle
+      value is irrelevant for zero-debt positions. Verify that loanInfo returns zeros for
+      liquidation fields when debt=0.
+    solidity: |
+      // VV-O-14: zero-debt positions are never liquidatable
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          uint256 tokenId = ghost_allTokenIds[i];
+          (uint256 debtShares) = vault.loans(tokenId);
+          if (debtShares == 0) {
+              try vault.loanInfo(tokenId) returns (uint256 debt, uint256, uint256, uint256 liqCost, uint256 liqValue) {
+                  eq(debt, 0, "VV-O-14: zero shares but non-zero debt");
+                  eq(liqCost, 0, "VV-O-14: zero-debt position shows liquidation cost");
+                  eq(liqValue, 0, "VV-O-14: zero-debt position shows liquidation value");
+              } catch {}
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 95
+
+false_positives:
+  - id: VV-O-FP-01
+    description: "Oracle revert on pool price manipulation is by design, not a bug"
+    reason: |
+      The oracle intentionally reverts when pool spot price diverges from oracle-derived price
+      by more than maxPoolPriceDifference. This blocks liquidations temporarily but is a
+      FEATURE to prevent price manipulation attacks. Arbitrageurs restore the price. This is
+      documented in the oracle comments and is an accepted tradeoff.
+
+  - id: VV-O-FP-02
+    description: "Fee exclusion for staked positions is intentional"
+    reason: |
+      Staked positions have their fees directed to the gauge. The vault correctly passes
+      ignoreFees=true to the oracle for staked positions. This means staked positions have
+      lower collateral value, which is correct behavior -- the fees are not available to the
+      vault for liquidation recovery.
+
+  - id: VV-O-FP-03
+    description: "Interest rate model returning extreme rates under mock conditions"
+    reason: |
+      The IRM returns rates based on utilization (balance vs debt). With mocks, utilization can
+      reach 100% producing extreme rates. This is a mock artifact, not an oracle bug. Test with
+      fork and real IRM for realistic rates.

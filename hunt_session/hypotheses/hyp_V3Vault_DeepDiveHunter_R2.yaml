@@ -1,0 +1,486 @@
+component: V3Vault
+hunter: DeepDiveHunter_R2
+methodology: |
+  Section 1 — Unexplored Attack Surfaces (Round 2):
+    - Transform callback window: transformer has NFT approval + borrow access + health check deferred
+    - Multicall batching: delegatecall preserves storage state between subcalls
+    - Staking/unstaking timing: fee inclusion/exclusion in health checks depends on staking state
+    - Daily limit reset boundary: UTC midnight allows 2x daily limit in consecutive blocks
+    - NFT replacement in transform mode: debt migration between different token pairs
+  Section 2 — Cross-Function State Analysis (R2):
+    - multicall → borrow → repay → borrow cycle: dailyDebtIncreaseLimitLeft replenished on repay
+    - transform → leverageUp → borrow (no health check) → leftover extraction to recipient
+    - stakePosition after max borrow: fee exclusion reduces collateralValue post-stake
+    - _resetDailyDebtIncreaseLimit: time = uint32(block.timestamp / 1 days) boundary
+    - onERC721Received replacement: _cleanupLoan(old) + _updateAndCheckCollateral(new) non-atomic for different pairs
+  Section 3 — Value Exit Trace (R2):
+    - LeverageTransformer.leverageUp line 98-104: leftover tokens sent to params.recipient (user-controlled)
+    - LeverageTransformer.leverageDown line 184-192: leftover tokens sent to params.recipient
+    - AutoRangeAndCompound.execute line 307-311: leftover tokens sent to realOwner
+    - borrow() line 637: assets sent to msg.sender (transformer during transform mode)
+    - _repay(): dailyDebtIncreaseLimitLeft += assets (replenishes daily limit)
+  Section 4 — Convergence Deep-Dive (R2):
+    - Daily limit + multicall: repay replenishes limit, enabling borrow cycling within same tx
+    - Staking + health check: _isStaked() result changes fee visibility in oracle valuation
+    - Transform + NFT replacement: debt migrates but collateral value limits checked per-token-pair
+    - LeverageTransformer recipient: user-controlled destination for borrowed funds after swap
+
+false_positives_consumed:
+  - VV-TB-FP-01 (transformedTokenId sentinel blocks general reentrancy)
+  - VV-FP-01 (onERC721Received owner override is intentional)
+  - VV-FP-03 (transform data parameter is C4 H-03 known)
+  - VV-TB-FP-02 (share inflation impossible by design)
+
+hypotheses:
+  - id: VV-DD-06
+    tier: 2
+    type: domain
+    description: "Daily debt/lend limit 2x bypass at UTC midnight boundary — consecutive blocks across day boundary reset limits, allowing double the intended daily borrow cap"
+    attack_scenario: |
+      1. Vault has totalLent = 1,000,000 USDC, daily debt limit = 10% = 100,000 USDC
+      2. At block.timestamp = 86400*N - 1 (23:59:59 UTC), attacker borrows 100,000 USDC
+         - dailyDebtIncreaseLimitLeft = 0
+         - dailyDebtIncreaseLimitLastReset = N-1
+      3. Next block: block.timestamp = 86400*N (00:00:00 UTC)
+      4. Attacker calls borrow() again:
+         - _resetDailyDebtIncreaseLimit: time = uint32(86400*N / 86400) = N > N-1 → RESETS
+         - dailyDebtIncreaseLimitLeft = fresh 100,000 USDC
+      5. Attacker borrows another 100,000 USDC
+      6. Total: 200,000 USDC borrowed in ~12 seconds (2 blocks)
+      7. Daily limit designed to cap at 100K/day was bypassed — 2x the intended rate
+      8. With flash loan: deposit large amount before midnight to inflate limit, borrow max,
+         cross midnight, borrow max again, use proceeds to repay flash loan + profit from
+         over-leveraged position
+    solidity: |
+      function property_vv_dd_06() public {
+          // INV: Total borrow within any 24h rolling window should not exceed 2x daily limit
+          // This invariant tracks cumulative borrows across midnight boundary
+          uint256 currentDailyLimit = vault.dailyDebtIncreaseLimitLeft();
+          uint256 minLimit = vault.dailyDebtIncreaseLimitMin();
+          (,uint256 lent,,,,uint256 lendRate) = vault.vaultInfo();
+          uint256 maxDailyLimit = lent * vault.MAX_DAILY_DEBT_INCREASE_X32() / (2**32);
+          uint256 effectiveLimit = minLimit > maxDailyLimit ? minLimit : maxDailyLimit;
+          // At midnight boundary, attacker can use up to 2x effectiveLimit
+          // Ghost variable tracks total borrowed in last 2 blocks
+          uint256 totalBorrowedRecent = ghost_borrowedThisBlock + ghost_borrowedLastBlock;
+          lte(totalBorrowedRecent, effectiveLimit * 2,
+            "VV-DD-06: borrowed > 2x daily limit across midnight boundary");
+      }
+    ghost_vars:
+      - "uint256 ghost_borrowedThisBlock"
+      - "uint256 ghost_borrowedLastBlock"
+    validated: false
+    priority: medium
+    confidence: 65
+    call_stack: |
+      Block N-1 (23:59:59 UTC):
+        borrow(tokenId, 100000e6)
+          → _resetDailyDebtIncreaseLimit: time = N-1, no reset needed
+          → dailyDebtIncreaseLimitLeft -= 100000e6 → 0
+      Block N (00:00:00 UTC):
+        borrow(tokenId, 100000e6)
+          → _resetDailyDebtIncreaseLimit: time = N > dailyDebtIncreaseLimitLastReset(N-1) → RESET
+          → dailyDebtIncreaseLimitLeft = fresh limit (100000e6)
+          → dailyDebtIncreaseLimitLeft -= 100000e6 → 0
+      Total: 200000e6 in ~12 seconds vs intended 100000e6/day
+    poc_sketch: |
+      function test_VV_DD_06_midnight_limit_bypass() public {
+          // Setup: vault with 1M USDC deposited
+          vault.deposit(1_000_000e6, address(this));
+          vault.setLimits(1000e6, 2_000_000e6, 2_000_000e6, 100_000e6, 100_000e6);
+
+          uint256 tokenId = _createPosition(2000 ether);
+          nonfungiblePositionManager.safeTransferFrom(address(this), address(vault), tokenId);
+
+          // Warp to just before midnight
+          uint256 midnight = ((block.timestamp / 1 days) + 1) * 1 days;
+          vm.warp(midnight - 1);
+
+          vault.borrow(tokenId, 100_000e6);
+          // dailyDebtIncreaseLimitLeft should be ~0
+
+          // Cross midnight
+          vm.warp(midnight);
+
+          // This should succeed because limit resets
+          vault.borrow(tokenId, 100_000e6);
+
+          // Total borrowed: 200K in 1 second — 2x daily limit
+          (uint256 debt,,,,) = vault.loanInfo(tokenId);
+          assertGe(debt, 200_000e6, "borrowed 2x daily limit");
+      }
+
+  - id: VV-DD-07
+    tier: 1
+    type: flow
+    description: "LeverageTransformer leverageUp borrows vault assets during transform mode (no health check) and routes leftover tokens to arbitrary recipient — if swap is manipulated via sandwich, borrowed funds leak to attacker via leftover path"
+    attack_scenario: |
+      1. Attacker is loan owner with position tokenId in vault
+      2. Attacker calls transform(tokenId, leverageTransformer, maliciousData)
+      3. In leverageUp(), attacker sets:
+         - borrowAmount = large amount (e.g., 500K USDC)
+         - amountIn0 = borrowAmount (swap all to token0)
+         - swapData0 = crafted to route through attacker's pool/contract
+         - amountOut0Min = 0 (or very low)
+         - recipient = attacker's address
+      4. LeverageTransformer borrows 500K USDC from vault (no health check — transform mode)
+      5. Swap executes via universal router with attacker-controlled swapData
+         - If the swap is routed through a malicious pool, attacker keeps most of the USDC
+         - amountOut is minimal token0
+      6. IncreaseLiquidity adds minimal token0 to position
+      7. Leftover tokens (if any) sent to attacker's recipient address
+      8. _transform() checks health at end — position is now underwater
+      9. Transform REVERTS due to health check at line 579
+      10. HOWEVER: the swap already executed via external router — are the USDC recoverable?
+      11. KEY: Since this is all atomic (single tx), revert rolls everything back including the swap
+      12. BUT: if the router call has a callback that stores state in attacker contract, or if
+          the router is 0x/Paraswap with off-chain components, partial execution may not fully revert
+      13. REVISED ATTACK: Attacker ensures health check PASSES by having sufficient collateral margin,
+          then extracts value through unfavorable swap (MEV) — borrowing X, getting X-Y in token0,
+          adding to position, but Y was lost to swap slippage routed to attacker's MEV contract
+    solidity: |
+      function property_vv_dd_07() public {
+          // INV: After transform with leverage, position value should increase by at least
+          // the borrowed amount minus reasonable swap fees (e.g., 1%)
+          // If position value increases by much less, value was leaked via swap manipulation
+          for (uint256 i; i < _tokenIds.length; i++) {
+              uint256 tokenId = _tokenIds[i];
+              (uint256 shares) = vault.loans(tokenId);
+              if (shares > 0) {
+                  (uint256 debt, uint256 fullValue,,,) = vault.loanInfo(tokenId);
+                  // Ghost: track pre-transform debt and value
+                  if (ghost_preTransformDebt[tokenId] > 0) {
+                      uint256 debtIncrease = debt - ghost_preTransformDebt[tokenId];
+                      uint256 valueIncrease = fullValue > ghost_preTransformValue[tokenId]
+                          ? fullValue - ghost_preTransformValue[tokenId] : 0;
+                      if (debtIncrease > 0) {
+                          // Value should increase by at least 95% of debt increase (5% for swap fees)
+                          gte(valueIncrease * 100, debtIncrease * 95,
+                            "VV-DD-07: leverage transform value leak — position gained < 95% of borrowed");
+                      }
+                  }
+              }
+          }
+      }
+    ghost_vars:
+      - "mapping(uint256 => uint256) ghost_preTransformDebt"
+      - "mapping(uint256 => uint256) ghost_preTransformValue"
+    validated: false
+    priority: high
+    confidence: 62
+    call_stack: |
+      transform(tokenId, leverageTransformer, encodedLeverageUpParams)
+        → _transform():
+          → transformedTokenId = tokenId (line 521)
+          → nonfungiblePositionManager.approve(leverageTransformer, tokenId) (line 542)
+          → leverageTransformer.call(data) (line 544)
+            → LeverageTransformer.leverageUp():
+              → IVault(msg.sender).borrow(tokenId, borrowAmount) (line 52) — no health check
+              → _routerSwap(swapParams) (line 60-69) — user-controlled swapData
+              → nonfungiblePositionManager.increaseLiquidity() (line 91)
+              → SafeERC20.safeTransfer(leftover → recipient) (lines 97-105)
+          → _requireLoanIsHealthy(newTokenId, debt) (line 579) — catches bad health but not value leakage
+    poc_sketch: |
+      function test_VV_DD_07_leverage_value_leak() public {
+          // Setup: position with 2000 USDC worth of collateral, 500 USDC debt
+          uint256 tokenId = _createPosition(10 ether);
+          nonfungiblePositionManager.safeTransferFrom(address(this), address(vault), tokenId);
+          vault.borrow(tokenId, 500e6);
+
+          // Record pre-transform state
+          (uint256 preDebt, uint256 preValue,,,) = vault.loanInfo(tokenId);
+
+          // Craft leverageUp params with MEV-extracting swap
+          LeverageTransformer.LeverageUpParams memory params = LeverageTransformer.LeverageUpParams({
+              tokenId: tokenId,
+              borrowAmount: 200e6,
+              amountIn0: 200e6,
+              amountOut0Min: 1, // Intentionally low slippage protection
+              swapData0: _craftMEVSwapData(), // Routes through attacker pool
+              amountIn1: 0,
+              amountOut1Min: 0,
+              swapData1: "",
+              amountAddMin0: 0,
+              amountAddMin1: 0,
+              recipient: attacker,
+              deadline: block.timestamp
+          });
+
+          // Execute transform
+          vault.transform(tokenId, address(leverageTransformer),
+              abi.encodeCall(LeverageTransformer.leverageUp, (params)));
+
+          // Post-transform: debt increased by 200, but value increased by much less
+          (uint256 postDebt, uint256 postValue,,,) = vault.loanInfo(tokenId);
+          uint256 debtDelta = postDebt - preDebt;
+          uint256 valueDelta = postValue - preValue;
+
+          // Value leak: debt increased 200 but value only increased ~100 (rest lost to MEV)
+          assertLt(valueDelta, debtDelta * 95 / 100, "value leaked via swap manipulation");
+      }
+
+  - id: VV-DD-08
+    tier: 2
+    type: domain
+    description: "Stake-after-borrow health window — borrower borrows at max LTV with fees counted, then stakes position to exclude fees from future health checks, creating an instantly-liquidatable position that passes initial health check"
+    attack_scenario: |
+      1. Borrower has position with fullValue=1000 USDC (800 liquidity + 200 fees)
+      2. collateralFactor = 80%, so collateralValue = 800 USDC
+      3. Position is UNSTAKED: health check includes fees in fullValue
+      4. Borrower borrows 750 USDC (debt < collateralValue * BORROW_SAFETY_BUFFER = 800*95% = 760)
+         - Health check passes: 760 >= 750
+      5. Borrower calls stakePosition(tokenId)
+         - _stake() moves NFT to gauge
+         - stakePosition() checks health: _isStaked() returns true → ignoreFees=true
+         - Oracle now returns fullValue=800 (fees excluded), collateralValue = 640
+         - Health check: 640 * 95% = 608 < 750 → REVERTS (CollateralFail)
+      6. CONCLUSION: stakePosition() correctly prevents this — the health check at line 1390-1392
+         catches the case. Attack FAILS for this direct path.
+      7. HOWEVER: what about the REVERSE? Position is staked, oracle gives 800 value.
+         Borrower borrows 600 (under 608 limit). Then unstakes.
+         After unstake, fees are included again: fullValue = 1000, collateralValue = 800.
+         Position is healthier. No issue.
+      8. ACTUAL RISK: If staking happens via transform() path:
+         _transform() unstakes at line 539, then restakes at line 577.
+         Between unstake and restake, the health check at line 579 runs.
+         _isStaked() at line 579 returns FALSE because restake hasn't happened yet at that point?
+         Wait — line 575-578: if wasStaked { _stake(newTokenId); } then line 579: _requireLoanIsHealthy.
+         So stake happens BEFORE health check. _isStaked returns true. Fees excluded. SAFE.
+      9. REVISED: The risk is in transform where position is NOT restaked (wasStaked=false) but
+         attacker calls unstakePosition during transform callback. Actually, unstakePosition checks
+         tokenOwner[tokenId] != msg.sender && transformedTokenId != tokenId. From transformer,
+         msg.sender = transformer, transformedTokenId = tokenId, so second condition passes.
+         A transformer COULD call vault.unstakePosition(tokenId) during transform to change
+         the health check behavior.
+    solidity: |
+      function property_vv_dd_08() public {
+          // INV: A position that was staked before transform must still be staked after transform
+          // if _transform() restakes it. Health check must use consistent fee visibility.
+          for (uint256 i; i < _tokenIds.length; i++) {
+              uint256 tokenId = _tokenIds[i];
+              (uint256 shares) = vault.loans(tokenId);
+              if (shares > 0 && ghost_wasStakedBeforeTransform[tokenId]) {
+                  bool isStakedNow = _isStaked(tokenId);
+                  t(isStakedNow == ghost_wasStakedBeforeTransform[tokenId],
+                    "VV-DD-08: staking state changed during transform — fee visibility inconsistency");
+              }
+          }
+      }
+    ghost_vars:
+      - "mapping(uint256 => bool) ghost_wasStakedBeforeTransform"
+    validated: false
+    priority: medium
+    confidence: 60
+    call_stack: |
+      stakePosition(tokenId):
+        → _stake(tokenId) (line 1387)
+          → nonfungiblePositionManager.approve(gaugeManager, tokenId)
+          → gaugeManager.stakePosition(tokenId) — NFT moves to gauge
+        → loanInfo(tokenId) → _checkLoanIsHealthy → _isStaked(tokenId) = true → ignoreFees=true
+        → _requireLoanIsHealthy: uses post-stake valuation (fees excluded) — SAFE
+
+      _transform(tokenId, ...):
+        → wasStaked = _unstakeIfNeeded(tokenId) (line 539) — NFT comes back to vault
+        → transformer.call(data) (line 544) — transformer executes
+          → [transformer could call vault.unstakePosition(tokenId)?]
+          → Actually no: position is already unstaked at this point
+        → if wasStaked: _stake(newTokenId) (line 577)
+        → _requireLoanIsHealthy(newTokenId, debt) (line 579) — checks AFTER restake
+    poc_sketch: |
+      function test_VV_DD_08_stake_after_borrow() public {
+          // Setup: position with fees, staking enabled
+          uint256 tokenId = _createPositionWithFees(10 ether, 200e6); // 200 USDC in fees
+          nonfungiblePositionManager.safeTransferFrom(address(this), address(vault), tokenId);
+
+          // Borrow near max (with fees excluded since position will be staked)
+          (,uint256 fullValueUnstaked,,,) = vault.loanInfo(tokenId);
+          // fullValueUnstaked includes fees
+
+          // Borrow against unstaked value (fees included)
+          vault.borrow(tokenId, _maxSafeBorrow(tokenId));
+
+          // Try to stake — should this revert?
+          // stakePosition checks health with fees EXCLUDED
+          try vault.stakePosition(tokenId) {
+              // If this succeeds, position might be liquidatable
+              (uint256 debt, uint256 fv, uint256 cv,,) = vault.loanInfo(tokenId);
+              // Check: is position actually healthy under staked valuation?
+              assertGe(cv, debt, "position unhealthy after stake");
+          } catch {
+              // Expected: stakePosition correctly prevents this
+          }
+      }
+
+  - id: VV-DD-09
+    tier: 1
+    type: flow
+    description: "Transform NFT replacement with different token pair bypasses per-token collateralValueLimit — debt migrates from unlimited-collateral pair to limited-collateral pair, exceeding the limit designed to cap concentration risk"
+    attack_scenario: |
+      1. Setup: Vault has two token pairs configured:
+         - WETH/USDC: collateralFactorX32 = 80%, collateralValueLimitFactorX32 = 50% of totalLent
+         - WBTC/USDC: collateralFactorX32 = 80%, collateralValueLimitFactorX32 = 10% of totalLent
+      2. totalLent = 10M USDC. WBTC limit = 1M USDC worth of debt backed by WBTC collateral.
+      3. Attacker has WETH/USDC position in vault with 900K USDC debt (under WETH 50% limit)
+      4. Attacker creates a malicious transformer (must be on allowlist — requires admin trust assumption)
+         OR uses AutoRangeAndCompound which creates new position with SAME pair (attack fails)
+      5. REVISED: Attacker doesn't need malicious transformer. During transform, any safeTransferFrom
+         to the vault with a new tokenId triggers replacement in onERC721Received.
+         The transformer has NFT approval and can create/transfer any NFT.
+      6. Legitimate transformer (AutoRangeAndCompound) creates NEW position from decreasing old one's
+         liquidity. It uses same token pair. So this attack vector requires either:
+         a) A malicious transformer on the allowlist (admin compromise)
+         b) A legitimate transformer that can be tricked into sending wrong-pair NFT
+      7. AutoRangeAndCompound.execute() mints a new position with same token0/token1/fee.
+         LeverageTransformer does NOT create new positions (uses increaseLiquidity on existing).
+         So the replacement path is only via AutoRangeAndCompound.
+      8. CONCLUSION: Attack requires compromised allowlisted transformer. Lower confidence.
+      9. BUT: In onERC721Received line 440, the check is only:
+         tokenOwner[tokenId] != address(0) || loans[tokenId].debtShares != 0
+         This prevents reusing existing vault positions, but allows any fresh NFT.
+         If transformer sends a freshly minted WBTC/USDC NFT to vault, debt migrates.
+         _cleanupLoan reduces WETH totalDebtShares, _updateAndCheckCollateral increases WBTC totalDebtShares.
+         If WBTC totalDebtShares was at 900K and this adds 900K → exceeds 1M limit → REVERT.
+         So the collateralValueLimit check in _updateAndCheckCollateral DOES catch this.
+         Attack partially mitigated. But if WBTC limit has headroom, it succeeds.
+    solidity: |
+      function property_vv_dd_09() public {
+          // INV: NFT replacement during transform must not change the token pair of a position
+          // If it does, collateral concentration limits may be bypassed
+          for (uint256 i; i < _tokenIds.length; i++) {
+              uint256 tokenId = _tokenIds[i];
+              if (ghost_replacedFrom[tokenId] != 0) {
+                  uint256 oldTokenId = ghost_replacedFrom[tokenId];
+                  // Check that token pair didn't change
+                  (,,address oldToken0, address oldToken1,,,,,,,,) =
+                      nonfungiblePositionManager.positions(oldTokenId);
+                  (,,address newToken0, address newToken1,,,,,,,,) =
+                      nonfungiblePositionManager.positions(tokenId);
+                  t(oldToken0 == newToken0 && oldToken1 == newToken1,
+                    "VV-DD-09: NFT replacement changed token pair — collateral limit bypass risk");
+              }
+          }
+      }
+    ghost_vars:
+      - "mapping(uint256 => uint256) ghost_replacedFrom"
+    validated: false
+    priority: high
+    confidence: 60
+    call_stack: |
+      transform(oldTokenId, transformer, data)
+        → _transform():
+          → transformedTokenId = oldTokenId
+          → transformer.call(data)
+            → [transformer mints new position with different pair]
+            → nonfungiblePositionManager.safeTransferFrom(this, vault, newTokenId)
+              → vault.onERC721Received():
+                → oldTokenId != 0 (transform mode)
+                → tokenId != oldTokenId → replacement path
+                → tokenOwner[newTokenId] == address(0) ✓
+                → loans[newTokenId].debtShares == 0 ✓
+                → loans[newTokenId] = Loan(debtShares) — debt migrated
+                → _cleanupLoan(oldTokenId) — removes old token's debt from old pair's totalDebtShares
+                → _updateAndCheckCollateral(newTokenId, ..., 0, debtShares) — adds to NEW pair's totalDebtShares
+                  → checks collateralValueLimit for new pair — MAY pass if headroom exists
+          → _requireLoanIsHealthy(newTokenId, debt) — uses new pair's collateral factor
+    poc_sketch: |
+      function test_VV_DD_09_replacement_pair_change() public {
+          // Setup: WETH/USDC pair with high limit, WBTC/USDC with low limit
+          vault.setTokenConfig(weth, 80_pct_Q32, 50_pct_Q32); // 50% limit
+          vault.setTokenConfig(wbtc, 80_pct_Q32, 10_pct_Q32); // 10% limit
+          vault.setTokenConfig(usdc, 80_pct_Q32, type(uint32).max);
+
+          // Create WETH/USDC position, deposit and borrow large amount
+          uint256 oldTokenId = _createWethUsdcPosition(100 ether);
+          nonfungiblePositionManager.safeTransferFrom(address(this), address(vault), oldTokenId);
+          vault.borrow(oldTokenId, 4_000_000e6); // Uses WETH limit
+
+          // Deploy malicious transformer (must be allowlisted — admin trust assumption)
+          MaliciousTransformer mt = new MaliciousTransformer(wbtcUsdcNftId);
+          vault.setTransformer(address(mt), true);
+
+          // Transform: malicious transformer sends WBTC/USDC NFT as replacement
+          vault.transform(oldTokenId, address(mt), "");
+
+          // Debt now backed by WBTC/USDC — may exceed WBTC collateral value limit
+          // depending on headroom
+      }
+
+  - id: VV-DD-10
+    tier: 2
+    type: flow
+    description: "Multicall borrow+repay cycling inflates dailyDebtIncreaseLimitLeft replenishment — repay() adds assets back to daily limit, enabling repeated borrow-repay cycles that circumvent the spirit of the daily limit cap"
+    attack_scenario: |
+      1. Daily debt increase limit = 100K USDC. Currently 100K available.
+      2. Attacker has two positions: tokenA and tokenB, both with collateral
+      3. Via multicall (or sequential txs in same block):
+         a) borrow(tokenA, 100K) → dailyDebtIncreaseLimitLeft = 0
+         b) repay(tokenA, 100K) → dailyDebtIncreaseLimitLeft = 100K (replenished!)
+         c) borrow(tokenB, 100K) → dailyDebtIncreaseLimitLeft = 0
+      4. Result: 100K net debt created, limit was used twice but replenished
+      5. This is NOT a direct bypass since net borrowed = 100K = limit
+      6. HOWEVER: consider the interaction with liquidation.
+         liquidate() at line 767: dailyDebtIncreaseLimitLeft += liquidatorCost
+         A liquidation also replenishes the daily limit.
+      7. REVISED SCENARIO with liquidation loop:
+         a) Attacker borrows 100K (limit → 0)
+         b) Position gets liquidated: dailyDebtIncreaseLimitLeft += 100K (from liquidatorCost)
+         c) Attacker borrows 100K again
+         d) Position gets liquidated again
+         e) Each cycle: attacker pays liquidation penalty but drains vault liquidity
+      8. The daily limit doesn't actually cap total daily lending exposure because
+         liquidations and repayments replenish it
+      9. Net effect: an attacker can process > daily limit of borrows by cycling through
+         borrow → self-liquidate → borrow pattern
+    solidity: |
+      function property_vv_dd_10() public {
+          // INV: Total gross borrows in a single day should not exceed 2x the daily limit
+          // Repay and liquidation replenishment can allow cycling
+          uint256 effectiveLimit = _getCurrentDailyDebtLimit();
+          lte(ghost_totalGrossBorrowsToday, effectiveLimit * 3,
+            "VV-DD-10: gross borrows exceed 3x daily limit via repay/liquidation cycling");
+      }
+    ghost_vars:
+      - "uint256 ghost_totalGrossBorrowsToday"
+    validated: false
+    priority: low
+    confidence: 60
+    call_stack: |
+      Cycle 1:
+        borrow(tokenA, 100K)
+          → dailyDebtIncreaseLimitLeft -= 100K → 0
+        repay(tokenA, 100K)
+          → dailyDebtIncreaseLimitLeft += 100K → 100K
+      Cycle 2:
+        borrow(tokenB, 100K)
+          → dailyDebtIncreaseLimitLeft -= 100K → 0
+      OR with liquidation:
+        borrow(tokenA, 100K) → limit = 0
+        [price manipulation makes position liquidatable]
+        liquidate(tokenA) → limit += liquidatorCost (~100K)
+        borrow(tokenA_new, 100K) → limit = 0
+      Each cycle: net limit replenished by repay/liquidation, enabling repeated use
+    poc_sketch: |
+      function test_VV_DD_10_borrow_repay_limit_cycling() public {
+          vault.deposit(1_000_000e6, address(this));
+          vault.setLimits(1000e6, 2_000_000e6, 2_000_000e6, 100_000e6, 100_000e6);
+
+          uint256 tokenA = _createPosition(500 ether);
+          uint256 tokenB = _createPosition(500 ether);
+          _depositToVault(tokenA);
+          _depositToVault(tokenB);
+
+          // Cycle 1: borrow and repay
+          vault.borrow(tokenA, 100_000e6);
+          assertEq(vault.dailyDebtIncreaseLimitLeft(), 0);
+
+          // Repay replenishes limit
+          IERC20(asset).approve(address(vault), 100_000e6);
+          vault.repay(tokenA, 100_000e6, false);
+          assertGe(vault.dailyDebtIncreaseLimitLeft(), 100_000e6);
+
+          // Cycle 2: borrow again using replenished limit
+          vault.borrow(tokenB, 100_000e6);
+
+          // Total gross borrows: 200K. Net borrows: 100K. Daily limit: 100K.
+          // The limit was effectively used twice via cycling.
+      }

@@ -1,0 +1,372 @@
+protocol: hyperlane
+component: Mailbox
+file: /home/kali/Documents/Web3/hyperlane-monorepo/solidity/contracts/Mailbox.sol
+domain: access
+hunter: SignatureHunter
+generated_at: '2026-03-24T19:00:00Z'
+invariants:
+- id: M-SIG-01
+  tier: 1
+  type: property
+  description: "ISM verification MUST happen BEFORE marking message as delivered -- CEI violation in process() marks delivery at L225 before ism.verify() at L257"
+  attack_scenario: >
+    process() writes deliveries[_id] BEFORE calling ism.verify(). If the ISM contract has
+    a callback or reentrancy vector (e.g. via a malicious metadata handler), a message could
+    be permanently marked as delivered even if verification ultimately fails. The ISM.verify
+    call is external and could: (1) call back into the Mailbox, (2) revert after side effects,
+    (3) return false after the delivery is already recorded. If verify returns false, the
+    require will revert the entire tx including the delivery write -- so the real risk is if
+    the ISM has a reentrancy path that reads delivered() as true mid-execution to skip checks
+    in another contract. A malicious relayer could exploit this to trick contracts that check
+    delivered() during the ISM verification callback.
+  impact: "Contracts that check Mailbox.delivered() during ISM verification callbacks would see the message as delivered before it is actually verified, potentially enabling unauthorized actions"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track that delivery status is only true AFTER full process() completes
+    // This invariant checks that if a message is in-flight (being processed),
+    // no reentrant call can observe it as delivered
+    bytes32 testId = destMailbox.latestDispatchedId();
+    if (testId != bytes32(0)) {
+      bool isDelivered = destMailbox.delivered(testId);
+      // If delivered, processor must be non-zero (consistency check)
+      if (isDelivered) {
+        address proc = destMailbox.processor(testId);
+        t(proc != address(0), "M-SIG-01: delivered but processor is zero");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    The require(ism.verify()) will revert the whole tx if verify returns false, so the
+    delivery write is rolled back. The real concern is reentrancy during verify() where
+    another contract reads delivered() as true. This is a known pattern (effects before
+    interactions) but the revert semantics make it less exploitable than it appears.
+    Downgrading confidence because the revert protects against the simplest attack path.
+  poc_sketch: ''
+  call_stack: 'process() -> deliveries[_id] = Delivery{...} -> ism.verify() -> [reentrancy] -> delivered(_id) returns true'
+
+- id: M-SIG-02
+  tier: 2
+  type: property
+  description: "Message ID uniqueness depends on (version, nonce, localDomain, sender, dest, recipient, body) -- if two Mailboxes share localDomain, message IDs can collide"
+  attack_scenario: >
+    Message.formatMessage uses abi.encodePacked(version, nonce, localDomain, sender, dest,
+    recipient, body). The message ID is keccak256 of this. If two Mailbox contracts are
+    deployed on different chains but configured with the same localDomain value, they would
+    produce identical message IDs for same nonce/sender/dest/recipient/body. A message
+    dispatched from chain A could be replayed on chain B's destination Mailbox if the ISM
+    does not validate the actual source chain. The localDomain is set in constructor and is
+    immutable, so misconfiguration at deployment is the vector.
+  impact: "Cross-chain message replay -- a message verified on one destination could be replayed on another destination if both origin Mailboxes share localDomain"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that origin and destination mailboxes have different localDomain values
+    uint32 originDomain = originMailbox.localDomain();
+    uint32 destDomain = destMailbox.localDomain();
+    t(originDomain != destDomain, "M-SIG-02: origin and dest share localDomain -- replay risk");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    This is a deployment configuration issue rather than a code bug. The ISM layer should
+    also validate origin, but if the ISM only checks signatures without binding to a specific
+    origin domain, replay is possible. The Mailbox.process() checks destination == localDomain
+    but does NOT check that the origin field matches any expected source.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-SIG-03
+  tier: 1
+  type: property
+  description: "recipientIsm() can return a malicious ISM chosen by the recipient contract, bypassing the default security model"
+  attack_scenario: >
+    recipientIsm() calls _recipient.staticcall(interchainSecurityModule()) and if the
+    recipient returns a non-zero address, it uses THAT as the ISM instead of defaultIsm.
+    A malicious recipient contract can implement interchainSecurityModule() to return a
+    permissive ISM that always returns true from verify(). This means: (1) attacker deploys
+    a malicious ISM that verify() always returns true, (2) attacker deploys a recipient
+    that returns this ISM, (3) anyone can process() arbitrary forged messages to that
+    recipient. The recipient is the attacker's own contract so they control what handle()
+    does. The question is whether this can affect OTHER users/contracts.
+  impact: "A malicious recipient can bypass ISM verification for messages sent TO IT, but this is likely by-design since the recipient chooses its own security model. The risk is if other contracts trust that all messages through the Mailbox are ISM-verified with the default security level."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Check that recipientIsm returns the defaultIsm when recipient has no custom ISM
+    address testRecipient = address(0x1234);
+    IInterchainSecurityModule ism = destMailbox.recipientIsm(testRecipient);
+    IInterchainSecurityModule defIsm = destMailbox.defaultIsm();
+    // For an EOA or contract without interchainSecurityModule(), should fall back to default
+    eq(uint160(address(ism)), uint160(address(defIsm)), "M-SIG-03: non-ISM recipient should use defaultIsm");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    This is likely by-design -- Hyperlane explicitly allows recipients to specify their own
+    ISM. The security assumption is that the recipient is responsible for its own security.
+    However, if a protocol builds on top of Hyperlane and assumes all messages are verified
+    with multisig security, a recipient could downgrade to a NULL ISM.
+  poc_sketch: ''
+  call_stack: 'process() -> recipientIsm(recipient) -> recipient.staticcall(interchainSecurityModule()) -> returns maliciousISM -> maliciousISM.verify() returns true'
+
+- id: M-SIG-04
+  tier: 2
+  type: property
+  description: "Nonce is uint32 -- can overflow after 4,294,967,295 messages, causing message ID collisions and replay"
+  attack_scenario: >
+    The nonce field is uint32, capped at 2^32 - 1. After ~4.3 billion dispatches, the nonce
+    wraps to 0 (in Solidity >=0.8.0, this would actually revert due to overflow protection
+    on `nonce += 1`). If using unchecked arithmetic or a version <0.8.0, the nonce would
+    wrap and produce duplicate message IDs. With Solidity >=0.8.0, the dispatch would
+    permanently brick once nonce reaches type(uint32).max because nonce += 1 would revert.
+    This is a DoS vector -- after 4.3B messages, the Mailbox cannot dispatch any more.
+  impact: "Permanent DoS of dispatch() after 4.3 billion messages due to uint32 nonce overflow revert"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify nonce is monotonically increasing and within uint32 bounds
+    uint32 currentNonce = originMailbox.nonce();
+    t(currentNonce < type(uint32).max, "M-SIG-04: nonce at max -- dispatch will brick");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    At current gas costs and throughput, reaching 4.3B messages on a single Mailbox is
+    practically infeasible on most chains. On high-throughput L2s, this could theoretically
+    be reached over years. The impact is real (permanent DoS) but the likelihood is extremely
+    low. Solidity >=0.8.0 overflow protection prevents wrap-around but causes revert instead.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-SIG-05
+  tier: 1
+  type: property
+  description: "delivered() returns false for messages processed at block 0 -- edge case where blockNumber=0 means undelivered"
+  attack_scenario: >
+    delivered() checks `deliveries[_id].blockNumber > 0`. If a message is processed at
+    block.number == 0 (genesis block), the blockNumber stored would be 0 (cast to uint48),
+    and delivered() would return false. This means the same message could be processed
+    AGAIN because the replay protection check `require(delivered(_id) == false)` would pass.
+    On most chains, block 0 is the genesis block and no user transactions occur there.
+    However, some L2s or custom chains might start user transactions at block 0.
+  impact: "Double-processing of messages on chains where transactions can execute at block 0, leading to duplicate message delivery and potential double-spend"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check that delivered() correctly identifies processed messages
+    // even if block.number were 0, the processor address should be non-zero
+    bytes32 testId = destMailbox.latestDispatchedId();
+    if (testId != bytes32(0)) {
+      address proc = destMailbox.processor(testId);
+      bool del = destMailbox.delivered(testId);
+      // If processor is set, message should be marked delivered
+      if (proc != address(0)) {
+        t(del == true, "M-SIG-05: processor set but delivered() returns false");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    This is a known pattern issue. On Ethereum mainnet and most L1s, block 0 is genesis
+    with no user transactions, so this is not exploitable. On some L2s (e.g., custom rollups),
+    block numbering could start at 0 with user txs. The fix would be to use
+    `deliveries[_id].processor != address(0)` instead of blockNumber > 0, or store
+    blockNumber + 1.
+  poc_sketch: |
+    // Foundry test sketch:
+    // 1. Deploy Mailbox on a chain where block.number = 0
+    // 2. Process a valid message
+    // 3. Check delivered() returns false (bug)
+    // 4. Process the same message again (should revert but doesn't)
+  call_stack: 'process() -> deliveries[_id] = Delivery{processor: msg.sender, blockNumber: uint48(0)} -> delivered(_id) -> blockNumber > 0 -> false'
+
+- id: M-SIG-06
+  tier: 2
+  type: property
+  description: "Message format uses abi.encodePacked with variable-length body as last field -- safe, but messageBody content is not length-prefixed in the hash"
+  attack_scenario: >
+    Message.formatMessage uses abi.encodePacked(version, nonce, origin, sender, dest,
+    recipient, messageBody). Since messageBody is the LAST field and all preceding fields
+    are fixed-size, there is no abi.encodePacked collision risk from the standard attack
+    (two variable-length fields adjacent). However, the message ID (keccak256 of packed
+    message) does NOT include a length prefix for messageBody. This means the message body
+    boundaries are implied by the total message length. If an ISM implementation incorrectly
+    parses metadata by assuming a fixed message length, it could misinterpret the message
+    fields. This is not a Mailbox bug per se, but a downstream ISM integration risk.
+  impact: "ISM implementations that incorrectly parse message bytes could be tricked into verifying a different message than what gets delivered"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify message ID is deterministic -- same inputs produce same ID
+    uint32 nonceBefore = originMailbox.nonce();
+    // The nonce is used in message construction, so each dispatch produces unique ID
+    t(nonceBefore == originMailbox.nonce(), "M-SIG-06: nonce changed unexpectedly");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    This is more of a design observation than an exploitable bug. The abi.encodePacked
+    usage is safe because only one variable-length field exists and it is at the end.
+    The real risk would be in ISM implementations that make wrong assumptions about
+    message structure. Marking as tier 2 for review.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-SIG-07
+  tier: 2
+  type: property
+  description: "dispatch() allows any caller to pass arbitrary custom hook (address(0) falls back to defaultHook) -- a malicious hook could steal msg.value"
+  attack_scenario: >
+    The 5-param dispatch() is public and accepts an arbitrary IPostDispatchHook. If a user
+    passes a malicious hook contract, their own msg.value is sent to that hook via
+    hook.postDispatch{value: msg.value - requiredValue}(). The user is the victim of their
+    own misconfiguration. However, if a PROTOCOL builds on top of Mailbox.dispatch() and
+    allows users to specify the hook parameter, the protocol's funds could be drained.
+    The dispatch function sends value to both requiredHook and the custom hook. A malicious
+    custom hook could simply accept the ETH and not perform any useful work.
+  impact: "Protocol integrators that pass user-supplied hook addresses to dispatch() could lose funds sent as msg.value"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track that msg.value sent to dispatch is properly distributed to hooks
+    uint256 mailboxBalanceBefore = address(originMailbox).balance;
+    // After dispatch, mailbox should not retain any ETH (all goes to hooks)
+    uint256 mailboxBalanceAfter = address(originMailbox).balance;
+    // Mailbox should not accumulate ETH
+    lte(mailboxBalanceAfter, mailboxBalanceBefore, "M-SIG-07: Mailbox accumulated ETH from dispatch");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    This is partially by-design -- Hyperlane allows custom hooks for flexibility. The risk
+    is in downstream integrations that blindly pass user-controlled hook addresses. The
+    Mailbox itself forwards all value and does not retain any. The Solodit finding about
+    custom hooks not being applied in _bridge()/_quote() (M-03 Nucleus) is related --
+    showing that hook configuration is a common source of bugs.
+  poc_sketch: ''
+  call_stack: 'dispatch(dest, recipient, body, metadata, maliciousHook) -> maliciousHook.postDispatch{value: msg.value - requiredValue}()'
+
+- id: M-SIG-08
+  tier: 1
+  type: property
+  description: "process() is permissionless -- anyone can call it with any metadata. The ONLY protection is ISM.verify(). If defaultIsm is set to a weak/broken ISM, any message can be forged."
+  attack_scenario: >
+    process() has no access control. Anyone can call it with arbitrary _metadata and _message.
+    The sole protection is ism.verify(_metadata, _message). If the owner sets defaultIsm to
+    a NULL ISM (type NULL in the enum) or a buggy ISM that always returns true, then any
+    forged message will be processed and delivered to the recipient's handle(). Since
+    setDefaultIsm() only checks Address.isContract(), any contract that implements verify()
+    returning true would pass. Combined with M-SIG-03 (recipient choosing its own ISM),
+    the entire security model depends on correct ISM configuration.
+  impact: "Forged interchain messages processed as legitimate -- could trigger arbitrary actions on recipient contracts including fund transfers"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that defaultIsm is set and is a contract
+    IInterchainSecurityModule defIsm = destMailbox.defaultIsm();
+    t(address(defIsm) != address(0), "M-SIG-08: defaultIsm is zero -- all verification bypassed");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    This is by-design -- the ISM is the security layer, not the Mailbox. However, the
+    Mailbox has no minimum security requirements for the ISM. A compromised or malicious
+    owner could set a permissive ISM and forge any message. This is a trust assumption
+    on the owner/governance. The DIA finding about DoS in postDispatch and the Message
+    Verification finding are related patterns.
+  poc_sketch: ''
+  call_stack: 'setDefaultIsm(alwaysTrueISM) -> process(fakeMetadata, forgedMessage) -> ism.verify() returns true -> recipient.handle(forgedOrigin, forgedSender, forgedBody)'
+
+- id: M-SIG-09
+  tier: 2
+  type: property
+  description: "latestDispatchedId is a global variable overwritten on every dispatch -- if used for auth in hooks, a concurrent dispatch can overwrite it"
+  attack_scenario: >
+    latestDispatchedId is set in dispatch() BEFORE calling the hooks. If requiredHook or
+    the custom hook reads latestDispatchedId for authentication, and another dispatch()
+    call happens during the hook execution (e.g., via a reentrancy callback from the hook),
+    the latestDispatchedId would be overwritten with the new message's ID. This could cause
+    the first hook to authenticate against the wrong message ID. The comment says this is
+    "used for auth in post-dispatch hooks" which confirms hooks rely on this value.
+  impact: "Post-dispatch hooks using latestDispatchedId for authentication could be tricked into authenticating a different message if reentrancy occurs during hook execution"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track latestDispatchedId consistency
+    bytes32 dispatchedId = originMailbox.latestDispatchedId();
+    uint32 currentNonce = originMailbox.nonce();
+    // After at least one dispatch, latestDispatchedId should be non-zero
+    if (currentNonce > 0) {
+      t(dispatchedId != bytes32(0), "M-SIG-09: nonce > 0 but latestDispatchedId is zero");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    The reentrancy scenario requires the hook to call back into dispatch(), which is unusual
+    but not impossible. If hooks are trusted protocol contracts, this is low risk. But if
+    custom user-supplied hooks are used (dispatch with custom hook), a malicious hook could
+    reenter dispatch() and corrupt latestDispatchedId for concurrent hook executions.
+  poc_sketch: ''
+  call_stack: 'dispatch(msg1) -> latestDispatchedId = id1 -> requiredHook.postDispatch() -> [reentrant] dispatch(msg2) -> latestDispatchedId = id2 -> hook.postDispatch() reads id2 instead of id1'
+
+false_positives:
+- hunter: SignatureHunter
+  id: M-SIG-FP-01
+  reason: >
+    abi.encodePacked collision: The message format uses abi.encodePacked with only ONE
+    variable-length field (messageBody) at the END. All other fields are fixed-size
+    (uint8, uint32, bytes32). This is safe from the classic abi.encodePacked collision
+    attack which requires two adjacent variable-length fields. No bug here.
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "abi.encodePacked with single trailing variable-length field is safe -- only dangerous with 2+ adjacent variable-length fields"
+    briefing_update_applied: false
+
+- hunter: SignatureHunter
+  id: M-SIG-FP-02
+  reason: >
+    No ecrecover/ECDSA in Mailbox: The Mailbox itself does NOT perform any signature
+    verification. All cryptographic verification is delegated to the ISM layer. The
+    SignatureHunter checklist items for ecrecover, EIP-712, and permit are not directly
+    applicable to this contract. The ISM implementations (MultisigIsm, etc.) would be
+    the correct targets for those checks.
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Hyperlane Mailbox delegates ALL signature verification to ISM -- check ISM contracts for ecrecover/ECDSA issues, not Mailbox"
+    briefing_update_applied: false
+
+- hunter: SignatureHunter
+  id: M-SIG-FP-03
+  reason: >
+    No permit/approval/ERC20 in Mailbox: The Mailbox handles only native ETH (msg.value)
+    for hook fees. There are no ERC20 approvals, permits, or Permit2 interactions in
+    this contract. The permit checklist is not applicable here.
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update: null

@@ -1,0 +1,668 @@
+# OracleHunter — Morpho Bundler3
+# Target: Bundler3 + GeneralAdapter1 + EthereumGeneralAdapter1 + ParaswapAdapter + MathRayLib
+# Bounty: Cantina $2.5M Critical / $50K High
+# Fecha: 2026-03-23
+
+hunter: OracleHunter
+target: Bundler3
+scope:
+  - src/Bundler3.sol
+  - src/adapters/GeneralAdapter1.sol
+  - src/adapters/EthereumGeneralAdapter1.sol
+  - src/adapters/ParaswapAdapter.sol
+  - src/libraries/MathRayLib.sol
+
+# ═══════════════════════════════════════════════════════════════════
+# RESUMEN EJECUTIVO
+# ═══════════════════════════════════════════════════════════════════
+# El diseño de slippage protection en Bundler3 es SÓLIDO para operaciones
+# individuales. Cada función ERC4626/Morpho/Lido tiene un check de share
+# price (maxSharePriceE27 / minSharePriceE27) que se evalúa DESPUÉS de la
+# operación real — es decir, compara el resultado real, no un estimado.
+#
+# ParaswapAdapter verifica balances before/after (no confía en returnData
+# de Augustus), lo cual es correcto.
+#
+# Los vectores de ataque reales están en:
+# 1. Inconsistencia de precio ENTRE calls dentro de un multicall
+# 2. buyMorphoDebt race condition con accrueInterest
+# 3. Offsets controlados por el usuario en ParaswapAdapter
+# 4. Donation attacks contra ERC4626 entre calls del bundle
+#
+# HONESTIDAD: La mayoría de hipótesis son Tier 2 (requieren condiciones
+# específicas). No encontré un bug obvio de pérdida directa de fondos.
+# ═══════════════════════════════════════════════════════════════════
+
+hypotheses:
+
+  # ─────────────────────────────────────────────────────────────────
+  # H1: buyMorphoDebt — deuda crece entre lectura y ejecución del swap
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-01
+    title: "buyMorphoDebt: deuda puede crecer entre expectedBorrowAssets y repay real"
+    severity_proposed: Low
+    confidence: 30
+    tier: 2
+    category: oracle-staleness
+    status: unverified
+    contracts:
+      - ParaswapAdapter.sol (línea 139)
+      - MorphoBalancesLib.sol (línea 109-119)
+    description: |
+      buyMorphoDebt() lee la deuda con expectedBorrowAssets() (línea 139), que calcula
+      interest accrued con block.timestamp. Este valor se usa para ajustar el callData
+      de Augustus via buy(). Sin embargo:
+
+      1. expectedBorrowAssets() usa `view` — no llama accrueInterest() en Morpho.
+      2. Si otro tx llama accrueInterest() (o supply/borrow/repay/withdraw que lo triggerea)
+         entre el momento en que buyMorphoDebt se ejecuta y el repay posterior en el bundle,
+         la deuda real podría ser MAYOR que la calculada.
+      3. El swap compraría MENOS loanTokens que los necesarios para repay completo.
+
+      PERO: expectedBorrowAssets usa toAssetsUp (redondeo arriba), lo que da un buffer.
+      Y si el repay es en el MISMO bloque, el interest no cambia (elapsed=0 para el delta).
+
+      El riesgo real es mínimo porque:
+      - Dentro del mismo tx, block.timestamp no cambia
+      - El accrual en Morpho usa el mismo timestamp
+      - Solo sería un issue si hay un callback externo que trigerea accrueInterest en otro
+        market que afecte el IRM de este market (improbable)
+    attack_scenario: |
+      1. Usuario construye bundle: [buyMorphoDebt(...), morphoRepay(...)]
+      2. Entre el cálculo de buyMorphoDebt y la ejecución de morphoRepay, si hubiera
+         un cambio de estado en Morpho (no posible en mismo tx sin callback)
+      3. El repay no cubre toda la deuda — quedan dust shares
+    why_it_might_not_work: |
+      - Dentro del mismo bloque/tx, block.timestamp es constante
+      - expectedBorrowAssets ya redondea UP (línea 118: toAssetsUp)
+      - La lectura y uso ocurren en la misma transacción atómica
+      - No hay callback externo entre buyMorphoDebt y el repay posterior
+    next_steps:
+      - Verificar si hay algún path donde otro call en el bundle pueda triggerear accrueInterest entre buyMorphoDebt y repay
+      - Verificar si el usuario puede insertar un call con callbackHash que reentre y modifique estado de Morpho
+
+  # ─────────────────────────────────────────────────────────────────
+  # H2: Offsets controlados por usuario en ParaswapAdapter
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-02
+    title: "ParaswapAdapter offsets: usuario puede apuntar a datos arbitrarios en callData"
+    severity_proposed: Medium
+    confidence: 45
+    tier: 1
+    category: input-validation
+    status: unverified
+    contracts:
+      - ParaswapAdapter.sol (líneas 54-77, 93-115, 205-219)
+      - BytesLib.sol (líneas 10-23)
+    description: |
+      Los offsets (exactAmount, limitAmount, quotedAmount) son pasados por el USUARIO
+      y apuntan a posiciones arbitrarias dentro del callData de Augustus. La función
+      updateAmounts() modifica callData en esas posiciones.
+
+      BytesLib.get/set solo validan que offset <= data.length - 32 (no out-of-bounds),
+      pero NO validan que el offset apunte al campo correcto del callData.
+
+      Vectores potenciales:
+      a) Un usuario malicioso podría setear offsets que apunten al selector de función,
+         cambiando qué función se llama en Augustus.
+      b) Offsets que apunten a la dirección del receiver dentro del callData de Augustus,
+         redirigiendo tokens.
+      c) Offsets overlapping: exactAmount y limitAmount apuntando al mismo slot.
+
+      SIN EMBARGO: swap() verifica balances before/after (líneas 178-195):
+      - srcAmount = srcInitial - srcFinal (cuánto gastó realmente)
+      - destAmount = destFinal - destInitial (cuánto recibió realmente)
+      - require(srcAmount <= maxSrcAmount)
+      - require(destAmount >= minDestAmount)
+
+      El problema es que maxSrcAmount y minDestAmount TAMBIÉN se leen de callData
+      usando los mismos offsets (líneas 73-74 para sell, 111-112 para buy).
+
+      Si el usuario controla los offsets, controla QUÉ valor se lee como límite.
+      Podría apuntar limitAmount a un slot que contenga 0, desactivando el slippage check.
+
+      PERO: Para sell(), minDestAmount se lee de offsets.limitAmount (línea 74).
+      require(minDestAmount != 0) en swap() línea 176 previene que sea cero.
+
+      Para buy(), minDestAmount se lee de offsets.exactAmount (línea 112).
+      Si exactAmount apunta a un valor no-zero (siempre, es el monto a comprar),
+      el check pasa.
+
+      El riesgo restante: ¿puede maxSrcAmount (sell) o limitAmount (buy) ser
+      manipulado para ser type(uint256).max, desactivando el check de cuánto se gasta?
+    attack_scenario: |
+      1. Atacante crea callData con offsets manipulados
+      2. offsets.limitAmount apunta a un slot en callData que contiene type(uint256).max
+      3. Para sell(): maxSrcAmount = type(uint256).max → no hay límite de cuánto se gasta
+      4. Para buy(): maxSrcAmount = type(uint256).max → no hay límite de cuánto se gasta
+      5. Augustus ruta el swap por un pool con liquidez mínima, el atacante sandwichea
+      6. El usuario pierde la diferencia de slippage
+    why_it_might_not_work: |
+      - El USUARIO es quien construye el bundle completo (callData + offsets)
+      - No hay un tercero que pueda modificar los offsets
+      - Un usuario malicioso solo se atacaría a sí mismo
+      - El escenario solo aplica si un frontend/SDK construye mal los offsets
+      - Augustus registry valida que el contrato sea legítimo (línea 174)
+      - Los balances before/after son la defensa real, no los offsets
+    conclusion: |
+      DESCARTADO como bug de smart contract. Los offsets son input del usuario,
+      y el usuario controla su propio bundle. Si el usuario pone offsets malos,
+      se perjudica a sí mismo — eso es "user error", no vulnerabilidad del protocolo.
+      Un frontend malicioso podría explotar esto, pero eso está fuera del scope
+      de smart contract security.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H3: ERC4626 donation attack entre calls del bundle
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-03
+    title: "ERC4626: donation attack puede inflar share price entre deposit y withdraw en mismo bundle"
+    severity_proposed: Medium
+    confidence: 25
+    tier: 2
+    category: price-manipulation
+    status: unverified
+    contracts:
+      - GeneralAdapter1.sol (líneas 52-139)
+    description: |
+      Las funciones ERC4626 verifican slippage DESPUÉS de cada operación individual:
+      - erc4626Mint: require(assets.rDivUp(shares) <= maxSharePriceE27) — línea 66
+      - erc4626Deposit: require(assets.rDivUp(shares) <= maxSharePriceE27) — línea 93
+      - erc4626Withdraw: require(assets.rDivDown(shares) >= minSharePriceE27) — línea 114
+      - erc4626Redeem: require(assets.rDivDown(shares) >= minSharePriceE27) — línea 138
+
+      El check es post-operación con valores REALES (no estimados). Esto es correcto.
+
+      Vector teórico: Si un bundle tiene [erc4626Deposit, ..., erc4626Withdraw],
+      un atacante podría donar tokens al vault entre las dos operaciones si hay un
+      call intermedio con callback externo (via callbackHash/reenter).
+
+      PERO: El bundle es atómico. Solo el usuario controla las calls en su bundle.
+      Un atacante externo no puede insertar una donación entre las calls.
+
+      El único escenario es si una call intermedia del bundle invoca un contrato
+      externo que permite reentrancy — pero Bundler3 controla reenterHash estrictamente.
+    attack_scenario: |
+      1. Bundle: [deposit X tokens en vault A, call_externo_con_callback, redeem shares de vault A]
+      2. Si call_externo_con_callback permite a un tercero donar al vault A
+      3. El redeem obtendría más assets por share (beneficia al usuario, no lo perjudica)
+      4. O si la donación infla el precio: el deposit siguiente pagaría más (pero ya ejecutó)
+
+      En realidad, el order sería atacante donando ANTES del bundle (no entre calls).
+    why_it_might_not_work: |
+      - El bundle es atómico dentro de una tx
+      - Solo el initiator controla qué calls se ejecutan
+      - Un atacante externo necesitaría front-run, no insertar entre calls
+      - El slippage check post-operación protege contra front-running si se configura bien
+      - La donación beneficiaría al usuario (más assets por share), no lo perjudicaría
+    conclusion: |
+      No es un bug. El slippage check post-operación con valores reales es la
+      defensa correcta. El usuario debe configurar maxSharePriceE27/minSharePriceE27
+      adecuadamente para protegerse de front-running.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H4: stakeEth — transferencia de stETH usa amount, no sharesReceived
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-04
+    title: "stakeEth: transfiere `amount` de stETH en vez de balance real recibido"
+    severity_proposed: Medium
+    confidence: 65
+    tier: 1
+    category: accounting-mismatch
+    status: unverified
+    contracts:
+      - EthereumGeneralAdapter1.sol (líneas 104-116)
+    description: |
+      En stakeEth():
+      ```
+      uint256 sharesReceived = IStEth(ST_ETH).submit{value: amount}(referral);  // línea 112
+      require(amount.rDivUp(sharesReceived) <= maxSharePriceE27, ...);           // línea 113
+      if (receiver != address(this)) SafeERC20.safeTransfer(IERC20(ST_ETH), receiver, amount); // línea 115
+      ```
+
+      Lido stETH es un token rebasing. submit() retorna SHARES, no stETH balance.
+      La función transfiere `amount` (la cantidad de ETH enviada) como stETH.
+
+      En Lido, 1 ETH staked ≈ 1 stETH (por diseño del rebase). Pero hay edge cases:
+      - stETH tiene un "1-2 wei" rounding issue conocido (transferencias pueden perder 1 wei)
+      - En condiciones normales amount == stETH recibido (±1 wei)
+
+      El slippage check usa sharesReceived correctamente: verifica que no se paguen
+      demasiados wei por share. Esto protege contra manipulación del share rate.
+
+      ISSUE POTENCIAL: Si por alguna razón el adapter no recibe exactamente `amount`
+      de stETH (rounding de Lido), el safeTransfer podría revertir por insufficient
+      balance. Esto causaría DoS, no pérdida de fondos.
+
+      Pero esto es un edge case conocido de stETH — la diferencia es máximo 1-2 wei.
+      El protocolo probablemente lo acepta como comportamiento conocido.
+    attack_scenario: |
+      1. Usuario llama stakeEth(1 ether, maxPrice, referral, receiver)
+      2. Lido submit() retorna shares, adapter recibe 1 ether - 1 wei de stETH (rounding)
+      3. safeTransfer(receiver, 1 ether) — intenta transferir 1 wei más de lo que tiene
+      4. Revert → DoS del bundle completo
+    why_it_might_not_work: |
+      - Lido submit() en la práctica da exactamente `amount` de stETH (balance rebasing)
+      - El 1-wei issue de stETH es en TRANSFERENCIAS, no en submit()
+      - submit(msg.value) acredita msg.value de stETH balance al caller siempre
+      - Solo sería un issue si el share rate diverge significativamente de 1:1
+    next_steps:
+      - Verificar on-chain si IStEth.submit() siempre acredita exactamente msg.value de stETH balance
+      - Verificar si el rounding issue de stETH aplica a submit() o solo a transfers
+      - Buscar tests existentes que cubran este caso
+
+  # ─────────────────────────────────────────────────────────────────
+  # H5: Sandwich del multicall completo — slippage params del usuario
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-05
+    title: "Front-running del bundle: slippage protection depende 100% de los params del usuario"
+    severity_proposed: Informational
+    confidence: 90
+    tier: 2
+    category: mev-exposure
+    status: verified_by_design
+    contracts:
+      - Bundler3.sol
+      - GeneralAdapter1.sol
+      - ParaswapAdapter.sol
+    description: |
+      Bundler3 NO tiene protección global contra MEV. La protección es per-call:
+      cada operación individual (deposit, borrow, swap) tiene su propio slippage param.
+
+      Un MEV bot puede:
+      1. Ver el bundle en el mempool
+      2. Front-run con una tx que mueva precios (en AMM, oracle, vault share price)
+      3. El bundle se ejecuta con precios peores (pero dentro del slippage permitido)
+      4. Back-run para capturar la diferencia
+
+      Esto es BY DESIGN — Bundler3 delega la protección al usuario vía parámetros.
+      Si el usuario pone maxSharePriceE27 = type(uint256).max, pierde toda protección.
+
+      No es un bug — es el modelo de seguridad estándar de multicall/bundler.
+    why_it_might_not_work: |
+      - Es comportamiento by-design, no un bug
+      - El usuario tiene las herramientas para protegerse (slippage params)
+      - Frontends/SDKs deben calcular slippage params razonables
+    conclusion: |
+      Informational. El diseño es correcto. La responsabilidad de slippage
+      la tiene el usuario/frontend. Morpho no puede proteger contra un usuario
+      que pone slippage infinito.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H6: MathRayLib overflow en rDivUp con valores extremos
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-06
+    title: "MathRayLib.rDivUp: overflow si x > type(uint256).max / 1e27"
+    severity_proposed: Low
+    confidence: 70
+    tier: 1
+    category: math-overflow
+    status: unverified
+    contracts:
+      - MathRayLib.sol (líneas 10-17)
+    description: |
+      rDivUp(x, y) = (x * RAY + (y - 1)) / y, donde RAY = 1e27.
+
+      La multiplicación x * RAY hace overflow si x > type(uint256).max / 1e27.
+      type(uint256).max / 1e27 ≈ 1.157e50
+
+      En Solidity 0.8.28, esto causa un revert (checked arithmetic), no un wrap-around.
+      Esto es un DoS, no una pérdida de fondos.
+
+      ¿Puede x ser tan grande? En el contexto de uso:
+      - erc4626Mint: assets.rDivUp(shares) — assets son tokens, usualmente < 1e30
+      - morphoSupply: suppliedAssets.rDivUp(suppliedShares) — similar
+      - stakeEth: amount.rDivUp(sharesReceived) — ETH en wei, < 1e30 para valores reales
+
+      Para tokens de 18 decimales, 1e50 = 1e32 tokens. Nadie tiene esa cantidad.
+      Para tokens de 0 decimales (raros), 1e50 sería más alcanzable pero aún enorme.
+
+      Solidity 0.8 protege contra overflow silencioso. El peor caso es un revert,
+      que bloquea la operación pero no pierde fondos.
+    attack_scenario: |
+      1. Token con 0 decimales y supply > 1e50
+      2. Un deposit/supply con amount > 1e50
+      3. rDivUp(amount, shares) reverts por overflow
+      4. El bundle entero falla — DoS
+    why_it_might_not_work: |
+      - No existen tokens con supply > 1e50 en la práctica
+      - Solidity 0.8 checked arithmetic previene corruption — solo causa revert
+      - Es un DoS auto-infligido (el usuario tendría que tener ese balance)
+    conclusion: |
+      Low/Informational. El overflow causa revert (DoS), no pérdida de fondos.
+      Los valores requeridos para triggerear son astronómicos para cualquier
+      token razonable. No reportable.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H7: ParaswapAdapter.swap() — forceApprove max antes de llamar Augustus
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-07
+    title: "ParaswapAdapter: forceApprove(max) a Augustus podría ser explotado si Augustus es malicioso"
+    severity_proposed: Low
+    confidence: 20
+    tier: 2
+    category: trust-boundary
+    status: unverified
+    contracts:
+      - ParaswapAdapter.sol (líneas 181-186)
+    description: |
+      swap() hace:
+      ```
+      SafeERC20.forceApprove(IERC20(srcToken), augustus, type(uint256).max);  // línea 181
+      (bool success, ...) = augustus.call(callData);                            // línea 183
+      SafeERC20.forceApprove(IERC20(srcToken), augustus, 0);                   // línea 186
+      ```
+
+      Durante la ejecución de augustus.call(), Augustus tiene allowance infinito
+      sobre srcToken del adapter.
+
+      Si Augustus fuera malicioso (o comprometido), podría:
+      1. Transferir todo el srcToken del adapter (no solo maxSrcAmount)
+      2. Pero el check posterior (srcAmount <= maxSrcAmount) revertería el tx
+
+      ESPERA — el check es post-call. Si Augustus hace un call externo durante
+      su ejecución que modifique el estado, ¿podría evitar el check?
+
+      No. Porque:
+      - srcInitial se captura ANTES del call (línea 178)
+      - srcFinal se captura DESPUÉS del call (línea 188)
+      - srcAmount = srcInitial - srcFinal
+      - Si Augustus toma más de maxSrcAmount, el tx reverts
+
+      La aprobación se resetea a 0 después (línea 186), así que no queda persistente.
+
+      El riesgo solo existe si Augustus puede causar un revert selectivo que
+      skipee la línea 186 pero no la 183. Pero eso es imposible — si el call
+      reverts, se propaga por lowLevelRevert (línea 184).
+
+      La validación AUGUSTUS_REGISTRY.isValidAugustus(augustus) (línea 174) es la
+      defensa principal. Si el registry es comprometido, todo se rompe.
+    attack_scenario: |
+      1. Augustus registry es comprometido (governance attack en Paraswap)
+      2. Se registra un Augustus malicioso
+      3. Usuario (o atacante que construye bundle para víctima) usa Augustus malicioso
+      4. Augustus toma srcToken del adapter durante la ejecución
+      5. Pero srcAmount check revierte si toma más de lo esperado
+    why_it_might_not_work: |
+      - Augustus registry es trust boundary explícita del diseño
+      - Los checks before/after de balance son sólidos
+      - La aprobación se resetea a 0 después
+      - Si el usuario construye su propio bundle, controla qué Augustus usa
+    conclusion: |
+      La confianza en Augustus Registry es by-design. Si el registry es
+      comprometido, es un problema de Paraswap, no de Morpho Bundler3.
+      Los checks de balance before/after mitigan bien el riesgo residual.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H8: Cross-call price inconsistency en multicall
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-08
+    title: "Multicall: precio puede cambiar entre calls si una call tiene callback externo"
+    severity_proposed: Medium
+    confidence: 35
+    tier: 1
+    category: cross-call-consistency
+    status: unverified
+    contracts:
+      - Bundler3.sol (líneas 54-68)
+      - GeneralAdapter1.sol (callbacks líneas 145-165)
+    description: |
+      Bundler3._multicall() ejecuta calls secuencialmente. Si una call tiene
+      callbackHash != 0, se permite reentrada via reenter().
+
+      Escenario: Un bundle con [morphoSupply(data=callback), erc4626Deposit].
+      Durante morphoSupply, Morpho llama onMorphoSupply, que reentra al bundler.
+      El callback podría ejecutar calls que modifiquen el estado de un vault ERC4626.
+      Luego, erc4626Deposit se ejecuta con un share price diferente al esperado.
+
+      PERO: el callback es controlado por el usuario (data del callback es parte
+      del bundle original). El usuario sabe qué calls ejecutará el callback.
+
+      El riesgo es si el callback invoca un contrato externo que tiene side effects
+      no anticipados. Por ejemplo, si el callback llama a un AMM que modifica un
+      oracle que un vault usa para su share price.
+
+      Este es un riesgo teórico de composabilidad, no un bug del bundler.
+      El bundler no puede (ni debe) proteger contra todas las interacciones
+      posibles entre protocolos.
+    attack_scenario: |
+      1. Víctima construye bundle: [morphoSupply con callback, erc4626Deposit en vault V]
+      2. El callback ejecuta un swap en un AMM que el vault V usa como oracle
+      3. El share price de V cambia entre el callback y erc4626Deposit
+      4. La víctima deposita a un precio peor
+      5. Pero maxSharePriceE27 debería proteger contra esto
+    why_it_might_not_work: |
+      - El usuario controla completamente el callback
+      - maxSharePriceE27 protege contra precio peor en el deposit
+      - El usuario que construye un bundle con callbacks sabe qué efectos tendrán
+      - No hay un tercero que pueda inyectar callbacks maliciosos
+    conclusion: |
+      Riesgo de composabilidad genérico, no un bug específico. Los slippage
+      params per-call son la defensa correcta. Si el usuario pone slippage
+      adecuado, está protegido incluso con callbacks intermedios.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H9: rDivDown vs rDivUp — dirección de redondeo en slippage checks
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-09
+    title: "Slippage checks: ¿dirección de redondeo siempre favorece al protocolo?"
+    severity_proposed: Low
+    confidence: 50
+    tier: 1
+    category: rounding-direction
+    status: unverified
+    contracts:
+      - GeneralAdapter1.sol
+      - MathRayLib.sol
+    description: |
+      Análisis de dirección de redondeo en cada slippage check:
+
+      OPERACIONES DONDE EL USUARIO PAGA (maxSharePriceE27 = precio máximo a pagar):
+      - erc4626Mint: assets.rDivUp(shares) <= maxSharePriceE27
+        → rDivUp: redondea el precio UP → más estricto para el usuario → CORRECTO
+      - erc4626Deposit: assets.rDivUp(shares) <= maxSharePriceE27
+        → rDivUp: igual → CORRECTO
+      - morphoSupply: suppliedAssets.rDivUp(suppliedShares) <= maxSharePriceE27
+        → rDivUp: igual → CORRECTO
+      - morphoRepay: repaidAssets.rDivUp(repaidShares) <= maxSharePriceE27
+        → rDivUp: igual → CORRECTO
+      - stakeEth: amount.rDivUp(sharesReceived) <= maxSharePriceE27
+        → rDivUp: igual → CORRECTO
+
+      OPERACIONES DONDE EL USUARIO RECIBE (minSharePriceE27 = precio mínimo a recibir):
+      - erc4626Withdraw: assets.rDivDown(shares) >= minSharePriceE27
+        → rDivDown: redondea el precio DOWN → más estricto para el usuario → CORRECTO
+      - erc4626Redeem: assets.rDivDown(shares) >= minSharePriceE27
+        → rDivDown: igual → CORRECTO
+      - morphoBorrow: borrowedAssets.rDivDown(borrowedShares) >= minSharePriceE27
+        → rDivDown: igual → CORRECTO
+      - morphoWithdraw: withdrawnAssets.rDivDown(withdrawnShares) >= minSharePriceE27
+        → rDivDown: igual → CORRECTO
+
+      CONCLUSIÓN: Todas las direcciones de redondeo son CORRECTAS.
+      Cuando el usuario paga, rDivUp sobreestima el precio → check más estricto.
+      Cuando el usuario recibe, rDivDown subestima el precio → check más estricto.
+      El usuario siempre está protegido por el lado conservador.
+    conclusion: |
+      No hay bug. La dirección de redondeo es correcta en todos los casos.
+      El diseño es sólido.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H10: updateAmounts — division by zero si oldExactAmount es 0
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-10
+    title: "ParaswapAdapter.updateAmounts: division by zero si oldExactAmount es 0"
+    severity_proposed: Low
+    confidence: 60
+    tier: 1
+    category: math-edge-case
+    status: unverified
+    contracts:
+      - ParaswapAdapter.sol (líneas 205-219)
+    description: |
+      updateAmounts() lee oldExactAmount del callData:
+      ```
+      uint256 oldExactAmount = callData.get(offsets.exactAmount);  // línea 209
+      ...
+      uint256 limitAmount = callData.get(offsets.limitAmount).mulDiv(exactAmount, oldExactAmount, rounding);  // línea 212
+      ```
+
+      Si oldExactAmount == 0, mulDiv divide por cero → revert.
+
+      ¿Puede oldExactAmount ser 0?
+      - sell() con sellEntireBalance=true: llama updateAmounts con newSrcAmount = balance.
+        oldExactAmount se lee del callData original. Si el callData original tiene 0
+        como exactAmount, division by zero.
+      - buy() con newDestAmount != 0: similar, oldExactAmount del callData original.
+
+      En la práctica, un callData con exactAmount=0 no tendría sentido para un swap.
+      Augustus revertería de todas formas. Pero el revert ocurre en updateAmounts,
+      no en Augustus — el error podría ser confuso para el usuario.
+
+      Es un DoS auto-infligido (callData mal formado), no una vulnerabilidad explotable.
+    attack_scenario: |
+      1. Usuario crea callData con exactAmount = 0 en el campo indicado por offsets
+      2. Llama sell(sellEntireBalance=true) o buy(newDestAmount != 0)
+      3. updateAmounts reverts por division by zero
+      4. Bundle falla — DoS del usuario
+    why_it_might_not_work: |
+      - El usuario controla el callData — se atacaría a sí mismo
+      - Un callData con exactAmount=0 es inválido para cualquier swap
+      - Es un input validation issue menor, no un bug de seguridad
+    conclusion: |
+      Informational. Un require(oldExactAmount != 0) sería más limpio
+      pero no hay impacto de seguridad. El usuario que pasa callData
+      mal formado solo se bloquea a sí mismo.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H11: Lido share rate manipulation via beacon chain
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-11
+    title: "stakeEth: Lido share rate NO es manipulable por atacante en el mismo bloque"
+    severity_proposed: Informational
+    confidence: 85
+    tier: 2
+    category: oracle-manipulation
+    status: verified_not_vulnerable
+    contracts:
+      - EthereumGeneralAdapter1.sol (líneas 104-116)
+    description: |
+      Lido's share rate (stETH/share) cambia solo cuando Lido's oracle reporta
+      rewards/slashing del beacon chain. Esto ocurre una vez al día y es controlado
+      por un quorum de oracles.
+
+      Un atacante NO puede:
+      - Manipular el share rate de Lido con un flash loan
+      - Cambiar el share rate dentro de un bloque
+      - Influenciar el oracle report de Lido
+
+      El maxSharePriceE27 check en stakeEth protege contra:
+      - Oracle reports que cambien el rate justo antes del tx del usuario
+      - Slashing events que devalúen stETH
+
+      La protección es adecuada.
+    conclusion: |
+      No vulnerable. El share rate de Lido es robusto contra manipulación
+      intra-bloque. El slippage check es suficiente.
+
+  # ─────────────────────────────────────────────────────────────────
+  # H12: sell() — srcToken == destToken permite auto-swap accounting bypass
+  # ─────────────────────────────────────────────────────────────────
+  - id: H-ORACLE-12
+    title: "ParaswapAdapter.swap: si srcToken == destToken, el accounting de balance se rompe"
+    severity_proposed: Medium
+    confidence: 55
+    tier: 1
+    category: accounting-mismatch
+    status: unverified
+    contracts:
+      - ParaswapAdapter.sol (líneas 165-200)
+    description: |
+      swap() calcula:
+      ```
+      uint256 srcInitial = IERC20(srcToken).balanceOf(address(this));   // línea 178
+      uint256 destInitial = IERC20(destToken).balanceOf(address(this)); // línea 179
+      // ... call to Augustus ...
+      uint256 srcFinal = IERC20(srcToken).balanceOf(address(this));     // línea 188
+      uint256 destFinal = IERC20(destToken).balanceOf(address(this));   // línea 189
+
+      uint256 srcAmount = srcInitial - srcFinal;                        // línea 191
+      uint256 destAmount = destFinal - destInitial;                     // línea 192
+      ```
+
+      Si srcToken == destToken:
+      - srcInitial == destInitial (mismo balance)
+      - srcFinal == destFinal (mismo balance)
+      - srcAmount = srcInitial - srcFinal
+      - destAmount = srcFinal - srcInitial (= -srcAmount si srcFinal < srcInitial)
+
+      Caso 1: Augustus "swap" resulta en pérdida neta (balance final < inicial):
+      - srcAmount = initial - final > 0 (positivo)
+      - destAmount = final - initial < 0 → underflow → revert (Solidity 0.8)
+
+      Caso 2: Augustus "swap" resulta en ganancia neta (balance final > inicial):
+      - srcAmount = initial - final → underflow → revert
+
+      Caso 3: Balance no cambia:
+      - srcAmount = 0, destAmount = 0
+      - require(destAmount >= minDestAmount) con minDestAmount != 0 → revert
+
+      En TODOS los casos, si srcToken == destToken, la función reverts.
+      Esto es un DoS auto-infligido (¿quién haría un swap de un token consigo mismo?).
+
+      PERO: ¿hay un escenario donde Augustus pueda hacer algo útil con
+      srcToken == destToken? Sí — un "swap" que en realidad es una
+      operación de routing compleja que pasa por varios pools y vuelve
+      al mismo token con profit (arbitrage loop). Pero esto fallaría
+      con el accounting de balance descrito arriba.
+    attack_scenario: |
+      1. Usuario intenta arb loop: USDC → WETH → DAI → USDC via Augustus
+      2. srcToken = USDC, destToken = USDC
+      3. Augustus ejecuta el loop exitosamente, adapter tiene más USDC
+      4. srcAmount = initial - final → underflow → revert (porque final > initial)
+      5. El usuario no puede ejecutar arb loops via Bundler3
+    why_it_might_not_work: |
+      - Nadie haría srcToken == destToken intencionalmente para un swap
+      - Augustus probablemente no soporta este caso tampoco
+      - Es un DoS del usuario, no una pérdida de fondos
+      - No hay un tercero que pueda forzar srcToken == destToken
+    conclusion: |
+      Edge case que causa DoS auto-infligido. No es explotable por terceros.
+      Podría merecer un require(srcToken != destToken) para mejor UX,
+      pero no es una vulnerabilidad de seguridad. Informational como máximo.
+
+# ═══════════════════════════════════════════════════════════════════
+# RESUMEN DE FINDINGS
+# ═══════════════════════════════════════════════════════════════════
+summary:
+  total_hypotheses: 12
+  tier_1_actionable: 5  # H2, H4, H6, H9, H10, H12
+  tier_2_theoretical: 5  # H1, H3, H5, H7, H8, H11
+
+  verified_not_vulnerable:
+    - H9 (rounding direction — correcto en todos los casos)
+    - H11 (Lido rate — no manipulable)
+
+  most_promising:
+    - id: H-ORACLE-04
+      reason: "stakeEth transfiere `amount` en vez de balance real de stETH. Si Lido submit() no acredita exactamente msg.value (rounding de rebasing), safeTransfer podría revertir. Necesita verificación on-chain."
+      next_action: "Fork mainnet, llamar stakeEth con valores donde el rounding de stETH sea > 0, verificar si reverts"
+
+    - id: H-ORACLE-12
+      reason: "srcToken == destToken causa underflow en balance accounting. Es un DoS, no pérdida de fondos, pero podría afectar arb routing."
+      next_action: "Verificar si hay escenarios legítimos donde srcToken == destToken"
+
+  honest_assessment: |
+    El diseño de slippage protection de Bundler3 es sólido. Cada operación
+    tiene su propio check post-ejecución con valores reales (no estimados).
+    Las direcciones de redondeo son correctas en todos los casos.
+
+    No encontré una vulnerabilidad de pérdida directa de fondos. Los findings
+    más prometedores son:
+    - H-ORACLE-04 (stETH rounding DoS) — Low/Medium si se confirma
+    - H-ORACLE-12 (srcToken==destToken DoS) — Informational
+
+    Los vectores de manipulación de precios (donation attacks, sandwich,
+    oracle manipulation) están mitigados por los slippage params per-call.
+
+    El principal riesgo residual es que el USUARIO configure slippage
+    params demasiado permisivos — pero eso es by design, no un bug.

@@ -1,0 +1,550 @@
+protocol: pancakeswap-infinity
+component: BinPoolManager
+file: src/pool-bin/BinPoolManager.sol
+domain: dex
+hunter: MathHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: BPM-M01
+  tier: 1
+  type: property
+  description: >
+    Round-trip mint->burn must never be profitable. Depositing tokens into any bin
+    and immediately burning all received shares must return <= deposited amounts for
+    BOTH token0 and token1. The share calculation in getSharesAndEffectiveAmountsIn
+    uses mulDivRoundDown for shares, and getAmountOutOfBin also uses mulDivRoundDown
+    for output. Both round down (favor pool). BUT: in the active bin, the composition
+    fee branch (BinPool.sol:447-469) recalculates shares with a DIFFERENT formula:
+    userLiquidity.mulDivRoundDown(supply, binLiquidity) where binLiquidity already
+    includes the fee accrued to existing LPs. If the composition fee rounds to 0
+    (dust amounts with low-decimal tokens), shares are minted as if no fee was charged,
+    and the attacker burns for proportional reserves that include the "fee" tokens.
+  attack_scenario: >
+    1. Pool has active bin with existing reserves (e.g., USDC/WETH).
+    2. Attacker deposits into active bin with ratio slightly different from current bin.
+    3. Composition fee computed via getCompositionFee: amtSwapped * totalFee * (totalFee + 1e18) / 1e36.
+    4. With feeBips=100 (0.01%), totalFee=1e14. For amtSwapped < 1e4 (e.g., 9999 USDC units = 0.009999 USDC),
+       fee = 9999 * 1e14 * (1e14 + 1e18) / 1e36 = 9999 * 1e14 / 1e18 approx = 0.9999 -> truncates to 0.
+    5. No fee deducted. Shares minted at full value. Attacker burns and receives proportional reserves.
+    6. Repeat N times. Each iteration the attacker's deposit changes the bin ratio slightly,
+       and the fee should charge for this implicit swap but doesn't (truncated to 0).
+    Amplification: with 6-decimal tokens, amounts < 10000 units produce 0 composition fee at min fee.
+  impact: "LP value extraction via zero-fee composition on dust amounts, amplified by repetition"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track tokens before/after a mint+burn cycle for the same user and bin
+    lte(ghost_withdrawnX, ghost_depositedX, "BPM-M01: X profit on round-trip");
+    lte(ghost_withdrawnY, ghost_depositedY, "BPM-M01: Y profit on round-trip");
+  ghost_vars:
+    - uint128 internal ghost_depositedX;
+    - uint128 internal ghost_depositedY;
+    - uint128 internal ghost_withdrawnX;
+    - uint128 internal ghost_withdrawnY;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    getCompositionFee formula: amountWithFees * totalFee * (totalFee + PRECISION) / SQUARED_PRECISION.
+    With feeBips=100 and amountWithFees=9999 (6-dec token dust), totalFee=1e14.
+    Result = 9999 * 1e14 * 1.0001e18 / 1e36 ~ 9999 * 1e14 / 1e18 ~ 0.9999 -> 0.
+    Fee truncates to 0 for implicit swap amounts below ~10000 units at min fee.
+    The round-trip profit per iteration is bounded by this truncated fee amount.
+    Gas cost likely exceeds profit per iteration, but on L2s (Base, BNB Chain) gas is cheap.
+
+- id: BPM-M02
+  tier: 1
+  type: property
+  description: >
+    Composition fee is structurally less than swap fee at ALL fee levels.
+    getCompositionFee = amt * f * (f + P) / P^2 where f = feeBips * 1e12, P = 1e18.
+    Equivalent swap fee via getFeeAmount = amt * f / (P - f).
+    Ratio: composition/swap = (f + P)(P - f) / P^2 = 1 - (f/P)^2.
+    Since f > 0 always, this ratio is ALWAYS < 1. The composition fee is ALWAYS cheaper
+    than a direct swap. This enables fee arbitrage: implicit swap via mint/burn pays less
+    than a direct swap. At max fee (10%, f=1e17): ratio = 0.99, composition is 1% cheaper.
+  attack_scenario: >
+    Attacker identifies a pool with high LP fee (approaching 10% max).
+    Instead of swapping X->Y directly (paying swap fee), attacker mints into active bin
+    with all X and no Y, triggering composition fee on the Y component.
+    Then immediately burns all shares to receive both X and Y.
+    Net cost = composition fee < swap fee. Profit = swap fee - composition fee.
+    For 1000 USDC implicitly swapped at 10% fee:
+    Swap fee = amt * 1e17 / (1e18 - 1e17) = 1000 * 1e17 / 9e17 = 111.11 USDC.
+    Composition fee = 1000 * 1e17 * 1.1e18 / 1e36 = 110 USDC.
+    Profit = 1.11 USDC per operation.
+    Must account for MINIMUM_SHARE lockup cost and gas. On existing bins (not first deposit),
+    no MINIMUM_SHARE cost. Gas on L2s is negligible.
+  impact: "Fee arbitrage via mint/burn at high-fee pools — LP value extraction."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a mint into active bin with composition fee:
+    // Compare composition fee paid vs what a swap would have cost
+    if (ghost_compositionFeeAmt > 0 && ghost_swapFeeBips > 0) {
+        uint256 totalFee = uint256(ghost_swapFeeBips) * 1e12;
+        uint256 equivalentSwapFee = (uint256(ghost_implicitSwapAmt) * totalFee +
+            (1e18 - totalFee) - 1) / (1e18 - totalFee);
+        gte(ghost_compositionFeeAmt, equivalentSwapFee,
+            "BPM-M02: composition fee < swap fee — arbitrage via mint");
+    }
+  ghost_vars:
+    - uint128 internal ghost_compositionFeeAmt;
+    - uint128 internal ghost_implicitSwapAmt;
+    - uint24 internal ghost_swapFeeBips;
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    MATHEMATICALLY PROVEN: composition/swap ratio = 1 - (f/P)^2 < 1 for all f > 0.
+    This is not a rounding issue — it's a formula design issue. The quadratic composition
+    fee formula structurally undercharges relative to the swap fee. At low fees (0.01%),
+    the difference is negligible (~0.0001%). At high fees (10%), it's ~1%.
+    This was likely accepted as a tradeoff in the Trader Joe v2 design, but may not have
+    been explicitly acknowledged. Prior audits (Zellic, OtterSec, Hexens, Cyfrin) may have
+    noted this as by-design, but it's worth verifying.
+
+- id: BPM-M03
+  tier: 1
+  type: property
+  description: >
+    Share price monotonicity after swaps: the value-per-share (liquidity/totalShares)
+    of any bin must never decrease due to swap operations. Swaps add net positive value
+    to reserves (fee stays in bin after protocol fee deduction). The rounding directions
+    are: exactIn output rounds DOWN (less out = good for LPs), exactOut input rounds UP
+    (more in = good for LPs). Protocol fee rounds DOWN via getProtocolFeeAmt (less taken
+    from LP = good for LPs). All directions favor the pool. But verify that the COMBINATION
+    at extreme values (1-wei swaps, max-price bins) doesn't produce a net decrease.
+  attack_scenario: >
+    If share price decreases after a swap, an attacker can sandwich:
+    1. Mint into bin before a swap that decreases share price.
+    2. After swap, share price is lower.
+    3. Wait for next swap that restores/increases share price.
+    4. Burn for profit.
+    More realistically: at very small reserve amounts with high binStep, price precision
+    loss in getPriceFromId combined with mulShiftRoundDown could produce amountOut
+    slightly higher than theoretical, decreasing reserves-per-share by dust.
+    Over thousands of swaps this could accumulate.
+  impact: "LP share value dilution through accumulated rounding in swap output"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For each bin, track liquidity/shares ratio after every swap
+    bytes32 binReserves = pool.reserveOfBin[binId];
+    uint256 supply = pool.shareOfBin[binId];
+    if (supply > 0 && binReserves != bytes32(0)) {
+        uint256 price = uint24(binId).getPriceFromId(binStep);
+        uint256 currentLiquidity = binReserves.getLiquidity(price);
+        uint256 liquidityPerShare = currentLiquidity / supply;
+        gte(liquidityPerShare, ghost_lastLiqPerShare[binId],
+            "BPM-M03: share price decreased after swap");
+        ghost_lastLiqPerShare[binId] = liquidityPerShare;
+    }
+  ghost_vars:
+    - mapping(uint24 => uint256) internal ghost_lastLiqPerShare;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Rounding analysis:
+    - getAmountsOut: amountOut = (amountIn-fee) * price >> 128 rounds DOWN -> good for LP
+    - getAmountsIn: amountIn = amountOut << 128 / price rounds UP -> good for LP
+    - getFeeAmountFrom: rounds UP -> more fee -> good for LP
+    - getFeeAmount: rounds UP -> more fee -> good for LP
+    - getProtocolFeeAmt: rounds DOWN -> less protocol fee -> good for LP
+    All directions favor pool, so this SHOULD hold. But integer division edge cases
+    with 1-wei values need fuzzing verification.
+
+- id: BPM-M04
+  tier: 1
+  type: property
+  description: >
+    getCompositionFeesAmount underflow risk: at BinHelper.sol:197, if receivedAmountX > amountX,
+    the code computes amtSwapped = amountY - receivedAmountY. This assumes that if you
+    receive more X than deposited, you must receive less Y. But getAmountOutOfBin uses
+    mulDivRoundDown for BOTH X and Y independently. In theory, rounding could make BOTH
+    receivedAmountX >= amountX AND receivedAmountY >= amountY simultaneously for specific
+    (shares, totalSupply, reserves) values. If receivedAmountY > amountY here, the
+    subtraction underflows and reverts — DoS on minting into that bin.
+    The opposite case (BinHelper.sol:203, amountX - receivedAmountX) has the same risk.
+  attack_scenario: >
+    1. An attacker finds specific bin state (reserves, supply) where getAmountOutOfBin
+       returns both receivedX >= inputX and receivedY >= inputY for certain share amounts.
+    2. Any user trying to mint into the active bin with a ratio that triggers composition
+       fee will have their transaction revert.
+    3. This creates a permanent DoS on the active bin for composition-fee mints.
+    4. The attacker can manipulate the bin state to trigger this (via precise deposits/withdrawals).
+    More subtly: even if the underflow doesn't occur, if amtSwapped = 0 (receivedAmountY == amountY
+    exactly), then compositionFee = getCompositionFee(0, fee) = 0, bypassing the fee entirely.
+  impact: "DoS on active bin minting or composition fee bypass via zero amtSwapped"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For any active bin mint that triggers composition fees:
+    // verify getCompositionFeesAmount doesn't revert unexpectedly
+    // by checking that at most one of (recX > inX, recY > inY) is true
+    bytes32 newRes = binReserves.add(amountsIn);
+    uint256 newSupply = totalSupply + shares;
+    (uint128 recX, uint128 recY) = BinHelper.getAmountOutOfBin(newRes, shares, newSupply).decode();
+    (uint128 inX, uint128 inY) = amountsIn.decode();
+    bool bothGreater = (recX > inX) && (recY > inY);
+    t(!bothGreater, "BPM-M04: both dimensions rounded up — composition fee will revert");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    getAmountOutOfBin uses mulDivRoundDown for both X and Y. Since it rounds DOWN,
+    receivedAmount <= proportional share in theory. But the proportional share is
+    shares/(totalSupply+shares) * (reserves+deposit), and the user's deposit IS included
+    in the numerator. So received can be >= deposited if the user's share represents a
+    large fraction. Actually for the first depositor in an empty bin, shares/supply=1
+    and received = reserves + deposit exactly. But the active bin path already has reserves.
+    Need concrete counterexamples.
+
+- id: BPM-M05
+  tier: 1
+  type: property
+  description: >
+    First depositor protection: MINIMUM_SHARE = 1e3 is locked on first deposit to a new bin.
+    With 6-decimal tokens (USDC), 1e3 shares represent ~0.001 USDC of locked liquidity.
+    To inflate the share price by N, an attacker needs to donate N * 0.001 USDC worth.
+    But donate() has minBinShareForDonate = 2^128 (default), which requires an astronomically
+    large share supply before donation is allowed. HOWEVER: swap fees accumulate in the bin
+    without the minBinShareForDonate check. An attacker could inflate bin reserves through
+    many swaps that route through the target bin, with each swap's LP fee staying in the bin.
+    After MINIMUM_SHARE worth of reserve inflation, subsequent depositors get 0 shares.
+  attack_scenario: >
+    1. Attacker is first depositor in a new bin, deposits tiny amount -> gets shares - 1e3.
+    2. donate() is blocked by minBinShareForDonate.
+    3. BUT: attacker performs many swaps through this bin. Each swap leaves LP fee in reserves.
+    4. After enough swaps, bin reserves are inflated while totalSupply is still small.
+    5. Victim deposits $10 into the bin. shares = victimLiquidity * supply / binLiquidity.
+       If binLiquidity is much larger than victimLiquidity * supply, shares round to 0.
+    6. revert BinPool__ZeroShares.
+    Cost: attacker pays swap fees on each swap (fee goes to the bin = attacker's bin).
+    So the attacker is paying themselves via swap fees — net cost is only the protocol fee
+    portion + gas. On L2 with 0 protocol fee, cost is only gas.
+  impact: "Share inflation attack via swap fee accumulation, bypassing donate() protection"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any user deposits into a bin: verify they got > 0 shares
+    // (the contract reverts on 0 shares, so this tests that deposits don't revert unexpectedly)
+    // Track share price inflation ratio
+    uint256 supply = pool.shareOfBin[binId];
+    bytes32 binRes = pool.reserveOfBin[binId];
+    uint256 price = uint24(binId).getPriceFromId(binStep);
+    uint256 liq = binRes.getLiquidity(price);
+    if (supply > 0 && supply <= 2000) { // near MINIMUM_SHARE
+        // Share price should not be inflated more than 1e6x (1M)
+        uint256 liqPerShare = liq / supply;
+        lte(liqPerShare, 1e6, "BPM-M05: share price inflated >1Mx in low-supply bin");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    The minBinShareForDonate = 2^128 protects against donate()-based inflation.
+    But swap fee accumulation is not gated. The question is: how many swaps and how much
+    capital is needed to inflate reserves significantly? With 0.01% fee and $1M per swap,
+    each swap adds $100 to reserves. 10000 swaps adds $1M. At supply=1e3, this creates
+    liqPerShare = $1M/1e3 = $1000 per share. A $1 deposit would get 0 shares.
+    But 10000 swaps on L2 costs ~$1-10 in gas. Protocol fee (if any) is the main cost.
+    Need to verify if swapping through a specific bin is controllable by the attacker.
+
+- id: BPM-M06
+  tier: 1
+  type: property
+  description: >
+    Swap conservation: for every swap, the token conservation equation must hold.
+    total_reserves_after + protocol_fee_accrued + tokens_out_to_user
+    == total_reserves_before + tokens_in_from_user.
+    This must hold PER TOKEN across all bins traversed in a single swap.
+    The swap loop updates reserves per bin (line 176) and accumulates protocol fee (line 172).
+    The final delta represents tokens in/out from the user's perspective.
+  attack_scenario: >
+    In exactOutput mode across multiple bins, each bin's amountIn is computed with roundUp
+    independently. The total amountIn = sum of per-bin roundUps, which could be larger than
+    a single roundUp on the total. This means the user pays more than necessary — not an attack
+    vector but an LP windfall. The converse (user pays less) would be a bug. Check: can any
+    rounding combination in the swap loop cause the user to pay less than the theoretical
+    exact amount? getAmountsOut rounds output DOWN (user gets less), getAmountsIn rounds
+    input UP (user pays more). Both favor pool. So conservation should hold with pool >= 0.
+  impact: "Pool leaks value per swap via accumulated rounding at bin boundaries"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After swap: verify conservation
+    // reservesAfter + protocolFee + amountOut == reservesBefore + amountIn
+    uint128 expectedResX = ghost_preSwapResX + ghost_swapInX - ghost_protocolFeeX - ghost_swapOutX;
+    eq(ghost_postSwapResX, expectedResX, "BPM-M06: swap conservation X violated");
+    uint128 expectedResY = ghost_preSwapResY + ghost_swapInY - ghost_protocolFeeY - ghost_swapOutY;
+    eq(ghost_postSwapResY, expectedResY, "BPM-M06: swap conservation Y violated");
+  ghost_vars:
+    - uint128 internal ghost_preSwapResX;
+    - uint128 internal ghost_preSwapResY;
+    - uint128 internal ghost_postSwapResX;
+    - uint128 internal ghost_postSwapResY;
+    - uint128 internal ghost_swapInX;
+    - uint128 internal ghost_swapInY;
+    - uint128 internal ghost_swapOutX;
+    - uint128 internal ghost_swapOutY;
+    - uint128 internal ghost_protocolFeeX;
+    - uint128 internal ghost_protocolFeeY;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    The conservation should hold exactly (not approximately) because the reserve update
+    (line 176) is binReserves + amountsInWithFees - amountsOutOfBin, and amountsInWithFees
+    already had protocolFee subtracted (line 173). So:
+    newReserves = oldReserves + (amountsInWithFees - pFee) - amountsOut
+    = oldReserves + userAmountIn - pFee - amountsOut.
+    This is exact arithmetic (PackedUint128Math add/sub). No rounding involved in the
+    reserve update itself. Conservation should hold strictly.
+
+- id: BPM-M07
+  tier: 1
+  type: property
+  description: >
+    getSharesAndEffectiveAmountsIn effective amounts calculation: when a user deposits more
+    liquidity than their shares represent (due to rounding), the function computes
+    effectiveLiquidity = shares.mulDivRoundUp(binLiquidity, totalSupply) and returns the
+    "excess" to the user by reducing amountsIn. The excess is first removed from Y (quote),
+    then from X (base). But the conversion from deltaLiquidity to deltaY uses
+    deltaY = deltaLiquidity >> SCALE_OFFSET (line 86 BinHelper), and deltaX = deltaLiquidity / price
+    (line 96). These are both truncating divisions. If deltaLiquidity < SCALE (2^128),
+    deltaY = 0 and the full deltaLiquidity is tried against price. If deltaLiquidity < price,
+    deltaX = 0 too. Result: effective amounts are NOT reduced despite being over-represented.
+    The user deposits more than their shares warrant, gifting the excess to the pool.
+  attack_scenario: >
+    Not directly exploitable by an attacker (the overpayer is the depositor, not a victim).
+    But: if a protocol integrates with BinPool and assumes effectiveAmountsIn is always
+    tightly bounded, this dusty excess could accumulate and be extracted by other LPs via
+    subsequent withdrawals. The excess is small (< 1 SCALE in liquidity terms, which for
+    18-dec tokens is < 1 wei). But for tokens with very high value per unit and low decimals,
+    this could matter.
+  impact: "Depositors overpay by dust amounts that accrue to other LPs"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After mint: verify depositor's share value <= deposited amounts
+    // shares = userLiquidity * supply / binLiquidity (roundDown)
+    // effectiveLiquidity = shares * binLiquidity / supply (roundUp)
+    // The gap = userLiquidity - effectiveLiquidity should be minimized
+    uint256 gap = ghost_userLiquidity - ghost_effectiveLiquidity;
+    // Gap should be < price + SCALE (bounded by one unit of each conversion)
+    lte(gap, ghost_binPrice + (1 << 128), "BPM-M07: excessive liquidity gap in deposit");
+  ghost_vars:
+    - uint256 internal ghost_userLiquidity;
+    - uint256 internal ghost_effectiveLiquidity;
+    - uint256 internal ghost_binPrice;
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    The effective amounts reduction (BinHelper.sol:80-103) tries to return excess to user
+    but is bounded by integer division precision. The max unreturned excess is
+    SCALE + price - 2 in liquidity terms. For typical prices (around 2^128 for 1:1 pair),
+    this is ~2 * 2^128 in liquidity, which corresponds to ~2 tokens-Y-equivalent.
+    For 18-dec tokens this is ~2 wei. For 6-dec tokens this is ~2 * 1e-6 USDC.
+    Negligible in isolation but worth documenting.
+
+- id: BPM-M08
+  tier: 2
+  type: property
+  description: >
+    Bin removal at MINIMUM_SHARE strands reserves permanently. When all non-locked shares
+    are burned (supply reaches MINIMUM_SHARE), the bin is removed from the tree (line 338).
+    The reserves proportional to MINIMUM_SHARE / original_supply remain in the bin forever.
+    Nobody can burn the MINIMUM_SHARE (they're not assigned to any user). If swap fees or
+    donations inflated reserves before the withdrawal, the stranded amount could be material.
+  attack_scenario: >
+    1. Attacker creates a bin in the active trading range, deposits large amount.
+    2. Many swaps route through this bin, accumulating LP fees in reserves.
+    3. Attacker withdraws all but MINIMUM_SHARE.
+    4. Bin removed from tree. Reserves proportional to MINIMUM_SHARE are stranded.
+    5. Reserves = (MINIMUM_SHARE / totalSupply_before_burn) * reserves_before_burn.
+       With inflated reserves from fees, this could be non-trivial.
+    Not profitable for the attacker (they benefit from the fees before burning).
+    But the stranded reserves are a permanent loss of pool value.
+  impact: "Permanent reserve locking in depleted bins — grief vector for token supply"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After burn, if supply == MINIMUM_SHARE, stranded reserves should be dust
+    uint256 supply = pool.shareOfBin[binId];
+    if (supply == 1e3) {
+        bytes32 binRes = pool.reserveOfBin[binId];
+        (uint128 rx, uint128 ry) = binRes.decode();
+        lte(uint256(rx), 1e6, "BPM-M08: significant X stranded in dead bin");
+        lte(uint256(ry), 1e6, "BPM-M08: significant Y stranded in dead bin");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 65
+  notes: >
+    By design (same as Trader Joe v2). The reserves proportional to MINIMUM_SHARE are
+    intentionally stranded for inflation protection. The concern is whether fee accumulation
+    or donation can inflate these stranded reserves beyond dust. With MINIMUM_SHARE = 1e3
+    and a typical supply of 1e18, the fraction is 1e-15, so even with $1M in reserves,
+    stranded value = $0.000001. Negligible unless supply stays near MINIMUM_SHARE.
+
+- id: BPM-M09
+  tier: 1
+  type: property
+  description: >
+    getProtocolFeeAmt fee splitting: the protocol fee is computed as
+    totalFee * protocolFeeRate / swapFee (PackedUint128Math.sol:234).
+    The division rounds DOWN. The LP receives totalFee - protocolFee.
+    If protocolFeeRate == swapFee, the protocol gets everything (special case line 231).
+    If protocolFeeRate > 0 but small relative to swapFee, rounding could make protocolFee = 0
+    and the LP gets everything. This is by design (round in favor of LP). BUT: the getProtocolFeeAmt
+    function decodes BOTH X and Y fees from totalFee and applies DIFFERENT protocol fee rates
+    (fee0 for X, fee1 for Y). If one direction has protocolFee but the other doesn't, and a
+    swap only touches one direction, the cross-direction fee could be non-zero when it should be 0.
+  attack_scenario: >
+    Consider: protocolFee is encoded as two 12-bit values (fee0 for 0->1, fee1 for 1->0).
+    getProtocolFeeAmt decodes BOTH fee0 and fee1, then applies fee0 to amountX and fee1 to amountY
+    of the totalFee bytes32. But in a swap, only one direction has fees (either X or Y, depending
+    on swapForY). The totalFee should only have value in one half (X or Y).
+    If totalFee incorrectly has value in BOTH halves due to a bug in getAmountsOut/getAmountsIn
+    encoding, protocolFee could be charged on the wrong side.
+    Actually: getAmountsOut/In encode fee128 in the correct half (encodeFirst for X, encodeSecond for Y).
+    So totalFee should only have one non-zero half. The other half is 0, and fee0/fee1 * 0 = 0. Safe.
+  impact: "Incorrect protocol fee calculation if totalFee encoding is wrong"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After swap: verify protocol fee is only charged on the input token side
+    bytes32 pFee = ghost_lastProtocolFee;
+    (uint128 pfX, uint128 pfY) = pFee.decode();
+    if (ghost_lastSwapForY) {
+        // swapForY: input is X, output is Y. Fee should be on X only.
+        eq(pfY, 0, "BPM-M09: protocol fee charged on output side (Y) in swapForY");
+    } else {
+        // swapForX: input is Y, output is X. Fee should be on Y only.
+        eq(pfX, 0, "BPM-M09: protocol fee charged on output side (X) in swapForX");
+    }
+  ghost_vars:
+    - bytes32 internal ghost_lastProtocolFee;
+    - bool internal ghost_lastSwapForY;
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    The encoding logic in getAmountsOut/getAmountsIn correctly places fee in the input
+    direction only. But the getProtocolFeeAmt applies BOTH fee0 and fee1 to their respective
+    halves. If a multi-bin swap crosses bins where the active bin changes direction somehow,
+    the totalFee could have values in both halves. Need to verify that the fee accumulation
+    across bins (line 172 BinPool.swap) correctly maintains single-direction fees.
+
+- id: BPM-M10
+  tier: 3
+  type: optimize
+  description: >
+    Maximize profit from composition fee arbitrage (optimization counterpart to BPM-M02).
+    Find the optimal parameters (fee level, deposit ratio skew, bin reserves) that maximize
+    the fee difference between implicit swap via mint/burn vs direct swap.
+    Mathematical lower bound: profit/amount = (f/P)^2 * f / (P - f).
+    At max fee (f=1e17): profit = amt * (1e-2) * 1e17 / 9e17 = amt * 0.00111 (0.111%).
+  attack_scenario: >
+    For each fee level and reserve ratio, compute:
+    1. Cost of direct swap for amount A (swap fee).
+    2. Cost of implicit swap via mint + composition fee + burn for same amount A.
+    3. Profit = (1) - (2) - rounding losses from mint/burn.
+    Echidna should maximize this across all parameter combinations.
+  solidity: |
+    int256 swapCost = int256(uint256(ghost_equivalentSwapFee));
+    int256 mintBurnCost = int256(uint256(ghost_actualCompositionFee)) +
+                          int256(uint256(ghost_mintBurnRoundingLoss));
+    return swapCost - mintBurnCost;
+  ghost_vars:
+    - uint128 internal ghost_equivalentSwapFee;
+    - uint128 internal ghost_actualCompositionFee;
+    - uint128 internal ghost_mintBurnRoundingLoss;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    Mathematical proof shows composition fee is ALWAYS less than swap fee.
+    The question for Echidna: is the PRACTICAL profit (after rounding losses from mint/burn)
+    still positive? If mint/burn rounding losses exceed the fee difference, the arbitrage
+    is not viable. At high fee (10%) and large amounts ($10K+), the fee difference ($11+)
+    should exceed rounding losses (~1 wei). Need empirical verification.
+
+false_positives:
+- hunter: MathHunter
+  id: BPM-FP-01
+  reason: >
+    PackedUint128Math.add() overflow check (z < x || uint128(z) < uint128(x)) initially
+    appeared to have a gap for cross-half carry, but detailed analysis shows both checks
+    together catch ALL overflow cases. The z < x (full 256-bit) catches upper-half overflow.
+    The uint128 cast comparison catches lower-half overflow where carry corrupts upper bits.
+    Both needed, both correct.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      PackedUint128Math dual-check pattern (z < x || uint128(z) < uint128(x)) is correct
+      for detecting overflow in either half of a packed bytes32. Don't re-analyze.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BPM-FP-02
+  reason: >
+    The unchecked block in swap() (BinPool.sol:206-221) for negating amount to create
+    BalanceDelta looks risky but is safe: amount passed safeInt128() before negation,
+    so it's at most 2^127-1. Negating a positive int128 always produces a valid negative int128.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      BinPool swap unchecked negation of uint128->int128 is safe because safeInt128()
+      validates the value fits in int128 range first. Not a bug.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BPM-FP-03
+  reason: >
+    LiquidityConfigurations.getAmountsAndId assembly multiplication: max product is
+    (2^128-1) * 1e18 = ~2^188, fits in uint256. Result after division by 1e18 is at most
+    2^128-1, fits in uint128 for encode(). No overflow or truncation possible.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      LiquidityConfigurations assembly mul/div: uint128 * uint64(max 1e18) / 1e18
+      fits in uint128. Safe by construction.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BPM-FP-04
+  reason: >
+    protocolFeesAccrued unchecked addition (BinPoolManager.sol:186-189): theoretically
+    could overflow uint256 but would require 2^128+ swaps with max fee. Physically
+    impossible. Not a real vulnerability.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      protocolFeesAccrued unchecked uint256 addition is safe — accumulating uint128 values
+      to overflow uint256 requires physically impossible number of swaps.
+    briefing_update_applied: false

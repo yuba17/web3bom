@@ -1,0 +1,513 @@
+protocol: pancakeswap-infinity
+component: CLPoolManager
+file: src/pool-cl/CLPoolManager.sol
+domain: dex
+hunter: OracleHunter
+generated_at: '2026-03-23T02:00:00Z'
+invariants:
+
+# ============================================================================
+# CLPM-O-01: slot0 sqrtPriceX96 is a SPOT price — manipulable within a single tx
+# ============================================================================
+- id: CLPM-O-01
+  tier: 1
+  type: property
+  description: >
+    getSlot0() expone sqrtPriceX96 como vista pública. Este es un precio SPOT
+    que se actualiza atómicamente con cada swap. Cualquier protocolo externo
+    que lea getSlot0().sqrtPriceX96 como fuente de precio está usando un valor
+    manipulable por flash loan en la misma transacción. CLPoolManager NO implementa
+    TWAP ni acumuladores de observación (a diferencia de Uniswap V3 que tiene
+    Oracle.sol con observations[]). Esto significa que NO hay forma segura de obtener
+    un precio time-weighted desde este contrato — solo spot.
+  attack_scenario: >
+    1. Atacante toma flash loan de token0 (ej. 10M USDC)
+    2. Swap masivo token0→token1 en CLPoolManager, mueve sqrtPriceX96 dramáticamente
+    3. Protocolo externo (lending, vault, derivados) lee getSlot0().sqrtPriceX96
+       para valorar colateral o calcular mint/redeem ratio
+    4. Atacante explota el precio distorsionado (ej. borrow contra colateral inflado,
+       mint shares baratas, liquidar posiciones sanas)
+    5. Swap inverso restaura precio, repay flash loan
+    Capital necesario: depende de la liquidez del pool. Pools con <$1M TVL son
+    extremadamente baratos de manipular. Pools con >$10M requieren capital significativo.
+  impact: >
+    Pérdida de fondos para protocolos que dependan de getSlot0() como oracle.
+    Magnitud proporcional al TVL del protocolo víctima. Históricamente este
+    patrón ha causado pérdidas de $10M+ (Harvest Finance, Warp Finance, etc).
+  impact_rating: Critical
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Medir cuánto se puede mover el precio en una sola tx
+    // Pre: guardar precio antes del swap
+    (uint160 priceBefore,,,) = clPoolManager.getSlot0(poolId);
+
+    // Ejecutar swap grande (simulando flash loan)
+    // ... swap amountSpecified ...
+
+    (uint160 priceAfter,,,) = clPoolManager.getSlot0(poolId);
+
+    // El invariante es: si un protocolo externo lee priceAfter como precio "real",
+    // la desviación respecto a priceBefore indica el riesgo de manipulación
+    uint256 deviation = priceBefore > priceAfter
+        ? uint256(priceBefore - priceAfter) * 1e18 / priceBefore
+        : uint256(priceAfter - priceBefore) * 1e18 / priceBefore;
+
+    // Si la desviación es >10% con un swap "normal", el pool es explotable
+    // NOTA: este invariante testea la SUSCEPTIBILIDAD, no un bug en CLPoolManager per se
+    lte(deviation, 1e17, "CLPM-O-01: spot price moved >10% in single swap");
+  ghost_vars:
+  - uint160 internal ghost_sqrtPriceBefore;
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    Este NO es un bug en CLPoolManager — es un riesgo de diseño CONOCIDO para
+    cualquier AMM spot price. Pero la AUSENCIA de un mecanismo TWAP (que Uniswap V3
+    sí tiene con Oracle.sol y observations[]) hace que PancakeSwap Infinity sea
+    más peligroso como fuente de precio. Cualquier protocolo que integre con
+    CLPoolManager.getSlot0() para pricing está en riesgo. Relevante para el
+    ecosystem de hooks que podrían construir oracles encima.
+
+# ============================================================================
+# CLPM-O-02: tick/sqrtPriceX96 consistency — tick debe corresponder al precio
+# ============================================================================
+- id: CLPM-O-02
+  tier: 1
+  type: property
+  description: >
+    El tick almacenado en slot0 DEBE ser consistente con sqrtPriceX96. Específicamente,
+    sqrtPriceX96 debe estar entre getSqrtRatioAtTick(tick) y getSqrtRatioAtTick(tick+1).
+    Si se desincroniza, cualquier consumidor externo que use tick como proxy de precio
+    (ej. para determinar qué posiciones están in-range) obtendría un estado inconsistente.
+    NOTA: En el swap, cuando zeroForOne y el precio aterriza exactamente en un tick boundary,
+    el tick se decrementa (tickNext - 1). Esto es by-design para el swap, pero un consumidor
+    externo que use tick podría malinterpretar el estado.
+  attack_scenario: >
+    Si tick y sqrtPriceX96 se desincronizan, un protocolo externo que calcule
+    posiciones in-range usando tick obtendría resultados diferentes que uno usando
+    sqrtPriceX96. Un atacante podría explotar esta discrepancia para manipular
+    qué posiciones se consideran activas. Ejemplo: un hook que distribuye rewards
+    solo a posiciones "in-range" basándose en slot0.tick podría excluir/incluir
+    posiciones incorrectamente.
+  impact: >
+    Distribución incorrecta de fees/rewards en hooks o protocolos que lean tick
+    para determinar posiciones activas.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (uint160 sqrtPrice, int24 tick,,) = clPoolManager.getSlot0(poolId);
+
+    // Verificar que tick corresponde al precio
+    uint160 sqrtPriceAtTick = TickMath.getSqrtRatioAtTick(tick);
+    uint160 sqrtPriceAtTickPlus1 = TickMath.getSqrtRatioAtTick(tick + 1);
+
+    // sqrtPrice debe estar en [sqrtPriceAtTick, sqrtPriceAtTickPlus1)
+    // Excepción: cuando zeroForOne swap aterriza exactamente en boundary,
+    // tick = tickNext - 1 y sqrtPrice = getSqrtRatioAtTick(tickNext)
+    // En ese caso sqrtPrice == sqrtPriceAtTickPlus1
+    bool consistent = sqrtPrice >= sqrtPriceAtTick && sqrtPrice <= sqrtPriceAtTickPlus1;
+    t(consistent, "CLPM-O-02: tick/sqrtPrice inconsistency");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    CLPool.sol L314-341: cuando sqrtPriceX96 == sqrtPriceNextX96 y zeroForOne,
+    tick = tickNext - 1. Esto puede crear un estado donde tick apunta "un tick abajo"
+    del precio real. Es by design para el swap loop (el comentario en L314-317
+    lo documenta explícitamente para donate), pero un consumidor externo podría
+    malinterpretarlo. Investigar si algún hook de PancakeSwap usa slot0.tick
+    directamente para lógica de pricing.
+
+# ============================================================================
+# CLPM-O-03: Extsload expone TODA la storage — read-only reentrancy risk
+# ============================================================================
+- id: CLPM-O-03
+  tier: 1
+  type: property
+  description: >
+    CLPoolManager hereda Extsload, que expone extsload(bytes32 slot) como vista pública.
+    Esto permite a CUALQUIER contrato externo leer CUALQUIER slot de storage,
+    incluyendo pools[id].slot0, pools[id].liquidity, ticks, positions, etc.
+    Esto es intencionalmente permissive, PERO crea un riesgo de read-only reentrancy:
+    durante la ejecución de un hook callback (beforeSwap, afterSwap, etc.), el hook
+    puede llamar a extsload o getSlot0 para leer el estado del pool MIENTRAS
+    el swap está en progreso. El estado puede estar parcialmente actualizado.
+  attack_scenario: >
+    1. Hook malicioso registrado en un pool con beforeSwap callback
+    2. Durante beforeSwap, el hook llama a clPoolManager.getSlot0(otherPoolId)
+       o usa extsload para leer el slot0 de OTRO pool
+    3. Si ese otro pool está siendo swapeado en la misma tx (ej. multi-hop),
+       su estado podría estar en un punto intermedio
+    4. Hook usa ese precio intermedio para tomar una decisión (ej. arbitrage
+       contra un lending protocol)
+    MITIGACIÓN NATURAL: PancakeSwap usa vault.lock() que previene reentrada
+    al PoolManager. Sin embargo, las funciones view (getSlot0, extsload) no
+    requieren el lock y son legibles durante callbacks.
+  impact: >
+    Un hook malicioso podría leer precios parcialmente actualizados y usarlos
+    para explotar protocolos externos. Sin embargo, el hook es configurado por
+    el pool creator, así que el riesgo principal es para protocolos que
+    trustean pools con hooks desconocidos.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Este invariante verifica que slot0 es consistente cuando se lee
+    // durante una operación de swap (simulando lo que un hook vería)
+    // Pre-swap state
+    (uint160 pricePre, int24 tickPre,,) = clPoolManager.getSlot0(poolId);
+    uint128 liqPre = clPoolManager.getLiquidity(poolId);
+
+    // Verificar que el estado es internamente consistente
+    // (no está en un punto medio de actualización)
+    bool priceNonZero = pricePre > 0; // pool initialized
+    t(priceNonZero, "CLPM-O-03: slot0 read during mid-operation shows uninitialized");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    La mitigación principal es el patrón vault.lock() que PancakeSwap usa.
+    Un hook solo puede ser llamado DENTRO del lock, y reentrar a swap/modifyLiquidity
+    dentro del mismo lock requiere que el vault lo permita. Las funciones view
+    (getSlot0, getLiquidity, extsload) SÍ son legibles sin el lock.
+    El riesgo real depende de si hay hooks que hagan cross-pool reads durante callbacks.
+    Marcar como validated: false hasta confirmar el modelo de vault lock.
+
+# ============================================================================
+# CLPM-O-04: protocolFeeController external call trust — _fetchProtocolFee
+# ============================================================================
+- id: CLPM-O-04
+  tier: 1
+  type: property
+  description: >
+    _fetchProtocolFee() en ProtocolFees.sol hace una staticcall a protocolFeeController
+    durante initialize(). Si protocolFeeController es un contrato malicioso o
+    comprometido, puede devolver fees que maximicen la extracción de valor.
+    El fee está capped a MAX_PROTOCOL_FEE (4000 = 0.4%), lo cual limita el daño.
+    Sin embargo, el protocolFeeController también tiene acceso directo a
+    setProtocolFee() y collectProtocolFees(), lo que le da control total sobre
+    la acumulación y retiro de protocol fees.
+  attack_scenario: >
+    1. Owner (governance) configura un protocolFeeController malicioso via setProtocolFeeController()
+    2. El controller establece protocolFee al máximo (4000 pips = 0.4%) en ambas direcciones
+    3. Cada swap pierde 0.4% al protocol fee
+    4. El controller llama collectProtocolFees() para drenar los fees acumulados
+    NOTA: Esto requiere que el OWNER sea malicioso o comprometido. Es un riesgo
+    de centralización, no un bug de código. El fee está capped, limitando la extracción.
+    Alternativa más sutil: el controller puede cambiar fees dinámicamente entre pools
+    para front-run trades grandes (MEV extraction via protocol fee manipulation).
+  impact: >
+    Máximo 0.4% de cada swap extraído como protocol fee. En un pool con $100M
+    de volumen diario, esto son $400K/día. Requiere owner comprometido.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el protocol fee nunca excede MAX_PROTOCOL_FEE
+    (,, uint24 protocolFee,) = clPoolManager.getSlot0(poolId);
+
+    uint16 fee0to1 = uint16(protocolFee & 0xfff);
+    uint16 fee1to0 = uint16(protocolFee >> 12);
+
+    lte(uint256(fee0to1), 4000, "CLPM-O-04: protocolFee 0->1 exceeds max");
+    lte(uint256(fee1to0), 4000, "CLPM-O-04: protocolFee 1->0 exceeds max");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    ProtocolFees.sol L34-35: setProtocolFee requiere msg.sender == protocolFeeController.
+    L36: validate() confirma que ambos fees <= 4000. L80: setProtocolFeeController
+    es onlyOwner. La cadena de trust es: Owner → FeeController → ProtocolFee.
+    El riesgo es de centralización/governance, no de lógica de código.
+    El MEV via fee manipulation (cambiar fee justo antes de un trade grande) es
+    más interesante pero requiere que el controller sea un contrato con lógica
+    de front-running, lo cual es visible on-chain.
+
+# ============================================================================
+# CLPM-O-05: Hook puede modificar swap amount y override LP fee — price oracle impact
+# ============================================================================
+- id: CLPM-O-05
+  tier: 1
+  type: property
+  description: >
+    beforeSwap hook puede: (1) modificar amountToSwap via HOOKS_BEFORE_SWAP_RETURNS_DELTA,
+    y (2) override el lpFee si el pool tiene dynamic fee. Esto significa que el
+    precio efectivo de un swap (lo que realmente paga el swapper) puede ser
+    DIFERENTE del sqrtPriceX96 almacenado en slot0, porque el hook puede
+    interceptar parte del input/output. Para un observador externo que solo
+    lee slot0, el precio PARECE ser X, pero el swapper realmente pagó Y.
+    Además, afterSwap hook puede tomar un delta adicional (hookDeltaUnspecified),
+    creando otra discrepancia entre precio aparente y precio real.
+  attack_scenario: >
+    1. Pool con hook malicioso que retorna beforeSwapDelta grande (absorbe parte del input)
+    2. El swap ejecuta con amount reducido → sqrtPriceX96 se mueve MENOS de lo esperado
+    3. Protocolo externo ve un movimiento de precio "pequeño" en slot0
+    4. Pero el swapper realmente pagó más (hook se quedó con la diferencia)
+    5. Arbitrageur que usa slot0 para calcular oportunidades sería engañado
+    Impacto práctico: limitado a pools con hooks específicos. Un usuario que
+    interactúa con un pool con hooks ya asume cierto trust en el hook.
+  impact: >
+    Discrepancia entre precio observado (slot0) y precio efectivo pagado.
+    Afecta a integradores y arbitrageurs que confían en slot0 como fuente de verdad.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Post-swap: verificar que el delta total (caller + hook) es consistente
+    // con el movimiento de precio en slot0
+    // NOTA: difícil de verificar externamente porque hookDelta no se expone
+    // Este invariante verifica que sqrtPrice se movió en la dirección correcta
+    (uint160 priceAfter, int24 tickAfter,,) = clPoolManager.getSlot0(poolId);
+
+    if (ghost_lastSwapZeroForOne) {
+        // zeroForOne: precio debe bajar o mantenerse (nunca subir)
+        lte(uint256(priceAfter), uint256(ghost_sqrtPriceBefore),
+            "CLPM-O-05: price increased on zeroForOne swap");
+    } else {
+        // oneForZero: precio debe subir o mantenerse (nunca bajar)
+        gte(uint256(priceAfter), uint256(ghost_sqrtPriceBefore),
+            "CLPM-O-05: price decreased on oneForZero swap");
+    }
+  ghost_vars:
+  - uint160 internal ghost_sqrtPriceBefore;
+  - bool internal ghost_lastSwapZeroForOne;
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    CLHooks.beforeSwap L150-159: hookDeltaSpecified modifica amountToSwap.
+    CLHooks.afterSwap L175-179: hookDeltaUnspecified modifica el delta final.
+    Ambos son solo posibles si el pool tiene los flags correspondientes activados.
+    Un pool sin hooks no tiene este riesgo. El riesgo es para consumidores
+    que NO verifican los hook permissions del pool antes de confiar en su precio.
+
+# ============================================================================
+# CLPM-O-06: donate() inflates feeGrowthGlobal without affecting sqrtPriceX96
+# ============================================================================
+- id: CLPM-O-06
+  tier: 2
+  type: property
+  description: >
+    donate() incrementa feeGrowthGlobal0X128/feeGrowthGlobal1X128 sin cambiar
+    sqrtPriceX96 ni tick. Esto crea una discrepancia: el "valor" de una posición LP
+    (incluyendo fees acumulados) cambia, pero el precio spot no se mueve. Un hook o
+    protocolo externo que calcule el valor de una posición LP solo basándose en
+    sqrtPriceX96 y liquidity SUBESTIMARÍA el valor real (que incluye unclaimed fees).
+    El comentario en CLPool.sol L52-54 documenta explícitamente que feeGrowthGlobal
+    puede ser "artificially inflated" por self-donation.
+  attack_scenario: >
+    1. Atacante crea un pool con una sola posición de liquidez (es el único LP)
+    2. Hace donate() masivo de tokens al pool — feeGrowthGlobal se infla
+    3. Un protocolo externo que lea getFeeGrowthGlobals() o que calcule el APR del pool
+       basándose en el crecimiento de feeGrowthGlobal vería un APR artificial
+    4. Usuarios depositan liquidez atraídos por el APR falso
+    5. Atacante retira su liquidez (con los fees que él mismo donó) y deja a los
+       nuevos LPs con un pool sin actividad real
+    NOTA: la donación es a costa del atacante, así que el incentivo económico
+    es indirecto (ej. atraer TVL para un token scam).
+  impact: >
+    Inflación artificial de métricas de rendimiento. No hay pérdida directa de fondos
+    del protocolo, pero usuarios pueden ser engañados a depositar en pools con
+    rendimiento artificial. Self-donation es a pérdida para el donante.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que feeGrowthGlobal solo crece por trading real, no por donación
+    // Este invariante monitorea si donate() puede inflar feeGrowthGlobal
+    // desproporcionadamente respecto al volumen de trading real
+    (uint256 feeGrowth0, uint256 feeGrowth1) = clPoolManager.getFeeGrowthGlobals(poolId);
+
+    // Post-donate: fee growth cambió
+    bool feeGrowthChanged = feeGrowth0 != ghost_feeGrowth0Before || feeGrowth1 != ghost_feeGrowth1Before;
+
+    // Pero price no cambió
+    (uint160 priceNow,,,) = clPoolManager.getSlot0(poolId);
+    bool priceUnchanged = priceNow == ghost_sqrtPriceBefore;
+
+    // Si feeGrowth creció pero price no se movió, fue donate (no swap)
+    // NOTA: esto es by-design, pero documenta el riesgo para consumidores
+    if (feeGrowthChanged && priceUnchanged) {
+        // Log for analysis — not a hard invariant break
+        // t(false, "CLPM-O-06: feeGrowthGlobal inflated without price change (donate)");
+    }
+  ghost_vars:
+  - uint256 internal ghost_feeGrowth0Before;
+  - uint256 internal ghost_feeGrowth1Before;
+  - uint160 internal ghost_sqrtPriceBefore;
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    CLPool.sol L52-54 documenta explícitamente: "feeGrowthGlobal can be artificially
+    inflated. For pools with a single liquidity position, actors can donate to
+    themselves to freely inflate feeGrowthGlobal". Esto es conocido y aceptado
+    por el protocolo. El riesgo es para integradores que usen feeGrowthGlobal
+    como proxy de actividad de trading real.
+
+# ============================================================================
+# CLPM-O-07: sqrtPriceLimitX96 boundary — swap puede detenerse sin completar
+# ============================================================================
+- id: CLPM-O-07
+  tier: 2
+  type: property
+  description: >
+    En swap(), el parámetro sqrtPriceLimitX96 actúa como tope de precio. Si un
+    protocolo externo usa swap() para mover el precio a un target específico (ej.
+    un oracle update hook), el swap puede detenerse parcialmente si el liquidity
+    es insuficiente o si el limit se alcanza. El estado final puede dejar
+    amountSpecifiedRemaining > 0, lo que significa que no todo el input fue consumido.
+    Un consumidor que asuma que el swap siempre consume todo el input podría
+    tener accounting incorrecto.
+  attack_scenario: >
+    1. Hook o protocolo externo calcula un swap exacto para mover el precio a un target
+    2. El swap se detiene al alcanzar sqrtPriceLimitX96 o al cruzar un gap de liquidez
+    3. El precio final NO es el esperado por el protocolo
+    4. Decisiones subsecuentes basadas en el precio esperado (pero no alcanzado) son incorrectas
+    Ejemplo concreto: un liquidation bot que asume que puede mover el precio
+    a un nivel específico con un swap determinado.
+  impact: >
+    Swap parcial inesperado puede causar estados inconsistentes en protocolos
+    que asuman que el swap siempre completa. Impacto depende del integrador.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Después de un swap, verificar que si amountRemaining > 0,
+    // el precio aterrizó exactamente en el limit
+    (uint160 priceAfter,,,) = clPoolManager.getSlot0(poolId);
+
+    // Si el swap no consumió todo el input/output, debe ser porque
+    // alcanzó sqrtPriceLimitX96
+    if (ghost_swapDidNotComplete) {
+        bool atLimit = priceAfter == ghost_sqrtPriceLimitX96;
+        t(atLimit, "CLPM-O-07: partial swap but price not at limit");
+    }
+  ghost_vars:
+  - bool internal ghost_swapDidNotComplete;
+  - uint160 internal ghost_sqrtPriceLimitX96;
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    CLPool.swap L251: "while state.amountSpecifiedRemaining != 0 && state.sqrtPriceX96 != sqrtPriceLimitX96".
+    El swap termina cuando AMBAS condiciones se rompen. Si termina porque
+    sqrtPriceX96 == sqrtPriceLimitX96 pero amountSpecifiedRemaining != 0,
+    el swap fue parcial. Esto es correcto y documented, pero consumidores
+    deben estar preparados. No es un bug per se.
+
+# ============================================================================
+# FLASH LOAN HYPOTHESIS — por función que modifica estado
+# ============================================================================
+
+# swap():
+# 1. ¿Lee estado manipulable? SÍ — slot0.sqrtPriceX96, slot0.tick, liquidity
+# 2. ¿Ese estado afecta movimiento de fondos? SÍ — determina cuánto se recibe
+# 3. ¿Se puede leer y consumir en la misma tx? SÍ — getSlot0() es view
+# 4. ¿Hay verificación post-acción? NO — no hay FREI-PI pattern
+# 5. ¿Tiene reentrancy guard? SÍ — vault.lock() previene reentrada a swap
+# 6. ¿Si es callback, verifica initiator? N/A — hooks verifican selector
+# 7. ¿Usa spot price o TWAP? SPOT — sqrtPriceX96 es spot puro
+# 8. ¿Reward/share se calcula por balance instantáneo? NO — usa liquidity tracking
+# 9. ¿Hay cap/threshold cruzable atómicamente? NO — no hay health factors
+# 10. ¿Permite self-liquidation? NO — no aplica
+# 11. ¿Fee rounding a zero con montos pequeños? POSIBLE — step.feeAmount podría ser 0
+#     con montos muy pequeños (ver SwapMath.computeSwapStep)
+# 12. ¿Checkpoint usa storage o memory? STORAGE — slot0 se persiste al final del swap
+
+# modifyLiquidity():
+# 1. ¿Lee estado manipulable? SÍ — slot0.tick para determinar qué tokens aportar
+# 2. ¿Ese estado afecta movimiento de fondos? SÍ — tick determina ratio token0/token1
+# 3. ¿Se puede leer y consumir en la misma tx? SÍ
+# 4. ¿Verificación post-acción? NO
+# 5. ¿Reentrancy guard? SÍ — vault.lock()
+# 6-12: similar a swap
+
+# donate():
+# 1. ¿Lee estado manipulable? SÍ — liquidity (para distribuir fees)
+# 2. ¿Ese estado afecta movimiento de fondos? SÍ — determina quién recibe el donate
+# 3. ¿Se puede leer y consumir en la misma tx? SÍ
+# 4-12: donate es unidireccional (donante pierde), bajo riesgo de flash loan
+
+# initialize():
+# 1. ¿Lee estado manipulable? Parcialmente — _fetchProtocolFee hace staticcall
+# 2. Solo se puede llamar una vez por pool (PoolAlreadyInitialized check)
+# No es vector de flash loan — operación one-time
+
+# getSlot0() / getLiquidity() / extsload():
+# Son view functions — no modifican estado, pero SÍ son la interfaz por la cual
+# otros protocolos leerían precios manipulados. El riesgo está en el CONSUMIDOR,
+# no en estas funciones per se.
+
+# CONCLUSIÓN FLASH LOAN:
+# El vector principal es CLPM-O-01: swap() mueve spot price → getSlot0() lo expone
+# → protocolo externo lo consume. CLPoolManager no tiene TWAP integrado (a diferencia
+# de Uniswap V3), lo que aumenta el riesgo para integradores ingenuos.
+
+# ============================================================================
+# ORACLE DEEP CHECK — no aplica directamente
+# ============================================================================
+# CLPoolManager no usa oracles externos (no hay latestRoundData, no hay Chainlink).
+# CLPoolManager ES una fuente de precio (slot0.sqrtPriceX96) que OTROS protocolos
+# podrían consumir como oracle. Las 6 preguntas del oracle deep check aplican
+# a los CONSUMIDORES de getSlot0(), no a CLPoolManager mismo.
+#
+# 1. ¿Se verifica updatedAt? → N/A — CLPoolManager no tiene timestamps en slot0
+# 2. ¿answeredInRound >= roundId? → N/A
+# 3. ¿price > 0? → sqrtPriceX96 es 0 solo si pool no inicializado (checkPoolInitialized)
+# 4. ¿Check sequencer down? → N/A
+# 5. ¿minAnswer/maxAnswer? → No hay clamp de precio. sqrtPriceX96 está bounded por
+#    TickMath.MIN_SQRT_RATIO y MAX_SQRT_RATIO, pero el rango es enorme.
+# 6. ¿Oracle sandwicheable? → SÍ — spot price is trivially sandwicheable.
+#    Este es exactamente CLPM-O-01.
+
+false_positives:
+- hunter: OracleHunter
+  id: CLPM-FP-01
+  reason: >
+    Investigado: tick preemptive decrement en zeroForOne swaps (CLPool.sol L335-336:
+    state.tick = tickNext - 1). Esto parece una inconsistencia tick/price, pero es
+    by design — documentado en comentario L314-317. El decrement asegura que el
+    siguiente swap empiece buscando en el tick correcto. donate() incluso tiene
+    un warning específico sobre verificar BOTH price and tick. No es un bug.
+  investigated_at: '2026-03-23T02:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      En CLPool/UniV3-style: cuando un zeroForOne swap aterriza exactamente en un tick
+      boundary, tick se decrementa a tickNext-1. Es by-design para el swap loop.
+      NO es una inconsistencia tick/price explotable. donate() debe verificar
+      BOTH price AND tick para distribuir fees correctamente.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: CLPM-FP-02
+  reason: >
+    Investigado: _fetchProtocolFee usa staticcall con gas() al protocolFeeController.
+    Podría parecer un vector de gas griefing (controller gasta todo el gas y revierte).
+    Sin embargo, el código L55 usa staticcall(gas(), ...) y L60-61 verifica
+    returndatasize() == 32. Si el controller revierte o no retorna 32 bytes,
+    _fetchProtocolFee revierte con ProtocolFeeCannotBeFetched. Esto solo afecta
+    initialize() — no afecta swaps existentes. Y el controller es configurado
+    por el owner, así que gas griefing es auto-infligido. No es un bug explotable.
+  investigated_at: '2026-03-23T02:00:00Z'
+  pending_briefing_update: null
+
+- hunter: OracleHunter
+  id: CLPM-FP-03
+  reason: >
+    Investigado: feeGrowthGlobal overflow. feeGrowthGlobal0X128/1X128 son uint256
+    y se incrementan con UnsafeMath.simpleMulDiv en unchecked blocks. Podría
+    parecer que un overflow causaría distribución incorrecta de fees. Sin embargo,
+    UniV3 y PancakeSwap usan "modular arithmetic" intencionalmente — el overflow
+    de feeGrowthGlobal es by design, y la diferencia entre feeGrowthInside y
+    feeGrowthOutside se calcula correctamente incluso con overflow. Documentado
+    ampliamente en la implementación de UniV3.
+  investigated_at: '2026-03-23T02:00:00Z'
+  pending_briefing_update: null

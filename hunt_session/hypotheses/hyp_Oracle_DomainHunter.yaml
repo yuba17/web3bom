@@ -1,0 +1,642 @@
+protocol: variational
+component: Oracle+SettlementPool+SettlementPoolFactory
+file: src/Oracle.sol, src/SettlementPool.sol, src/SettlementPoolFactory.sol
+domain: derivatives-settlement
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+###############################################################################
+# H-01: grantRole PROVIDER_ROLE — numProviders check AFTER super.grantRole
+#        already granted the role → require always reverts → DoS
+###############################################################################
+- id: VAR-DOM-01
+  tier: 1
+  type: property
+  description: >
+    Oracle.grantRole() calls super.grantRole() FIRST (line 439), which grants the role,
+    then checks hasRole on line 442. Since super already granted it, hasRole returns true
+    and the require("Provider already added") ALWAYS reverts. This means grantRole() for
+    PROVIDER_ROLE is permanently broken — only addProvider() works. If admin code or
+    external tooling calls the standard AccessControl.grantRole() (which is the OpenZeppelin
+    standard path), it will always revert. This is a logic bug but may be Low since
+    addProvider() exists as an alternative.
+  attack_scenario: >
+    Admin or governance contract calls grantRole(PROVIDER_ROLE, newProvider) — the standard
+    OZ interface. The call always reverts because super.grantRole runs first, setting the role,
+    then the require(!hasRole(...)) fails. The provider is never added via this path.
+    numProviders counter stays out of sync if grantRole was expected to work.
+  impact: "DoS on standard AccessControl interface for adding providers. If admin tooling
+    relies on grantRole instead of addProvider, new providers can never be added."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // grantRole(PROVIDER_ROLE, addr) should succeed for a new provider
+    // but it always reverts due to ordering bug
+    address newProvider = address(0x1234);
+    try oracle.grantRole(oracle.PROVIDER_ROLE(), newProvider) {
+        t(false, "VAR-DOM-01: grantRole should have reverted but didn't");
+    } catch {
+        // Expected: always reverts — this IS the bug
+        t(true, "VAR-DOM-01: grantRole permanently broken for PROVIDER_ROLE");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    Line 438-446 of Oracle.sol. super.grantRole(role, account) on line 439 grants the role
+    BEFORE the hasRole check on line 442. The require(!hasRole(PROVIDER_ROLE, account))
+    will ALWAYS revert for a new grant because super already set it. For revokeRole (lines
+    449-457), the pattern is correct because the check happens BEFORE super.revokeRole.
+    Similarly, if grantRole is called for an ALREADY-existing provider, super.grantRole is
+    a no-op, and hasRole returns true, so it also reverts — meaning grantRole ALWAYS reverts
+    for PROVIDER_ROLE regardless of input.
+  poc_sketch: |
+    function test_grantRole_always_reverts() public {
+        address newProvider = makeAddr("newProvider");
+        // This should succeed but doesn't
+        vm.prank(admin);
+        vm.expectRevert("Oracle: Provider already added.");
+        oracle.grantRole(oracle.PROVIDER_ROLE(), newProvider);
+    }
+  call_stack: >
+    Oracle.grantRole() → super.grantRole() [grants role] → hasRole() returns true → revert
+
+###############################################################################
+# H-02: Pool creation fee — provider-controlled transferFrom(feePaidBy, feeRequestor, feeAmount)
+#        Provider can set feePaidBy = victim who approved factory for other reasons
+###############################################################################
+- id: VAR-DOM-02
+  tier: 1
+  type: property
+  description: >
+    In Oracle.createPool (line 359-380), the provider passes feePaidBy and feeAmount. These
+    flow to Factory.createPool (line 77-81) which calls usdcAddress.transferFrom(feePaidBy,
+    feeRequestor, feeAmount). The feeRequestor is msg.sender to the factory = the Oracle
+    contract, but in Oracle.createPool line 375, it passes msg.sender (the provider) as
+    feeRequestor. So the provider controls: feePaidBy (who pays), feeAmount (how much),
+    and receives the fee themselves. If any address has approved the Factory contract for
+    USDC (which users do for deposits), a malicious provider can drain their approval.
+  attack_scenario: >
+    1. User Alice approves SettlementPoolFactory for USDC (she does this to interact with pools).
+    2. Malicious provider calls createPool with feePaidBy=Alice, feeRequestor=provider (via
+       msg.sender passthrough), feeAmount=Alice's full approval.
+    3. Factory.createPool executes transferFrom(Alice, provider, feeAmount).
+    4. Provider steals Alice's USDC.
+  impact: "Direct theft of USDC from any address that has approved the Factory contract.
+    Up to full approval amount per victim."
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Provider should not be able to drain arbitrary user approvals via fee mechanism
+    uint256 victimBalanceBefore = usdc.balanceOf(victim);
+    // malicious provider creates pool with feePaidBy=victim
+    // if this succeeds and victim loses funds, invariant broken
+    uint256 victimBalanceAfter = usdc.balanceOf(victim);
+    gte(victimBalanceBefore, victimBalanceAfter + feeAmount,
+        "VAR-DOM-02: provider stole funds via fee mechanism");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 45
+  notes: >
+    KILL SIGNAL: Users probably DON'T approve the Factory — they approve individual
+    SettlementPool contracts (see _depositUSDCOnBehalf line 98 which checks allowance
+    on the Pool, not Factory). The transferFrom in Factory line 78 needs the victim to have
+    approved the FACTORY address specifically. If nobody approves the Factory, this is
+    unexploitable. However, if any off-chain flow or UI asks users to approve the Factory
+    (e.g., for pool creation fees they actually want to pay), a malicious provider could
+    abuse other users' approvals. Needs verification of what addresses users approve.
+    Also: PROVIDER_ROLE is trusted — if providers are fully trusted, this is by-design.
+    Confidence lowered significantly because of trust model uncertainty.
+  poc_sketch: |
+    function test_provider_steals_via_fee() public {
+        // Alice approves factory for some reason
+        vm.prank(alice);
+        usdc.approve(address(factory), 1000e6);
+        // Malicious provider creates pool, steals Alice's USDC
+        vm.prank(provider);
+        oracle.createPool(
+            provider, // creatorAddress
+            otherAddresses,
+            poolUuid,
+            rfqUuid,
+            parentQuoteUuid,
+            alice,  // feePaidBy = victim
+            1000e6  // feeAmount = drain full approval
+        );
+        assertEq(usdc.balanceOf(alice), 0); // Alice drained
+    }
+  call_stack: >
+    Oracle.createPool(feePaidBy=victim) → Factory.createPool(feeRequestor=provider, feePaidBy=victim)
+    → usdcAddress.transferFrom(victim, provider, feeAmount)
+
+###############################################################################
+# H-03: Dual pool mapping divergence — Oracle.pools vs Factory.getPool
+###############################################################################
+- id: VAR-DOM-03
+  tier: 1
+  type: property
+  description: >
+    Oracle.createPool writes to BOTH Oracle.pools[poolUuid] (line 379) AND Factory.getPool[poolUuid]
+    (via Factory.createPool, line 96). These are the ONLY write paths for both mappings.
+    Functions use different lookups: withdrawUSDC/depositUSDC/atomicDeposit use Oracle.getPool()
+    (Oracle.pools), while collectFees/batchAtomicDeposit/processTreasuryManagement* use
+    factory.getPool(). If setSettlementPoolFactory() is called (line 392-398) to point to a
+    NEW factory, the new factory has EMPTY getPool mappings. All functions using factory.getPool()
+    would fail, while functions using Oracle.pools would still work. This creates an inconsistent
+    state where some operations work and others don't.
+  attack_scenario: >
+    1. Admin calls setSettlementPoolFactory() to migrate to a new factory (legitimate upgrade).
+    2. All existing pools are in Oracle.pools but NOT in newFactory.getPool.
+    3. depositUSDC, withdrawUSDC, atomicDeposit still work (use Oracle.pools).
+    4. collectFees, batchAtomicDeposit, processTreasuryManagement* all revert with "no pool
+       mapping found" because newFactory.getPool returns address(0).
+    5. Fees cannot be collected from existing pools. Provider is locked out of fee collection.
+    6. Treasury management operations on existing pools are bricked.
+  impact: "After factory migration, fee collection and treasury management operations are
+    permanently bricked for all pre-existing pools. Fees accumulate but can never be withdrawn."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After factory change, both lookup paths should return the same pool address
+    address oraclePool = oracle.getPool(poolUuid);
+    address factoryPool = factory.getPool(poolUuid);
+    eq(oraclePool, factoryPool,
+       "VAR-DOM-03: pool mapping divergence — Oracle and Factory disagree");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The divergence is structural and verifiable by code inspection. The question is
+    whether setSettlementPoolFactory() is ever actually called in practice. If so,
+    this is a real Medium. The factory migration has no pool-migration mechanism — there's
+    no function to copy getPool mappings from old factory to new factory. Admin-only trigger
+    reduces likelihood but impact is real (fees locked forever).
+  poc_sketch: |
+    function test_factory_migration_breaks_fees() public {
+        // Create pool with original factory
+        vm.prank(provider);
+        oracle.createPool(creator, others, poolUuid, rfqUuid, pqUuid, address(0), 0);
+        // Migrate to new factory
+        SettlementPoolFactory newFactory = new SettlementPoolFactory(impl, address(usdc));
+        vm.prank(admin);
+        oracle.setSettlementPoolFactory(address(newFactory));
+        // collectFees now reverts
+        Fees.CollectionRequest[] memory reqs = new Fees.CollectionRequest[](1);
+        reqs[0] = Fees.CollectionRequest(poolUuid, 100e6, 1);
+        vm.prank(provider);
+        vm.expectRevert("no pool mapping found for given poolUuid");
+        oracle.collectFees(reqs);
+        // But withdrawUSDC still works (uses Oracle.pools)
+        vm.prank(provider);
+        oracle.withdrawUSDC(requestor, 100e6, poolUuid, 1);
+    }
+  call_stack: >
+    setSettlementPoolFactory(newFactory) → factory = newFactory
+    → collectFees → factory.getPool(poolUuid) → returns address(0) → revert
+
+###############################################################################
+# H-04: depositUSDCOnBehalfOfParty — no party validation on sender
+###############################################################################
+- id: VAR-DOM-04
+  tier: 1
+  type: property
+  description: >
+    Oracle.depositUSDC (line 344-357) calls pool.depositUSDCOnBehalfOfParty(sender, amount,
+    transferUuid) where sender is whatever address the provider passes. The Pool function
+    (line 233-245) has onlyOracle modifier but does NOT check that sender is a pool party.
+    It calls _depositUSDCOnBehalf which does transferFrom(sender, pool, amount) — pulling
+    USDC from sender. Compare with atomicDeposit (line 309-313) which explicitly checks that
+    addresses match pool parties. A malicious provider could use depositUSDC to pull funds
+    from any address that has approved the Pool contract, even if they aren't a party to
+    that specific pool.
+  attack_scenario: >
+    1. User Bob approves SettlementPool_A for USDC (he's a party in Pool A).
+    2. Malicious provider calls Oracle.depositUSDC(sender=Bob, amount=Bob's_approval,
+       poolUuid=Pool_B) where Pool_B is a different pool.
+    3. Pool_B calls transferFrom(Bob, Pool_B, amount).
+    4. This fails because Bob approved Pool_A, not Pool_B. BUT if Bob has also approved
+       Pool_B (multi-pool user), his funds go to Pool_B where he may not be a party and
+       cannot withdraw them.
+  impact: "Provider can redirect user deposits to pools where the user is not a party,
+    effectively locking their funds. Severity depends on whether users approve multiple pools."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // depositUSDCOnBehalfOfParty should only accept addresses that are pool parties
+    // If sender is not a party, the deposit should revert
+    address nonParty = address(0xDEAD);
+    // The following should revert but doesn't (only fails on transferFrom if no approval)
+    bool isParty = pool.creatorAddress() == nonParty || pool.checkOtherAddress(nonParty);
+    t(isParty, "VAR-DOM-04: deposit accepted for non-party address");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 40
+  notes: >
+    KILL SIGNAL: The transferFrom will fail unless the sender has approved the specific Pool
+    contract. Users typically approve individual pools, not all pools. So the practical
+    exploitability requires a user to have approved a pool they're not a party to, which is
+    unusual. Also PROVIDER_ROLE is trusted. If providers are fully trusted off-chain
+    operators, this is by-design. However, the inconsistency with atomicDeposit (which DOES
+    check parties) suggests the check was intended but forgotten in depositUSDC.
+    Similarly, withdrawUSDC flows through _withdrawUSDCOnBehalf which DOES check
+    party membership (line 270-273). The asymmetry between deposit (no check) and
+    withdraw (has check) further supports this being an oversight.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.depositUSDC(sender=nonParty) → pool.depositUSDCOnBehalfOfParty(nonParty)
+    → _depositUSDCOnBehalf(nonParty) → transferFrom(nonParty, pool, amount) — no party check
+
+###############################################################################
+# H-05: transferUuid=0 bypass in atomic deposits — second party deposit
+#        skips replay protection
+###############################################################################
+- id: VAR-DOM-05
+  tier: 1
+  type: property
+  description: >
+    In _depositUSDCOnBehalf (SettlementPool line 106-108), if transferUuid == 0, the transfer
+    is NOT marked as processed. In both depositUSDCAtomic (line 196-197) and
+    batchDepositUSDCAtomic (line 139-140), after the first party deposit, transferUuid is
+    reset to 0 for the second party's deposit. This means the second party's deposit has NO
+    replay protection — it cannot be replayed because the provider would need to call the
+    function again, and it's the provider who controls calls, not users. But there's a subtler
+    issue: the require on line 97 checks transfers_processed[0] which is always false for
+    uuid=0. So uuid=0 ALWAYS passes the replay check. The depositUSDCNoEvent function
+    (line 285-296, used by processTreasuryManagementDeposits) has NO check for transferUuid != 0.
+    A provider could pass transferUuid=0 to processTreasuryManagementDeposits, and
+    _depositUSDCOnBehalf would execute with transferUuid=0, skipping replay marking.
+    This allows the same deposit to be processed multiple times.
+  attack_scenario: >
+    1. Provider calls processTreasuryManagementDeposits with deposits containing transferUuid=0.
+    2. depositUSDCNoEvent calls _depositUSDCOnBehalf with transferUuid=0.
+    3. _depositUSDCOnBehalf: transfers_processed[0] is always false → passes check.
+    4. Transfer executes but transfers_processed[0] is never set to true (line 106-108 skips when uuid=0).
+    5. Provider can repeat this call infinitely, pulling funds from the requestor each time.
+    6. Each call does a real transferFrom, so the requestor's USDC is drained repeatedly
+       up to their approval amount.
+  impact: "Provider can drain a user's USDC approval by replaying treasury management deposits
+    with transferUuid=0. Each replay pulls real funds from the user."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // transferUuid=0 should not bypass replay protection
+    // After a deposit with uuid=0, the same deposit should not be processable again
+    // But _depositUSDCOnBehalf never marks uuid=0 as processed
+    bool canReplay = (transfers_processed[0] == false); // always true
+    t(!canReplay, "VAR-DOM-05: transferUuid=0 permanently bypasses replay protection");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 55
+  notes: >
+    IMPORTANT NUANCE: The real damage depends on whether the victim has approved the Pool for
+    enough USDC AND whether the provider is trusted. If PROVIDER_ROLE is a fully trusted
+    off-chain service, replay attacks are "by design" trust in the provider. But the replay
+    protection mechanism exists precisely to prevent provider bugs/compromises from causing
+    double-processing. The transferUuid=0 bypass undermines this safety net.
+
+    depositUSDCOnBehalfOfParty (used by Oracle.depositUSDC) requires transferUuid != 0 (line 238).
+    depositUSDCNoEvent (used by processTreasuryManagementDeposits) does NOT require != 0.
+    withdrawUSDCNoEvent (used by processTreasuryManagementWithdrawals) flows through
+    _withdrawUSDCOnBehalf which DOES require transferUuid != 0 (line 269).
+
+    This inconsistency (deposits allow 0, withdrawals don't) suggests the check was forgotten
+    in depositUSDCNoEvent.
+  poc_sketch: |
+    function test_replay_deposit_uuid_zero() public {
+        // User approves pool for 1000 USDC
+        vm.prank(user);
+        usdc.approve(address(pool), 1000e6);
+        // Provider processes deposit with uuid=0
+        TreasuryManagement.Deposit[] memory deps = new TreasuryManagement.Deposit[](1);
+        deps[0] = TreasuryManagement.Deposit(poolUuid, 0, 100e6);
+        vm.prank(provider);
+        oracle.processTreasuryManagementDeposits(user, deps);
+        // Replay — should fail but doesn't
+        vm.prank(provider);
+        oracle.processTreasuryManagementDeposits(user, deps);
+        // User lost 200 USDC instead of 100
+        assertEq(usdc.balanceOf(user), 800e6);
+    }
+  call_stack: >
+    Oracle.processTreasuryManagementDeposits(deps with uuid=0)
+    → pool.depositUSDCNoEvent(sender, amount, 0)
+    → _depositUSDCOnBehalf(sender, amount, 0, false)
+    → transfers_processed[0] == false ✓ (always)
+    → transferFrom succeeds
+    → if(transferUuid != 0) → false → skip marking
+    → transfers_processed[0] still false → replay possible
+
+###############################################################################
+# H-06: withdrawFees has no party check — sends to arbitrary requestor
+###############################################################################
+- id: VAR-DOM-06
+  tier: 2
+  type: property
+  description: >
+    SettlementPool.withdrawFees (line 247-260) sends USDC to `requestor` which is passed
+    by the Oracle (msg.sender from collectFees, line 107). The requestor is the provider
+    (msg.sender in Oracle.collectFees). There's no check that requestor is a pool party.
+    Compare with _withdrawUSDCOnBehalf (line 270-273) which explicitly checks
+    "requestor must be one of creatorCompany or otherCompany". withdrawFees has NO such check.
+    This allows the provider to withdraw fees to any address they control.
+  attack_scenario: >
+    Provider calls collectFees and receives USDC directly to their own address from any pool.
+    If the fee amount is not properly validated off-chain, the provider could extract more
+    than entitled.
+  impact: "Provider can withdraw fees to any address. Low impact if provider is fully trusted
+    and fee amounts are validated off-chain. Higher impact if fee amounts are provider-controlled
+    (which they are — amountRequested is provider input)."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Fee withdrawal should be bounded by actual fees owed
+    // But there's no on-chain accounting of fees — provider decides amount
+    uint256 poolBalanceBefore = usdc.balanceOf(address(pool));
+    // provider requests fee larger than any reasonable fee
+    // if it succeeds, the pool is drained
+    uint256 poolBalanceAfter = usdc.balanceOf(address(pool));
+    t(poolBalanceAfter >= 0, "VAR-DOM-06: pool drained via excessive fee collection");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    KILL SIGNAL: This is likely by-design — the provider IS the trusted fee collector.
+    The entire protocol architecture trusts the provider (PROVIDER_ROLE) to submit correct
+    amounts. The on-chain contracts are essentially settlement infrastructure controlled by
+    the provider. However, the lack of ANY on-chain fee accounting means a compromised
+    provider key can drain all pools instantly. The fees_batch_id replay protection only
+    prevents double-processing of the same batch, not excessive amounts.
+    Low confidence because this likely falls under "trusted role" exclusion in most bounties.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.collectFees([{poolUuid, amountRequested=poolBalance, feesBatchId}])
+    → pool.withdrawFees(provider, poolBalance, feesBatchId)
+    → usdc.transfer(provider, poolBalance) — no fee accounting check
+
+###############################################################################
+# H-07: atomicDeposit — party validation AFTER transfer, not before
+###############################################################################
+- id: VAR-DOM-07
+  tier: 1
+  type: property
+  description: >
+    In Oracle.atomicDeposit (line 287-322), when partyOneAmountRequested > 0 and
+    partyTwoAmountRequested == 0 (single-party deposit), the USDC transfer happens on
+    lines 300-307 BEFORE the party validation on lines 309-313. If the party check fails
+    (wrong addresses), the entire transaction reverts and the transfer is undone. This is
+    NOT a vulnerability per se (revert undoes everything), but it wastes gas and the
+    ordering is unusual. More critically: the single-party case (lines 298-308) transfers
+    USDC to the pool via Oracle (transferFrom user → Oracle → pool), and then RETURNS from
+    depositUSDCAtomic on line 179 without actually recording anything in pool state (no
+    balance tracking). The pool just receives raw USDC.
+  attack_scenario: >
+    Not directly exploitable because revert undoes the transfer. But the gas cost is borne
+    by the provider, and pool has no internal accounting of the deposit (just raw USDC balance).
+  impact: "No direct fund loss. Gas waste on invalid party addresses. Pool has no internal
+    accounting of deposits — relies entirely on events and USDC balance."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Party validation should happen before USDC transfer
+    // Check that validation occurs first
+    // Not a direct loss invariant — ordering/gas concern
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    The party check on lines 309-313 will revert the entire tx if addresses are wrong,
+    including undoing the transfer. No fund loss possible. This is a code quality / gas
+    optimization issue, not a security bug. Low priority.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.atomicDeposit() → transferFrom (line 301) → party check (line 309) → revert undoes all
+
+###############################################################################
+# H-08: batchDepositUSDCAtomic — creatorPartyAmountRequested charged PER ITEM
+###############################################################################
+- id: VAR-DOM-08
+  tier: 1
+  type: property
+  description: >
+    In SettlementPool.batchDepositUSDCAtomic (line 122-157), the loop iterates over items
+    and for EACH item where creatorPartyAmountRequested > 0, it calls _depositUSDCOnBehalf
+    with creatorPartyAmountRequested (line 131-136). This means the creator is charged
+    creatorPartyAmountRequested ONCE PER ITEM, not once total. If there are 10 items,
+    the creator pays 10x. The first item uses parentQuoteUuid for replay protection, but
+    after that, transferUuid is reset to 0 (line 140), so items 2-10 have no replay protection
+    AND each pulls the full creatorPartyAmountRequested from the creator.
+  attack_scenario: >
+    1. Provider calls batchAtomicDeposit with creatorPartyAmountRequested=1000 USDC and
+       10 items.
+    2. Creator is charged 1000 USDC × 10 = 10,000 USDC total.
+    3. Items 2-10 use transferUuid=0, so no replay protection on those transfers.
+    4. If the creator only intended to deposit 1000 USDC total (not per-item), they lose 9x.
+  impact: "Creator is charged creatorPartyAmountRequested per batch item, potentially much
+    more than intended. Combined with transferUuid=0 bypass for items 2+, there's no
+    replay protection on the repeated charges."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Creator should not be charged more than creatorPartyAmountRequested total
+    uint256 creatorBalanceBefore = usdc.balanceOf(creator);
+    // After batchDepositUSDCAtomic with N items:
+    uint256 creatorBalanceAfter = usdc.balanceOf(creator);
+    uint256 totalCharged = creatorBalanceBefore - creatorBalanceAfter;
+    lte(totalCharged, creatorPartyAmountRequested,
+        "VAR-DOM-08: creator charged more than requested amount");
+  ghost_vars:
+  - uint256 internal ghost_creatorTotalCharged;
+  validated: false
+  priority: critical
+  confidence: 70
+  notes: >
+    This is either a critical bug (creator overcharged N×) or by-design (creator amount IS
+    per-item). The naming "creatorPartyAmountRequested" is ambiguous — could mean "per item"
+    or "total". The function signature has it as a single uint256 outside the items array,
+    which suggests it's a TOTAL amount. But the code charges it per item.
+
+    KILL SIGNAL: If this is intentional (per-item deposit), it's by design. The creator must
+    have approved enough USDC — if approval is insufficient, transferFrom will fail
+    naturally. But the creator approved based on what they THOUGHT they'd be charged.
+
+    The replay protection issue compounds this: only item[0] has a real parentQuoteUuid
+    checked. Items 1..N use transferUuid=0 which is never marked as processed. So even if
+    the batch is called twice with the same parentQuoteUuid, only item[0] would be blocked
+    — items 1..N would execute again.
+  poc_sketch: |
+    function test_creator_overcharged_per_item() public {
+        vm.prank(creator);
+        usdc.approve(address(pool), 10000e6);
+
+        SettlementPools.AtomicDepositBatchItem[] memory items = new SettlementPools.AtomicDepositBatchItem[](5);
+        for (uint i = 0; i < 5; i++) {
+            items[i] = SettlementPools.AtomicDepositBatchItem(otherAddr, 0, rfqUuid, pqUuid + uint128(i));
+        }
+
+        vm.prank(provider);
+        oracle.batchAtomicDeposit(poolUuid, creator, 1000e6, items);
+
+        // Creator lost 5000 USDC, not 1000
+        assertEq(usdc.balanceOf(creator), startBalance - 5000e6);
+    }
+  call_stack: >
+    Oracle.batchAtomicDeposit(creator, 1000e6, items[5])
+    → pool.batchDepositUSDCAtomic(creator, 1000e6, items)
+    → loop: item[0] → _depositUSDCOnBehalf(creator, 1000e6, pqUuid[0]) ✓
+    →        item[1] → _depositUSDCOnBehalf(creator, 1000e6, 0) — uuid=0, no replay mark
+    →        item[2] → _depositUSDCOnBehalf(creator, 1000e6, 0) — same
+    →        ... × 5 = 5000 USDC total
+
+###############################################################################
+# H-09: transferFromOLPToPool — no pool UUID validation on poolAddress
+###############################################################################
+- id: VAR-DOM-09
+  tier: 2
+  type: property
+  description: >
+    Oracle.transferFromOLPToPool (line 267-285) accepts both poolUuid and poolAddress as
+    parameters but NEVER validates that poolAddress actually corresponds to poolUuid.
+    The poolAddress is used for the actual USDC transfer (line 282), while poolUuid is only
+    used in the event emission (line 284). A provider could pass a mismatched poolAddress
+    (any address, including their own) and the USDC would be sent there, while the event
+    logs a different poolUuid.
+  attack_scenario: >
+    1. Provider calls transferFromOLPToPool(olpWallet, attackerAddress, amount, poolUuid, ...).
+    2. OLP's USDC is transferred to attackerAddress (not a pool).
+    3. Event logs say the transfer went to poolUuid's pool, but it actually went to attacker.
+    4. OLP loses funds, attacker gains them.
+  impact: "Provider can redirect OLP-to-pool transfers to any address, including themselves.
+    Direct theft of OLP funds up to OLP's approval amount."
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // poolAddress must match the pool registered for poolUuid
+    address registeredPool = oracle.getPool(poolUuid);
+    eq(poolAddress, registeredPool,
+       "VAR-DOM-09: poolAddress doesn't match poolUuid — funds sent to wrong address");
+  ghost_vars: []
+  validated: true
+  priority: critical
+  confidence: 95
+  poc: variational-audit/test/DD01_ForkTest.t.sol
+  severity: critical
+  notes: >
+    The function never calls getPool(poolUuid) or factory.getPool(poolUuid) — it just uses
+    whatever poolAddress is passed. The require on line 276 only checks poolAddress != 0.
+    This is a clear validation gap. However, PROVIDER_ROLE is trusted. If the provider is
+    a trusted off-chain system, this is by-design trust in the provider to pass correct
+    parameters. A compromised provider key would allow immediate fund theft though.
+
+    The OLP wallet must have approved the Oracle contract for USDC (transferFrom on line 280
+    goes from olpWallet to Oracle, then Oracle transfers to poolAddress). If OLP hasn't
+    approved Oracle, this is not exploitable. But the OLP is the $23M counterparty — it
+    almost certainly has approved Oracle for large amounts.
+  poc_sketch: |
+    function test_olp_funds_redirected() public {
+        // OLP approves Oracle
+        vm.prank(olpWallet);
+        usdc.approve(address(oracle), type(uint256).max);
+        // Provider redirects to attacker
+        vm.prank(provider);
+        oracle.transferFromOLPToPool(
+            olpWallet,
+            attacker,  // NOT a real pool
+            1000000e6, // $1M
+            poolUuid,
+            rfqUuid,
+            parentQuoteUuid
+        );
+        assertEq(usdc.balanceOf(attacker), 1000000e6);
+    }
+  call_stack: >
+    Oracle.transferFromOLPToPool(olpWallet, attackerAddr, amount, poolUuid, ...)
+    → transferFrom(olpWallet, oracle, amount) → transfer(attackerAddr, amount)
+    → emit OLPToPoolTransfer(olpWallet, attackerAddr, poolUuid, ...) — misleading event
+
+###############################################################################
+# H-10: No balance check before withdrawals — pool can be drained below
+#        other users' deposits
+###############################################################################
+- id: VAR-DOM-10
+  tier: 2
+  type: property
+  description: >
+    SettlementPool has NO internal accounting of per-user balances. It tracks total USDC
+    via _totalBalance() (raw ERC20 balance). withdrawFees and _withdrawUSDCOnBehalf simply
+    call usdc.transfer(requestor, amount) without checking if the pool has sufficient
+    balance or if the withdrawal would drain funds belonging to other parties. The
+    transfer() will fail if balance is insufficient (ERC20 reverts), but there's no
+    concept of "this user deposited X, so they can only withdraw X". The provider
+    decides who withdraws how much.
+  attack_scenario: >
+    1. User A deposits 1000 USDC to pool.
+    2. User B deposits 500 USDC to pool. Pool has 1500 USDC total.
+    3. Provider calls withdrawUSDC for User A with amount=1500 (full pool balance).
+    4. User A gets all 1500 USDC, including User B's 500.
+    5. User B tries to withdraw — pool has 0 USDC, transfer fails.
+  impact: "Provider-controlled fund redistribution between pool parties. One party can
+    receive another party's deposits. Up to full pool balance."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Each party should only be able to withdraw what they deposited (or are owed)
+    // But there's no per-party accounting — just total balance
+    // This is by-design in a settlement pool model
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 25
+  notes: >
+    KILL SIGNAL: This is almost certainly by-design. Settlement pools are meant to hold
+    funds for settlement between parties, and the provider (trusted off-chain system)
+    determines who gets what based on off-chain derivative settlement. The on-chain contract
+    is intentionally "dumb" — it just holds USDC and lets the trusted provider move it.
+    Per-party accounting would be done off-chain. Very low confidence this is a bug.
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: DomainHunter
+  id: VAR-DOM-FP-01
+  reason: >
+    Pool party validation on deposits: Initially suspected depositUSDCOnBehalfOfParty lacks
+    party check, but the transferFrom requires the sender to have approved the specific pool
+    contract. Users would only approve pools they're parties to, making exploitation
+    impractical without user error.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: VAR-DOM-FP-02
+  reason: >
+    No per-party balance accounting in SettlementPool: This is by-design for a settlement
+    pool architecture where the trusted provider manages off-chain accounting. The on-chain
+    contract is intentionally a simple escrow.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

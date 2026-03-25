@@ -1,0 +1,640 @@
+protocol: morpho-vault-v2
+component: VaultV2
+hunter: DeepDiveHunter
+file: src/VaultV2.sol
+generated_at: '2026-03-25T00:00:00Z'
+convergence_summary: |
+  6 hunters flagged exit/withdraw, 5 flagged forceDeallocate, 6 flagged multicall.
+  Core root cause: transient firstTotalAssets creates a stale snapshot that diverges
+  from _totalAssets across multiple operations within a single transaction.
+  Combined with the CEI pattern in exit() and the delegatecall in multicall(),
+  multiple cross-function state inconsistencies emerge.
+
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-01: Stale firstTotalAssets allows over-allocation after exit
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-01
+  title: "Stale firstTotalAssets after exit() allows allocator to bypass relative caps"
+  description: |
+    DESIGN ASSUMPTION VIOLATED: firstTotalAssets reflects actual vault state for cap checks.
+
+    In a single transaction via multicall or sequential calls:
+    1. User calls exit() which decreases _totalAssets (L808) but firstTotalAssets (transient)
+       stays at the value set by the FIRST accrueInterest() of the tx.
+    2. Allocator calls allocate() in the same tx (or later in same tx via multicall).
+    3. allocateInternal() L584 checks: _caps.allocation <= firstTotalAssets.mulDivDown(relativeCap, WAD)
+    4. But firstTotalAssets > _totalAssets because exit reduced _totalAssets.
+    5. The relative cap allows MORE allocation than what current _totalAssets would permit.
+
+    Example: vault has 1M _totalAssets, firstTotalAssets = 1M, relativeCap = 50% (0.5 WAD).
+    Max allocation = 500K. User exits 400K. Now _totalAssets = 600K but relative cap still
+    allows up to 500K (50% of 1M), which is 83% of actual assets. An allocator can concentrate
+    83% of real assets into one adapter, far exceeding the intended 50% limit.
+
+    This is NOT the known donation finding — this is about cap bypass via normal exit flow.
+  severity: medium
+  confidence: 80
+  solidity: |
+    function property_vv2_dd_01() public {
+      uint256 currentTotalAssets = uint256(vault._totalAssets());
+      uint256 fta = vault.firstTotalAssets();
+      // If firstTotalAssets is set (within a tx), it should not be MORE than
+      // 2x the current _totalAssets. A larger gap means caps are stale.
+      if (fta > 0 && currentTotalAssets > 0) {
+        // After exits, firstTotalAssets can be much larger than _totalAssets
+        // which makes relative caps overly permissive
+        t(fta <= currentTotalAssets * 2, "DD-01: firstTotalAssets > 2x _totalAssets, caps stale");
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_01_stale_cap_after_exit() public {
+      // Setup: vault with 1M assets, adapter with relativeCap=50%
+      vault.deposit(1_000_000e18, alice);
+      // Allocator allocates 400K to adapterA
+      vm.prank(allocator);
+      vault.allocate(adapterA, data, 400_000e18);
+
+      // Alice exits 500K in same tx context (or via multicall)
+      // Now _totalAssets = 500K but firstTotalAssets = 1M
+      vm.prank(alice);
+      vault.withdraw(500_000e18, alice, alice);
+
+      // Allocator can now allocate up to 500K (50% of 1M firstTotalAssets)
+      // but that's 100% of current _totalAssets (500K)
+      vm.prank(allocator);
+      vault.allocate(adapterA, data, 100_000e18); // This should fail at 50% but passes
+
+      // Assert: adapterA allocation = 500K = 100% of real assets
+      assertGt(vault.allocation(idA), currentTotalAssets * 50 / 100);
+    }
+  call_stack: "exit -> _totalAssets -= assets | allocateInternal -> caps check uses firstTotalAssets"
+  affected_functions:
+    - exit
+    - withdraw
+    - redeem
+    - allocateInternal
+    - allocate
+  attack_scenario: |
+    1. Vault: 10M assets, adapter X has relativeCap=30% (3M max).
+    2. In one tx: large depositor exits 7M. _totalAssets drops to 3M.
+    3. Allocator (compromised or colluding) calls allocate(X, data, 3M).
+    4. Cap check: 3M <= firstTotalAssets(10M) * 30% = 3M. PASSES.
+    5. But 3M is 100% of current _totalAssets. All vault assets in one adapter.
+    6. If adapter X is risky, all depositors bear concentrated risk.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-02: forceDeallocate double-accrual avoidance creates stale pricing
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-02
+  title: "forceDeallocate penalty computed on stale share price due to transient firstTotalAssets"
+  description: |
+    CROSS-FUNCTION STATE: forceDeallocate (L822) -> deallocateInternal -> withdraw -> accrueInterest
+
+    forceDeallocate flow:
+    1. L826: deallocateInternal() — this does NOT call accrueInterest. Assets come from adapter.
+    2. L827: penaltyAssets = assets.mulDivUp(forceDeallocatePenalty[adapter], WAD)
+    3. L828: withdraw(penaltyAssets, address(this), onBehalf)
+       - withdraw() calls accrueInterest() at L778
+       - But if forceDeallocate was called after ANY other vault interaction in the same tx,
+         firstTotalAssets is already set, so accrueInterest returns early (L653).
+       - The penalty shares are computed with previewWithdraw which uses the STALE _totalAssets
+         that doesn't reflect the just-deallocated assets sitting idle.
+
+    After deallocateInternal returns assets to the vault, the vault's idle balance increases
+    but _totalAssets hasn't changed (deallocateInternal doesn't modify _totalAssets — it only
+    updates cap allocations). So the share price used for penalty calculation is correct
+    in that sense. BUT: if the adapter's realAssets() now returns less (because we deallocated),
+    the NEXT accrueInterest will see lower realAssets, potentially causing a loss event that
+    hits the penalty payer unfairly.
+
+    More critically: if forceDeallocate is the FIRST call in a tx, accrueInterest runs fully.
+    If it's the SECOND call (after deposit/withdraw), it uses stale data. This means the
+    penalty in shares differs depending on call ordering within a multicall batch.
+  severity: medium
+  confidence: 70
+  solidity: |
+    function property_vv2_dd_02() public {
+      // The penalty shares burned from onBehalf should be consistent regardless
+      // of whether forceDeallocate is first or second call in a tx
+      if (ghost_forceDeallocateCalled && ghost_penaltyShares > 0) {
+        uint256 expectedPenaltyAssets = ghost_forceDeallocateAmount * ghost_penalty / 1e18;
+        uint256 actualAssetsValue = vault.previewRedeem(ghost_penaltyShares);
+        // Penalty shares should represent approximately penaltyAssets worth
+        uint256 tolerance = expectedPenaltyAssets / 100; // 1% tolerance
+        t(
+          actualAssetsValue >= expectedPenaltyAssets - tolerance &&
+          actualAssetsValue <= expectedPenaltyAssets + tolerance,
+          "DD-02: penalty shares mispriced due to stale accrual"
+        );
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_02_penalty_pricing_inconsistency() public {
+      // Setup vault with assets in adapter
+      vault.deposit(1_000_000e18, alice);
+      vm.prank(allocator);
+      vault.allocate(adapterA, data, 500_000e18);
+
+      // Warp to accumulate interest
+      vm.warp(block.timestamp + 7 days);
+
+      // Scenario A: forceDeallocate as first call (fresh accrual)
+      uint256 snapshot = vm.snapshot();
+      vm.prank(alice);
+      uint256 penaltySharesA = vault.forceDeallocate(adapterA, data, 100_000e18, alice);
+      vm.revertTo(snapshot);
+
+      // Scenario B: deposit first (sets firstTotalAssets), then forceDeallocate
+      vm.prank(bob);
+      vault.deposit(1e18, bob); // triggers accrueInterest, sets firstTotalAssets
+      vm.prank(alice);
+      uint256 penaltySharesB = vault.forceDeallocate(adapterA, data, 100_000e18, alice);
+
+      // penaltySharesA != penaltySharesB due to stale firstTotalAssets
+      assertEq(penaltySharesA, penaltySharesB, "Penalty differs based on call order");
+    }
+  call_stack: "forceDeallocate -> deallocateInternal -> withdraw -> accrueInterest (early return if firstTotalAssets set) -> previewWithdraw -> exit"
+  affected_functions:
+    - forceDeallocate
+    - withdraw
+    - accrueInterest
+    - accrueInterestView
+    - deallocateInternal
+  attack_scenario: |
+    1. Attacker observes vault with accumulated interest (7 days since lastUpdate).
+    2. Attacker calls deposit(1 wei) to trigger accrueInterest and set firstTotalAssets.
+    3. Interest accrual increases _totalAssets and mints fee shares.
+    4. Attacker immediately calls forceDeallocate — penalty shares computed with
+       post-fee share price (different from fresh-accrual scenario).
+    5. Depending on fee configuration, the penalty in shares can be more or less
+       favorable vs a standalone forceDeallocate call.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-03: multicall + delegatecall bypasses gate checks via msg.sender
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-03
+  title: "multicall delegatecall preserves msg.sender, enabling gate bypass patterns"
+  description: |
+    DESIGN ASSUMPTION VIOLATED: Gates control who can send/receive shares and assets.
+
+    multicall() at L280 uses delegatecall, which preserves msg.sender and msg.value.
+    The gate checks in enter/exit use msg.sender:
+    - enter L766: require(canSendAssets(msg.sender))
+    - exit L794: require(canSendShares(onBehalf))
+    - exit L802: if (msg.sender != onBehalf) check allowance
+
+    The delegatecall pattern itself is standard, but the interaction with the gate system
+    creates a subtle issue: if a CONTRACT calls multicall, the msg.sender inside each
+    delegatecalled function is the contract, not the EOA. This is expected.
+
+    BUT: consider a contract that is both a sendAssetsGate-approved sender AND holds
+    user funds. If a user has approved this contract, the contract can multicall
+    [deposit(X, victim), withdraw(X, attacker, victim)] in one tx. The first call
+    deposits on behalf of victim (requires canReceiveShares(victim) which may pass),
+    the second withdraws from victim (requires allowance OR msg.sender == onBehalf).
+
+    Key insight: if the approved contract IS the sendSharesGate or is whitelisted by it,
+    AND also has allowance from victim, it can batch deposit-then-withdraw within a
+    single tx where firstTotalAssets prevents re-accrual, potentially getting shares at
+    one price and redeeming at another within the same tx.
+
+    This is primarily a gate model concern: contracts approved as gate-passers have
+    disproportionate power when combined with multicall batching.
+  severity: low
+  confidence: 55
+  solidity: |
+    function property_vv2_dd_03() public {
+      // In a multicall batch, no user should have their shares decrease
+      // unless they initiated the call (msg.sender == onBehalf) or gave allowance
+      if (ghost_multicallActive) {
+        for (uint256 i = 0; i < ghost_trackedUsers.length; i++) {
+          address user = ghost_trackedUsers[i];
+          if (user != ghost_multicallCaller) {
+            uint256 balAfter = vault.balanceOf(user);
+            t(
+              balAfter >= ghost_balanceBefore[user],
+              "DD-03: user balance decreased in multicall without being caller"
+            );
+          }
+        }
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_03_multicall_gate_bypass() public {
+      // Setup: GateContract is whitelisted in sendAssetsGate
+      // Alice has approved GateContract for shares
+      vm.prank(alice);
+      vault.approve(address(gateContract), type(uint256).max);
+
+      // GateContract batches: deposit for alice, then withdraw from alice to attacker
+      bytes[] memory calls = new bytes[](2);
+      calls[0] = abi.encodeCall(vault.deposit, (100e18, alice));
+      calls[1] = abi.encodeCall(vault.withdraw, (100e18, attacker, alice));
+
+      // GateContract calls multicall — msg.sender = GateContract for both
+      vm.prank(address(gateContract));
+      vault.multicall(calls);
+
+      // Alice deposited then was immediately withdrawn from
+      assertEq(vault.balanceOf(alice), 0);
+    }
+  call_stack: "multicall -> delegatecall(deposit) -> enter -> gate check | delegatecall(withdraw) -> exit -> allowance check"
+  affected_functions:
+    - multicall
+    - enter
+    - exit
+    - deposit
+    - withdraw
+    - canSendAssets
+    - canReceiveShares
+  attack_scenario: |
+    1. Attacker deploys contract C that is approved in sendAssetsGate.
+    2. Users approve C for share spending (common in DeFi integrations).
+    3. C calls vault.multicall([deposit(X, user), withdraw(X, attacker, user)]).
+    4. Within delegatecall, msg.sender = C for both calls.
+    5. deposit succeeds because C passes canSendAssets and user passes canReceiveShares.
+    6. withdraw succeeds because C has allowance from user.
+    7. User's assets end up with attacker.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-04: forceDeallocate + exit race allows double-spend of idle assets
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-04
+  title: "forceDeallocate returns assets to vault that exit() can immediately consume"
+  description: |
+    VALUE EXIT TRACE: Two paths compete for the same idle balance.
+
+    forceDeallocate (L822-831):
+    1. deallocateInternal() at L826 pulls assets FROM adapter TO vault (increases idle balance).
+    2. withdraw() at L828 is called with receiver=address(this), so penalty assets stay in vault.
+    3. BUT withdraw -> exit (L793-811) checks idleAssets at L797 BEFORE potentially deallocating more.
+
+    The critical sequence in a single tx:
+    - forceDeallocate calls deallocateInternal (assets arrive at vault, idle += assets)
+    - forceDeallocate then calls withdraw(penaltyAssets, address(this), onBehalf)
+    - withdraw -> accrueInterest (early return) -> previewWithdraw -> exit
+    - exit checks idleAssets = balanceOf(asset, vault) — this NOW includes the just-deallocated assets
+    - exit transfers penaltyAssets to address(this) — this is a self-transfer, no-op for balance
+    - exit decreases _totalAssets by penaltyAssets
+
+    Meanwhile, if ANOTHER user calls withdraw in the same block:
+    - Their exit() sees the deallocated assets as idle
+    - They can withdraw using those idle assets
+    - But _totalAssets was decreased by forceDeallocate's penalty AND their withdrawal
+
+    The issue: after forceDeallocate, _totalAssets decreased by penaltyAssets, but the
+    actual assets that LEFT the vault = 0 (self-transfer). The vault's real balance is
+    inflated relative to _totalAssets by penaltyAssets. This means the next accrueInterest
+    will see realAssets > _totalAssets, interpreting the difference as "interest" (capped
+    by maxRate). The penalty effectively becomes a donation to all remaining shareholders.
+
+    This is BY DESIGN (NatSpec L817: "share price doesn't change except rounding"), but
+    combined with maxRate gating, the penalty-as-donation creates an opportunity window
+    where the vault's real balance diverges from _totalAssets.
+  severity: medium
+  confidence: 75
+  solidity: |
+    function property_vv2_dd_04() public {
+      // After forceDeallocate, the vault's actual balance should not exceed
+      // _totalAssets by more than the penalty amount + rounding
+      uint256 vaultBalance = IERC20(asset).balanceOf(address(vault));
+      uint256 totalAssetsTracked = uint256(vault._totalAssets());
+      uint256 adapterAssets = 0;
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        adapterAssets += IAdapter(vault.adapters(i)).realAssets();
+      }
+      uint256 totalReal = vaultBalance + adapterAssets;
+      if (totalReal > totalAssetsTracked && totalAssetsTracked > 0) {
+        uint256 excess = totalReal - totalAssetsTracked;
+        // Excess should be bounded by accumulated penalties + maxRate interest
+        t(
+          excess <= ghost_accumulatedPenalties + ghost_maxRateInterest + 1e6,
+          "DD-04: excess balance beyond penalties + maxRate bounds"
+        );
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_04_penalty_creates_donation() public {
+      // Setup: vault with 1M, adapter with 500K, penalty=2%
+      vault.deposit(1_000_000e18, alice);
+      vault.deposit(100_000e18, bob);
+      vm.prank(allocator);
+      vault.allocate(adapterA, data, 500_000e18);
+      vm.prank(curator);
+      vault.setForceDeallocatePenalty(adapterA, 0.02e18); // 2%
+
+      // Alice forceDeallocates 500K, penalty = 10K shares worth
+      vm.prank(alice);
+      vault.forceDeallocate(adapterA, data, 500_000e18, alice);
+
+      // Now: _totalAssets decreased by ~10K (penalty), but vault balance unchanged
+      // realAssets > _totalAssets by ~10K
+      uint256 vaultBal = token.balanceOf(address(vault));
+      uint256 tracked = uint256(vault._totalAssets());
+      assertGt(vaultBal, tracked, "Balance exceeds tracked after penalty");
+
+      // Bob can front-run the next accrueInterest to capture part of the penalty
+      // The penalty is distributed to ALL shareholders via share price increase
+      vm.warp(block.timestamp + 1);
+      uint256 bobSharesBefore = vault.previewRedeem(vault.balanceOf(bob));
+      vault.accrueInterest();
+      uint256 bobSharesAfter = vault.previewRedeem(vault.balanceOf(bob));
+      assertGt(bobSharesAfter, bobSharesBefore, "Bob profits from penalty donation");
+    }
+  call_stack: "forceDeallocate -> deallocateInternal (assets to vault) -> withdraw(penalty, address(this), onBehalf) -> exit -> self-transfer"
+  affected_functions:
+    - forceDeallocate
+    - deallocateInternal
+    - withdraw
+    - exit
+    - accrueInterest
+    - accrueInterestView
+  attack_scenario: |
+    1. Vault has 10M assets. AdapterA has 5M allocated, penalty=2%.
+    2. Alice (large holder) needs liquidity, calls forceDeallocate(adapterA, 5M, alice).
+    3. Penalty = 100K assets worth of shares burned from Alice.
+    4. Vault balance stays same (self-transfer), _totalAssets drops by 100K.
+    5. Now realAssets > _totalAssets by 100K — this is "interest" for next accrual.
+    6. Eve monitors mempool, sees forceDeallocate, front-runs deposit before it.
+    7. After forceDeallocate + next accrueInterest, Eve captures share of 100K penalty.
+    8. Eve extracts value that should have gone to existing holders.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-05: enter() _totalAssets update before allocateInternal creates
+#            temporary accounting gap exploitable by adapter
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-05
+  title: "enter() updates _totalAssets before allocateInternal, creating transient over-accounting"
+  description: |
+    CROSS-FUNCTION STATE: enter() L770 does `_totalAssets += assets` THEN L773 calls
+    `allocateInternal(liquidityAdapter, liquidityData, assets)`.
+
+    allocateInternal L574 does `safeTransfer(asset, adapter, assets)` — sends the just-deposited
+    assets to the adapter. Then the adapter's allocate() is called.
+
+    At this point: _totalAssets includes the new assets, but the assets are now held by the
+    adapter (not the vault). This is correct IF the adapter correctly reports them via realAssets().
+
+    BUT: if the adapter's allocate() reverts or loses some assets (NatSpec L83-85 acknowledges
+    small losses), _totalAssets was already increased. The revert case is fine (entire tx reverts).
+    The loss case is the issue: if adapter.allocate() succeeds but results in a small loss
+    (e.g., entry fee on underlying market), _totalAssets is inflated by that loss amount.
+
+    More critically: the adapter is called with msg.sig = the enter function's selector
+    (deposit or mint). If the adapter behaves differently based on selector, it could
+    report different changes. The adapter returns `change` which is applied to cap allocations,
+    but it does NOT adjust _totalAssets. The _totalAssets += assets happens unconditionally.
+
+    If adapter.allocate() returns a change < assets (entry fees), the cap accounting is correct
+    but _totalAssets is overstated relative to real assets. This creates a temporary share
+    price inflation until the next accrueInterest which will see lower realAssets and cap it.
+
+    The window between enter() and next accrueInterest (same tx due to firstTotalAssets)
+    means the share price is inflated for any subsequent deposit/withdraw in the same tx.
+  severity: medium
+  confidence: 65
+  solidity: |
+    function property_vv2_dd_05() public {
+      // _totalAssets should never exceed sum of idle + sum of adapter realAssets + tolerance
+      uint256 idle = IERC20(asset).balanceOf(address(vault));
+      uint256 adapterTotal = 0;
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        adapterTotal += IAdapter(vault.adapters(i)).realAssets();
+      }
+      uint256 realTotal = idle + adapterTotal;
+      uint256 tracked = uint256(vault._totalAssets());
+      // Allow small tolerance for rounding
+      if (tracked > realTotal) {
+        uint256 gap = tracked - realTotal;
+        t(gap <= tracked / 1000, "DD-05: _totalAssets exceeds real assets by >0.1%");
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_05_entry_fee_inflation() public {
+      // Setup: liquidityAdapter that charges 0.1% entry fee
+      // (keeps 0.1% of allocated assets, returns change = assets * 99.9%)
+      vault.deposit(1_000_000e18, alice); // no adapter yet
+
+      vm.prank(allocator);
+      vault.setLiquidityAdapterAndData(address(feeAdapter), data);
+
+      // Bob deposits 100K — enter() adds 100K to _totalAssets
+      // then allocateInternal sends 100K to feeAdapter
+      // feeAdapter takes 0.1% fee = 100 tokens, only deploys 99.9K
+      // change = 99.9K (correct for caps) but _totalAssets += 100K (overstated by 100)
+      vm.prank(bob);
+      vault.deposit(100_000e18, bob);
+
+      uint256 tracked = uint256(vault._totalAssets());
+      uint256 idle = token.balanceOf(address(vault));
+      uint256 adapterBal = feeAdapter.realAssets();
+      uint256 realTotal = idle + adapterBal;
+
+      assertGt(tracked, realTotal, "_totalAssets overstated after entry fee");
+    }
+  call_stack: "deposit -> accrueInterest -> previewDeposit -> enter -> _totalAssets += assets -> allocateInternal -> safeTransfer -> adapter.allocate()"
+  affected_functions:
+    - enter
+    - deposit
+    - mint
+    - allocateInternal
+  attack_scenario: |
+    1. Curator adds adapter with non-trivial entry fee (e.g., Aave with deposit fee).
+    2. First user deposits 1M via deposit(). _totalAssets = 1M. Adapter holds 999K.
+    3. _totalAssets is overstated by 1K.
+    4. Second user deposits in same tx via multicall. previewDeposit uses
+       _totalAssets=1M (overstated), giving them FEWER shares than deserved.
+    5. When next accrueInterest runs (next tx), realAssets=999K+idle, and if
+       realAssets < _totalAssets, the vault recognizes a loss.
+    6. Loss socialized to ALL holders including second depositor who already got fewer shares.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-06: accrueInterestView fee underflow when canReceiveShares returns
+#            false mid-transaction
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-06
+  title: "Fee recipient gate change between accrueInterestView and accrueInterest causes inconsistency"
+  description: |
+    DESIGN ASSUMPTION VIOLATED: canReceiveShares(feeRecipient) is stable within a transaction.
+
+    accrueInterestView() at L664 checks:
+    `interest > 0 && performanceFee > 0 && canReceiveShares(performanceFeeRecipient)`
+    If canReceiveShares returns false, performanceFeeAssets = 0.
+
+    accrueInterest() at L637 calls accrueInterestView() to get the values, then at L641:
+    `if (performanceFeeShares != 0) createShares(performanceFeeRecipient, performanceFeeShares)`
+
+    The gate is checked in accrueInterestView but NOT re-checked in createShares (L894).
+    createShares only checks `to != address(0)`.
+
+    However the REAL issue is the reverse: if the gate changes BETWEEN two calls to
+    accrueInterestView within the same tx. Since firstTotalAssets prevents double-accrual,
+    this scenario requires:
+    - Call accrueInterest() — sets firstTotalAssets, mints fee shares.
+    - Gate changes (via setCurator -> setReceiveSharesGate in multicall).
+    - Any subsequent call to accrueInterestView returns (totalAssets, 0, 0) because
+      firstTotalAssets != 0.
+
+    The subtler issue: if gate blocks fee recipient, fees are NOT charged (L664-665).
+    This means: setting receiveSharesGate to block the fee recipient effectively makes
+    the vault fee-free. A curator can collude: set gate to block fee recipient, accrue
+    interest without fees, then unblock. All interest goes to shareholders, zero to fees.
+    This is a curator-level attack that circumvents the fee structure.
+  severity: medium
+  confidence: 70
+  solidity: |
+    function property_vv2_dd_06() public {
+      // If performance fee > 0 and interest > 0, fee shares should be minted
+      // (unless fee recipient genuinely cannot receive shares)
+      uint256 perfFee = vault.performanceFee();
+      address perfRecipient = vault.performanceFeeRecipient();
+      if (perfFee > 0 && perfRecipient != address(0)) {
+        // Track: if interest was earned but no fee shares minted
+        uint256 currentAssets = uint256(vault._totalAssets());
+        if (currentAssets > ghost_lastKnownTotalAssets && ghost_lastKnownTotalAssets > 0) {
+          uint256 interest = currentAssets - ghost_lastKnownTotalAssets;
+          uint256 expectedFeeAssets = interest * perfFee / 1e18;
+          if (expectedFeeAssets > 0) {
+            // Fee recipient balance should have increased
+            t(
+              vault.balanceOf(perfRecipient) >= ghost_feeRecipientBalanceBefore,
+              "DD-06: interest earned but no fee shares minted"
+            );
+          }
+        }
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_06_gate_blocks_fees() public {
+      // Setup: vault with 10% performance fee
+      vault.deposit(1_000_000e18, alice);
+      vm.prank(allocator);
+      vault.allocate(adapterA, data, 500_000e18);
+
+      // Simulate interest accrual
+      vm.warp(block.timestamp + 30 days);
+      // Adapter reports 5% gain
+      adapterA.setRealAssets(525_000e18);
+
+      // Curator sets gate that blocks fee recipient
+      vm.prank(curator);
+      vault.setReceiveSharesGate(address(blockingGate));
+      // blockingGate.canReceiveShares(feeRecipient) returns false
+
+      // Now accrueInterest: interest = 25K, but performanceFeeAssets = 0
+      // because canReceiveShares(feeRecipient) = false
+      vault.accrueInterest();
+
+      // Fee recipient gets ZERO despite 25K interest and 10% fee
+      assertEq(vault.balanceOf(feeRecipient), 0, "Fee recipient got nothing");
+
+      // All interest goes to shareholders — curator effectively waived fees
+    }
+  call_stack: "accrueInterest -> accrueInterestView -> canReceiveShares(feeRecipient) returns false -> performanceFeeAssets=0"
+  affected_functions:
+    - accrueInterest
+    - accrueInterestView
+    - canReceiveShares
+    - setReceiveSharesGate
+  attack_scenario: |
+    1. Curator colludes with large shareholder (or IS the large shareholder).
+    2. Curator submits setReceiveSharesGate(blockingGate) via timelock.
+    3. After timelock, gate is set. Now canReceiveShares(feeRecipient) = false.
+    4. Vault accrues interest — performance fee = 0, management fee = 0 (if both blocked).
+    5. All interest goes to shareholders instead of fee recipients.
+    6. Curator unblocks the gate after capturing the interest period.
+    7. Fee recipients lost their entitled fees. Shareholders (incl. curator) profited.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VV2-DD-07: multicall enables atomic deposit+allocate bypassing relative
+#            cap update lag
+# ═══════════════════════════════════════════════════════════════════════════
+- id: VV2-DD-07
+  title: "multicall deposit+allocate uses stale firstTotalAssets for cap check on new deposits"
+  description: |
+    CROSS-FUNCTION STATE interaction between enter() and allocateInternal():
+
+    In a multicall by an allocator:
+    1. Call deposit(X, self) — enter() increases _totalAssets by X.
+       - If this is first call, accrueInterest sets firstTotalAssets = old _totalAssets.
+       - After enter: _totalAssets = old + X, but firstTotalAssets = old.
+    2. Call allocate(adapter, data, Y) — allocateInternal checks:
+       `_caps.allocation <= firstTotalAssets.mulDivDown(relativeCap, WAD)`
+       - firstTotalAssets = old value (does NOT include the new deposit X).
+       - The relative cap is computed against the OLD total assets.
+
+    This means: a large deposit followed by allocate in the same multicall gets its
+    allocation capped against the PRE-deposit total. The cap is MORE restrictive than
+    intended for the new deposit amount.
+
+    HOWEVER: for exit+allocate (see DD-01), the reverse is true — caps are LESS restrictive.
+
+    The asymmetry means: allocators who want to exceed caps can do exit+allocate (DD-01),
+    while deposit+allocate is artificially constrained. This asymmetry breaks the intended
+    relative cap semantics: caps should represent a percentage of CURRENT assets, but
+    firstTotalAssets creates a lag.
+
+    An allocator can EXPLOIT this: first deposit a large amount via a separate address
+    (increasing _totalAssets), then in a NEW transaction, allocate using the now-higher
+    firstTotalAssets. The one-tx lag creates an advantage for strategic allocators.
+  severity: low
+  confidence: 75
+  solidity: |
+    function property_vv2_dd_07() public {
+      // After any allocate, the allocation should not exceed relativeCap % of
+      // CURRENT _totalAssets (not firstTotalAssets)
+      uint256 currentAssets = uint256(vault._totalAssets());
+      if (currentAssets > 0) {
+        for (uint256 i = 0; i < ghost_trackedIds.length; i++) {
+          bytes32 id = ghost_trackedIds[i];
+          uint256 alloc = vault.allocation(id);
+          uint256 relCap = vault.relativeCap(id);
+          if (relCap < 1e18 && relCap > 0) {
+            uint256 maxAllowed = currentAssets * relCap / 1e18;
+            t(
+              alloc <= maxAllowed + currentAssets / 10000, // 0.01% tolerance
+              "DD-07: allocation exceeds relativeCap of current _totalAssets"
+            );
+          }
+        }
+      }
+    }
+  poc_sketch: |
+    function test_VV2_DD_07_cap_lag_asymmetry() public {
+      // Setup: vault with 1M, adapter with relativeCap=50%
+      vault.deposit(1_000_000e18, alice);
+
+      // Tx 1: Alice exits 600K
+      vm.prank(alice);
+      vault.withdraw(600_000e18, alice, alice);
+      // Now _totalAssets = 400K, firstTotalAssets = 1M (stale in this tx)
+
+      // In same tx: allocator allocates 500K (50% of 1M firstTotalAssets)
+      // But 500K > 400K _totalAssets — allocating 125% of real assets!
+      vm.prank(allocator);
+      vault.allocate(adapterA, data, 400_000e18);
+
+      // This PASSES cap check because 400K <= 1M * 50% = 500K
+      // But 400K = 100% of current _totalAssets, far exceeding intended 50%
+      uint256 alloc = vault.allocation(idA);
+      assertGt(alloc * 100 / uint256(vault._totalAssets()), 50, "Exceeds 50% of real assets");
+    }
+  call_stack: "multicall -> [exit -> _totalAssets -= | allocate -> allocateInternal -> caps check vs firstTotalAssets]"
+  affected_functions:
+    - multicall
+    - allocate
+    - allocateInternal
+    - exit
+    - withdraw
+    - deposit
+    - enter
+  attack_scenario: |
+    1. Vault: 10M assets, adapter X relativeCap=30%.
+    2. Allocator + whale collude. Whale exits 8M in one tx.
+    3. _totalAssets = 2M, firstTotalAssets = 10M (stale).
+    4. Same tx: allocator calls allocate(X, data, 2M).
+    5. Cap check: 2M <= 10M * 30% = 3M. PASSES.
+    6. But 2M = 100% of current _totalAssets. Complete concentration.
+    7. If adapter X is risky or malicious, remaining 2M depositors are fully exposed.

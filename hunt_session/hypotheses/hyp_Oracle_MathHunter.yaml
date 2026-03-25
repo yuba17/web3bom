@@ -1,0 +1,333 @@
+component: Oracle
+hunter: MathHunter
+date: 2026-03-23
+target: Variational (Immunefi, $100K max, Arbitrum)
+files_analyzed:
+  - src/Oracle.sol (468 lines)
+  - src/SettlementPool.sol (332 lines)
+  - src/SettlementPoolFactory.sol (112 lines)
+  - src/library/Fees.sol (10 lines)
+  - src/library/TreasuryManagement.sol (15 lines)
+  - src/library/SettlementPools.sol (11 lines)
+
+invariants:
+  - id: "VAR-MATH-01"
+    title: "batchDepositUSDCAtomic charges creator N times instead of once"
+    description: |
+      In SettlementPool.batchDepositUSDCAtomic (line 122-157), the loop iterates over
+      items[] and for EACH item, if creatorPartyAmountRequested > 0, it calls
+      _depositUSDCOnBehalf(creatorPartyAddress, creatorPartyAmountRequested, ...).
+      This transfers creatorPartyAmountRequested from the creator's wallet on EVERY
+      iteration. The parameter is passed as a single uint256 from Oracle.batchAtomicDeposit
+      (line 339), suggesting it's the TOTAL amount, not per-item. But the implementation
+      charges it N times (once per item in the batch).
+
+      Each item has a DIFFERENT parentQuoteUuid used as transferUuid, so the replay
+      protection (transfers_processed) does NOT prevent repeated charges.
+
+      If N=10 items and creatorPartyAmountRequested=1000 USDC, the creator is charged
+      10,000 USDC instead of 1,000 USDC.
+    confidence: 65
+    severity: "High"
+    location: "SettlementPool.sol:127-141, Oracle.sol:324-342"
+    solidity: |
+      // Invariant: total USDC transferred from creator in batchDepositUSDCAtomic
+      // must equal creatorPartyAmountRequested (if intended as total)
+      // OR must equal creatorPartyAmountRequested * items.length (if intended as per-item)
+      // The ambiguity itself is the bug.
+      // assert(creatorBalanceBefore - creatorBalanceAfter == creatorPartyAmountRequested);
+    attack_scenario: |
+      1. Provider calls Oracle.batchAtomicDeposit with creatorPartyAmountRequested=1000 USDC
+         and items.length=5 (5 counterparties in the batch)
+      2. Oracle calls pool.batchDepositUSDCAtomic
+      3. The loop charges creator 1000 USDC per item = 5000 USDC total
+      4. If the provider intended 1000 total, the creator loses 4000 USDC extra
+      5. The extra USDC sits in the pool — provider can withdraw it via treasury management
+    kill_signals: |
+      - If design docs confirm creatorPartyAmountRequested is PER-ITEM, this is by design
+      - If the off-chain system always passes amount/N, the on-chain bug is masked
+      - Check if any batch calls exist on-chain with items.length > 1
+    impact: "Direct fund loss for pool creator — overcharged by (N-1) * amount"
+    notes: |
+      The event BatchDepositedAtomic emits creatorPartyAmountRequested as a single value,
+      not N*amount, which suggests a mismatch between intent (single charge) and
+      implementation (N charges). The struct AtomicDepositBatchItem does NOT contain
+      a creatorAmount field — another signal that the single amount is meant to be total.
+
+  - id: "VAR-MATH-02"
+    title: "grantRole override always reverts for PROVIDER_ROLE — numProviders desync"
+    description: |
+      Oracle.grantRole (line 438-446) overrides AccessControl.grantRole. It calls
+      super.grantRole(role, account) FIRST, which grants the role. Then it checks
+      require(!hasRole(PROVIDER_ROLE, account)) — but since the role was JUST granted,
+      hasRole returns true, and the require ALWAYS reverts.
+
+      This means grantRole() for PROVIDER_ROLE is a dead function — it always reverts.
+      The transaction reverts entirely (including the super.grantRole), so no state change
+      occurs. The intended path addProvider() uses _grantRole() directly and works fine.
+
+      However, if an admin uses the standard AccessControl.grantRole path (which is the
+      standard OZ interface), it silently fails. More critically: if someone discovers
+      the bug and uses _grantRole via another path, numProviders goes out of sync.
+    confidence: 92
+    severity: "Low"
+    location: "Oracle.sol:438-446"
+    solidity: |
+      // grantRole for PROVIDER_ROLE should succeed when account doesn't have the role
+      // Currently: super.grantRole grants it, then require(!hasRole) always fails
+      // assert(canGrantProviderRole == true) // This always fails
+    attack_scenario: |
+      1. Admin calls oracle.grantRole(PROVIDER_ROLE, newProvider)
+      2. super.grantRole grants the role
+      3. require(!hasRole(PROVIDER_ROLE, newProvider)) checks — account NOW has role
+      4. Require fails, entire transaction reverts
+      5. Admin is confused — standard OZ interface doesn't work
+      6. If admin uses addProvider() instead, it works but the grantRole path is broken
+    kill_signals: |
+      - If the team only uses addProvider/removeProvider (never raw grantRole), impact is minimal
+      - This is a logic bug but not exploitable for fund loss — more of a DoS on admin interface
+    impact: "Broken admin interface — grantRole for PROVIDER_ROLE always reverts. Low severity because addProvider works and no funds at risk."
+
+  - id: "VAR-MATH-03"
+    title: "transferUuid=0 bypasses replay protection in deposits"
+    description: |
+      In SettlementPool._depositUSDCOnBehalf (line 106-108):
+        if (transferUuid != 0) { transfers_processed[transferUuid] = true; }
+
+      When transferUuid=0, the transfer is NOT marked as processed. This means:
+      1. depositUSDCNoEvent (called by treasury management deposits) passes the
+         transferUuid from the struct — if it's 0, no replay protection
+      2. batchDepositUSDCAtomic INTENTIONALLY resets transferUuid to 0 after the
+         first deposit in each item (line 140), meaning the second deposit in each
+         atomic pair has NO replay protection
+
+      For case 2, the provider (PROVIDER_ROLE) controls the call, so replay is
+      provider-initiated. Since PROVIDER_ROLE is trusted, this may be by design.
+
+      For case 1 (depositUSDCNoEvent via treasury management), if the provider sends
+      the same deposit request twice with transferUuid=0, the user gets charged twice.
+    confidence: 45
+    severity: "Medium"
+    location: "SettlementPool.sol:106-108, 129-140"
+    solidity: |
+      // Invariant: every deposit should be replay-protected
+      // assert(transfers_processed[transferUuid] == true) after any deposit
+      // Violated when transferUuid == 0
+    attack_scenario: |
+      1. Malicious or buggy provider calls processTreasuryManagementDeposits with
+         a deposit where transferUuid=0
+      2. The deposit goes through — user's USDC is transferred to pool
+      3. Provider sends the SAME request again (transferUuid=0 again)
+      4. Since transfers_processed[0] was never set to true, it passes the replay check
+      5. User is double-charged
+    kill_signals: |
+      - PROVIDER_ROLE is highly trusted — if they're malicious, bigger problems exist
+      - The off-chain system may never send transferUuid=0 for treasury deposits
+      - depositUSDC (user-facing) requires transferUuid != 0 (line 224)
+      - depositUSDCOnBehalfOfParty also requires transferUuid != 0 (line 238)
+    impact: "If provider sends duplicate deposits with transferUuid=0, users get double-charged. Mitigated by provider trust assumption."
+
+  - id: "VAR-MATH-04"
+    title: "withdrawFees has no balance check — relies on ERC20 revert"
+    description: |
+      SettlementPool.withdrawFees (line 247-260) attempts usdc.transfer(requestor,
+      amountRequested) without first checking if the pool has sufficient balance.
+      It relies on the ERC20 transfer reverting if balance is insufficient.
+
+      With standard USDC (which reverts on insufficient balance), this is safe.
+      However, some ERC20 tokens return false instead of reverting. The code uses
+      a try/catch but the catch only catches reverts, not false returns.
+    confidence: 35
+    severity: "Low"
+    location: "SettlementPool.sol:255-259"
+    solidity: |
+      // Invariant: pool balance after withdrawFees >= 0
+      // assert(usdc.balanceOf(address(pool)) >= 0); // always true for uint
+      // Real check: transfer should revert if balance insufficient
+    attack_scenario: |
+      1. Pool has 100 USDC balance
+      2. Provider calls collectFees requesting 200 USDC
+      3. usdc.transfer(requestor, 200) — if USDC reverts, caught by catch → revert
+      4. But if a non-standard ERC20 returns false, try succeeds, no revert
+      5. Since the contract uses immutable USDC address and this is on Arbitrum (real USDC),
+         this is largely theoretical
+    kill_signals: |
+      - Arbitrum USDC (bridged or native) reverts on insufficient balance
+      - The factory sets USDC address immutably at deploy time — can't swap to weird token
+      - This is a defense-in-depth concern, not an exploitable bug
+    impact: "Theoretical — only exploitable with non-standard ERC20 that returns false. Real USDC reverts."
+
+  - id: "VAR-MATH-05"
+    title: "Unbounded array length in batch functions — gas DoS potential"
+    description: |
+      Multiple functions accept unbounded arrays:
+      - Oracle.collectFees: requests.length unbounded (line 102 loop)
+      - Oracle.processTreasuryManagementDeposits: deposits.length unbounded (line 153)
+      - Oracle.processTreasuryManagementWithdrawals: withdrawals.length unbounded (line 202)
+      - Oracle.batchAtomicDeposit: items.length unbounded (line 334)
+      - SettlementPool.batchDepositUSDCAtomic: items.length unbounded (line 127)
+      - SettlementPoolFactory.createPool: otherAddresses with O(n^2) dedup loop (line 50-64)
+
+      Each iteration does external calls (transferFrom/transfer) which cost ~25K+ gas.
+      A batch with 200+ items could exceed the Arbitrum block gas limit.
+
+      The factory's createPool has O(n^2) duplicate checking for otherAddresses (line 59-64)
+      which is especially gas-intensive for large arrays.
+    confidence: 70
+    severity: "Low"
+    location: "Oracle.sol:102,153,202,334; SettlementPool.sol:127; SettlementPoolFactory.sol:50-64"
+    solidity: |
+      // Invariant: batch size should be bounded
+      // assert(requests.length <= MAX_BATCH_SIZE);
+      // No MAX_BATCH_SIZE exists in the code
+    attack_scenario: |
+      1. Provider (PROVIDER_ROLE) submits a batch with 500 fee collection requests
+      2. Each iteration does an external call to the pool + USDC transfer
+      3. Transaction exceeds gas limit and reverts
+      4. All requests in the batch fail — provider must retry with smaller batches
+      5. No fund loss, but operational disruption
+    kill_signals: |
+      - PROVIDER_ROLE is trusted — they control batch sizes
+      - Off-chain system likely enforces reasonable batch sizes
+      - Arbitrum has high gas limits (much higher than L1)
+      - This is an operational concern, not a security vulnerability
+    impact: "Operational — provider can DoS their own batch calls. No fund loss. Low severity because only trusted providers can call these functions."
+
+  - id: "VAR-MATH-06"
+    title: "atomicDeposit skips party address validation when only partyOne deposits"
+    description: |
+      In Oracle.atomicDeposit (line 287-322), when partyOneAmountRequested > 0 and
+      partyTwoAmountRequested == 0, the function transfers funds from partyOneAddress
+      to the pool (lines 300-307) and then calls pool.depositUSDCAtomic.
+
+      The address validation (lines 309-313) happens AFTER the transfer. This means
+      the transferFrom executes even if the addresses don't match the pool's creator
+      or otherAddresses. However, the require on line 309 will revert the entire
+      transaction including the transfer, so no funds are actually lost.
+
+      But there's a subtlety: the transferFrom needs partyOneAddress to have approved
+      the Oracle contract. If partyOneAddress has approved Oracle for USDC, and a provider
+      calls atomicDeposit with wrong pool/party combo, the transfer happens, gets reverted,
+      but gas is wasted. Not a real vulnerability.
+    confidence: 25
+    severity: "Info"
+    location: "Oracle.sol:298-313"
+    solidity: |
+      // Invariant: address validation should happen BEFORE transfer
+      // Currently: transfer (line 301) happens before require (line 309)
+      // But require reverts the entire tx, so no state change
+    attack_scenario: |
+      Not exploitable — the require on line 309 reverts the entire transaction
+      including the transferFrom. Gas is wasted but no funds lost.
+    kill_signals: |
+      - The entire transaction reverts if addresses don't match — no state change
+      - This is a code quality / gas efficiency issue, not a vulnerability
+    impact: "None — transaction reverts atomically. Info-level code quality observation."
+
+  - id: "VAR-MATH-07"
+    title: "numProviders can reach 0 via renounceRole, blocking removeProvider"
+    description: |
+      Oracle does NOT override renounceRole from AccessControl. A provider can call
+      renounceRole(PROVIDER_ROLE, self) to remove their own role. This does NOT
+      decrement numProviders. If the last 2 providers each renounce their role,
+      numProviders stays at 2 but there are actually 0 providers.
+
+      More critically: removeProvider requires numProviders > 1. If providers renounce
+      instead of being removed, numProviders is inflated. The admin can never call
+      removeProvider to clean up because the removed providers no longer have the role
+      (hasRole check fails on line 426-428).
+
+      Conversely, if one provider renounces and numProviders drops to what the admin
+      thinks is 1, calling removeProvider on the remaining provider fails because
+      numProviders is still 2 (not decremented by renounce), so the check passes but...
+      actually the numProviders > 1 check on line 429 would pass, and the removal would
+      succeed, leaving numProviders=1 but 0 actual providers. No one can call provider
+      functions anymore.
+    confidence: 78
+    severity: "Medium"
+    location: "Oracle.sol:19,417,429,432; AccessControl.renounceRole not overridden"
+    solidity: |
+      // Invariant: numProviders == count of addresses with PROVIDER_ROLE
+      // Violated when renounceRole is used — numProviders not decremented
+      // uint256 actualProviders = countProvidersOnChain();
+      // assert(numProviders == actualProviders);
+    attack_scenario: |
+      1. Admin adds 2 providers (numProviders=2)
+      2. Provider A calls renounceRole(PROVIDER_ROLE, providerA) — succeeds via OZ
+      3. numProviders still = 2, but only 1 actual provider
+      4. Provider B also renounces — numProviders still = 2, 0 actual providers
+      5. No one can call any PROVIDER_ROLE function (deposits, withdrawals, fees)
+      6. All pools are frozen — no deposits or withdrawals possible
+      7. Admin calls addProvider to add a new one — numProviders becomes 3 (should be 1)
+      8. Counter is permanently desynchronized
+    kill_signals: |
+      - Providers are trusted institutional entities — unlikely to renounce maliciously
+      - Admin can always addProvider to recover
+      - The desync is inconvenient but doesn't directly cause fund loss
+      - Funds in pools can potentially be recovered by admin adding new providers
+    impact: "numProviders counter desync can prevent removeProvider from working correctly. If all providers renounce, pools are frozen until admin adds new providers. Medium because it can freeze protocol operations."
+
+  - id: "VAR-MATH-08"
+    title: "Pool UUID collision — Oracle.pools and Factory.getPool are independent mappings"
+    description: |
+      Oracle.createPool (line 359-380) checks pools[poolUuid] == address(0) in its
+      own mapping AND calls factory.createPool which checks getPool[poolUuid] == address(0)
+      in the factory's mapping. Both store the result independently:
+      - Oracle: pools[poolUuid] = poolAddress (line 379)
+      - Factory: getPool[poolUuid] = pool (line 96)
+
+      Oracle.getPool (line 401) reads from pools[] mapping.
+      But other Oracle functions (batchAtomicDeposit line 330, addOtherParty line 386,
+      processTreasuryManagementDeposits line 154) use factory.getPool() instead.
+
+      If the factory's oracle is changed (setOracleAddress) and a new Oracle is deployed,
+      the new Oracle has an empty pools[] mapping but factory.getPool still works.
+      The old Oracle's pools[] mapping becomes stale.
+
+      Within a single Oracle instance, both mappings should be consistent. But if
+      factory.createPool is called by the owner directly (bypassing Oracle), the
+      factory mapping has a pool that Oracle.pools doesn't know about.
+    confidence: 55
+    severity: "Low"
+    location: "Oracle.sol:21,379,401; Oracle.sol:330,386 use factory.getPool"
+    solidity: |
+      // Invariant: Oracle.pools[uuid] == Factory.getPool[uuid] for all uuid
+      // assert(pools[poolUuid] == factory.getPool(poolUuid));
+    attack_scenario: |
+      1. Factory owner calls factory.createPool directly (not through Oracle)
+      2. Factory.getPool[uuid] = newPoolAddress, but Oracle.pools[uuid] = address(0)
+      3. Oracle.getPool(uuid) reverts — "Pool not found"
+      4. But Oracle.batchAtomicDeposit uses factory.getPool — works fine
+      5. Oracle.withdrawUSDC uses Oracle.getPool — fails
+      6. Inconsistent behavior depending on which Oracle function is called
+    kill_signals: |
+      - Factory.createPool requires msg.sender == owner or oracle — owner bypass is intentional
+      - If owner always uses Oracle to create pools, mappings stay in sync
+      - The dual mapping is likely a design artifact, not a bug
+    impact: "Inconsistent pool lookup if pools are created outside Oracle. Low severity — requires factory owner to bypass Oracle intentionally."
+
+summary: |
+  Analyzed 6 source files (937 lines total) for Variational protocol.
+
+  HIGHEST PRIORITY findings:
+  1. VAR-MATH-01 (High, 65% confidence): batchDepositUSDCAtomic charges creator N times
+     per batch instead of once. Potential direct fund loss. Needs design doc confirmation.
+  2. VAR-MATH-07 (Medium, 78% confidence): renounceRole not overridden — numProviders
+     desync can freeze protocol operations.
+  3. VAR-MATH-03 (Medium, 45% confidence): transferUuid=0 bypasses replay protection.
+     Mitigated by provider trust.
+
+  LOWER PRIORITY:
+  4. VAR-MATH-02 (Low, 92% confidence): grantRole always reverts for PROVIDER_ROLE.
+     Confirmed logic bug but no fund loss.
+  5. VAR-MATH-05 (Low, 70% confidence): Unbounded arrays in batch functions.
+  6. VAR-MATH-08 (Low, 55% confidence): Dual pool mapping inconsistency.
+  7. VAR-MATH-04 (Low, 35% confidence): No balance pre-check in withdrawFees.
+  8. VAR-MATH-06 (Info, 25% confidence): Address validation after transfer (reverts atomically).
+
+  MATH-SPECIFIC OBSERVATIONS:
+  - No complex math (no percentage calculations, no share/exchange rates, no interest accrual)
+  - All amounts are flat uint256 USDC values — no precision/rounding concerns
+  - Fee in createPool is a flat amount, not calculated — no rounding attack surface
+  - No overflow risk with Solidity ^0.8.2 built-in checks
+  - uint128 UUIDs have no truncation risk — they're used as mapping keys only

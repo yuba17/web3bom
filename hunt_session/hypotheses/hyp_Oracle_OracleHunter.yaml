@@ -1,0 +1,532 @@
+protocol: variational
+component: Oracle + SettlementPool
+file: src/Oracle.sol, src/SettlementPool.sol, src/SettlementPoolFactory.sol
+domain: clearing-settlement
+hunter: OracleHunter
+generated_at: '2026-03-23T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIRMACIÓN: NO hay oracle de precios on-chain
+# ═══════════════════════════════════════════════════════════════════
+#
+# Verificado: CERO cálculos de precio on-chain.
+# - No hay Chainlink feeds, no hay TWAP, no hay price calculations.
+# - "Oracle" es un nombre engañoso — el contrato es un clearing/settlement engine.
+# - Todos los montos (deposits, withdrawals, fees) son pasados por el PROVIDER_ROLE.
+# - El provider es la única fuente de verdad para cantidades.
+# - _totalBalance() usa balanceOf(address(this)) pero NO hay share/exchange rate system.
+#
+# TRUST MODEL COMPLETO — Lo que el provider controla:
+#   1. Todos los montos de deposit (amount parameter)
+#   2. Todos los montos de withdrawal (amountRequested parameter)
+#   3. Todos los montos de fees (amountRequested en CollectionRequest)
+#   4. Qué direcciones reciben fondos (requestor parameter)
+#   5. Creación de pools (creator, other addresses, fees)
+#   6. Transferencias OLP→Pool (olpWallet, poolAddress, amount)
+#   7. Adición de partes a pools (addOtherParty)
+#
+# El sistema es fundamentalmente custodial con el provider como trusted intermediary.
+# Los ataques de manipulación de precio son off-chain concerns, no smart contract bugs.
+#
+# ═══════════════════════════════════════════════════════════════════
+
+invariants:
+
+# ─────────────────────────────────────────────────────────────────
+# H1: REPLAY PROTECTION GAP — transferUuid=0 bypasses replay check
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-01
+  tier: 1
+  type: property
+  description: >
+    En _depositUSDCOnBehalf (SettlementPool.sol:106-108), cuando transferUuid=0,
+    el replay check se SALTA: `if (transferUuid != 0) { transfers_processed[transferUuid] = true; }`.
+    Esto significa que el provider puede llamar la misma operación con transferUuid=0
+    múltiples veces sin que el contrato lo detecte como replay.
+    PERO: el provider ya es trusted y los fondos vienen del sender via transferFrom
+    (requiere allowance). El sender perdería fondos solo si tiene allowance infinita
+    al pool y el provider llama múltiples veces. En la práctica, el front-end
+    probablemente aprueba exactos.
+  attack_scenario: >
+    1. Usuario aprueba USDC al pool con allowance = type(uint256).max (patrón común en DeFi).
+    2. Provider (off-chain) tiene un bug o es malicioso.
+    3. Provider llama depositUSDCNoEvent(user, 1000e6, 0) repetidamente.
+    4. Cada llamada pasa porque transferUuid=0 nunca marca transfers_processed.
+    5. El pool drena toda la allowance del usuario.
+    KILL SIGNAL: El provider es trusted, así que esto es "trusted role abuse".
+    Immunefi generalmente excluye ataques que requieren provider comprometido.
+    Sin embargo, la falta de replay protection para uuid=0 es un gap real en defensa en profundidad.
+  impact: "Drenaje de fondos de usuarios con allowance infinita al pool, si el provider es comprometido o tiene un bug off-chain"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Probar que transferUuid=0 permite múltiples depósitos idénticos
+    // sin que transfers_processed lo bloquee
+    uint256 balBefore = usdc.balanceOf(user);
+    pool.depositUSDCNoEvent(user, 100e6, 0); // via Oracle as provider
+    pool.depositUSDCNoEvent(user, 100e6, 0); // segunda vez — NO revierte
+    uint256 balAfter = usdc.balanceOf(user);
+    // Si el user tenía allowance >= 200e6, perdió 200e6 en vez de 100e6
+    eq(balBefore - balAfter, 200e6, "ORC-OH-01: doble depósito con uuid=0");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    El código tiene paths donde transferUuid=0 es intencional: en batchDepositUSDCAtomic
+    (línea 140), transferUuid se resetea a 0 para el segundo depósito de un atomic pair.
+    Esto es "by design" para el caso batch. PERO depositUSDCNoEvent desde Oracle
+    (processTreasuryManagementDeposits) no filtra transferUuid=0 — depende del provider
+    enviar UUIDs válidos. La pregunta es si el programa de bounty considera provider
+    comprometido como in-scope.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.processTreasuryManagementDeposits() → SettlementPool.depositUSDCNoEvent()
+    → _depositUSDCOnBehalf(sender, amount, transferUuid=0, false)
+    → transfers_processed[0] nunca se marca true (line 106-108)
+
+# ─────────────────────────────────────────────────────────────────
+# H2: NO HAY SANITY CHECK DE MONTOS — provider puede pasar amount > balance
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-02
+  tier: 2
+  type: property
+  description: >
+    withdrawFees, _withdrawUSDCOnBehalf, y withdrawUSDC no verifican que
+    amountRequested <= _totalBalance(). Dependen del try/catch del transfer ERC20
+    para fallar si no hay fondos suficientes. Esto es técnicamente correcto
+    (USDC.transfer revertirá si balance insuficiente) pero no hay CAP ni rate limit.
+    Un provider comprometido podría intentar extraer todo el balance de un pool
+    en una sola llamada.
+  attack_scenario: >
+    1. Provider llama withdrawFees(providerAddress, pool.totalBalance, feesBatchId).
+    2. El transfer de USDC tiene éxito porque amount <= balance.
+    3. El pool queda con 0 USDC.
+    4. Todos los usuarios del pool pierden sus fondos.
+    KILL SIGNAL: Provider es trusted — esto es "admin can rug" por diseño.
+    No hay on-chain guardrails (ni timelock, ni rate limit, ni multisig enforcement).
+  impact: "Drenaje completo de un pool si el provider es comprometido"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que no hay cap en retiros de fees
+    uint256 poolBalance = usdc.balanceOf(address(pool));
+    // Provider puede retirar TODO como fees
+    pool.withdrawFees(provider, poolBalance, feesBatchId);
+    uint256 remaining = usdc.balanceOf(address(pool));
+    eq(remaining, 0, "ORC-OH-02: pool drenado completamente via fees");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Esto es más un finding de diseño que un bug. El sistema es inherentemente
+    custodial — el provider tiene control total sobre los fondos. No hay
+    mecanismo on-chain que proteja a los usuarios de un provider malicioso.
+    Immunefi probablemente lo marca como "by design" o "trusted role".
+    Sin embargo, la ausencia TOTAL de guardrails (ni siquiera un daily limit
+    o una verificación de que fees_collected <= total_volume * max_fee_rate)
+    es notable como hallazgo informativo.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.collectFees() → SettlementPool.withdrawFees(requestor, amount, batchId)
+    → usdc.transfer(requestor, amount) — sin check previo de balance
+
+# ─────────────────────────────────────────────────────────────────
+# H3: DONATION ATTACK — direct USDC transfer al pool
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-03
+  tier: 2
+  type: property
+  description: >
+    _totalBalance() usa balanceOf(address(this)) (SettlementPool.sol:78-80).
+    Cualquiera puede enviar USDC directamente al pool sin pasar por deposit.
+    PERO: _totalBalance() NO se usa en ninguna lógica de decisión.
+    No hay exchange rates, no hay shares, no hay ratio calculations.
+    El balance solo afecta si un withdrawal/transfer tendrá éxito
+    (más balance = siempre pasa). Una donación solo AYUDA al pool.
+    RESULTADO: No hay vector de ataque. La donación no puede perjudicar a nadie.
+  attack_scenario: >
+    NINGUNO VIABLE. La donación directa de USDC al pool:
+    - No cambia ningún ratio (no hay shares/exchange rate).
+    - No afecta accounting (no hay internal balance tracking).
+    - Solo aumenta el balance real del pool.
+    - Los fondos donados son "recuperables" solo si el provider los
+      retira via withdrawFees (pero eso ya requiere provider role).
+  impact: "Ninguno — no hay mecanismo de share/ratio que pueda ser manipulado"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Confirmar que donación directa no afecta ninguna lógica
+    uint256 balBefore = usdc.balanceOf(address(pool));
+    usdc.transfer(address(pool), 1000e6); // donación directa
+    uint256 balAfter = usdc.balanceOf(address(pool));
+    // El balance subió pero NO hay side effects en el contrato
+    gte(balAfter, balBefore + 1000e6, "ORC-OH-03: donación recibida");
+    // No hay función que use _totalBalance() para decisiones
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    DESCARTADO como vector de ataque. _totalBalance() existe pero no se
+    llama desde ninguna función pública o interna del contrato. Es código
+    muerto (o usado solo para queries off-chain via direct call).
+    No hay donation attack surface porque no hay ratio/share system.
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────
+# H4: grantRole PROVIDER_ROLE — numProviders desync bug
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-04
+  tier: 1
+  type: property
+  description: >
+    Oracle.grantRole() (línea 438-446) hace super.grantRole(role, account) ANTES
+    del require(!hasRole(PROVIDER_ROLE, account)). Esto significa que cuando se
+    llama grantRole(PROVIDER_ROLE, newAddr):
+    1. super.grantRole() concede el rol exitosamente.
+    2. hasRole(PROVIDER_ROLE, account) ahora retorna TRUE.
+    3. El require(!hasRole(...)) SIEMPRE falla porque el rol ya se concedió.
+    4. La transacción revierte, pero el efecto neto es: grantRole NUNCA funciona
+       para PROVIDER_ROLE a través del path estándar AccessControl.grantRole.
+    El admin DEBE usar addProvider() en su lugar.
+
+    IMPACTO REAL: grantRole para PROVIDER_ROLE siempre revierte. numProviders
+    nunca se incrementa via grantRole (pero addProvider funciona).
+    Esto es un BUG de código muerto/roto, no un exploit, porque addProvider
+    es el path correcto. PERO si alguien intenta usar grantRole (el path
+    estándar de AccessControl), siempre falla silenciosamente.
+  attack_scenario: >
+    1. Admin llama grantRole(PROVIDER_ROLE, newProvider).
+    2. super.grantRole concede el rol en el mapping interno de AccessControl.
+    3. hasRole retorna true → require(!hasRole) revierte toda la transacción.
+    4. El nuevo provider NO se añade (toda la tx revierte).
+    5. No hay pérdida de fondos, pero el path grantRole está roto para PROVIDER_ROLE.
+
+    NOTA: revokeRole tiene el patrón correcto (check ANTES de super.revokeRole).
+    Solo grantRole tiene el bug de ordenamiento.
+  impact: "grantRole(PROVIDER_ROLE, ...) siempre revierte — path estándar AccessControl roto para providers. No hay pérdida de fondos."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // grantRole siempre revierte para PROVIDER_ROLE
+    // Porque super.grantRole() se ejecuta ANTES del require
+    vm.expectRevert("Oracle: Provider already added.");
+    oracle.grantRole(PROVIDER_ROLE, newProvider);
+    // Pero addProvider funciona correctamente:
+    oracle.addProvider(newProvider);
+    assertTrue(oracle.hasRole(PROVIDER_ROLE, newProvider));
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    BUG CONFIRMADO por lectura estática. La secuencia en grantRole es:
+    L439: super.grantRole(role, account) → concede el rol
+    L442: require(!hasRole(PROVIDER_ROLE, account)) → SIEMPRE falla porque L439 ya concedió
+    Toda la transacción revierte (incluyendo el super.grantRole).
+
+    Comparar con revokeRole que tiene el patrón correcto:
+    L451: require(hasRole(...)) → check PRIMERO
+    L453: numProviders--
+    L456: super.revokeRole(role, account) → revoca DESPUÉS
+
+    Severidad: Low/QA — addProvider() funciona, no hay pérdida de fondos.
+    Pero es un bug real: grantRole es la interfaz estándar de AccessControl
+    y un admin podría razonablemente esperar que funcione.
+  poc_sketch: |
+    function test_grantRole_always_reverts_for_provider() public {
+        // Setup: oracle deployed, admin is msg.sender
+        address newProvider = makeAddr("newProvider");
+
+        // grantRole reverts
+        vm.prank(admin);
+        vm.expectRevert("Oracle: Provider already added.");
+        oracle.grantRole(oracle.PROVIDER_ROLE(), newProvider);
+
+        // addProvider works
+        vm.prank(admin);
+        oracle.addProvider(newProvider);
+        assertTrue(oracle.hasRole(oracle.PROVIDER_ROLE(), newProvider));
+    }
+  call_stack: >
+    Admin → Oracle.grantRole(PROVIDER_ROLE, account)
+    → AccessControl.grantRole (super) → _grantRole → sets role = true
+    → require(!hasRole(PROVIDER_ROLE, account)) → hasRole returns true → REVERT
+
+# ─────────────────────────────────────────────────────────────────
+# H5: atomicDeposit — parentQuoteUuid=0 bypasses replay protection
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-05
+  tier: 1
+  type: property
+  description: >
+    En Oracle.atomicDeposit (líneas 298-308), cuando partyOneAmountRequested > 0
+    y partyTwoAmountRequested == 0, hay replay check via atomic_deposits_processed[parentQuoteUuid].
+    PERO si parentQuoteUuid == 0, la línea 305-307 SALTA el marcaje:
+    `if (parentQuoteUuid != 0) { atomic_deposits_processed[parentQuoteUuid] = true; }`.
+    Esto permite que el provider llame atomicDeposit con parentQuoteUuid=0 múltiples
+    veces para el mismo depósito sin replay detection.
+
+    Mismo patrón que ORC-OH-01 pero en atomicDeposit. El depósito requiere
+    transferFrom del sender, así que necesita allowance.
+  attack_scenario: >
+    1. partyOne tiene allowance infinita de USDC al Oracle contract.
+    2. Provider llama atomicDeposit(partyOne, partyTwo, 1000e6, 0, poolUuid, rfqUuid, 0).
+    3. parentQuoteUuid=0, así que atomic_deposits_processed[0] no se marca.
+    4. Provider repite la llamada N veces.
+    5. Cada vez transfiere 1000e6 del partyOne al pool.
+    6. partyOne pierde N * 1000e6.
+    KILL SIGNAL: Misma limitación que ORC-OH-01 — provider es trusted.
+  impact: "Drenaje de fondos de partyOne si tiene allowance infinita y parentQuoteUuid=0"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // parentQuoteUuid=0 permite replay de atomicDeposit
+    oracle.atomicDeposit(partyOne, partyTwo, 1000e6, 0, poolUuid, rfqUuid, 0);
+    // Segunda llamada NO revierte:
+    oracle.atomicDeposit(partyOne, partyTwo, 1000e6, 0, poolUuid, rfqUuid, 0);
+    // partyOne perdió 2000e6
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    Patrón idéntico a ORC-OH-01. El `if (parentQuoteUuid != 0)` en línea 305
+    es intencional para permitir el caso donde no hay parentQuoteUuid,
+    pero abre un gap en la replay protection. El require de línea 299
+    (`atomic_deposits_processed[parentQuoteUuid] == false`) pasa porque
+    transfers_processed[0] por defecto es false (y nunca se marca true).
+
+    NOTA: Para el path donde AMBOS partyOneAmount > 0 Y partyTwoAmount > 0,
+    depositUSDCAtomic en SettlementPool tiene `require(parentQuoteUuid != 0)` en línea 181,
+    así que ese path está protegido. Solo el path de single-party deposit (linea 298-308)
+    permite parentQuoteUuid=0.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.atomicDeposit(partyOne, partyTwo, amount, 0, pool, rfq, parentQuoteUuid=0)
+    → L299: atomic_deposits_processed[0] == false ✓ (siempre)
+    → L300-304: transferFrom + transfer (mueve fondos)
+    → L305: if (0 != 0) → false → NO marca processed
+    → Repetible indefinidamente
+
+# ─────────────────────────────────────────────────────────────────
+# H6: transferFromOLPToPool — sin replay protection
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-06
+  tier: 2
+  type: property
+  description: >
+    Oracle.transferFromOLPToPool (líneas 267-285) NO tiene ningún mecanismo
+    de replay protection. No usa transfers_processed ni atomic_deposits_processed.
+    Los parámetros rfqUuid y parentQuoteUuid solo se emiten en el evento,
+    no se usan para nada on-chain.
+
+    El provider puede llamar esta función repetidamente con los mismos parámetros.
+    Los fondos vienen del olpWallet via transferFrom, así que requiere allowance.
+  attack_scenario: >
+    1. OLP wallet tiene allowance infinita de USDC al Oracle contract.
+    2. Provider llama transferFromOLPToPool(olp, pool, 10000e6, ...) repetidamente.
+    3. No hay replay check — cada llamada transfiere 10000e6 más.
+    4. OLP wallet se drena completamente.
+    KILL SIGNAL: Provider trusted, pero este path no tiene NINGUNA protección,
+    ni siquiera el check condicional de uuid!=0 que tienen los otros paths.
+  impact: "Drenaje completo de OLP wallet si tiene allowance infinita y provider es comprometido"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // transferFromOLPToPool no tiene replay protection
+    oracle.transferFromOLPToPool(olp, pool, 1000e6, poolUuid, rfqUuid, parentQuoteUuid);
+    oracle.transferFromOLPToPool(olp, pool, 1000e6, poolUuid, rfqUuid, parentQuoteUuid);
+    // Ambas pasan sin revert — OLP pierde 2000e6
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 90
+  notes: >
+    Este es el path con MENOS protección en todo el sistema. Ni siquiera tiene
+    el patrón condicional de uuid!=0. rfqUuid y parentQuoteUuid son puramente
+    informativos (solo se emiten en evento). Si el provider tiene un bug off-chain
+    que envía duplicados, no hay defensa on-chain alguna.
+
+    Comparar con otros paths:
+    - depositUSDC: require(transferUuid != 0) + transfers_processed check
+    - atomicDeposit: atomic_deposits_processed check (aunque con gap en uuid=0)
+    - transferFromOLPToPool: NINGÚN check
+  poc_sketch: ''
+  call_stack: >
+    Oracle.transferFromOLPToPool(olp, pool, amount, poolUuid, rfqUuid, parentQuoteUuid)
+    → require checks (addresses non-zero, amount > 0)
+    → usdc.transferFrom(olp, oracle, amount)
+    → usdc.transfer(pool, amount)
+    → emit event
+    → NO replay protection
+
+# ─────────────────────────────────────────────────────────────────
+# H7: withdrawFees — requestor no está validado como party del pool
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-07
+  tier: 2
+  type: property
+  description: >
+    SettlementPool.withdrawFees (líneas 247-260) envía USDC a `requestor`
+    sin verificar que requestor sea creatorAddress o esté en otherAddresses.
+    Comparar con _withdrawUSDCOnBehalf (líneas 270-272) que SÍ verifica:
+    `require(requestor == creatorAddress || otherAddresses[requestor] == true)`.
+
+    En withdrawFees, el requestor es msg.sender del Oracle (el provider),
+    así que los fees van al provider directamente. Esto parece ser by design
+    (el provider cobra fees), pero permite enviar fees a cualquier dirección
+    que el provider especifique, no solo al provider mismo.
+
+    WAIT: Re-leyendo el código, en Oracle.collectFees (línea 107), se pasa
+    msg.sender como requestor, que es el provider. Así que el requestor
+    siempre es el provider. Esto ES by design.
+  attack_scenario: >
+    No hay ataque — el requestor en withdrawFees siempre es msg.sender
+    (el provider) porque Oracle.collectFees pasa msg.sender en línea 107.
+    DESCARTADO.
+  impact: "Ninguno — requestor es siempre el provider (msg.sender)"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // No aplica — el requestor es siempre msg.sender del provider
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    DESCARTADO tras análisis más profundo. Aunque withdrawFees no valida
+    requestor como party del pool, el requestor viene hardcodeado como
+    msg.sender en Oracle.collectFees. No hay path donde un non-provider
+    pueda llamar esta función (onlyOracle modifier + PROVIDER_ROLE).
+
+# ─────────────────────────────────────────────────────────────────
+# H8: batchDepositUSDCAtomic — creator deposita N veces en batch
+# ─────────────────────────────────────────────────────────────────
+- id: ORC-OH-08
+  tier: 1
+  type: property
+  description: >
+    En SettlementPool.batchDepositUSDCAtomic (líneas 122-157), si hay N items
+    en el batch, el creatorPartyAddress deposita creatorPartyAmountRequested
+    N veces (una por cada item). Esto es porque el loop en línea 127 llama
+    _depositUSDCOnBehalf para el creator en cada iteración (línea 130-136).
+
+    La primera iteración usa parentQuoteUuid como transferUuid para replay
+    protection. Las iteraciones 2..N usan transferUuid=0 (reseteado en línea 140)
+    PERO: después de la primera iteración, transfers_processed[parentQuoteUuid]=true.
+    En la segunda iteración, transferUuid=items[1].parentQuoteUuid (un UUID DIFERENTE).
+
+    WAIT: Re-leyendo... El transferUuid se asigna en línea 129 DENTRO del loop:
+    `uint128 transferUuid = items[i].parentQuoteUuid;` — cada iteración usa
+    el parentQuoteUuid del item correspondiente. Y el reset a 0 en línea 140
+    es solo para que el segundo _depositUSDCOnBehalf (del otherParty en el mismo item)
+    no haga replay check.
+
+    PERO: El creator deposita creatorPartyAmountRequested en CADA iteración del loop.
+    Si hay 10 items, el creator deposita 10 * creatorPartyAmountRequested.
+    ¿Es esto intencional? El caller (Oracle.batchAtomicDeposit) pasa el mismo
+    creatorPartyAmountRequested para todos los items. Esto parece ser by design
+    para depositar el margen del creator para cada contraparte.
+  attack_scenario: >
+    Probablemente by design — el creator deposita margen separado para cada
+    contraparte en el batch. Pero un usuario que no entiende que el monto
+    se multiplica por N items podría perder más de lo esperado.
+    Esto es un riesgo UX, no un bug de contrato.
+  impact: "Confusión de usuario sobre monto total depositado — UX issue, no exploit"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que creator deposita N veces el monto
+    uint256 balBefore = usdc.balanceOf(creator);
+    // Batch con 5 items, cada uno con su UUID
+    oracle.batchAtomicDeposit(poolUuid, creator, 100e6, items5);
+    uint256 balAfter = usdc.balanceOf(creator);
+    // Creator perdió 500e6, no 100e6
+    eq(balBefore - balAfter, 500e6, "ORC-OH-08: creator deposita N veces");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    Probablemente by design para mercados bilaterales donde el creator
+    mantiene posiciones separadas con cada contraparte. Pero la API es
+    confusa — creatorPartyAmountRequested sugiere un monto total, no
+    un monto por item. Necesita confirmación del equipo.
+  poc_sketch: ''
+  call_stack: >
+    Oracle.batchAtomicDeposit() → SettlementPool.batchDepositUSDCAtomic()
+    → for each item: _depositUSDCOnBehalf(creator, creatorAmount, uuid, false)
+    → Creator deposita creatorAmount * items.length total
+
+false_positives:
+- hunter: OracleHunter
+  id: ORC-OH-FP-01
+  reason: >
+    "Oracle" no es un price oracle — no hay cálculos de precio, TWAP, feeds de
+    Chainlink, ni ningún dato de precio on-chain. Todos los vectores clásicos de
+    oracle manipulation (TWAP manipulation, flash loan price impact, stale data)
+    son IRRELEVANTES para este contrato. El nombre es engañoso.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: OracleHunter
+  id: ORC-OH-FP-02
+  reason: >
+    Donation attack via direct USDC transfer al pool. _totalBalance() usa
+    balanceOf pero no se usa en ninguna lógica de decisión. No hay shares,
+    no hay exchange rates, no hay ratio calculations. La donación no puede
+    causar ningún efecto adverso.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: OracleHunter
+  id: ORC-OH-FP-03
+  reason: >
+    withdrawFees envía a requestor sin validar que sea party del pool.
+    Pero requestor siempre es msg.sender (el provider) porque Oracle.collectFees
+    hardcodea msg.sender en línea 107. No hay path alternativo.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+# ═══════════════════════════════════════════════════════════════════
+# RESUMEN EJECUTIVO
+# ═══════════════════════════════════════════════════════════════════
+#
+# FINDINGS CON POTENCIAL (requieren determinar si provider-compromise es in-scope):
+#
+# 1. ORC-OH-04 (grantRole bug) — CONFIRMADO por lectura estática. Low severity.
+#    grantRole(PROVIDER_ROLE, ...) siempre revierte. El orden super.grantRole()
+#    antes del require(!hasRole) causa que el check siempre falle. addProvider()
+#    funciona, pero la interfaz estándar AccessControl está rota.
+#    CONFIANZA: 95% — este es un bug real, verificable con un test.
+#
+# 2. ORC-OH-01/05/06 (replay gaps) — Gaps reales en replay protection.
+#    transferUuid=0 y parentQuoteUuid=0 saltan el replay check.
+#    transferFromOLPToPool no tiene NINGÚN replay check.
+#    PERO: requieren provider comprometido + allowance infinita del sender.
+#    CONFIANZA: 85% — los gaps existen, pero el impacto depende del threat model.
+#
+# 3. ORC-OH-02 (no amount cap) — By design en sistema custodial.
+#    Informativo/QA.
+#
+# DESCARTADOS:
+# - Price oracle attacks (no hay oracle de precios)
+# - Donation attacks (no hay share/ratio system)
+# - withdrawFees requestor validation (always msg.sender)
+#
+# RECOMENDACIÓN:
+# - ORC-OH-04 es el finding más sólido — bug real, fácil de demostrar con PoC.
+# - ORC-OH-01/05/06 dependen de si el bounty acepta "defense in depth" findings.
+# - Los demás son informativos o descartados.

@@ -1,0 +1,329 @@
+component: AbstractMultisigIsm
+hunter: WildcardHunter
+date: '2026-03-24'
+overall_assessment: |
+  HALLAZGO PRINCIPAL: La factory NO valida duplicados en el validator set. Si se deploya
+  un ISM con validators = [A, A, A, B, B] y threshold = 3, el two-pointer loop permite
+  que A matchee en posicion 0, A matchee en posicion 1, A matchee en posicion 2 --
+  cumpliendo el threshold con UNA SOLA firma (de A, repetida 3 veces con el mismo digest).
+
+  ESPERA -- ECDSA.recover con el MISMO digest y la MISMA firma siempre retorna el MISMO
+  signer. Pero el loop itera sobre i=0,1,2 pidiendo signatureAt(metadata, 0), signatureAt(metadata, 1),
+  signatureAt(metadata, 2). Si las 3 firmas son IDENTICAS (mismo r,s,v), recover retorna
+  la misma address A. El two-pointer avanza por las posiciones de A en validators[].
+
+  ESTO ES UN BUG REAL si la factory permite duplicados. Con validators=[A,A,A,B,B],
+  threshold=3, un atacante que controla SOLO la key de A puede firmar cualquier mensaje.
+  Necesita 3-of-5 pero solo controla 1-of-2 unique validators.
+
+  SEVERIDAD: Depende de si la factory es el unico path para crear ISMs. La factory
+  SI permite duplicados (no hay check). Pero: quien llama a deploy()? Si es governance
+  con review, el riesgo es operacional. Si es permissionless, es critico.
+
+  VERIFICACION: deploy() es `public`, cualquiera puede llamarlo. PERO el ISM resultante
+  solo se usa si alguien lo configura como ISM en el Mailbox. Asi que el riesgo real
+  es: admin configura un ISM con duplicados sin darse cuenta, o un atacante convence
+  al admin de usar su ISM pre-deployed con duplicados ocultos.
+
+invariants:
+- id: ISM-WC-01
+  title: "CRITICAL: Duplicate validators in set reduce effective threshold"
+  tier: 1
+  type: property
+  confidence: 85
+  severity: critical
+  description: |
+    El two-pointer en verify() itera validators[] secuencialmente. Para cada firma,
+    busca el signer en validators[] desde _validatorIndex en adelante. Si un address
+    aparece multiples veces, cada ocurrencia puede matchear una firma diferente.
+
+    Con validators = [A, A, A, B, B] y threshold = 3:
+    - Firma 0: recover -> A, match validators[0], _validatorIndex = 1
+    - Firma 1: recover -> A, match validators[1], _validatorIndex = 2
+    - Firma 2: recover -> A, match validators[2], _validatorIndex = 3
+    - Threshold cumplido con solo la key de A!
+
+    El atacante proporciona 3 firmas identicas de A sobre el mismo digest.
+    ECDSA.recover retorna A para las 3 (deterministic).
+
+    La factory (StaticThresholdAddressSetFactory.deploy) valida:
+    - 0 < _threshold <= _values.length ✓
+    - NO valida duplicados en _values ✗
+    - NO valida address(0) en _values ✗
+
+    IMPACTO: Si un ISM con duplicados es configurado en un Mailbox, el effective
+    threshold se reduce al numero de validators UNICOS. Con [A,A,A,B,B] threshold=3,
+    el effective threshold es 1 (solo necesitas A).
+
+    PREREQUISITO: El ISM con duplicados debe ser configurado como ISM activo por
+    un admin. Esto limita el impacto a un escenario de misconfiguracion o social
+    engineering, no a un exploit directo permissionless.
+  attack_scenario: |
+    1. Atacante deploya ISM via factory con validators=[Attacker, Attacker, Attacker, V1, V2], threshold=3
+    2. Atacante convence al admin que el ISM es legit (las addresses parecen distintas si estan en hex)
+    3. Admin configura este ISM en el Mailbox para un dominio
+    4. Atacante firma cualquier mensaje con su key, provee 3 firmas identicas
+    5. verify() pasa -- threshold 3 cumplido con 1 key
+    6. Atacante puede fabricar mensajes cross-chain arbitrarios
+  solidity: |
+    // Verificar que el two-pointer NO permite duplicados para reducir threshold
+    // Esto requiere un setup con ISM desplegado con duplicados
+    // Conceptual: si validators tiene duplicados, una sola key puede cumplir threshold > 1
+    t(true, "ISM-WC-01: conceptual -- requires ISM deployed with duplicate validators");
+  validated: false
+  status: hypothesis
+
+- id: ISM-WC-02
+  title: "Factory deploy() has no duplicate check -- enables ISM-WC-01"
+  tier: 1
+  type: property
+  confidence: 95
+  severity: high
+  description: |
+    StaticThresholdAddressSetFactory.deploy() acepta address[] calldata _values sin
+    validar unicidad. El unico check es:
+      require(0 < _threshold && _threshold <= _values.length, "Invalid threshold")
+
+    Falta:
+    1. No verifica que _values no contenga duplicados
+    2. No verifica que _values no contenga address(0)
+    3. No verifica que _values este sorted (el two-pointer REQUIERE sorted order para funcionar correctamente)
+
+    NOTA IMPORTANTE sobre sorting: El two-pointer en verify() asume que las FIRMAS estan
+    sorted en el mismo orden que los validators. Si validators = [B, A] (unsorted) y
+    firmas = [sig_A, sig_B], el two-pointer fallaria porque busca A antes que B pero
+    validators tiene B primero. PERO el comentario dice "Consider sorting addresses to
+    ensure contract reuse" -- es una recomendacion, no un enforcement.
+
+    IMPACTO DIRECTO: Permite crear ISMs con validator sets que tienen menor effective
+    threshold que el threshold declarado.
+  attack_scenario: |
+    1. Llamar factory.deploy([addr1, addr1, addr1, addr2, addr3], 3)
+    2. Factory acepta sin error
+    3. ISM creado tiene effective threshold = 1 (solo addr1 necesario)
+    4. Si este ISM es usado, la seguridad m-of-n esta comprometida
+  solidity: |
+    // La factory no valida duplicados -- esto es verificable directamente
+    // deploy([A, A, A], 2) deberia fallar pero no falla
+    t(true, "ISM-WC-02: factory accepts duplicate validators without error");
+  validated: false
+  status: hypothesis
+
+- id: ISM-WC-03
+  title: "MetaProxy.metadata() reads arbitrary calldata tail when called outside proxy"
+  tier: 2
+  type: property
+  confidence: 40
+  severity: medium
+  description: |
+    MetaProxy.metadata() usa assembly para leer los ultimos N bytes del calldata,
+    donde N esta en los ultimos 32 bytes. Si esta funcion se llama en un contrato
+    que NO es un MetaProxy (i.e., sin metadata appended al bytecode), lee basura
+    del calldata.
+
+    En el contexto de StaticMultisigIsm, validatorsAndThreshold() llama MetaProxy.metadata()
+    y luego abi.decode(). Si el contrato no es un MetaProxy real:
+    - calldatasize() no incluye metadata appended
+    - Lee los ultimos 32 bytes del calldata REAL como "size"
+    - Esto podria ser parte del _message parameter
+    - abi.decode intentaria decodificar bytes arbitrarios como (address[], uint8)
+    - Probablemente reverts con decode error
+
+    PERO: para que esto sea explotable, alguien tendria que llamar verify() en la
+    IMPLEMENTACION directamente (no a traves del proxy). La implementacion NO tiene
+    metadata en su bytecode.
+
+    ANALISIS: La implementacion es deployed por la factory en el constructor:
+    `implementation = _deployImplementation()` -> `new StaticMerkleRootMultisigIsm()`
+    Esta implementacion NO es un MetaProxy. Si alguien llama verify() en ella directamente,
+    MetaProxy.metadata() leera basura.
+
+    PERO: No hay fondos en la implementacion. No hay estado. Es un pure/view call.
+    El peor caso es que devuelve un resultado incorrecto, pero nadie deberia llamar
+    la implementacion directamente.
+
+    CONCLUSION: Bajo impacto. La implementacion no deberia ser llamada directamente,
+    y si lo es, no hay consecuencias financieras.
+  attack_scenario: |
+    Atacante llama verify() en la implementacion (no proxy). MetaProxy.metadata()
+    lee basura del calldata. Si por alguna casualidad el decode produce un validator
+    set con threshold=1 y un address que matchea una firma... extremadamente improbable.
+    Ademas, la implementacion no controla fondos ni estado.
+  solidity: |
+    t(true, "ISM-WC-03: MetaProxy.metadata on non-proxy is garbage -- but no funds at risk");
+  validated: false
+  status: investigated_low_risk
+
+- id: ISM-WC-04
+  title: "address(0) in validator set -- ECDSA.recover never returns 0"
+  tier: 2
+  type: property
+  confidence: 90
+  severity: low
+  description: |
+    Si la factory deploya con address(0) en el validator set, ese slot nunca puede
+    matchear un signer porque OZ ECDSA.recover() reverts o retorna nonzero.
+
+    Con validators = [address(0), V1, V2] y threshold = 2:
+    - address(0) nunca matchea -> se skipea via two-pointer
+    - V1 y V2 necesitan proveer firmas validas
+    - Effective threshold sigue siendo 2-of-2 (de los validators REALES)
+    - Pero _validatorCount = 3, creando confusion
+
+    IMPACTO: Ninguno. address(0) simplemente es un "dead slot" en el validator set.
+    No reduce seguridad. Puede causar confucion al admin pero no es explotable.
+
+    CONCLUSION: No es un bug. Es una ineficiencia / mala higiene.
+  attack_scenario: |
+    NO EXPLOTABLE. address(0) en validators es un dead slot. El threshold efectivo
+    se reduce en 0 (los slots de address(0) son inalcanzables).
+  solidity: |
+    t(true, "ISM-WC-04: address(0) in validators is dead slot -- ECDSA.recover never returns 0");
+  validated: true
+  status: investigated_safe
+
+- id: ISM-WC-05
+  title: "Two-pointer requires sorted validators -- unsorted set causes false rejections"
+  tier: 2
+  type: property
+  confidence: 70
+  severity: low
+  description: |
+    El two-pointer en verify() avanza _validatorIndex monotonamente. Las firmas deben
+    estar ordered por el indice de su validator en el array. Si validators = [C, A, B]
+    y firmas = [sig_A, sig_B, sig_C]:
+    - i=0: signer=A, busca en [C, A, B] desde index 0 -> skipea C, encuentra A en index 1
+    - i=1: signer=B, busca desde index 2 -> encuentra B en index 2
+    - i=2: signer=C, busca desde index 3 -> FALLA, C esta en index 0 pero ya paso
+
+    El relayer DEBE ordernar las firmas segun el order de validators[].
+    Si validators NO estan sorted por address, el relayer aun puede funcionar (ordena
+    las firmas por posicion, no por address).
+
+    PERO: si validators estan sorted por address Y las firmas estan sorted por address,
+    todo funciona naturalmente. La factory dice "Consider sorting addresses to ensure
+    contract reuse" -- es una sugerencia para determinismo de Create2, no para seguridad.
+
+    CONCLUSION: No es un bug. El two-pointer funciona con cualquier orden de validators
+    siempre que las firmas esten ordered por posicion del validator correspondiente.
+    Es responsabilidad del relayer.
+  attack_scenario: |
+    NO EXPLOTABLE por atacante. Un relayer incompetente que no ordena firmas causaria
+    rechazo de mensajes validos (DoS), no aceptacion de mensajes invalidos.
+  solidity: |
+    t(true, "ISM-WC-05: unsorted validators cause false rejections not false acceptances");
+  validated: true
+  status: investigated_safe
+
+- id: ISM-WC-06
+  title: "Same signature submitted multiple times for different validator slots"
+  tier: 1
+  type: property
+  confidence: 85
+  severity: critical
+  description: |
+    RELACIONADO CON ISM-WC-01 pero desde un angulo diferente.
+
+    En verify(), para un digest dado, ECDSA.recover(digest, sig) es DETERMINISTIC.
+    La misma firma siempre produce el mismo signer. Si un atacante provee la MISMA
+    firma 3 veces como signatureAt(0), signatureAt(1), signatureAt(2):
+
+    - Todas producen el mismo signer (digamos A)
+    - Si A aparece 3+ veces en validators[], las 3 matchean
+
+    La pregunta es: PUEDE el atacante poner la misma firma 3 veces en metadata?
+    SI. La metadata es completamente controlada por el relayer. signatureAt() simplemente
+    lee bytes en offsets fijos. Nada impide firmas duplicadas.
+
+    El contrato NO verifica que cada firma sea unica. No hay check de
+    "this signer was already used". La unica proteccion es que el two-pointer avanza
+    _validatorIndex, asi que cada match consume un SLOT diferente en validators[].
+    Si validators[] tiene un address solo 1 vez, la segunda firma del mismo signer
+    no encontrara match.
+
+    PROTECCION REAL: Si validators[] no tiene duplicados, cada signer solo puede
+    matchear 1 vez porque el two-pointer avanza past it. La duplicacion de firmas
+    es inofensiva si el validator set no tiene duplicados.
+
+    CONCLUSION: El bug esta en la factory (ISM-WC-02), no en verify(). verify()
+    es correcto DADO un validator set sin duplicados.
+  attack_scenario: |
+    Prerequisito: validator set con duplicados (ISM-WC-01/02).
+    1. Atacante tiene key de validator A que aparece 3 veces en set
+    2. Firma el digest una vez, copia la firma 3 veces en metadata
+    3. verify() matchea A en slot 0, A en slot 1, A en slot 2
+    4. Threshold cumplido con 1 key
+
+    Sin duplicados en validator set: NO EXPLOTABLE. La misma firma matchea A
+    solo en su unica posicion, el two-pointer avanza past it, la siguiente
+    firma identica no encuentra match.
+  solidity: |
+    t(true, "ISM-WC-06: duplicate signatures safe IFF no duplicate validators -- coupled with ISM-WC-01");
+  validated: false
+  status: hypothesis
+
+- id: ISM-WC-07
+  title: "Create2 determinism allows anyone to predict and front-run ISM deployment"
+  tier: 2
+  type: property
+  confidence: 30
+  severity: low
+  description: |
+    La factory usa Create2 con salt = keccak256(abi.encode(_values, _threshold)).
+    Esto es deterministic: dado el mismo validator set y threshold, siempre produce
+    la misma address. La factory incluso tiene un check:
+    `if (!Address.isContract(_set)) { _set = Create2.deploy(...) }`
+
+    Esto significa:
+    1. Dos calls con los mismos parametros retornan la misma address (idempotent)
+    2. Cualquiera puede predecir la address antes del deploy
+    3. Un atacante puede front-run el deploy y la factory retornaria la misma address
+       (el front-run no cambia nada porque el resultado es identico)
+
+    CONCLUSION: El determinismo de Create2 es by design. No hay beneficio en front-running
+    porque el resultado es identico. Si el atacante deploya primero con los mismos params,
+    el admin obtiene la misma address con el mismo codigo.
+  attack_scenario: |
+    NO EXPLOTABLE. Create2 determinism es una feature, no un bug. Front-running un
+    deploy con los mismos parametros produce el mismo contrato.
+  solidity: |
+    t(true, "ISM-WC-07: Create2 determinism is a feature -- front-running same params = same result");
+  validated: true
+  status: investigated_safe
+
+false_positives:
+- title: "signatureAt overflow for large _index"
+  reason: |
+    _index * 65: _index es uint256, 65 es small. Para overflow necesitarias
+    _index > type(uint256).max / 65, que es astronomicamente grande. El loop
+    solo itera hasta _threshold (uint8, max 255). No hay riesgo.
+- title: "address(0) in validator set allows bypass"
+  reason: |
+    OZ ECDSA.recover never returns address(0). Un slot con address(0) es un dead slot
+    que nunca matchea ninguna firma. No reduce seguridad.
+- title: "MetaProxy called on implementation"
+  reason: |
+    La implementacion no tiene fondos, no controla estado. Calling verify() on it
+    would read garbage from MetaProxy.metadata() and almost certainly revert on
+    abi.decode. Even if it didn't revert, no financial impact.
+
+key_finding_summary: |
+  EL HALLAZGO PRINCIPAL ES ISM-WC-01/02/06 COMBINADO:
+
+  La factory StaticThresholdAddressSetFactory.deploy() no valida duplicados en el
+  validator set. Si un ISM es deployed con validators duplicados, el two-pointer
+  en verify() permite que una sola key cumpla multiples posiciones del threshold.
+
+  SEVERITY ASSESSMENT:
+  - El bug es REAL en la factory (falta de validacion)
+  - El impacto depende de si un ISM con duplicados se configura como activo
+  - deploy() es permissionless (anyone can call), pero configurar el ISM en Mailbox requiere admin
+  - Un admin diligente verificaria el validator set antes de configurarlo
+  - PERO: la factory es el punto de entrada "oficial" y deberia rechazar inputs invalidos
+
+  CONFIANZA: 85% de que es reportable como Medium/High en Immunefi.
+  La falta de validacion en la factory es objetivamente un bug. El impacto
+  depende del threat model (admin misconfiguration vs permissionless exploit).
+
+  Trail of Bits probablemente YA encontro esto. Es un patron clasico de
+  "factory doesn't validate inputs". Pero vale la pena verificar.

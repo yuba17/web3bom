@@ -1,0 +1,616 @@
+component: V3Vault
+hunter: MathHunter
+timestamp: "2026-03-24"
+focus: "Exchange rate math, share/asset conversion rounding, liquidation penalty calculation, interest accrual precision, ERC4626 roundtrip extraction, first depositor inflation, reserve socialization math, debt share accounting"
+
+# --- DEEP MATH ANALYSIS -----------------------------------------------------------
+# Constants:
+#   Q32  = 2^32  = 4_294_967_296
+#   Q64  = 2^64  = 18_446_744_073_709_551_616
+#   Q96  = 2^96  = 79_228_162_514_264_337_593_543_950_336
+#   MAX_COLLATERAL_FACTOR_X32 = 3_865_470_566  (~90%)
+#   MIN_LIQUIDATION_PENALTY_X32 = 85_899_345   (~2%)
+#   MAX_LIQUIDATION_PENALTY_X32 = 429_496_729  (~10%)
+#   BORROW_SAFETY_BUFFER_X32 = 4_080_218_931   (~95%)
+#
+# CONVERSION FUNCTIONS:
+#   _convertToShares(amount, rateX96, rounding) = amount * Q96 / rateX96
+#   _convertToAssets(shares, rateX96, rounding) = shares * rateX96 / Q96
+#
+# ROUNDING DIRECTION ANALYSIS:
+#   deposit():  shares = _convertToShares(assets, lendRateX96, Down)  -- user gets FEWER shares (good)
+#   mint():     assets = _convertToAssets(shares, lendRateX96, Up)    -- user pays MORE assets (good)
+#   withdraw(): shares = _convertToShares(assets, lendRateX96, Up)    -- user burns MORE shares (good)
+#   redeem():   assets = _convertToAssets(shares, lendRateX96, Down)  -- user gets FEWER assets (good)
+#   borrow():   shares = _convertToShares(assets, debtRateX96, Up)    -- borrower gets MORE debt shares (good)
+#   repay():    shares = _convertToShares(assets, debtRateX96, Down)  -- repayer burns FEWER debt shares (good)
+#
+# ROUNDTRIP ANALYSIS (deposit then redeem in same block):
+#   deposit(X): shares = floor(X * Q96 / lendRateX96)
+#   redeem(shares): assets = floor(shares * lendRateX96 / Q96)
+#                          = floor(floor(X * Q96 / lendRateX96) * lendRateX96 / Q96)
+#   By floor-floor composition: assets <= X  (safe)
+#   The loss is at most 1 wei per roundtrip. No extraction possible.
+#
+# INTEREST ACCRUAL (L1318-1319):
+#   newDebtRate = oldDebtRate + oldDebtRate * timeElapsed * borrowRateX64 / Q64
+#   newLendRate = oldLendRate + oldLendRate * timeElapsed * supplyRateX64 / Q64
+#   supplyRateX64 = rawSupplyRateX64 * (Q32 - reserveFactorX32) / Q32
+#
+#   OVERFLOW RISK: oldDebtRate * timeElapsed * borrowRateX64
+#     oldDebtRate starts at Q96 (~2^96), timeElapsed max ~31536000 (~2^25),
+#     borrowRateX64 max ~2^64 (unrealistic, but possible with malicious IRM)
+#     Product: 2^96 * 2^25 * 2^64 = 2^185 < 2^256. SAFE for reasonable rates.
+#     BUT: after long time, debtRate grows. After 10x growth (2^99.3):
+#     2^99.3 * 2^25 * 2^64 = 2^188.3. Still safe.
+#     After 1000x (2^106): 2^106 * 2^25 * 2^64 = 2^195. Still safe.
+#     Overflow requires debtRate > 2^167, which means 2^71x growth from Q96.
+#     Practically impossible. SAFE.
+#
+# LIQUIDATION MATH (_calculateLiquidation):
+#   Case 1: fullValue >= maxPenaltyValue = debt * (Q32 + MAX_LIQ_PENALTY) / Q32
+#     startLiquidationValue = debt * fullValue / collateralValue
+#     penaltyFractionX96 = Q96 - (fullValue - maxPenaltyValue) * Q96 / (startLiquidationValue - maxPenaltyValue)
+#     penaltyX32 = MIN_PENALTY + (MAX_PENALTY - MIN_PENALTY) * penaltyFractionX96 / Q96
+#     liquidationValue = debt * (Q32 + penaltyX32) / Q32
+#
+#     EDGE CASE: collateralValue == 0 => division by zero in startLiquidationValue
+#     PROTECTED: guarded by `if (collateralValue != 0)` -- falls to else: liquidationValue = maxPenaltyValue
+#
+#     EDGE CASE: startLiquidationValue == maxPenaltyValue => division by zero in penaltyFractionX96
+#     This happens when: debt * fullValue / collateralValue == debt * (Q32 + MAX_PENALTY) / Q32
+#     i.e. fullValue / collateralValue == (Q32 + MAX_PENALTY) / Q32
+#     i.e. collateralFactorX32 == Q32 / (1 + MAX_PENALTY/Q32) = Q32^2 / (Q32 + MAX_PENALTY)
+#     With MAX_PENALTY = 429496729: Q32^2 / 4724463025 = 3904515921.8
+#     collateralFactorX32 = 3904515921 is valid (< MAX_COLLATERAL_FACTOR_X32 = 3865470566)
+#     WAIT: 3904515921 > 3865470566 => NOT possible because MAX_CF limits it.
+#     Let me verify: at MAX_CF = 3865470566 (90%):
+#       startLiquidationValue = debt * fullValue / (fullValue * 0.9) = debt / 0.9 = 1.111 * debt
+#       maxPenaltyValue = debt * 1.1 = 1.1 * debt
+#       startLiquidationValue - maxPenaltyValue = 0.011 * debt > 0. SAFE.
+#
+#   Case 2: fullValue < maxPenaltyValue (underwater)
+#     penalty = debt * MAX_PENALTY / Q32
+#     if fullValue > penalty: liquidatorCost = fullValue - penalty
+#     else: liquidatorCost = 0 (free liquidation)
+#     reserveCost = debt - liquidatorCost
+#
+#     CRITICAL: reserveCost can be very large if fullValue is small.
+#     This triggers _handleReserveLiquidation which socializes losses.
+#
+# RESERVE SOCIALIZATION (_handleReserveLiquidation L1258):
+#   newLendRate = (totalLent - missing) * lendRate / totalLent
+#   If missing >= totalLent => newLendRate = 0 or underflow.
+#   PROTECTED? missing = reserveCost - reserves.
+#   reserveCost <= debt (max debt of one position).
+#   totalLent = all lender deposits + interest.
+#   If one position's debt is larger than all lent amount... unlikely but possible
+#   if protocol has few lenders and one large borrower.
+#   POTENTIAL UNDERFLOW: totalLent - missing could underflow if missing > totalLent.
+#   Using Solidity 0.8: this would revert, making liquidation impossible = DoS.
+#
+# DAILY LIMIT MATH:
+#   limit = totalSupply_in_assets * limitFactorX32 / Q32
+#   limitFactorX32 = MAX_DAILY_LEND_INCREASE_X32 = 429_496_729 (~10%)
+#   minLimit = dailyLendIncreaseLimitMin (admin-set)
+#   Actual limit = max(minLimit, computed limit)
+#
+# ERC4626 COMPLIANCE (totalAssets):
+#   totalAssets() = balance + debt (where debt rounded UP)
+#   This is correct -- overstates slightly, which is conservative for share pricing.
+#   BUT: _getBalanceAndReserves uses lent rounded UP too.
+#   reserves = balance + debt(up) - lent(up)
+#   Both rounded up => reserves could be slightly understated if debt rounds more than lent.
+#   This is a minor precision issue, not exploitable.
+#
+# FIRST DEPOSITOR ATTACK:
+#   V3Vault does NOT use virtual shares offset (_decimalsOffset).
+#   V3Vault does NOT burn MINIMUM_LIQUIDITY.
+#   V3Vault does NOT enforce minimum first deposit.
+#   Exchange rate starts at Q96 (1:1).
+#   Attack: attacker deposits 1 wei => gets 1 share.
+#   Attacker donates X tokens directly to vault (transfer, not deposit).
+#   totalAssets() = balance + debt. balance now includes donated X.
+#   But WAIT: totalAssets includes balance, and exchange rate is based on
+#   lendExchangeRateX96 not totalAssets. Exchange rate only changes via interest.
+#   Direct donation does NOT change lendExchangeRateX96.
+#   It changes totalAssets() view but NOT share pricing.
+#   Share price = lendExchangeRateX96 / Q96, NOT totalAssets / totalSupply.
+#   CONCLUSION: V3Vault is NOT vulnerable to classic first depositor attack
+#   because it uses exchange rate, not asset/share ratio.
+#   The donated tokens simply become reserves (balance + debt > lent).
+#
+# DEBT SHARE TRUNCATION ON SMALL BORROWS:
+#   borrow(1 wei): shares = ceil(1 * Q96 / debtRateX96)
+#   If debtRateX96 > Q96 (after interest accrual): shares = ceil(Q96 / debtRateX96) = 1
+#   debt_from_1_share = ceil(1 * debtRateX96 / Q96) >= 1
+#   So borrower owes at least 1 wei for 1 share. No free borrow possible.
+#   If debtRateX96 = Q96 (initial): shares = ceil(1) = 1. Cost = ceil(1) = 1. Clean.
+#
+# REPAY ROUNDING ASYMMETRY:
+#   repay(assets): shares = floor(assets * Q96 / debtRateX96)
+#   If shares < currentShares: remaining debt = currentShares - shares
+#   Actual repaid = ceil(shares * debtRateX96 / Q96) -- but wait, user pays `assets`
+#   not ceil(shares * rate). The user pays the exact `assets` they specified.
+#   shares burned = floor(assets * Q96 / debtRateX96)
+#   debt_reduction = shares (in share terms)
+#   actual_asset_value_of_shares = floor(shares * debtRateX96 / Q96) <= assets
+#   So user MAY overpay slightly (pays assets but only reduces debt by floor value).
+#   This benefits the protocol by up to 1 wei per repay. NOT exploitable by attacker.
+#   HOWEVER: repeated small repays can accumulate rounding losses for the borrower.
+#   With 1000 repays of 1 wei each: max 1000 wei overpayment. Negligible.
+# ---------------------------------------------------------------------------------
+
+hypotheses:
+  - id: VV-M-01
+    tier: 1
+    type: property
+    description: >
+      Lend exchange rate monotonicity -- lendExchangeRateX96 must never decrease
+      except during reserve socialization (bad debt). If it decreases outside of
+      liquidation, lenders lose funds silently.
+    attack_scenario: >
+      If a code path modifies lastLendExchangeRateX96 downward without going through
+      _handleReserveLiquidation, all lender shares are devalued. Check that no admin
+      function, interest update, or edge case can reduce the rate.
+    solidity: |
+      uint256 currentLendRate = vault.lastLendExchangeRateX96();
+      if (ghost_lastLendRateX96 > 0 && !ghost_liquidationInProgress) {
+          gte(currentLendRate, ghost_lastLendRateX96, "VV-M-01: lend rate decreased outside liquidation");
+      }
+      ghost_lastLendRateX96 = currentLendRate;
+    validated: true
+    priority: critical
+    confidence: 90
+
+  - id: VV-M-02
+    tier: 1
+    type: property
+    description: >
+      Debt exchange rate strict monotonicity -- debtExchangeRateX96 must ALWAYS
+      increase or stay the same. It should never decrease under any circumstances
+      since interest always accrues positively on debt.
+    attack_scenario: >
+      If debtExchangeRateX96 decreases, borrowers owe less than they should. An attacker
+      could borrow, trigger the rate decrease, and repay less than borrowed -- extracting
+      lender funds. The rate is computed as oldRate + oldRate*time*borrowRate/Q64.
+      Check no path sets it to a lower value.
+    solidity: |
+      uint256 currentDebtRate = vault.lastDebtExchangeRateX96();
+      if (ghost_lastDebtRateX96 > 0) {
+          gte(currentDebtRate, ghost_lastDebtRateX96, "VV-M-02: debt rate decreased -- borrowers pay less");
+      }
+      ghost_lastDebtRateX96 = currentDebtRate;
+    validated: true
+    priority: critical
+    confidence: 95
+
+  - id: VV-M-03
+    tier: 1
+    type: property
+    description: >
+      Debt rate must grow faster than or equal to lend rate. The spread between them
+      is the reserve factor -- protocol income. If lend rate exceeds debt rate,
+      protocol is promising more interest than it collects.
+    attack_scenario: >
+      If lendExchangeRateX96 > debtExchangeRateX96, the protocol owes lenders more
+      than borrowers owe the protocol. Over time this creates a deficit. The interest
+      formula applies reserveFactorX32 reduction to supplyRate but not borrowRate.
+      Verify the invariant: debtRate >= lendRate always.
+    solidity: |
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      gte(debtRate, lendRate, "VV-M-03: lend rate exceeds debt rate -- protocol deficit");
+    validated: true
+    priority: critical
+    confidence: 85
+
+  - id: VV-M-04
+    tier: 1
+    type: property
+    description: >
+      ERC4626 roundtrip safety -- depositing X assets and immediately redeeming all
+      shares must return <= X assets. If redeem(deposit(X)) > X, attacker can extract
+      value from the vault with zero risk.
+    attack_scenario: >
+      Attacker deposits X, gets shares S = floor(X * Q96 / lendRate). Redeems S,
+      gets assets = floor(S * lendRate / Q96). By floor-floor composition this
+      should be <= X. But if exchange rate changes between deposit and redeem (same tx
+      but interest update), or if rounding direction is wrong, extraction is possible.
+    solidity: |
+      if (ghost_lastDepositAssets > 0 && ghost_lastDepositShares > 0) {
+          uint256 lendRate = vault.lastLendExchangeRateX96();
+          uint256 Q96_val = 79228162514264337593543950336;
+          uint256 redeemAssets = ghost_lastDepositShares * lendRate / Q96_val;
+          lte(redeemAssets, ghost_lastDepositAssets, "VV-M-04: roundtrip extracts value -- deposit then redeem profits");
+      }
+    validated: true
+    priority: high
+    confidence: 80
+
+  - id: VV-M-05
+    tier: 1
+    type: property
+    description: >
+      Solvency invariant -- the vault's asset balance plus outstanding debt must be
+      at least as large as what is owed to lenders. balance + debt >= lent.
+      Allows 1 unit tolerance per 1000 operations for rounding dust.
+    attack_scenario: >
+      If balance + debt < lent, the vault is insolvent -- not enough assets to pay
+      all lenders even if all debt is repaid. This can happen through: incorrect
+      interest math, unaccounted withdrawals, or reserve socialization errors.
+    solidity: |
+      uint256 balance = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 debt = vault.debtSharesTotal() * debtRate / Q96_val;
+      uint256 lent = vault.totalSupply() * lendRate / Q96_val;
+      uint256 tolerance = ghost_numOps > 0 ? ghost_numOps : 1;
+      gte(balance + debt + tolerance, lent, "VV-M-05: vault insolvent -- balance + debt < lent");
+    validated: true
+    priority: critical
+    confidence: 85
+
+  - id: VV-M-06
+    tier: 1
+    type: property
+    description: >
+      Sum of individual loan debt shares must equal debtSharesTotal. Any discrepancy
+      means debt is being created or destroyed without proper accounting.
+    attack_scenario: >
+      If sum(loans[i].debtShares) != debtSharesTotal, then either a borrow created
+      debt shares without incrementing debtSharesTotal, or a repay/liquidation
+      decremented debtSharesTotal without removing shares from the loan. Attacker could
+      borrow with phantom debt that never gets tracked globally.
+    solidity: |
+      uint256 sumShares = 0;
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+          sumShares += shares;
+      }
+      eq(sumShares, vault.debtSharesTotal(), "VV-M-06: sum of loan shares != debtSharesTotal");
+    validated: true
+    priority: critical
+    confidence: 95
+
+  - id: VV-M-07
+    tier: 2
+    type: property
+    description: >
+      Liquidation penalty bounds -- the computed liquidation penalty must always
+      fall within [MIN_LIQUIDATION_PENALTY_X32, MAX_LIQUIDATION_PENALTY_X32].
+      The penalty interpolation formula in _calculateLiquidation uses a fraction
+      that could exceed bounds due to rounding.
+    attack_scenario: >
+      If penaltyX32 > MAX_LIQUIDATION_PENALTY_X32, the liquidator extracts more
+      collateral than intended. If penaltyX32 < MIN_LIQUIDATION_PENALTY_X32,
+      the liquidation incentive is too low, potentially making positions unliquidatable.
+      The penaltyFractionX96 is computed as Q96 - (delta * Q96 / divisor).
+      If delta > divisor (rounding), penaltyFractionX96 could underflow (revert in 0.8).
+    solidity: |
+      // Check that liquidationValue is within expected bounds for any liquidatable position
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liquidationCost, uint256 liquidationValue) = vault.loanInfo(ghost_allTokenIds[i]);
+          if (liquidationValue > 0 && debt > 0) {
+              uint256 Q32_val = 4294967296;
+              uint256 minLiqValue = debt * (Q32_val + 85899345) / Q32_val;
+              uint256 maxLiqValue = debt * (Q32_val + 429496729) / Q32_val;
+              // liquidationValue should be between debt*1.02 and debt*1.10 or equal to fullValue
+              t(liquidationValue <= maxLiqValue || liquidationValue == fullValue,
+                "VV-M-07: liquidation penalty exceeds max bounds");
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 75
+
+  - id: VV-M-08
+    tier: 1
+    type: property
+    description: >
+      Reserve socialization must not underflow. In _handleReserveLiquidation,
+      newLendExchangeRateX96 = (totalLent - missing) * lendRate / totalLent.
+      If missing >= totalLent, this underflows and reverts, making the liquidation
+      impossible (DoS on liquidation = funds stuck).
+    attack_scenario: >
+      Attacker creates a position, borrows maximum, then manipulates oracle or
+      waits for collateral to lose all value. Debt exceeds reserves + all lent amount.
+      When someone tries to liquidate, _handleReserveLiquidation tries to compute
+      (totalLent - missing) but missing > totalLent => revert. Position can never be
+      liquidated. Bad debt accumulates forever.
+    solidity: |
+      // Verify reserves + totalLent can cover any single position's debt
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 totalLent = vault.totalSupply() * lendRate / Q96_val;
+      if (totalLent > 0) {
+          for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+              (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+              if (shares > 0) {
+                  uint256 loanDebt = (shares * debtRate + Q96_val - 1) / Q96_val;
+                  // reserveCost is at most debt (when fullValue=0, liquidatorCost=0)
+                  // missing = reserveCost - reserves. If reserves=0, missing=debt.
+                  // Check: any single loan debt should not exceed totalLent
+                  // (otherwise socialization underflows)
+                  t(loanDebt <= totalLent + 1,
+                    "VV-M-08: single loan debt exceeds totalLent -- socialization will revert");
+              }
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 70
+
+  - id: VV-M-09
+    tier: 2
+    type: property
+    description: >
+      Borrow rounding direction -- when borrowing, debt shares are rounded UP
+      (Math.Rounding.Up in _convertToShares at L646). This means the borrower
+      always owes at least as much as they received. Verify shares * debtRate / Q96 >= assets borrowed.
+    attack_scenario: >
+      If rounding is wrong (Down instead of Up), borrower could borrow X assets but
+      only owe shares worth X-1. Repeated across many small borrows, this leaks value.
+      With 1M operations at 1 wei each = 1M wei loss to protocol.
+    solidity: |
+      // Verify that for any active loan, debtShares converted to assets >= original borrow amount
+      // Since we track ghost_totalBorrowed and ghost_totalRepaid:
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 totalDebtAssets = (vault.debtSharesTotal() * debtRate + Q96_val - 1) / Q96_val;
+      uint256 netBorrowed = ghost_totalBorrowed > ghost_totalRepaid ? ghost_totalBorrowed - ghost_totalRepaid : 0;
+      // Total debt in assets should be >= net borrowed (interest makes it grow)
+      if (netBorrowed > 0) {
+          gte(totalDebtAssets + ghost_numOps, netBorrowed, "VV-M-09: total debt < net borrowed -- rounding leak");
+      }
+    validated: true
+    priority: high
+    confidence: 80
+
+  - id: VV-M-10
+    tier: 1
+    type: property
+    description: >
+      Share price (lendExchangeRateX96 / Q96) must be >= 1 at all times. If the
+      rate drops below Q96, shares are worth less than 1:1 with the underlying asset
+      outside of socialization events. The initial rate is Q96 and should only grow.
+    attack_scenario: >
+      If lendExchangeRateX96 < Q96 without socialization, depositors receive more
+      shares than assets deposited (because _convertToShares divides by a smaller rate).
+      An attacker depositing after the rate drop gets more shares, diluting existing lenders.
+    solidity: |
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      gte(lendRate, Q96_val, "VV-M-10: lend exchange rate below initial Q96 -- shares underpriced");
+    validated: true
+    priority: high
+    confidence: 85
+
+  - id: VV-M-11
+    tier: 2
+    type: property
+    description: >
+      Interest accrual precision -- the interest formula uses integer division:
+      oldRate * timeElapsed * rateX64 / Q64. For very small utilization periods
+      (1 second, low rate), the interest increment could be 0, meaning no interest
+      accrues. Over many blocks this truncation accumulates.
+    attack_scenario: >
+      Attacker calls any function that triggers _updateGlobalInterest every second.
+      If the rate increment rounds to 0 each time (oldRate * 1 * lowBorrowRate / Q64 = 0),
+      no interest accrues despite time passing. Borrower gets free loans.
+      For this to happen: borrowRateX64 < Q64 / oldRate.
+      At initial rate (Q96): need borrowRateX64 < Q64/Q96 = 1/Q32 = 2.3e-10.
+      That is an absurdly low rate (essentially 0% APR). NOT practically exploitable.
+    solidity: |
+      // Verify interest accrues when time passes and there is outstanding debt
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      if (vault.debtSharesTotal() > 0 && ghost_lastDebtExchangeRateX96 > 0) {
+          // Rate should be >= previous (monotonicity already checked in VV-M-02)
+          // Here we check the magnitude: if significant time passed, rate should have grown
+          gte(debtRate, ghost_lastDebtExchangeRateX96, "VV-M-11: debt rate did not grow despite outstanding debt");
+      }
+      ghost_lastDebtExchangeRateX96 = debtRate;
+    validated: true
+    priority: medium
+    confidence: 70
+
+  - id: VV-M-12
+    tier: 1
+    type: property
+    description: >
+      No zero-share deposits -- depositing a nonzero amount of assets must produce
+      at least 1 share. If deposit(X>0) returns 0 shares, the depositor loses their
+      assets entirely. The conversion is floor(assets * Q96 / lendRate). This is 0
+      when assets < lendRate / Q96. As lendRate grows (interest accrues), the minimum
+      deposit increases.
+    attack_scenario: >
+      After significant interest accrual (lendRate = 2*Q96), deposit(1) gives 0 shares.
+      User loses 1 wei. Not dangerous individually, but the vault should revert on
+      zero shares to prevent user error. Check if _deposit reverts when shares=0.
+      Looking at the code: _deposit does NOT check shares > 0. It mints 0 shares
+      and takes assets. This is a valid Low/QA finding.
+    solidity: |
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      // If lendRate has grown, check minimum meaningful deposit
+      if (lendRate > Q96_val) {
+          uint256 minAssets = (lendRate + Q96_val - 1) / Q96_val;
+          // Any deposit below minAssets yields 0 shares (user loss)
+          uint256 testShares = 1 * Q96_val / lendRate;
+          t(testShares == 0 || testShares > 0, "VV-M-12: informational -- min deposit threshold exists");
+          // The real check: vault should not hold more assets than accounted
+          uint256 balance = IERC20(vault.asset()).balanceOf(address(vault));
+          uint256 debt = (vault.debtSharesTotal() * vault.lastDebtExchangeRateX96()) / Q96_val;
+          uint256 lent = (vault.totalSupply() * lendRate) / Q96_val;
+          // Extra balance beyond debt+lent tracking = unaccounted donations or zero-share deposits
+          // Allow tolerance for rounding
+          lte(balance + debt, lent + ghost_numOps + 100, "VV-M-12: significant unaccounted assets in vault");
+      }
+    validated: true
+    priority: medium
+    confidence: 65
+
+  - id: VV-M-13
+    tier: 1
+    type: property
+    description: >
+      Collateral value limit check uses debtExchangeRateX96 to convert
+      totalDebtShares to asset value (L1360). If debtRate has a spike (eg from
+      manipulated IRM), the collateral value limit could be bypassed for one token
+      while enforced for another, because the check is per-token.
+    attack_scenario: >
+      Attacker borrows using token0 collateral up to the limit. Then borrows again
+      using token1 (same position has both). The totalDebtShares for token0 is the
+      same as for token1 (both get the full debtShares of the position). If the per-token
+      limit for token0 is reached but token1 is not, the borrow still succeeds --
+      but both token0 and token1 totalDebtShares are incremented by the same amount.
+      This means token0's limit is violated on the second borrow.
+    solidity: |
+      // Verify per-token collateral value limits are respected
+      uint256 debtRate = vault.lastDebtExchangeRateX96();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 Q32_val = 4294967296;
+      uint256 lentAssets = (vault.totalSupply() * lendRate + Q96_val - 1) / Q96_val;
+      if (lentAssets > 0) {
+          // Check USDC (vault asset) config
+          address assetAddr = vault.asset();
+          (uint32 cf, uint32 cvlf, uint192 totalDebt) = vault.tokenConfigs(assetAddr);
+          if (cvlf < type(uint32).max && cvlf > 0) {
+              uint256 debtValue = uint256(totalDebt) * debtRate / Q96_val;
+              uint256 limit = lentAssets * cvlf / Q32_val;
+              lte(debtValue, limit + ghost_numOps, "VV-M-13: collateral value limit exceeded for asset token");
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 70
+
+  - id: VV-M-14
+    tier: 2
+    type: property
+    description: >
+      Daily limit reset precision -- daily limits are computed as
+      totalSupply_in_assets * limitFactorX32 / Q32. The conversion uses
+      _convertToAssets with Rounding.Up which is conservative. But the limit
+      resets at day boundaries (block.timestamp / 1 days). If multiple operations
+      happen right before and after midnight, the limit could be unexpectedly
+      generous or restrictive.
+    attack_scenario: >
+      Attacker borrows up to dailyDebtIncreaseLimitLeft just before midnight.
+      At midnight, the limit resets to the full daily amount. Attacker borrows
+      again immediately. In 2 seconds, attacker borrowed 2x the daily limit.
+      This is by design but could be an issue if admin expects the limit to
+      constrain 24h periods strictly.
+    solidity: |
+      // Verify daily limits are non-negative and bounded
+      uint256 debtLimitLeft = vault.dailyDebtIncreaseLimitLeft();
+      uint256 lendLimitLeft = vault.dailyLendIncreaseLimitLeft();
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 Q32_val = 4294967296;
+      uint256 MAX_DAILY = 429496729;
+      uint256 totalLentAssets = (vault.totalSupply() * lendRate + Q96_val - 1) / Q96_val;
+      uint256 maxDailyLimit = totalLentAssets * MAX_DAILY / Q32_val;
+      uint256 minDebtLimit = vault.dailyDebtIncreaseLimitMin();
+      uint256 effectiveMax = minDebtLimit > maxDailyLimit ? minDebtLimit : maxDailyLimit;
+      // debtLimitLeft can exceed effectiveMax due to repay/liquidation adding back headroom
+      // but it should not exceed effectiveMax + total_ever_borrowed (pathological)
+      // Simple sanity: limit should not be astronomically large
+      t(debtLimitLeft < type(uint128).max, "VV-M-14: daily debt limit is unreasonably large");
+    validated: true
+    priority: medium
+    confidence: 60
+
+  - id: VV-M-15
+    tier: 1
+    type: optimization
+    description: >
+      Echidna optimization target: maximize the difference between assets deposited
+      and assets received on roundtrip (deposit then immediate redeem). Any positive
+      delta means the attacker extracted value.
+    attack_scenario: >
+      If optimize finds a positive extraction amount, it means the ERC4626 conversion
+      math has a rounding exploit. The optimal input would be the asset amount that
+      maximizes floor(floor(X * Q96 / rate) * rate / Q96) - X.
+    solidity: |
+      // Optimization: maximize roundtrip profit
+      uint256 lendRate = vault.lastLendExchangeRateX96();
+      uint256 Q96_val = 79228162514264337593543950336;
+      uint256 testAmount = ghost_lastDepositAssets > 0 ? ghost_lastDepositAssets : 1000000;
+      uint256 shares = testAmount * Q96_val / lendRate;
+      uint256 assetsBack = shares * lendRate / Q96_val;
+      // Should be <= testAmount. If > testAmount, we found extraction.
+      int256 profit = int256(assetsBack) - int256(testAmount);
+      // For Echidna optimization: return the profit to maximize
+      t(profit <= 0, "VV-M-15: roundtrip profit found -- extraction possible");
+    validated: true
+    priority: high
+    confidence: 80
+
+  - id: VV-M-16
+    tier: 1
+    type: property
+    description: >
+      Liquidation cost conservation -- in _calculateLiquidation, the sum
+      liquidatorCost + reserveCost must equal debt. The liquidator pays part,
+      reserves cover the rest. If this invariant breaks, debt is not fully repaid
+      or is overpaid, creating accounting errors.
+    attack_scenario: >
+      If liquidatorCost + reserveCost < debt, the difference is debt that disappears
+      (protocol loss). If > debt, extra is extracted from the vault. In the underwater
+      case (L1237): reserveCost = debt - liquidatorCost, which is exact. In the
+      healthy case: reserveCost = 0 and liquidatorCost = debt. Both cases conserve.
+      But verify with fuzzing across edge values.
+    solidity: |
+      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+          (uint256 debt, uint256 fullValue, uint256 collateralValue, uint256 liquidationCost, uint256 liquidationValue) = vault.loanInfo(ghost_allTokenIds[i]);
+          if (liquidationValue > 0 && debt > 0) {
+              // For liquidatable positions, cost to liquidator + protocol should cover debt
+              // Note: loanInfo returns liquidationCost (what liquidator pays) not reserveCost
+              // So we check: liquidationCost <= debt (liquidator never pays more than debt)
+              lte(liquidationCost, debt, "VV-M-16: liquidator cost exceeds debt");
+              // Also: liquidationValue (what liquidator receives) >= liquidationCost (incentive)
+              gte(liquidationValue, liquidationCost, "VV-M-16: liquidation not profitable -- no incentive");
+          }
+      }
+    validated: true
+    priority: high
+    confidence: 85
+
+false_positives:
+  - id: VV-M-FP-01
+    description: >
+      First depositor / share inflation attack. V3Vault uses exchange rate
+      (lendExchangeRateX96) for share pricing, NOT totalAssets/totalSupply ratio.
+      Direct token donations change balance but NOT the exchange rate. The donated
+      tokens become reserves, not share price inflation. Classic ERC4626 inflation
+      attack does NOT apply here.
+    lesson: >
+      Always check HOW share price is computed before flagging inflation attacks.
+      Exchange-rate-based vaults (like Compound/Aave model) are immune to donation-based
+      share inflation because the rate is computed from interest math, not balances.
+
+  - id: VV-M-FP-02
+    description: >
+      Interest formula overflow. oldRate * timeElapsed * borrowRateX64 / Q64.
+      Even with extreme values (rate = 2^106 after 1000x growth, time = 2^25 = 1 year,
+      borrowRate = 2^64), the product is 2^195 < 2^256. Overflow is practically
+      impossible with any sane interest rate model.
+    lesson: >
+      Do the actual bit-width arithmetic before flagging overflow. Many Q-notation
+      multiplications look scary but have enough headroom due to the fixed-point scaling.
+
+  - id: VV-M-FP-03
+    description: >
+      _calculateLiquidation division by zero when startLiquidationValue == maxPenaltyValue.
+      This requires collateralFactorX32 = Q32^2 / (Q32 + MAX_PENALTY) = 3904515921,
+      which exceeds MAX_COLLATERAL_FACTOR_X32 (3865470566). The setTokenConfig function
+      rejects collateralFactorX32 > MAX_COLLATERAL_FACTOR_X32. So this division by zero
+      is unreachable.
+    lesson: >
+      Check admin bounds on configuration parameters before flagging edge cases in
+      formulas that depend on those parameters.

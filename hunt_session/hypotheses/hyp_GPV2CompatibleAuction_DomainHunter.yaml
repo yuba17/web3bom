@@ -1,0 +1,351 @@
+protocol: chainlink-pa-v2
+component: GPV2CompatibleAuction
+file: src/GPV2CompatibleAuction.sol
+domain: dex
+hunter: DomainHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+
+- id: GPVCA-DO-01
+  tier: 1
+  type: property
+  description: >
+    Static approval in _onAuctionStart may be insufficient if tokens arrive mid-auction.
+    forceApprove sets allowance = balanceOf(this) at auction start time. If additional tokens
+    of the same asset are sent to the contract during a live auction (e.g., direct transfer,
+    or another mechanism), the CowSwap vault relayer cannot transfer the excess because
+    allowance < balanceOf. Meanwhile bid() can access the full balance via safeTransfer.
+    This creates a dual-path asymmetry: CowSwap orders fail for the full balance while
+    bid() succeeds, potentially giving bid() users an unfair advantage or causing DoS
+    for CowSwap solvers who built valid orders based on current balance.
+  attack_scenario: >
+    1. Auction starts for tokenA with balance 1000. Allowance set to 1000.
+    2. Someone sends 500 tokenA directly to the contract (donation or dust attack).
+    3. CowSwap solver builds order for sellAmount=1200 (within balanceOf check in isValidSignature).
+    4. isValidSignature passes (1200 <= 1500 balance).
+    5. Settlement fails because vault relayer only has allowance for 1000.
+    6. A bid() caller can buy the full 1500 without issue.
+    Impact: CowSwap path is DoSed for amounts > original approval, forcing all trades
+    through bid() where the protocol may get worse execution (no solver competition).
+  impact: "DoS of CowSwap settlement path for excess balance; protocol gets suboptimal execution"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After _onAuctionStart, verify allowance covers full balance
+    uint256 balance = IERC20(asset).balanceOf(address(auction));
+    uint256 allowance = IERC20(asset).allowance(address(auction), gpv2VaultRelayer);
+    gte(allowance, balance, "GPVCA-DO-01: allowance < balance during live auction");
+  ghost_vars:
+  - "address internal ghost_lastAuctionAsset;"
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    The impact is limited because: (1) tokens arriving mid-auction is unusual but possible,
+    (2) the protocol still has bid() as fallback, (3) no direct fund loss, just suboptimal
+    execution. However, an attacker could intentionally donate tokens to disable CowSwap
+    path and force trades through bid() at a worse price. Check if performUpkeep or any
+    other function can send tokens to the contract during a live auction.
+
+- id: GPVCA-DO-02
+  tier: 1
+  type: property
+  description: >
+    isValidSignature validates order at block.timestamp price but CowSwap settlement
+    may execute partial fills across multiple transactions. Since the order is partiallyFillable=true,
+    the same order can be filled in multiple settlements. Each call to isValidSignature
+    re-validates at the CURRENT block.timestamp, so the price moves with the Dutch auction
+    curve. A solver could build one order and fill it in two tranches: first when price is
+    high (favorable to protocol), then later when price is low (favorable to solver). The
+    invariant verifies that the total LINK received across all partial fills is >= what
+    the protocol should have received at the volume-weighted average execution time.
+  attack_scenario: >
+    1. Auction starts at t=0, duration=3600s, startMult=1.1e18, endMult=0.98e18.
+    2. Solver creates order: sellAmount=1000, buyAmount=minBuyAmount_at_t3600 (lowest).
+    3. At t=0, solver fills 100 tokens. isValidSignature checks at t=0 price — buyAmount
+       must be >= minBuyAmount_at_t0 for the 100 amount. But the ORDER's buyAmount is for
+       the full 1000 at t=3600 price. CowSwap does proportional fill: (100/1000)*buyAmount.
+       If (100/1000)*buyAmount >= minBuyAmount_at_t0_for_100, it passes. This works because
+       buyAmount was set to the lowest possible (t=3600), so proportional fill for 100 is
+       buyAmount/10 which must be >= minBuyAmount at t=0 for 100. Since t=0 price is HIGHER
+       than t=3600 price, this will likely FAIL. So solver is FORCED to set a high enough
+       buyAmount. This appears safe by construction.
+  impact: "No direct impact — the Dutch auction price curve correctly increases minimum requirements at earlier times"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track cumulative sellAmount and buyAmount across CowSwap settlements
+    // Verify: totalBuyAmount >= _getAssetOutAmount(params, price, totalSellAmount, avgElapsedTime)
+    uint256 totalLinkReceived = IERC20(assetOut).balanceOf(address(auction));
+    uint256 totalSold = ghost_initialBalance - IERC20(asset).balanceOf(address(auction));
+    // Can't easily compute expected without oracle — ghost variable approach needed
+    gte(totalLinkReceived, ghost_minExpectedLink, "GPVCA-DO-02: received less LINK than expected");
+  ghost_vars:
+  - "uint256 internal ghost_initialBalance;"
+  - "uint256 internal ghost_minExpectedLink;"
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    After deeper analysis, the CowSwap partial fill mechanism naturally protects against this.
+    The order's buyAmount sets the MINIMUM per-unit price across ALL fills. isValidSignature
+    validates each call independently at current block.timestamp. The partiallyFillable nature
+    means CowSwap proportionally scales buyAmount for partial fills. Since Dutch auction price
+    decreases over time, early fills face STRICTER requirements. Marked as likely false positive
+    but worth fuzzing to confirm.
+
+- id: GPVCA-DO-03
+  tier: 1
+  type: property
+  description: >
+    bid() + CowSwap race condition: a bid() call in the same block as CowSwap settlement
+    reduces balanceOf, potentially causing CowSwap settlement to revert. Since bid() sets
+    s_entered=true and isValidSignature checks s_entered, these cannot execute in the
+    same transaction. But they CAN execute in the same BLOCK in different transactions.
+    If bid() executes first (lower nonce or higher gas price), the balance drops and
+    CowSwap settlement may fail because sellAmount > new balance.
+  attack_scenario: >
+    1. Auction live with 1000 tokenA balance.
+    2. CowSwap solver submits settlement tx for sellAmount=800.
+    3. Attacker front-runs with bid() for amount=500 in same block.
+    4. bid() executes first: balance drops to 500.
+    5. CowSwap settlement calls isValidSignature: sellAmount(800) > balanceOf(500) → reverts.
+    6. Solver wasted gas. If repeated, solvers stop participating → protocol gets worse prices.
+    This is a grief/DoS attack. The attacker pays the Dutch auction price for bid() so it's
+    not free — they actually buy tokens at fair price. But the intent is to deny CowSwap
+    execution to eliminate competition.
+  impact: "DoS of CowSwap settlement path via front-running with bid(); protocol loses solver competition"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any bid(), verify CowSwap path remains viable for remaining balance
+    uint256 remainingBalance = IERC20(asset).balanceOf(address(auction));
+    // This is more of a monitoring invariant — the balance naturally decreases from bids
+    // The key check is: can the protocol still get competitive pricing after bid?
+    // Track if CowSwap orders start failing more after bid activity
+    t(remainingBalance > 0 || s_auctionStarts[asset] == 0, "GPVCA-DO-03: auction drained without ending");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This is a known class of issues in dual-settlement systems. The question is severity:
+    the attacker PAYS fair price for the bid, so no direct fund loss. But the protocol may
+    get worse execution if CowSwap solvers are deterred. On CowSwap, solvers batch orders
+    and may include multiple users' swaps — reverting wastes their gas and delays other users.
+    The s_entered reentrancy guard prevents same-tx attacks but NOT same-block attacks.
+
+- id: GPVCA-DO-04
+  tier: 2
+  type: property
+  description: >
+    isValidSignature does not check that the order's sellAmount + already-filled amount
+    does not exceed the original auction balance. Since the order is partiallyFillable,
+    CowSwap tracks filled amounts internally. But isValidSignature only checks
+    sellAmount <= balanceOf(this). If multiple different orders exist for the same token
+    (different hash, different parameters), they could collectively exceed the balance.
+    CowSwap settlement would naturally fail for the second order (balance insufficient),
+    but the validation passes for both individually before either executes.
+  attack_scenario: >
+    1. Auction has 1000 tokenA. Solver A creates order for 1000. Solver B creates order for 1000.
+    2. Both orders pass isValidSignature (1000 <= 1000 each).
+    3. CowSwap settles order A first: 1000 tokens transferred out.
+    4. CowSwap tries to settle order B: balanceOf = 0, transferFrom fails.
+    5. No fund loss — just failed settlement. But solver B wasted gas.
+    This is inherent to any EIP-1271 multi-order system and is by design.
+  impact: "No fund loss — CowSwap natural fill-or-fail mechanism handles this correctly"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify total committed sellAmount across all valid orders <= balance
+    // This is hard to test without tracking all pending orders
+    uint256 balance = IERC20(asset).balanceOf(address(auction));
+    t(balance >= 0, "GPVCA-DO-04: balance check placeholder");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    After analysis, this is by design. CowSwap solvers are aware of this and handle competing
+    orders. The partiallyFillable flag means partial fills work naturally. No real vulnerability
+    here — marking as likely false positive.
+
+- id: GPVCA-DO-05
+  tier: 1
+  type: property
+  description: >
+    The receiver in isValidSignature is validated as address(this) (L138/L154), meaning
+    the LINK (assetOut) from CowSwap settlement goes to the auction contract itself.
+    The LINK is then swept to assetOutReceiver in _onAuctionEnd. But if the auction
+    ends via performUpkeep BEFORE CowSwap settlement executes, two things happen:
+    (1) allowance is revoked (_onAuctionEnd L119), so vault relayer can't take tokens;
+    (2) s_auctionStarts is deleted, so isValidSignature reverts with InvalidAuction.
+    This is CORRECT defense. But what about the timing: if performUpkeep tx and CowSwap
+    settlement tx are in the same block, and performUpkeep executes FIRST, the CowSwap
+    settlement fails. Solver loses gas but no funds are at risk.
+    The real concern: if CowSwap settlement executes FIRST in the same block as performUpkeep,
+    the LINK arrives at the contract, then performUpkeep calls _onAuctionEnd which sweeps
+    ALL assetOut balance (L393-396) — including the just-received LINK. This is correct
+    behavior (LINK goes to assetOutReceiver which is the intended destination).
+  attack_scenario: >
+    Not an attack — this is correct behavior. The LINK from CowSwap goes to the contract,
+    then _onAuctionEnd sweeps it to assetOutReceiver. Both paths (bid then sweep, or
+    CowSwap then sweep) result in LINK reaching assetOutReceiver.
+  impact: "None — the sweep correctly handles LINK from both bid() and CowSwap"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After auction end, all assetOut should have been swept to receiver
+    uint256 contractLinkBalance = IERC20(assetOut).balanceOf(address(auction));
+    // After _onAuctionEnd, LINK balance should be 0 (swept to receiver)
+    // This only holds if no new LINK arrives between end and check
+    eq(contractLinkBalance, 0, "GPVCA-DO-05: LINK stuck in contract after auction end");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    Investigated and appears correct by design. The _onAuctionEnd sweep handles both paths.
+    LINK from CowSwap and from bid() callers both accumulate in the contract and get swept.
+    Marking as likely false positive but the invariant is still useful to verify no LINK
+    gets stuck.
+
+- id: GPVCA-DO-06
+  tier: 1
+  type: property
+  description: >
+    Price manipulation via stale Data Streams price: isValidSignature calls _getAssetPrice
+    with withValidation=true, which reverts on stale/zero prices. However, the price is
+    fetched from s_dataStreamsPrice which is updated via transmit() by PRICE_ADMIN_ROLE.
+    If the PRICE_ADMIN delays updates, the Data Streams price becomes stale and the
+    system falls back to Chainlink data feed (usdDataFeed). The data feed may have a
+    different price than Data Streams (natural spread). An attacker could profit if they
+    can influence WHEN the price updates happen relative to their bid/settlement.
+    Since transmit() is permissioned (PRICE_ADMIN_ROLE), this requires trusted role
+    collusion. However, if the data feed lags significantly behind real market price,
+    a non-colluding attacker could still exploit the stale data feed by bidding when the
+    real market price of the sell token has dropped but the stale feed still shows high price.
+  attack_scenario: >
+    1. TokenA real market price drops 10% but Chainlink feed (heartbeat=1h) hasn't updated.
+    2. Data Streams price is also stale (PRICE_ADMIN hasn't called transmit()).
+    3. System uses stale Chainlink feed showing old (higher) price.
+    4. Attacker calls bid() for tokenA: pays assetOutAmount based on OLD high price.
+    5. Attacker receives tokenA at inflated value and can sell on market at real (lower) price.
+    Wait — this is backwards. If the old feed shows HIGH price for tokenA, then
+    _getAssetOutAmount will compute a HIGHER assetOutAmount (more LINK required from bidder).
+    That means the bidder OVERPAYS in LINK. So stale-high-price actually protects the protocol.
+    The dangerous case is stale-LOW-price: if feed shows LOW price but real price is HIGH,
+    then assetOutAmount is LOW and bidder gets cheap tokens. But Chainlink feeds update
+    on deviation thresholds, so if price moves UP significantly, the feed updates quickly.
+    The risk is more nuanced — need to check which direction benefits whom.
+  impact: "Depends on direction of staleness; stale-low may allow cheap acquisition of sell tokens"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that price used in bid/isValidSignature is within reasonable bounds of oracle
+    // This requires external oracle comparison which is hard in a unit test
+    // Simplified: verify price is non-zero and within staleness threshold
+    (uint256 price, uint256 updatedAt, bool isValid) = auction.getAssetPrice(asset);
+    t(isValid, "GPVCA-DO-06: price used for auction is invalid/stale");
+    uint256 age = block.timestamp - updatedAt;
+    // Price should not be close to staleness threshold during active bidding
+    t(age < stalenessThreshold / 2, "GPVCA-DO-06: price approaching staleness during auction");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    After analysis, the staleness check with withValidation=true in bid() and isValidSignature
+    provides reasonable protection. The risk is the window just before staleness threshold
+    where the price is technically valid but may have drifted. This is a known oracle
+    design tradeoff, not a specific vulnerability in this contract. Lower confidence because
+    this is a protocol-wide oracle design concern, not specific to GPV2CompatibleAuction.
+
+- id: GPVCA-DO-07
+  tier: 1
+  type: property
+  description: >
+    CowSwap order buyAmount is validated against minBuyAmount at isValidSignature time,
+    but CowSwap can partially fill the order. For partial fills, CowSwap scales buyAmount
+    proportionally: if filling 50% of sellAmount, solver provides 50% of buyAmount.
+    isValidSignature is called ONCE at settlement time with the FULL order, not per fill.
+    The question is: does CowSwap call isValidSignature for each partial fill or just once?
+    In GPv2 protocol, isValidSignature is called ONCE per settlement batch to validate
+    the order. The order UID includes the order hash + owner + validTo. Once validated,
+    the settlement contract tracks filled amounts internally.
+    CRITICAL: if isValidSignature validates at time T1 (price P1) but the partial fill
+    executes some time later at T2 (price P2 < P1), the protocol receives P2-worth of
+    LINK but isValidSignature validated at P1. However, CowSwap calls isValidSignature
+    in the SAME TRANSACTION as the fill, so T1 == T2 == block.timestamp. No time gap.
+  attack_scenario: >
+    Not exploitable — CowSwap validates and settles atomically within the same transaction.
+    The block.timestamp is identical for isValidSignature and the actual token transfers.
+  impact: "None — atomic execution prevents timing exploitation"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify price used in validation matches price at execution
+    // Since both happen at same block.timestamp, this should always hold
+    uint256 priceAtValidation = ghost_lastValidationPrice;
+    uint256 priceAtExecution = ghost_lastExecutionPrice;
+    eq(priceAtValidation, priceAtExecution, "GPVCA-DO-07: price mismatch between validation and execution");
+  ghost_vars:
+  - "uint256 internal ghost_lastValidationPrice;"
+  - "uint256 internal ghost_lastExecutionPrice;"
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Confirmed not exploitable after understanding CowSwap settlement flow.
+    isValidSignature is called within the settlement transaction, same block.timestamp.
+    Marking as false positive.
+
+false_positives:
+- hunter: DomainHunter
+  id: GPVCA-FP-01
+  reason: >
+    CowSwap partial fill timing: isValidSignature is called atomically within the
+    settlement transaction, so block.timestamp is identical for validation and execution.
+    No timing arbitrage possible between validation and fill. (GPVCA-DO-07)
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      CowSwap GPv2 settlement calls isValidSignature in the SAME transaction as the
+      token transfers. No timing gap between EIP-1271 validation and execution. Do not
+      waste time investigating temporal arbitrage between validation and settlement for
+      EIP-1271 based order systems.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: GPVCA-FP-02
+  reason: >
+    Multiple competing CowSwap orders for the same token: this is by design in CowSwap.
+    Solvers handle competing orders naturally via fill-or-fail. The partiallyFillable flag
+    means partial fills work. No vulnerability — standard CowSwap behavior. (GPVCA-DO-04)
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Multiple EIP-1271 orders for the same token with partiallyFillable=true is standard
+      CowSwap behavior. Solvers handle competing orders via fill-or-fail. Do not report
+      as a vulnerability.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: GPVCA-FP-03
+  reason: >
+    Receiver = address(this) for CowSwap orders: LINK accumulates in the contract and is
+    correctly swept by _onAuctionEnd to assetOutReceiver. Both bid() and CowSwap paths
+    result in LINK reaching the intended destination. By design. (GPVCA-DO-05)
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

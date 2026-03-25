@@ -1,0 +1,279 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: AccessHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: BPM-AC-01
+  tier: 1
+  type: property
+  description: "_addLiquidity no tiene checkApproval — cualquiera que sea el locker puede mintear tokens ERC1155 a una dirección arbitraria `to` sin que `to` haya aprobado nada. Esto permite que un atacante mintee LP tokens a nombre de una víctima, potencialmente forzándola a tener posiciones no deseadas que luego podrían causar efectos en integraciones downstream (e.g., contratos que calculan NAV basándose en posiciones held)."
+  attack_scenario: "Un atacante llama a modifyLiquidities con BIN_ADD_LIQUIDITY y establece `to` = dirección de la víctima. Los ERC1155 tokens se mintean a la víctima sin su consentimiento. Impacto directo limitado porque la víctima no pierde fondos, pero en protocolos que agregan posiciones automáticamente (vaults, aggregators), esto podría manipular cálculos de valor. Probabilidad baja de impacto real — el atacante paga la liquidez."
+  impact: "Bajo impacto directo — el atacante paga los tokens para la posición. Impacto indirecto en integraciones que usan balanceOf para calcular valor de portfolio."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que _addLiquidity con to != msgSender() no tiene restricciones
+    // Este es el comportamiento esperado en Uniswap V4 / PCS Infinity — mint a cualquier dirección
+    // Similar a ERC20 transfer donde el receptor no aprueba
+    // PROBABLY BY DESIGN — marcar como false positive si se confirma
+    address attacker = address(0xBEEF);
+    address victim = address(0xDEAD);
+    // attacker calls addLiquidity with to=victim
+    uint256 victimBalanceBefore = binFungibleToken.balanceOf(victim, tokenId);
+    // ... execute addLiquidity with to=victim
+    uint256 victimBalanceAfter = binFungibleToken.balanceOf(victim, tokenId);
+    t(victimBalanceAfter > victimBalanceBefore, "BPM-AC-01: tokens minted to non-consenting address");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 25
+  notes: "Muy probablemente by-design (igual que en Uniswap V4). El patrón de mint-to-arbitrary-address es estándar en LP tokens. Riesgo real solo en integraciones que no esperan recibir tokens no solicitados."
+
+- id: BPM-AC-02
+  tier: 1
+  type: property
+  description: "initializePool no tiene control de acceso ni deadline — cualquier usuario puede inicializar un pool con cualquier activeId. Además, el try/catch silencia TODOS los errores, lo que significa que si la inicialización falla por cualquier razón (pool ya existe, parámetros inválidos), el tx no revierte y el caller puede creer que el pool fue creado exitosamente."
+  attack_scenario: "Un usuario quiere crear un pool y llama initializePool. Un atacante front-runea con initializePool usando un activeId diferente (precio diferente). La llamada del usuario es silenciada por try/catch sin revertir. El usuario luego añade liquidez creyendo que el pool tiene su activeId deseado, pero en realidad tiene el activeId del atacante. Pérdida potencial si el activeId es significativamente diferente."
+  impact: "Loss potencial de fondos para el primer LP si añade liquidez inmediatamente después de initializePool sin verificar el activeId real. El slippage check en _addLiquidity (idSlippage) mitiga parcialmente."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Scenario: front-run initializePool con activeId diferente
+    // 1. Attacker calls initializePool(key, maliciousActiveId)
+    // 2. Victim calls initializePool(key, desiredActiveId) — silently succeeds (catch swallows)
+    // 3. Victim calls addLiquidity expecting desiredActiveId
+    // MITIGACIÓN: _addLiquidity tiene idSlippage check que compara activeIdDesired vs actual activeId
+    // Si idSlippage es tight, el addLiquidity revertirá
+    // PERO: si el usuario no sabe que debe setear idSlippage tight, puede perder
+    (uint24 actualActiveId,,) = binPoolManager.getSlot0(poolKey.toId());
+    t(actualActiveId == desiredActiveId, "BPM-AC-02: pool initialized with unexpected activeId");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: "El try/catch es explícitamente documentado: 'if the pool revert due to other error, then the follow-up action to the pool will still revert accordingly'. Sin embargo, el comentario no cubre el caso de front-running del activeId. La protección idSlippage en addLiquidity es la defensa real, pero depende de que el usuario la configure correctamente."
+
+- id: BPM-AC-03
+  tier: 1
+  type: property
+  description: "_removeLiquidity usa checkApproval(params.from, msgSender()) donde msgSender() es _getLocker() (el caller original de modifyLiquidities). Verificar que NO existe un path donde el locker se fija a una dirección y luego otro usuario puede ejecutar acciones con ese locker como identidad. En particular, modifyLiquiditiesWithoutLock NO adquiere vault lock — ¿podría un actor malicioso usar esto para burn tokens de otro usuario?"
+  attack_scenario: "modifyLiquiditiesWithoutLock llama _executeActionsWithoutLock SIN llamar vault.lock(). Esto significa que NO hay callback del vault, y msgSender() retorna _getLocker() que fue seteado por isNotLocked a msg.sender. Si un hook llama modifyLiquiditiesWithoutLock durante un callback, isNotLocked revertaría porque el locker ya está seteado. Pero ¿qué pasa si el locker se setea vía modifyLiquidities (msg.sender = attacker) y dentro del callback del vault, el attacker intenta remove liquidity de otro usuario? El attacker ES el locker, pero checkApproval exige que el locker sea el owner o aprobado. Seguro si la aprobación funciona correctamente."
+  impact: "Si se bypasea el checkApproval, un atacante podría quemar LP tokens de cualquier usuario y extraer su liquidez."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: solo el owner o un operador aprobado puede burn tokens
+    // _removeLiquidity tiene checkApproval(params.from, msgSender())
+    // msgSender() = _getLocker() = msg.sender de modifyLiquidities
+    // Verificar que no hay path para bypass
+    address attacker = address(0xBEEF);
+    address victim = address(0xDEAD);
+    bool isApproved = binFungibleToken.isApprovedForAll(victim, attacker);
+    // attacker intenta removeLiquidity con from=victim
+    // Debe revertir con BinFungibleToken_SpenderNotApproved
+    t(!isApproved, "BPM-AC-03: attacker should not be approved");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "La protección parece sólida: checkApproval compara params.from con msgSender(). msgSender() está vinculado al msg.sender original via tstore en isNotLocked. No se ve bypass obvio. Confianza alta de que es seguro, pero worth fuzzing."
+
+- id: BPM-AC-04
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock no tiene deadline check — es callable por hooks durante vault.lock(). Sin embargo, no existe restricción que SOLO hooks puedan llamarla. Cualquier usuario puede llamar modifyLiquiditiesWithoutLock directamente (es external). El modifier isNotLocked verifica que no hay un locker activo y luego setea msg.sender como locker. Esto da funcionalidad completa sin deadline protection."
+  attack_scenario: "Un usuario o front-end incorrecto llama modifyLiquiditiesWithoutLock en vez de modifyLiquidities. Las transacciones quedan en el mempool sin deadline protection. Si la tx se ejecuta mucho después de ser enviada, las condiciones del pool pueden haber cambiado significativamente. El idSlippage check en addLiquidity protege parcialmente, pero los min amounts en removeLiquidity podrían ser stale."
+  impact: "Pérdida potencial por ejecución tardía sin deadline. Mitigada por slippage checks internos."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // modifyLiquiditiesWithoutLock es callable por CUALQUIERA, no solo hooks
+    // No tiene deadline check
+    // Verificar si hay un path de uso sin deadline que cause daño
+    // La función es external payable con solo isNotLocked modifier
+    // NOTA: esto es by-design para hooks que operan dentro de un callback
+    // El riesgo es si un usuario regular la usa directamente
+    bool hasDeadline = false; // modifyLiquiditiesWithoutLock no tiene deadline param
+    t(hasDeadline, "BPM-AC-04: modifyLiquiditiesWithoutLock lacks deadline");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: "Probablemente by-design — la función está diseñada para hooks que ya operan dentro de un contexto con vault lock. Uniswap V4 tiene el mismo patrón. El riesgo es bajo porque los slippage checks internos protegen contra cambios de precio extremos."
+
+- id: BPM-AC-05
+  tier: 1
+  type: property
+  description: "multicall usa delegatecall a sí mismo — permite batch de llamadas en una sola tx. Dentro de delegatecall, msg.sender se preserva. Pero el locker se almacena en transient storage (tstore/tload). Si multicall llama modifyLiquidities y luego otra función, el locker se resetea a address(0) al final de modifyLiquidities (isNotLocked modifier limpia). ¿Es posible que multicall permita re-entrada al combinar modifyLiquidities con permit o sweep de manera que el locker context se corrompa?"
+  attack_scenario: "Atacante usa multicall para combinar: (1) permit() para aprobar tokens de una víctima, (2) modifyLiquidities() para remove la liquidez de la víctima. La llamada a permit() podría procesar un permit firmado previamente por la víctima. Sin embargo, permit2 requiere que la firma autorice al BinPositionManager como spender, no al atacante directamente. Y el checkApproval en _removeLiquidity compara params.from con _getLocker() = msg.sender (el atacante), no la víctima. Así que incluso con permit, el atacante no puede impersonar a la víctima en removeLiquidity."
+  impact: "Si el locker context se corrompe via multicall+delegatecall, un atacante podría impersonar otro usuario para operaciones de liquidez."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Multicall + delegatecall preserva msg.sender y storage context
+    // tstore/tload persiste durante toda la tx (incluyendo delegatecalls)
+    // isNotLocked modifier: check locker == 0, set locker = msg.sender, ..., clear locker
+    // En multicall: call1 = modifyLiquidities (sets+clears locker), call2 = modifyLiquidities (sets+clears locker)
+    // Cada subcall es independiente respecto al locker — no hay leak
+    // VERIFICAR: ¿qué pasa si call1 revierte pero multicall continúa? No — multicall propaga reverts
+    address lockerAfterMulticall = reentrancyLock._getLocker();
+    eq(lockerAfterMulticall, address(0), "BPM-AC-05: locker not cleared after multicall");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "Transient storage (tstore/tload) persiste durante toda la transacción, incluyendo delegatecalls dentro de multicall. Cada modifyLiquidities llama isNotLocked que limpia el locker al final. No parece haber leak. Pero la combinación de multicall + transient storage es una superficie nueva que merece fuzzing."
+
+- id: BPM-AC-06
+  tier: 1
+  type: property
+  description: "BinFungibleToken.batchTransferFrom tiene onlyIfVaultUnlocked modifier — las transferencias ERC1155 solo funcionan cuando el vault NO tiene un locker activo (vault.getLocker() == address(0)). Esto impide transferencias de LP tokens DURANTE operaciones de pool. Pero approveForAll NO tiene este modifier — las aprobaciones se pueden dar en cualquier momento. Verificar que no hay un race condition donde alguien aprovecha el timing de lock/unlock."
+  attack_scenario: "Un usuario llama modifyLiquidities (vault.lock activo). Durante el callback, un hook malicioso intenta transferir los LP tokens del usuario via batchTransferFrom. onlyIfVaultUnlocked lo previene. Sin embargo, si el hook puede setear approveForAll para sí mismo... No — approveForAll usa msg.sender directamente, no msgSender(). El hook sería msg.sender, no el usuario. El hook no puede auto-aprobarse como operator del usuario."
+  impact: "Si se bypasea onlyIfVaultUnlocked, transferencias no autorizadas de LP tokens durante operaciones de pool."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // batchTransferFrom tiene onlyIfVaultUnlocked
+    // approveForAll NO tiene onlyIfVaultUnlocked
+    // approveForAll usa msg.sender (correcto, no msgSender)
+    // No parece vulnerable — pero verificar que hooks no pueden bypass
+    bool vaultLocked = vault.getLocker() != address(0);
+    // during lock, batchTransferFrom should revert
+    if (vaultLocked) {
+        // t(false, "BPM-AC-06: batchTransferFrom should be blocked during vault lock");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: "La separación entre approveForAll (usa msg.sender, no restrictivo por vault lock) y batchTransferFrom (restrictivo por vault lock) parece correcta. El único vector sería si un hook durante vault.lock pudiera llamar approveForAll donde msg.sender = hook address, y luego después del unlock transferir tokens. Pero esto requiere que el usuario haya dado approval al hook, lo cual hooks son trusted."
+
+- id: BPM-AC-07
+  tier: 2
+  type: property
+  description: "La función _sweep envía TODO el balance del contrato de una currency a un recipient arbitrario (mappeado por _mapRecipient). Si quedan tokens ERC20 en el contrato por cualquier razón (dust de operaciones anteriores, donations, tokens enviados por error), cualquier locker puede sweepearlos. Verificar que _sweep no puede ser abusada para robar tokens que pertenecen a otra operación en curso."
+  attack_scenario: "Escenario 1: Usuario A envía tokens al BinPositionManager como parte de settle. Antes de que settle se complete, usuario A incluye un SWEEP action en su batch que transfiere TODO el balance del contrato (incluyendo tokens que podrían pertenecer a otros). Sin embargo, dado que isNotLocked previene llamadas concurrentes y el vault.lock es una ejecución atómica, solo hay un locker a la vez. Escenario 2: Tokens residuales de operaciones pasadas se acumulan — el próximo locker puede sweepearlos con SWEEP action."
+  impact: "Robo de tokens residuales en el contrato. Impacto depende de cuánto dust se acumula."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // _sweep transfiere currency.balanceOfSelf() a recipient
+    // Solo callable como action dentro de modifyLiquidities (con vault lock activo)
+    // ReentrancyLock previene ejecución concurrente
+    // Pero dust de operaciones anteriores puede ser sweepeable por el próximo caller
+    uint256 contractBalance = currency.balanceOf(address(binPositionManager));
+    // Después de sweep, el balance debería ser 0
+    // El riesgo es que este balance incluya tokens de otros
+    t(contractBalance == 0, "BPM-AC-07: residual tokens after sweep");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: "El sweep de dust es un patrón conocido en Uniswap V4 / PCS Infinity. Es by-design que cualquier caller pueda sweepear residuos. El riesgo es bajo porque las operaciones normales no deberían dejar residuos significativos. MEV bots podrían frontrunear para sweepear dust, pero el valor esperado es mínimo."
+
+- id: BPM-AC-08
+  tier: 1
+  type: property
+  description: "La función _pay usa permit2.transferFrom(payer, vault, amount, token) cuando payer != address(this). El payer se determina por _mapPayer(payerIsUser) donde payerIsUser viene de los calldata params. Si un atacante construye calldata con payerIsUser=true, el payer será msgSender() = _getLocker() = msg.sender del atacante mismo. Verificar que NO hay un path donde payerIsUser=true pero permit2 transfiere de un payer diferente al locker."
+  attack_scenario: "Si existe un bug donde _mapPayer retorna una dirección que no es el msg.sender real, permit2.transferFrom podría transferir tokens de una víctima que previamente aprobó permit2 para el BinPositionManager. Sin embargo, _mapPayer(true) retorna msgSender() = _getLocker() = el msg.sender de la llamada original. Esto es correcto siempre que tstore no esté corrupto."
+  impact: "Si _mapPayer retorna dirección incorrecta, robo de tokens vía permit2 allowance."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // _pay con payer != address(this) usa permit2.transferFrom
+    // payer viene de _mapPayer(payerIsUser) = msgSender() si payerIsUser=true
+    // msgSender() = _getLocker() = tload(LOCKED_BY_SLOT)
+    // LOCKED_BY_SLOT se setea en isNotLocked a msg.sender
+    // VERIFICAR: transient storage no puede ser corrompida por delegatecall en multicall
+    address expectedPayer = msg.sender; // el caller original
+    address actualPayer = binPositionManager.msgSender();
+    eq(expectedPayer, actualPayer, "BPM-AC-08: payer identity mismatch");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "La cadena de confianza es: msg.sender → tstore(LOCKED_BY_SLOT) → tload = _getLocker() = msgSender(). delegatecall en multicall preserva tstore context. No se ve forma de corromper el payer identity, pero es una hipótesis critical que DEBE ser fuzzeada."
+
+- id: BPM-AC-09
+  tier: 2
+  type: property
+  description: "_addLiquidity tiene una inconsistencia potencial en la verificación del idSlippage: usa aritmética sin unchecked que podría revert por underflow en Solidity 0.8.26. Si activeIdDesired < idSlippage, la resta `activeIdDesired - idSlippage` causa underflow y revert, impidiendo que un usuario añada liquidez a bins con activeId bajo. Esto es un DoS potencial, no un access control issue directo."
+  attack_scenario: "Un usuario quiere añadir liquidez con activeIdDesired=5, idSlippage=10. La verificación `activeIdDesired - idSlippage > activeId` causa underflow (5-10 underflows en uint256). Esto revertaría la tx. El atacante no puede explotar esto directamente, pero el usuario no puede protegerse contra downward slippage para activeIds bajos. Nota: activeIdDesired y idSlippage son uint256, la resta es sin unchecked."
+  impact: "DoS para addLiquidity en pools con activeId bajo cuando el usuario quiere un idSlippage amplio. Impacto bajo — el usuario puede ajustar idSlippage."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Línea 260: if (activeIdDesired - idSlippage > activeId)
+    // Si activeIdDesired < idSlippage → underflow en Solidity 0.8.26 → revert
+    // Pero activeIdDesired y idSlippage se validan contra type(uint24).max antes
+    // activeIdDesired max = 16777215, idSlippage max = 16777215
+    // Si activeIdDesired = 0 y idSlippage = 1 → 0 - 1 overflows → revert
+    uint256 activeIdDesired = 5;
+    uint256 idSlippage = 10;
+    // This will revert with arithmetic underflow
+    bool underflows = activeIdDesired < idSlippage;
+    t(!underflows, "BPM-AC-09: idSlippage underflow for low activeIdDesired");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: "La aritmética `activeIdDesired - idSlippage` puede underflow si activeIdDesired < idSlippage. En Uniswap V4 CLPositionManager no tienen este patrón exacto. Esto no es un bug de security per se, sino un revert inesperado (DoS). El usuario puede mitigar usando idSlippage <= activeIdDesired. Worth reporting como QA/Low."
+
+- id: BPM-AC-10
+  tier: 1
+  type: property
+  description: "TAKE action permite enviar tokens a un recipient arbitrario (no necesariamente el caller). Si un usuario tiene crédito positivo en el vault (delta > 0), puede dirigir los tokens a CUALQUIER dirección via el param recipient. Verificar que un atacante NO puede take los créditos que pertenecen a otra operación del mismo contrato."
+  attack_scenario: "El delta del vault es per-address (address(BinPositionManager)). Dentro de una sesión de vault.lock, el BinPositionManager acumula deltas. Un TAKE action dentro del batch del atacante solo puede take crédito positivo que fue generado por las acciones del MISMO batch (porque vault.lock es atómico y el delta empieza en 0). El atacante no puede take crédito de otro usuario porque cada vault.lock es independiente. Sin embargo, verificar que modifyLiquiditiesWithoutLock respeta los mismos principios cuando se llama fuera de vault.lock."
+  impact: "Si un atacante puede take créditos de otro usuario, robo directo de fondos."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // TAKE action: _take(currency, recipient, amount)
+    // amount puede ser OPEN_DELTA = _getFullCredit(currency)
+    // _getFullCredit lee vault.currencyDelta(address(this), currency)
+    // El delta es del BinPositionManager, no del usuario individual
+    // Pero cada vault.lock es atómico — el delta acumulado es del batch completo
+    // modifyLiquiditiesWithoutLock: NO llama vault.lock, opera directamente
+    // ¿El delta del BPM puede tener residuo de un vault.lock anterior?
+    // vault.lock DEBE forzar deltas = 0 al final — si no, revert
+    int256 deltaAfterLock = vault.currencyDelta(address(binPositionManager), currency);
+    eq(deltaAfterLock, 0, "BPM-AC-10: delta not zero after vault.lock");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "El vault fuerza que todos los deltas se resuelvan al final de lock() (net zero settlement). modifyLiquiditiesWithoutLock opera fuera de vault.lock, lo que significa que los deltas que genera NO están sujetos al settlement automático. ¿Quién fuerza el settlement en ese caso? El caller del hook que originalmente llamó vault.lock. Parece seguro, pero la interacción es sutil."
+
+false_positives:
+- hunter: AccessHunter
+  id: BPM-FP-01
+  reason: "_addLiquidity permite mint a dirección arbitraria `to` — esto es by-design, igual que en Uniswap V4. El caller paga los tokens, así que no hay pérdida para el receptor."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Mint LP tokens a dirección arbitraria sin consentimiento del receptor es patrón estándar en AMMs (Uniswap V4, PCS Infinity). No es bug — el caller paga."
+    briefing_update_applied: false
+
+- hunter: AccessHunter
+  id: BPM-FP-02
+  reason: "Hooks son FULLY TRUSTED según las instrucciones del hunt. Cualquier vector de ataque vía hooks maliciosos está fuera de scope."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "En PCS Infinity (y Uniswap V4), hooks son trusted por diseño. No reportar ataques que requieren un hook malicioso."
+    briefing_update_applied: false

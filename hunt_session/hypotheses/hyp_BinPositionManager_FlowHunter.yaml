@@ -1,0 +1,434 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: FlowHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: BPM-FL-01
+  tier: 1
+  type: property
+  description: "_pay() truncates amount to uint160 via permit2.transferFrom — if amount > type(uint160).max, the vault receives fewer tokens than the delta expects, leaving the vault insolvent"
+  attack_scenario: >
+    The _pay() function casts amount to uint160 when calling permit2.transferFrom(payer, vault, uint160(amount), token).
+    If amount exceeds type(uint160).max (~1.46e48), the high bits are silently truncated. The vault.settle() call
+    would register the full delta as settled via sync-then-settle pattern, but the actual transfer is only
+    uint160(amount). In practice, ERC20 totalSupply rarely exceeds uint160, so this is unlikely for standard tokens.
+    However, for tokens with extreme supply (rebasing, high-decimal, or custom tokens), this could allow settling
+    a debt with fewer tokens than owed. The attacker adds liquidity, creates a large debt, then settles with
+    truncated payment, keeping the difference.
+  impact: "Vault receives fewer tokens than accounted — potential insolvency for that currency"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // In a handler that calls _settle with a large amount:
+    // Verify that the amount passed to permit2 never exceeds uint160 max
+    // or that the full amount is actually transferred
+    uint256 debtBefore = vault.currencyDelta(address(positionManager), currency);
+    uint256 vaultBalBefore = IERC20(Currency.unwrap(currency)).balanceOf(address(vault));
+    // ... execute settle action ...
+    uint256 vaultBalAfter = IERC20(Currency.unwrap(currency)).balanceOf(address(vault));
+    uint256 debtAfter = vault.currencyDelta(address(positionManager), currency);
+    // The actual transfer must match the delta reduction
+    uint256 deltaReduced = uint256(-int256(debtBefore)) - uint256(-int256(debtAfter));
+    uint256 actualTransferred = vaultBalAfter - vaultBalBefore;
+    eq(deltaReduced, actualTransferred, "BPM-FL-01: settle amount != actual transfer (uint160 truncation)");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    The truncation is real in the code (line 394: uint160(amount)), but in practice ERC20 amounts
+    rarely exceed uint160. The vault.sync()/settle() pattern uses balance diffs, so if the transfer
+    is less than expected, settle() would only credit what was actually received. Need to verify
+    whether vault.settle() credits based on balance diff (safe) or based on the reported amount (vulnerable).
+    If vault uses balance diff via sync, this is NOT exploitable — it's a self-grief at most.
+
+- id: BPM-FL-02
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock has no deadline check — actions can be executed at any time after signing, enabling stale-state exploitation"
+  attack_scenario: >
+    modifyLiquidities() has checkDeadline(deadline) modifier, but modifyLiquiditiesWithoutLock() has NO
+    deadline check at all. If a user signs a multicall that includes modifyLiquiditiesWithoutLock, a keeper
+    or relayer could hold the transaction and execute it much later when market conditions have changed
+    drastically. For add liquidity, the user's activeIdDesired + idSlippage might still pass but at very
+    unfavorable rates. For remove liquidity, amount0Min/amount1Min might still pass but with value loss
+    due to IL. This is a design choice (the function is meant for vault-already-locked scenarios), but
+    the lack of ANY time-bounding is a slippage concern.
+  impact: "Users adding/removing liquidity via WithoutLock path have no time protection — stale execution possible"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // This is a design-level check — verify that modifyLiquiditiesWithoutLock
+    // is only callable in contexts where deadline is enforced upstream
+    // The test would be: can a user directly call modifyLiquiditiesWithoutLock?
+    // If yes, there's no deadline protection.
+    bool canCallDirectly = true; // modifyLiquiditiesWithoutLock is external
+    // It has isNotLocked modifier — so it requires vault to NOT be locked
+    // But it doesn't lock the vault itself either — it calls _executeActionsWithoutLock
+    // which just loops through actions without vault.lock()
+    t(canCallDirectly, "BPM-FL-02: modifyLiquiditiesWithoutLock callable without deadline");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    modifyLiquiditiesWithoutLock is designed for use when the vault is already locked by another
+    contract. But it's external and has no caller restriction beyond isNotLocked. If a user calls
+    it directly (vault not locked), actions execute without vault.lock() — meaning no delta
+    accounting via the vault's transient storage. This would likely revert when trying to settle/take
+    because there's no active locker. The real question is: can this be called in a context where
+    the lack of deadline matters? Need to verify vault.lock() requirements.
+
+- id: BPM-FL-03
+  tier: 1
+  type: property
+  description: "initializePool silently swallows ALL reverts via try/catch — pool initialization failures are invisible, leading users to add liquidity to non-existent or misconfigured pools"
+  attack_scenario: >
+    initializePool uses `try binPoolManager.initialize(key, activeId) {} catch {}` which catches ALL
+    errors silently. If initialization fails (e.g., currencyOutOfOrder, invalid binStep, pool already exists),
+    the function returns success. A user calling initializePool + addLiquidity in a multicall could
+    believe the pool was initialized when it wasn't. The addLiquidity would then either:
+    (a) revert if the pool doesn't exist — safe but confusing
+    (b) succeed if someone front-ran pool creation with different parameters — user adds liquidity
+    to an attacker-configured pool with malicious hooks or parameters.
+    Attack: Attacker monitors mempool for initializePool calls, front-runs with their own initialize
+    using the same poolKey but with a malicious hook address in the PoolKey. The user's initialize
+    fails silently, and their subsequent addLiquidity goes to the attacker's pool.
+  impact: "User liquidity deposited into attacker-controlled pool with malicious hooks"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Cannot directly test silent failure in an invariant — this is a design-level issue
+    // Test: call initializePool with invalid params, verify it doesn't revert
+    // Then verify the pool actually exists
+    // The invariant: if initializePool was called, the pool MUST exist afterward
+    // (poolId, activeId, protocolFee, hookRegistration) = binPoolManager.getSlot0(key.toId());
+    // If activeId == 0 and we called initializePool, the init was silently swallowed
+    (uint24 poolActiveId,,) = binPoolManager.getSlot0(poolKey.toId());
+    t(poolActiveId != 0, "BPM-FL-03: initializePool succeeded but pool doesn't exist");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    The code comment says "if the pool revert due to other error, then the follow-up action to the
+    pool will still revert accordingly" — meaning they rely on downstream calls to fail. But if the
+    user's multicall only contains initializePool (no addLiquidity), they get silent success on a
+    failed init. The front-running attack with different PoolKey hook is the real concern — PoolKey
+    includes hook address, so different hooks = different poolId. Actually, if the PoolKey is the SAME,
+    the front-runner can't change the hook because it's part of the key. So the attack requires
+    the SAME key — but then initialize just returns "already initialized" silently. The user's
+    addLiquidity would go to the front-runner's pool with the SAME params. This weakens the attack.
+    Revisit: the real risk is user confusion, not fund theft.
+
+- id: BPM-FL-04
+  tier: 1
+  type: property
+  description: "LP token totalSupply must equal sum of all user balances for every tokenId — _mint and _burn use unchecked arithmetic that could desync if overflow/underflow occurs"
+  attack_scenario: >
+    In BinFungibleToken._mint(), totalSupply[id] += amount is checked (can overflow-revert), but
+    balanceOf[to][id] += amount is unchecked. If totalSupply[id] is near type(uint256).max and a mint
+    pushes it over, it reverts. But balanceOf is unchecked — meaning if a single user's balance overflows
+    uint256, it wraps to zero silently. This requires an astronomically large number of mints to a single
+    address for the same tokenId, which is practically impossible. In _burn(), both totalSupply and
+    balanceOf subtractions are unchecked (after a balance check). The balance check prevents underflow
+    of balanceOf, and since totalSupply >= balanceOf by construction, totalSupply underflow is prevented.
+    The invariant is: totalSupply[id] == sum(balanceOf[user][id]) for all users.
+  impact: "If totalSupply desyncs from actual balances, users could burn more LP tokens than they own proportionally"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For each tracked tokenId, verify totalSupply == sum of known balances
+    uint256 tokenId = poolId.toTokenId(binId);
+    uint256 supply = bft.totalSupply(tokenId);
+    uint256 sumBalances = 0;
+    for (uint256 i = 0; i < actors.length; i++) {
+        sumBalances += bft.balanceOf(actors[i], tokenId);
+    }
+    eq(supply, sumBalances, "BPM-FL-04: totalSupply != sum(balances)");
+  ghost_vars:
+  - "uint256[] internal ghost_trackedTokenIds;"
+  - "address[] internal actors;"
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The unchecked block in _mint for balanceOf is standard ERC1155 pattern — justified by the fact
+    that totalSupply is checked first (if totalSupply doesn't overflow, no single balance can overflow
+    since balance <= totalSupply). This is mathematically sound IF no other code path modifies
+    balanceOf without going through _mint/_burn. batchTransferFrom also uses unchecked but with a
+    balance check first. The invariant is sound but likely won't break — still worth fuzzing as a
+    solvency invariant.
+
+- id: BPM-FL-05
+  tier: 1
+  type: property
+  description: "Delta accounting conservation: after a full modifyLiquidities call completes, the vault's currencyDelta for BinPositionManager must be zero for all currencies touched"
+  attack_scenario: >
+    The vault uses transient storage for delta accounting. When BinPositionManager calls vault.lock(),
+    executes actions (addLiquidity creates negative deltas, settle resolves them), and returns, all
+    deltas must net to zero. If a user crafts an action sequence that leaves a non-zero delta, the
+    vault.lock() should revert (the vault enforces zero-delta on lock release). But if there's a path
+    where deltas leak (e.g., via CLEAR_OR_TAKE forfeiting tokens, or via the FROM_DELTAS variant
+    consuming credit without full settlement), the vault might not catch it. A positive leftover delta
+    means the vault owes tokens that were never paid — an attacker could drain the vault.
+  impact: "Non-zero delta after lock release = vault insolvency or locked funds"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After modifyLiquidities returns, check all deltas are zero
+    // This is enforced by the vault, but we verify it as a meta-invariant
+    int256 delta0 = vault.currencyDelta(address(positionManager), currency0);
+    int256 delta1 = vault.currencyDelta(address(positionManager), currency1);
+    eq(uint256(delta0), 0, "BPM-FL-05: currency0 delta non-zero after lock release");
+    eq(uint256(delta1), 0, "BPM-FL-05: currency1 delta non-zero after lock release");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    The vault itself enforces this via its lock mechanism — if deltas are non-zero when lock() returns,
+    it reverts. So this invariant is really testing the vault's enforcement. The interesting case is
+    CLEAR_OR_TAKE which explicitly forfeits positive deltas (vault.clear) — this IS intentional leakage
+    but the clear function should properly zero out the delta. The BIN_ADD_LIQUIDITY_FROM_DELTAS variant
+    consumes existing credit — if credit is consumed but not fully, the remainder needs to be taken or
+    cleared. If the user forgets, the vault catches it. This is more of a meta-invariant.
+
+- id: BPM-FL-06
+  tier: 1
+  type: property
+  description: "BIN_ADD_LIQUIDITY_FROM_DELTAS uses _getFullCredit which reverts on negative delta — but if credit is zero, amount0/amount1 are zero, and mint() might mint zero-liquidity LP tokens"
+  attack_scenario: >
+    When using BIN_ADD_LIQUIDITY_FROM_DELTAS, the amounts are derived from _getFullCredit(currency).
+    If the credit is zero (no prior action generated credit), _getFullCredit returns 0 (delta is 0,
+    which is not < 0, so no revert). Then _addLiquidity is called with amount0=0, amount1=0.
+    The binPoolManager.mint() is called with amountIn = encode(0, 0). Depending on the pool manager's
+    behavior, this might:
+    (a) mint zero liquidity tokens (ghost positions) — polluting _positions mapping
+    (b) revert — safe
+    If zero-liquidity LP tokens are minted, they create positions that can never be burned for value
+    but consume gas and storage. More critically, if the LP token ID gets a non-zero _positions entry
+    with binId=0, future legitimate mints to that bin could be affected.
+  impact: "Ghost LP positions with zero value; potential _positions mapping pollution; binId=0 collision"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After addLiquidity, verify that minted liquidity is always > 0
+    // Check that no tokenId has totalSupply > 0 but represents zero actual pool liquidity
+    for (uint256 i = 0; i < mintArray.ids.length; i++) {
+        uint256 tokenId = poolId.toTokenId(mintArray.ids[i]);
+        uint256 supply = bft.totalSupply(tokenId);
+        if (supply > 0) {
+            // Verify the pool actually has liquidity for this bin
+            // binPoolManager should have non-zero bin reserves
+            t(supply > 0, "BPM-FL-06: LP tokens minted with zero actual liquidity");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Need to check what binPoolManager.mint() does with zero amountIn. If it returns empty
+    mintArray (no ids, no liquidity), the loop doesn't execute and no LP tokens are minted — safe.
+    If it returns entries with liquidityMinted=0, _mint(to, tokenId, 0) is a no-op for balanceOf
+    but still writes to _positions. The _positions[tokenId].binId == 0 check would trigger, writing
+    a position with binId=0 if the actual bin is bin 0 — but bins are uint24 so bin 0 exists.
+    Actually, if liquidityMinted[i] == 0, _mint does totalSupply[id] += 0 and balanceOf[to][id] += 0,
+    which are no-ops. But _positions still gets written. Low severity — storage pollution only.
+
+- id: BPM-FL-07
+  tier: 1
+  type: property
+  description: "_positions[tokenId].binId uses uint24 — bin 0 is a valid bin but is also the default/uninitialized value, making positions(tokenId) unable to distinguish 'not initialized' from 'bin 0'"
+  attack_scenario: >
+    The positions() view function checks `if (PoolId.unwrap(position.poolId) == 0) revert InvalidTokenID()`.
+    This protects against uninitialized poolId. But for a valid position in bin 0 (activeId=0 is
+    technically valid for uint24), the check passes. More importantly, in _addLiquidity line 308:
+    `if (_positions[tokenId].binId == 0)` — this condition is used to decide whether to write the
+    position. For bin 0, this means the position is ALWAYS overwritten on every addLiquidity call
+    to bin 0, even if it was already set. This is a minor inefficiency but not a bug since the
+    values written are identical. However, if two different pools happen to produce the same tokenId
+    (hash collision in BinTokenLibrary.toTokenId), the second pool's position would overwrite the first.
+    This is astronomically unlikely (keccak256 collision) but the code doesn't guard against it.
+  impact: "Bin 0 positions always re-written (gas waste); theoretical hash collision could corrupt position mapping"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that _positions is consistent: for any tokenId with totalSupply > 0,
+    // the stored poolId and binId must match the actual pool/bin
+    uint256 tokenId = poolId.toTokenId(binId);
+    (PoolKey memory storedKey, uint24 storedBinId) = positionManager.positions(tokenId);
+    // storedBinId must match the binId we minted to
+    eq(uint256(storedBinId), uint256(binId), "BPM-FL-07: stored binId mismatch");
+    // storedKey.toId() must match poolId
+    bytes32 storedPoolId = PoolId.unwrap(storedKey.toId());
+    bytes32 expectedPoolId = PoolId.unwrap(poolId);
+    eq(uint256(storedPoolId), uint256(expectedPoolId), "BPM-FL-07: stored poolId mismatch");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    The binId == 0 re-write is benign because it writes the same values. The real concern is whether
+    binId can legitimately be 0. In Liquidity Book (Trader Joe) style, the active bin starts at 2^23,
+    so bin 0 is far from active. In PancakeSwap's implementation, activeId is uint24 set at
+    initializePool — if someone initializes with activeId=0, bins around 0 are valid. The sentinel
+    value issue is cosmetic, not security-critical.
+
+- id: BPM-FL-08
+  tier: 1
+  type: property
+  description: "Reentrancy via BinFungibleToken.batchTransferFrom during vault-locked state — batchTransferFrom requires vault to be UNLOCKED (onlyIfVaultUnlocked), but this prevents composability with other vault-locked operations"
+  attack_scenario: >
+    batchTransferFrom has the onlyIfVaultUnlocked modifier, which reverts if vault.getLocker() != address(0).
+    During a modifyLiquidities call, the vault IS locked (BinPositionManager is the locker). This means
+    LP tokens CANNOT be transferred during a multicall/modifyLiquidities execution. This is a design
+    choice to prevent reentrancy. But it also means: if a hook or callback during addLiquidity/removeLiquidity
+    tries to transfer LP tokens, it will revert. Since hooks are trusted (per instructions), this is
+    acceptable. However, the INVERSE is the concern: can batchTransferFrom be called OUTSIDE of
+    vault lock to manipulate LP balances between two steps of a multicall? Since multicall is atomic,
+    this isn't possible within a single tx. Cross-tx MEV is the vector: attacker transfers LP tokens
+    away from a user between the user's approve and removeLiquidity transactions.
+  impact: "LP tokens locked during vault operations — potential composability issues but not direct fund loss"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that batchTransferFrom conserves totalSupply (no mint/burn side effect)
+    uint256 supplyBefore = bft.totalSupply(tokenId);
+    // ... execute batchTransferFrom ...
+    uint256 supplyAfter = bft.totalSupply(tokenId);
+    eq(supplyBefore, supplyAfter, "BPM-FL-08: batchTransferFrom changed totalSupply");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    The onlyIfVaultUnlocked on batchTransferFrom is a deliberate anti-reentrancy pattern. It prevents
+    any LP token movement during vault-locked operations, which is safe. The real question is whether
+    this is sufficient — or whether there's a path to move LP tokens DURING a vault lock that doesn't
+    go through batchTransferFrom. _mint and _burn are internal and only called from _addLiquidity and
+    _removeLiquidity, which are inside the vault lock. This looks sound.
+
+- id: BPM-FL-09
+  tier: 1
+  type: property
+  description: "_removeLiquidity burns LP tokens from params.from but delta credit goes to BinPositionManager (address(this)) — if the caller doesn't TAKE the credit to the correct recipient, tokens are stuck in the vault"
+  attack_scenario: >
+    In _removeLiquidity, binPoolManager.burn() creates a positive delta for BinPositionManager (the caller
+    of burn). The LP tokens are burned from params.from. But the underlying tokens (the positive delta)
+    are NOT automatically sent to params.from — they remain as a credit in the vault's transient storage
+    for BinPositionManager. The user must include a TAKE_PAIR or TAKE or CLOSE_CURRENCY action AFTER
+    BIN_REMOVE_LIQUIDITY to actually receive the tokens. If the user forgets or misconfigures the
+    recipient in the TAKE action, the tokens either:
+    (a) remain as credit and vault.lock() reverts (delta non-zero) — safe, tx fails
+    (b) are taken to the wrong address — fund loss for the LP token burner
+    The key issue: removeLiquidity checks approval from params.from, burns their LP tokens, but the
+    delta credit is positional to BinPositionManager, not to params.from. An approved operator could
+    burn someone's LP tokens and then TAKE to themselves.
+  impact: "Approved operator can burn LP tokens from a user and redirect underlying tokens to themselves"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After removeLiquidity + take, verify that the recipient of tokens
+    // is the same as the owner of burned LP tokens (or explicitly approved)
+    // This requires tracking the from address in removeLiquidity and the recipient in take
+    // Ghost variable tracks the last removeLiquidity from address
+    address burnFrom = ghost_lastRemoveLiquidityFrom;
+    address takeRecipient = ghost_lastTakeRecipient;
+    // If they differ, an operator redirected funds
+    if (burnFrom != address(0) && takeRecipient != address(0)) {
+        // This is BY DESIGN for approved operators — but is the user aware?
+        // The invariant: if from != msgSender, then recipient should be from
+        if (ghost_lastMsgSender != burnFrom) {
+            eq(takeRecipient, burnFrom, "BPM-FL-09: operator redirected remove liquidity funds");
+        }
+    }
+  ghost_vars:
+  - "address internal ghost_lastRemoveLiquidityFrom;"
+  - "address internal ghost_lastTakeRecipient;"
+  - "address internal ghost_lastMsgSender;"
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    This is actually BY DESIGN in Uniswap V4 and PCS Infinity architecture. Approved operators
+    can manage liquidity on behalf of users. The approval mechanism (isApprovedForAll) is the
+    user's consent. However, the approval is for LP token operations — the user might not expect
+    that approving LP token transfers also allows the operator to burn LP tokens AND redirect the
+    underlying tokens. In standard ERC1155, approval only allows transfers. Here, approval
+    allows burn + redirect. This is an expanded trust assumption that may not be obvious to users.
+    Severity depends on whether protocols integrating BinPositionManager understand this.
+
+- id: BPM-FL-10
+  tier: 2
+  type: property
+  description: "cachePoolKey only writes on first use (binStep == 0 check) — if a PoolKey with binStep=0 is somehow valid, the cache is never populated, breaking positions() lookups"
+  attack_scenario: >
+    cachePoolKey checks `if (_poolIdToPoolKey[...].parameters.getBinStep() == 0)` to decide whether
+    to cache. If a valid pool has binStep=0 in its parameters, the cache entry is never populated
+    because the condition always evaluates to true (the stored value is always 0). But getBinStep
+    extracts bits from the parameters field — if binStep=0 is invalid and prevented by
+    binPoolManager.initialize(), this is not exploitable. If binStep=0 IS valid (e.g., for special
+    pool types), then _poolIdToPoolKey never stores the key, and positions(tokenId) would return
+    a zeroed PoolKey — misleading for off-chain consumers but not directly exploitable on-chain.
+  impact: "positions() returns empty PoolKey for pools with binStep=0 — off-chain consumer confusion"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After addLiquidity, verify that the poolKey is cached
+    PoolId poolId = poolKey.toId();
+    PoolKey memory cached = _poolIdToPoolKey[PoolId.unwrap(poolId)];
+    // The cached key should have non-zero parameters
+    t(cached.parameters.getBinStep() != 0, "BPM-FL-10: poolKey not cached (binStep=0)");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    BinPoolManager likely validates binStep > 0 during initialize(). If so, this is unreachable.
+    Need to verify the core pool manager's validation. If binStep=0 is rejected at init time,
+    this hypothesis is invalid. Mark as needs-verification.
+
+false_positives:
+- hunter: FlowHunter
+  id: BPM-FP-01
+  reason: >
+    Hook-based attacks (beforeMint/afterMint callbacks manipulating state) are excluded per
+    instructions — hooks are FULLY TRUSTED in PancakeSwap Infinity. The IdSlippage check before
+    mint protects against hook-induced activeId changes, which is the correct design. Not a finding.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: BPM-FP-02
+  reason: >
+    ReentrancyLock uses transient storage (tstore/tload) for the locker address. This is safe in
+    Solidity 0.8.26 with EIP-1153 support. The isNotLocked modifier on both entry points
+    (modifyLiquidities, modifyLiquiditiesWithoutLock) prevents reentrant calls. The lock is
+    released at the end of the modifier. Standard pattern, no vulnerability.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: BPM-FP-03
+  reason: >
+    _sweep() sends the contract's entire balance to a recipient without access control — but it's
+    internal and only callable through _handleAction within a vault.lock() callback. The recipient
+    is controlled by the caller (msgSender = locker). This is by design for collecting dust/leftovers
+    after operations. Not exploitable because the contract should not hold funds between transactions
+    (all funds flow through vault).
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

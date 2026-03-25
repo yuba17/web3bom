@@ -1,0 +1,742 @@
+protocol: pancakeswap-infinity
+component: CLPoolManager
+file: src/pool-cl/CLPoolManager.sol
+domain: dex
+hunter: FlowHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+###############################################################################
+# CLPM-F01: Hook Delta Conservation in Swap
+# The sum (callerDelta + hookDelta) settled to the vault must equal the raw
+# pool.swap() output (amountIn/amountOut). A malicious hook returning arbitrary
+# beforeSwapDelta + afterSwapDelta could break this if the arithmetic in
+# CLHooks.afterSwap does not conserve value.
+#
+# KEY INSIGHT: In CLHooks.afterSwap, hookDelta is constructed from
+# (hookDeltaSpecified, hookDeltaUnspecified), where hookDeltaSpecified comes
+# from beforeSwapDelta and hookDeltaUnspecified = beforeSwapDelta.unspecified +
+# afterSwap return. Then delta = delta - hookDelta. So the vault sees
+# (delta - hookDelta) for the user and hookDelta for the hook.
+# The app-level reserve change is: delta0 + hookDelta0 and delta1 + hookDelta1
+# (from Vault.accountAppBalanceDelta). This should equal the ORIGINAL pool
+# delta (pre-hook adjustment). If the hook can inflate hookDelta without
+# the vault enforcing conservation, value leaks.
+#
+# ANALYSIS: Vault._accountDeltaForApp takes (delta0 + hookDelta0) which
+# equals the original pool delta because delta = originalDelta - hookDelta,
+# so delta + hookDelta = originalDelta. This IS conserved algebraically.
+# BUT: the beforeSwap hook can CHANGE amountToSwap (line 157 of CLHooks.sol),
+# which changes what pool.swap() processes. The hookDeltaSpecified from
+# beforeSwap is then added back in afterSwap. The question is whether
+# the hook can return a hookDeltaSpecified that doesn't match the actual
+# amount it withheld.
+#
+# VERDICT: The hook is trusted (pool creator chose it). BUT if the hook is
+# poorly implemented, it can steal from swappers. This is a systemic risk
+# for all pools with hooks. The invariant is: for any pool, the net tokens
+# flowing through the system must be conserved.
+###############################################################################
+- id: CLPM-F01
+  tier: 1
+  type: property
+  description: >
+    Swap delta conservation: vault app reserve change must equal the raw pool
+    swap output. For each swap, (callerDelta + hookDelta).amount0 and
+    (callerDelta + hookDelta).amount1 must equal what pool.swap() returned
+    before hook adjustments. If a hook inflates hookDeltaSpecified beyond
+    what it actually withheld from the swap, the app reserve diverges from
+    real token balances.
+  attack_scenario: >
+    A malicious beforeSwap hook returns hookDeltaSpecified = -X (pretending
+    to subsidize X tokens to the swap), reducing amountToSwap. pool.swap()
+    processes less. In afterSwap, hookDeltaSpecified is added to hookDelta,
+    meaning the hook is credited X tokens it never provided. The user pays
+    less, but the pool also swaps less, and the hook owes X to the vault
+    (negative delta). If the hook never settles, the vault.lock() reverts
+    with CurrencyNotSettled. So the attack vector is: can the hook return
+    a delta that it then settles from the pool's own reserves? If the hook
+    IS an LP and can collect fees atomically, it could settle its own debt
+    from fee collection.
+  impact: "Potential fund extraction from pool reserves through hook delta manipulation"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track raw pool delta before hook adjustments vs final settled amounts
+    // This requires ghost vars set in a wrapper around swap()
+    // After swap: callerDelta + hookDelta should == rawPoolDelta
+    int128 reconstructed0 = int128(ghost_lastCallerDelta0) + int128(ghost_lastHookDelta0);
+    int128 reconstructed1 = int128(ghost_lastCallerDelta1) + int128(ghost_lastHookDelta1);
+    eq(reconstructed0, ghost_rawPoolDelta0, "CLPM-F01: swap delta0 not conserved");
+    eq(reconstructed1, ghost_rawPoolDelta1, "CLPM-F01: swap delta1 not conserved");
+  ghost_vars:
+    - int128 internal ghost_lastCallerDelta0;
+    - int128 internal ghost_lastCallerDelta1;
+    - int128 internal ghost_lastHookDelta0;
+    - int128 internal ghost_lastHookDelta1;
+    - int128 internal ghost_rawPoolDelta0;
+    - int128 internal ghost_rawPoolDelta1;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Algebraically conserved in the happy path. The real risk is hooks that
+    game the settlement system. Need to verify with a malicious hook contract
+    in fuzz testing.
+
+###############################################################################
+# CLPM-F02: Donate Does NOT Use Hook Delta System
+# donate() calls vault.accountAppBalanceDelta (no hookDelta overload).
+# Meanwhile swap() and modifyLiquidity() call vault.accountAppDeltaWithHookDelta.
+# donate() calls beforeDonate/afterDonate hooks BUT these hooks CANNOT return
+# deltas — they use callHook (not callHookWithReturnDelta).
+# This means a hook cannot intercept/redirect donated tokens, unlike in swap.
+# This asymmetry is worth testing: if a hook expects to capture fees from
+# donate (like it can from swap), it gets nothing — potential design flaw.
+###############################################################################
+- id: CLPM-F02
+  tier: 2
+  type: property
+  description: >
+    Donate bypasses the hook delta system entirely. The beforeDonate and
+    afterDonate hooks use callHook() (no return delta), and donate() settles
+    directly via vault.accountAppBalanceDelta without hookDelta. This means
+    hooks cannot intercept or redirect donated tokens. If a hook expects to
+    take a cut of donations (as it can with swaps), the assumption is violated.
+  attack_scenario: >
+    A pool has a hook that is designed to take a fee on all token flows
+    (swap, liquidity, donate). The hook correctly takes fees on swap via
+    beforeSwap/afterSwap return deltas. But for donate, the hook's afterDonate
+    callback fires but CANNOT return a delta. The donated tokens go 100%
+    to LPs. If the hook protocol assumes it can capture donation fees, this
+    breaks its fee model. Not directly exploitable for fund theft, but
+    could cause incorrect fee accounting in hook protocols.
+  impact: "Hook fee model broken for donations — hook receives 0% of donated amount"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a donate call, verify that the hook address has zero delta change
+    // (confirming hooks cannot intercept donations)
+    // In a test wrapper:
+    // 1. Record hook's vault delta before donate
+    // 2. Execute donate
+    // 3. Verify hook's vault delta unchanged
+    int256 hookDeltaBefore0 = vault.currencyDelta(address(key.hooks), key.currency0);
+    int256 hookDeltaBefore1 = vault.currencyDelta(address(key.hooks), key.currency1);
+    // ... donate happens ...
+    int256 hookDeltaAfter0 = vault.currencyDelta(address(key.hooks), key.currency0);
+    int256 hookDeltaAfter1 = vault.currencyDelta(address(key.hooks), key.currency1);
+    eq(hookDeltaBefore0, hookDeltaAfter0, "CLPM-F02: hook captured donate delta0");
+    eq(hookDeltaBefore1, hookDeltaAfter1, "CLPM-F02: hook captured donate delta1");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    This is by design — the code clearly does not give donate hooks return
+    delta capability. The question is whether this creates an exploitable
+    inconsistency for hook contracts that assume uniform delta handling.
+
+###############################################################################
+# CLPM-F03: beforeSwap + afterSwap Combined Extraction
+# A hook with BOTH beforeSwap and afterSwap return delta permissions can
+# extract value from swappers. beforeSwap reduces amountToSwap (takes tokens),
+# afterSwap adds to hookDeltaUnspecified (takes output tokens too).
+# The combined effect: user pays more, gets less, hook profits.
+# The only constraint is HookDeltaExceedsSwapAmount (CLHooks.sol:158):
+#   if (exactInput ? amountToSwap > 0 : amountToSwap < 0) revert
+# This prevents the hook from REVERSING the swap direction, but does NOT
+# cap how much the hook takes. A hook taking 99.9% is valid.
+###############################################################################
+- id: CLPM-F03
+  tier: 1
+  type: property
+  description: >
+    Combined beforeSwap + afterSwap hook extraction: a hook can take from
+    the specified side (via beforeSwapDelta.specified) AND from the unspecified
+    side (via afterSwap return + beforeSwapDelta.unspecified). The only
+    validation is that the swap direction doesn't reverse. There is NO cap
+    on total hook extraction as a percentage of the swap.
+  attack_scenario: >
+    Pool is created with a malicious hook that has both beforeSwap and afterSwap
+    delta permissions. User does exactInput swap of 100 tokens.
+    1. beforeSwap: hookDeltaSpecified = -90 (hook takes 90 from input).
+       amountToSwap becomes -10 (only 10 enters the AMM).
+    2. pool.swap() produces ~10 output tokens.
+    3. afterSwap: hook returns hookDeltaUnspecified = 5 (takes 5 from output).
+    4. User paid 100, gets ~5 output. Hook profited 90 input + 5 output.
+    The pool is untouched (it processed a fair 10-for-10 swap).
+    If beforeSwapDelta.unspecified is also set, the hook can take even more.
+    Net: user is sandwiched by the hook. All within protocol rules.
+  impact: "Users can lose up to 100% of swap value to malicious hooks"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For any swap, the user should not lose more than a reasonable percentage
+    // to hooks. Track: user's net cost vs hook's net gain.
+    // exactInput (amountSpecified < 0): user pays |amountSpecified|, gets |delta.unspecified|
+    // Hook extraction = hookDelta.specified + hookDelta.unspecified
+    // Invariant: hook extraction <= MAX_HOOK_FEE_BPS * |amountSpecified| / 10000
+    // NOTE: This invariant is aspirational — the protocol does NOT enforce it.
+    // A failing test here means: the protocol allows unlimited hook extraction.
+    int256 hookTake0 = int256(ghost_lastHookDelta0);
+    int256 hookTake1 = int256(ghost_lastHookDelta1);
+    int256 totalHookTake = hookTake0 + hookTake1; // simplified
+    // If hook take is positive (hook is receiving), flag it
+    if (hookTake0 > 0 || hookTake1 > 0) {
+        // Hook is extracting value — log for manual review
+        t(false, "CLPM-F03: hook extracted value from swap");
+    }
+  ghost_vars:
+    - int128 internal ghost_lastHookDelta0;
+    - int128 internal ghost_lastHookDelta1;
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    This is partially by design — hooks are trusted by the pool creator. But
+    USERS don't choose hooks; they just see the pool. If a hook silently takes
+    90% of every swap, users are robbed. The protocol has NO maximum hook fee.
+    This is a systemic design concern worth flagging. Compare to Uniswap V4
+    which has the same architecture.
+
+###############################################################################
+# CLPM-F04: Protocol Fee Outside Delta System
+# Protocol fees accrue in protocolFeesAccrued[currency] (ProtocolFees.sol:19)
+# but are NOT part of the BalanceDelta returned by pool.swap(). The delta
+# already includes the fee — the protocol fee is carved out of the LP fee
+# within CLPool.swap() (line 292-303). The protocol fee is tracked SEPARATELY.
+# collectProtocolFees() calls vault.collectFee() which decrements
+# reservesOfApp and transfers tokens.
+# Invariant: protocolFeesAccrued should NEVER exceed reservesOfApp for
+# the pool manager. If it does, collectProtocolFees would underflow.
+###############################################################################
+- id: CLPM-F04
+  tier: 1
+  type: property
+  description: >
+    Protocol fees are tracked in a separate mapping (protocolFeesAccrued)
+    outside the delta/settlement system. They accumulate via unchecked
+    addition in swap(). collectProtocolFees() decrements and calls
+    vault.collectFee(). The invariant is: protocolFeesAccrued[currency]
+    must never exceed vault.reservesOfApp[poolManager][currency].
+  attack_scenario: >
+    If protocol fees can be artificially inflated (e.g., via overflow in
+    the unchecked block at CLPoolManager:203-206, or via hook manipulation
+    of the swap result that increases state.feeAmountToProtocol), then
+    collectProtocolFees could try to withdraw more than the pool manager's
+    reserves, causing underflow revert — or worse, draining reserves that
+    belong to LPs. The unchecked{} block: protocolFeesAccrued[currency] +=
+    state.feeAmountToProtocol. feeAmountToProtocol is uint256 but bounded
+    by swap input amount. With enough swaps, this accumulates. Overflow
+    requires >2^256 total fees — practically impossible.
+  impact: "If protocolFeesAccrued exceeds actual reserves, fee collection drains LP funds"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For each currency in each pool, protocol fees accrued must not exceed
+    // the pool manager's reserves in the vault
+    uint256 feesAccrued0 = poolManager.protocolFeesAccrued(key.currency0);
+    uint256 feesAccrued1 = poolManager.protocolFeesAccrued(key.currency1);
+    uint256 reserves0 = vault.reservesOfApp(address(poolManager), key.currency0);
+    uint256 reserves1 = vault.reservesOfApp(address(poolManager), key.currency1);
+    lte(feesAccrued0, reserves0, "CLPM-F04: protocol fees exceed reserves currency0");
+    lte(feesAccrued1, reserves1, "CLPM-F04: protocol fees exceed reserves currency1");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The protocol fee is carved from LP fees inside pool.swap(), so the tokens
+    backing it ARE in the pool. The question is whether reservesOfApp correctly
+    tracks them. Since protocol fees don't flow through the settlement system
+    (they stay in the vault), the accounting should be correct. But edge cases
+    with rounding or hook interference could create a gap.
+
+###############################################################################
+# CLPM-F05: Donate + Collect Fees in Same Lock (Flash Loan Pattern)
+# The code comment in CLPool.State says: "atomically donating and collecting
+# fees in the same lockAcquired callback may make the inflated value more
+# extreme." This is an ACKNOWLEDGED risk.
+#
+# Attack: Within a single vault.lock() callback:
+# 1. Add liquidity (become sole LP in range)
+# 2. Donate large amount to the pool (increases feeGrowthGlobal)
+# 3. Remove liquidity (collect the donated fees as feeDelta)
+# Net: donated tokens flow back to the attacker.
+# This is NOT free money — the attacker donates and gets back what they
+# donated. BUT if there are OTHER LPs in range, the attacker dilutes their
+# own donation across all LPs. So the attack only works profitably if the
+# attacker is the SOLE LP.
+#
+# The real risk: feeGrowthGlobal inflation affects all future fee calculations.
+# If feeGrowthGlobal0X128 overflows (uint256 wrapping), positions that haven't
+# collected fees could see incorrect feeGrowthInside calculations.
+###############################################################################
+- id: CLPM-F05
+  tier: 2
+  type: property
+  description: >
+    Within a single vault.lock() callback, an attacker can donate tokens and
+    immediately collect them as LP fees by being the sole liquidity provider
+    in the active range. This inflates feeGrowthGlobal artificially.
+    While the attacker doesn't profit (they get back what they donated minus
+    rounding), the inflated feeGrowthGlobal can cause overflow issues in
+    fee tracking for other positions.
+  attack_scenario: >
+    1. Attacker acquires vault.lock()
+    2. Adds concentrated liquidity at current tick (sole LP)
+    3. Donates 2^128 tokens (large but within uint256 range for feeGrowthGlobal)
+    4. feeGrowthGlobal += amount * Q128 / liquidity. With low liquidity and
+       large amount, this can approach uint256 max.
+    5. Removes liquidity, collecting the donated fees.
+    6. Repeats to push feeGrowthGlobal past uint256 max (wrapping).
+    7. Other LPs who added liquidity before the inflation now have incorrect
+       feeGrowthInside calculations — they may receive 0 fees or enormous
+       phantom fees that drain the pool.
+  impact: "feeGrowthGlobal overflow can corrupt fee accounting for all LPs"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track feeGrowthGlobal monotonicity (should never decrease, and should
+    // not wrap). Note: Uniswap V3 allows wrapping by design, so this may
+    // be a false positive if PancakeSwap follows the same model.
+    uint256 feeGrowth0 = poolManager.getFeeGrowthGlobals(poolId);
+    if (ghost_lastFeeGrowth0 > 0) {
+        // feeGrowthGlobal uses unchecked math, wrapping is expected in
+        // Uniswap V3 design. But rapid artificial inflation via donate
+        // is a distinct risk.
+        gte(feeGrowth0, ghost_lastFeeGrowth0, "CLPM-F05: feeGrowthGlobal0 decreased (wrapped?)");
+    }
+    ghost_lastFeeGrowth0 = feeGrowth0;
+  ghost_vars:
+    - uint256 internal ghost_lastFeeGrowth0;
+    - uint256 internal ghost_lastFeeGrowth1;
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The code itself has a comment acknowledging this risk (CLPool.sol:52-54).
+    In Uniswap V3, feeGrowthGlobal is designed to wrap (uint256 overflow is
+    expected), and fee calculations use unchecked subtraction of
+    feeGrowthInside values. If PancakeSwap follows the same model, the
+    wrapping is handled. But the RATE of inflation via donate is not bounded,
+    which could create issues if feeGrowthGlobal wraps multiple times within
+    a short period while some positions are active.
+
+###############################################################################
+# CLPM-F06: modifyLiquidity hookDelta Applied to (delta + feeDelta)
+# In CLPoolManager.modifyLiquidity() line 172:
+#   (delta, hookDelta) = CLHooks.afterModifyLiquidity(key, params, delta + feeDelta, feeDelta, hookData);
+# The hook receives (delta + feeDelta) as the total delta. It can return a
+# hookDelta. Then callerDelta = (delta + feeDelta) - hookDelta.
+# The vault settles: callerDelta for msg.sender, hookDelta for hook.
+#
+# CRITICAL: feeDelta is INCLUDED in the delta passed to the hook. The hook
+# can therefore claim the user's accrued fees by returning a hookDelta that
+# matches the feeDelta. For remove liquidity, feeDelta is negative (tokens
+# owed to user). If hookDelta matches feeDelta, the hook gets the fees.
+###############################################################################
+- id: CLPM-F06
+  tier: 1
+  type: property
+  description: >
+    In modifyLiquidity, the hook's afterModifyLiquidity callback receives
+    (delta + feeDelta) as the combined caller delta. The hook can return a
+    hookDelta that effectively captures the LP's accrued fees. Since feeDelta
+    represents fees owed TO the LP (negative values = tokens owed to user),
+    a hook returning hookDelta = feeDelta would redirect all LP fees to itself.
+  attack_scenario: >
+    1. Pool with hook that has afterRemoveLiquidity returns delta permission.
+    2. LP has accrued 100 USDC in fees (feeDelta = toBalanceDelta(-100, 0)).
+    3. LP removes liquidity. delta = toBalanceDelta(-50, -50) (tokens returned).
+    4. Combined: delta + feeDelta = toBalanceDelta(-150, -50).
+    5. Hook returns hookDelta = toBalanceDelta(-100, 0) — claiming the fee portion.
+    6. callerDelta = (-150, -50) - (-100, 0) = (-50, -50). User gets tokens back but NOT fees.
+    7. hookDelta = (-100, 0) — hook is credited 100 USDC.
+    8. Vault settles: user gets 50+50, hook gets 100. Total = 200, which matches pool outflow.
+    Conservation holds, but the user's fees were stolen.
+  impact: "Hook can steal LP accrued fees during liquidity removal"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After modifyLiquidity with liquidityDelta < 0, verify that the hook
+    // did not capture more than a reasonable share of the feeDelta.
+    // hookDelta should ideally be 0 or proportional to a declared hook fee.
+    if (ghost_lastLiquidityDelta < 0) {
+        // For remove liquidity, feeDelta amounts are negative (owed to user)
+        // hookDelta capturing fees means hookDelta has negative amounts (hook receives)
+        int128 hookCapture0 = ghost_lastHookDelta0; // negative = hook receives
+        int128 hookCapture1 = ghost_lastHookDelta1;
+        int128 feeDelta0 = ghost_lastFeeDelta0;
+        int128 feeDelta1 = ghost_lastFeeDelta1;
+        // Hook should not capture more than the fee delta
+        if (hookCapture0 < 0 && feeDelta0 < 0) {
+            gte(hookCapture0, feeDelta0, "CLPM-F06: hook captured more than feeDelta0");
+        }
+    }
+  ghost_vars:
+    - int128 internal ghost_lastLiquidityDelta;
+    - int128 internal ghost_lastHookDelta0;
+    - int128 internal ghost_lastHookDelta1;
+    - int128 internal ghost_lastFeeDelta0;
+    - int128 internal ghost_lastFeeDelta1;
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    This is the most concerning finding. Hooks with afterModifyLiquidity
+    return delta permission can silently redirect LP fees. Users interacting
+    with such pools may never realize their fees are being captured. The
+    protocol design gives hooks full power over the delta, with no maximum
+    extraction limit. This is similar to CLPM-F03 for swaps but arguably
+    worse because LP fees accumulate over time and can be large.
+
+###############################################################################
+# CLPM-F07: beforeSwap amountToSwap Modification Without Upper Bound
+# CLHooks.beforeSwap can modify amountToSwap via hookDeltaSpecified (line 157).
+# The ONLY check is that the swap direction doesn't reverse (line 158).
+# This means a beforeSwap hook can reduce amountToSwap to 1 wei, effectively
+# DOSing the swap while still executing. The user thinks they swapped X,
+# but only 1 wei went through the AMM, and the hook took X-1.
+# Combined with: the hook must settle its debt. If it doesn't, vault.lock()
+# reverts. So the hook needs a way to source the tokens.
+###############################################################################
+- id: CLPM-F07
+  tier: 2
+  type: property
+  description: >
+    beforeSwap can reduce the swap amount to near-zero without reverting.
+    The only check prevents direction reversal, not magnitude reduction.
+    Combined with the hook taking the difference via hookDeltaSpecified,
+    the hook effectively converts the user's swap into a transfer to the hook.
+  attack_scenario: >
+    1. User initiates exactInput swap of 1000 USDC for ETH.
+    2. beforeSwap hook returns hookDeltaSpecified = -999 (takes 999).
+    3. amountToSwap = -1000 + (-999) = ... wait, specified is negative for
+       exactInput. hookDeltaSpecified must be positive to reduce magnitude.
+       amountToSwap = -1000 + 999 = -1. Only 1 wei enters AMM.
+    4. User gets ~0 ETH output. Hook owes 999 USDC to settle.
+    5. The hook settles by using tokens from another source (or its own reserves).
+    6. Net: user paid 1000, got ~0 output. Hook gained 999 USDC.
+    This is only possible if: (a) hook has reserves to settle, or (b) the
+    lock callback provides settlement. Either way, the user is robbed.
+  impact: "beforeSwap hook can reduce swap amount to near-zero, extracting user funds"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a swap, verify that the actual swap amount processed by the AMM
+    // was not drastically less than what the user specified.
+    // ghost_userAmountSpecified vs ghost_actualAmountToSwap
+    if (ghost_userAmountSpecified != 0) {
+        int256 ratio;
+        if (ghost_userAmountSpecified < 0) {
+            // exactInput: both should be negative
+            ratio = (ghost_actualAmountToSwap * 10000) / ghost_userAmountSpecified;
+        } else {
+            ratio = (ghost_actualAmountToSwap * 10000) / ghost_userAmountSpecified;
+        }
+        // At least 1% of original amount should reach the AMM
+        // NOTE: Protocol does NOT enforce this — this is aspirational
+        gte(ratio, int256(100), "CLPM-F07: hook reduced swap amount to <1%");
+    }
+  ghost_vars:
+    - int256 internal ghost_userAmountSpecified;
+    - int256 internal ghost_actualAmountToSwap;
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    This is essentially the same risk as CLPM-F03 but from a different angle.
+    The key question for a real finding is: do users have adequate warnings
+    that hooks can take arbitrary amounts? If the UI shows the pool without
+    warning about hook extraction, this is a user-facing risk.
+
+###############################################################################
+# CLPM-F08: Protocol Fee Accumulation in Unchecked Block
+# CLPoolManager.swap() lines 203-206:
+#   unchecked { protocolFeesAccrued[currency] += state.feeAmountToProtocol; }
+# This uses unchecked addition. If protocolFeesAccrued overflows uint256,
+# the value wraps to 0 and protocol fees are lost.
+# state.feeAmountToProtocol is bounded per swap by the swap amount.
+# To overflow uint256, you'd need ~10^77 in accumulated fees.
+# Practically impossible. But worth documenting.
+###############################################################################
+- id: CLPM-F08
+  tier: 3
+  type: property
+  description: >
+    Protocol fee accumulation uses unchecked addition. Overflow would reset
+    accrued fees to zero. Practically impossible given uint256 bounds.
+  attack_scenario: >
+    Theoretical only: after ~10^77 tokens worth of swaps with protocol fees,
+    protocolFeesAccrued wraps to 0. Not achievable in practice.
+  impact: "Protocol fee loss via overflow — theoretical only"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify protocolFeesAccrued is monotonically non-decreasing
+    // (barring collectProtocolFees calls)
+    uint256 fees0 = poolManager.protocolFeesAccrued(key.currency0);
+    if (ghost_lastProtocolFees0 > 0 && !ghost_feeCollectedSinceLastCheck) {
+        gte(fees0, ghost_lastProtocolFees0, "CLPM-F08: protocol fees decreased without collection");
+    }
+    ghost_lastProtocolFees0 = fees0;
+  ghost_vars:
+    - uint256 internal ghost_lastProtocolFees0;
+    - bool internal ghost_feeCollectedSinceLastCheck;
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    This is practically a non-issue. uint256 overflow requires astronomical
+    values. Included for completeness since the code uses unchecked{}.
+
+###############################################################################
+# CLPM-F09: donate() Settles Directly to msg.sender (No Hook Interception)
+# In CLPoolManager.donate() line 245:
+#   vault.accountAppBalanceDelta(key.currency0, key.currency1, delta, msg.sender);
+# This uses the 4-arg overload (no hookDelta). Compare to swap/modifyLiquidity
+# which use accountAppDeltaWithHookDelta (6-arg via VaultAppDeltaSettlement).
+#
+# If a hook calls donate() within its own callback (e.g., afterSwap), the
+# msg.sender is the CLPoolManager (since it's the one calling the hook).
+# Wait — no. The hook is called by CLPoolManager, so within the hook callback,
+# msg.sender for the hook is CLPoolManager. But donate() is called on
+# CLPoolManager, so msg.sender there is whoever called it — NOT the hook.
+# Hooks can't call donate() directly through the CLPoolManager because they're
+# called BY the pool manager.
+#
+# BUT: within a vault.lock() callback, any contract can call donate(). If a
+# hook contract also acquires lock, it can call donate() with msg.sender = hook.
+# In that case, the hook pays for the donation (its own delta), and LP fees
+# increase. This is legitimate behavior, not an attack.
+###############################################################################
+- id: CLPM-F09
+  tier: 2
+  type: property
+  description: >
+    donate() uses direct settlement (no hookDelta pathway). Hooks cannot
+    intercept or redirect donations. Combined with the fact that hooks CAN
+    call donate() from within a lock callback, this creates an asymmetry:
+    hooks can inject fees into the pool (via donate) but cannot extract
+    fees from donations made by others.
+  attack_scenario: >
+    1. Hook acquires vault.lock() in a separate transaction.
+    2. Hook calls donate(pool, large_amount, 0) to inflate feeGrowthGlobal0.
+    3. Within the same lock, hook removes its LP position, collecting the
+       inflated fees.
+    4. Net: hook donated and collected its own donation — neutral.
+    5. BUT: if other LPs are in range, the donated fees are split
+       proportionally. The hook loses funds to other LPs.
+    6. This is NOT profitable for the hook unless it's the sole LP.
+    This is the same issue as CLPM-F05 viewed from the hook's perspective.
+  impact: "No direct fund loss — hook bears the cost of its own donations"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After donate, verify that msg.sender's delta is correctly debited
+    // and no other address receives a windfall.
+    // This is hard to test in isolation — needs multi-actor fuzz setup.
+    // Simplified: verify vault reserves increased by donated amount.
+    uint256 reservesBefore0 = ghost_vaultReserves0;
+    // ... donate(amount0, amount1) ...
+    uint256 reservesAfter0 = vault.reservesOfApp(address(poolManager), key.currency0);
+    eq(reservesAfter0, reservesBefore0 + amount0, "CLPM-F09: vault reserves mismatch after donate");
+  ghost_vars:
+    - uint256 internal ghost_vaultReserves0;
+    - uint256 internal ghost_vaultReserves1;
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    Confirmed by code analysis: donate is clean. The asymmetry with swap/
+    modifyLiquidity is intentional — donations are one-directional gifts
+    to LPs, not a token-exchange operation that hooks should modify.
+
+###############################################################################
+# CLPM-F10: Flash Loan Hypothesis — donate + collect in same lock
+# Flash loan pattern: borrow → manipulate → profit → repay.
+# With vault.lock():
+# 1. Attacker calls vault.lock()
+# 2. In lockAcquired: vault.take(token, attacker, amount) — borrows for free
+# 3. Attacker adds liquidity to pool (sole LP)
+# 4. Attacker donates borrowed tokens back into pool (feeGrowthGlobal increases)
+# 5. Attacker removes liquidity (collects donated fees)
+# 6. Attacker calls vault.settle() — repays the borrowed amount
+# Net: attacker has the same tokens, feeGrowthGlobal is inflated, and if
+# there were other LPs, the attacker diluted their fee share.
+#
+# KEY: vault.take() and vault.settle() act as a free flash loan.
+# The comment in the code (IVault.sol:95): "Can also be used as a mechanism
+# for free flash loans" — this is intentional!
+#
+# So the question is: can feeGrowthGlobal inflation via free flash loan
+# + donate harm other LPs? YES — if an attacker rapidly inflates
+# feeGrowthGlobal, existing LPs who haven't collected fees see their
+# feeGrowthInside values distorted by the wrapping behavior of uint256.
+###############################################################################
+- id: CLPM-F10
+  tier: 1
+  type: property
+  description: >
+    Free flash loans via vault.take()/settle() combined with donate() allow
+    an attacker to inflate feeGrowthGlobal without cost. If the attacker
+    is the sole LP, they recover 100% of the donation. The risk is
+    feeGrowthGlobal wrapping (uint256 overflow) which corrupts fee
+    calculations for positions that span the wrap boundary.
+  attack_scenario: >
+    1. Attacker calls vault.lock().
+    2. In lockAcquired: vault.take(USDC, attacker, 2^200).
+    3. Attacker adds liquidity = 1 wei in active tick range.
+    4. Attacker calls donate(2^200, 0).
+       feeGrowthGlobal0X128 += 2^200 * 2^128 / 1 = 2^328 which wraps uint256.
+    5. Attacker removes liquidity (collects fees — wrapping means ~0 due to
+       underflow in fee calculation).
+    6. vault.settle() — repays the 2^200.
+
+    Other LPs: position.feeGrowthInside is based on the OLD feeGrowthGlobal.
+    When they try to collect, the subtraction (currentFeeGrowth - lastFeeGrowth)
+    wraps, giving them either 0 or a huge phantom balance.
+    If phantom balance > actual pool reserves: LP withdraw fails (vault underflow).
+    If phantom balance = 0: LP loses all accrued fees.
+  impact: "Fee growth overflow can cause LPs to lose accrued fees or receive phantom fees"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any donate, check that feeGrowthGlobal hasn't grown by more than
+    // a reasonable amount relative to pool liquidity.
+    // MAX_SAFE_FEE_GROWTH_DELTA = 2^128 (one full Q128 unit per liquidity)
+    (uint256 fg0, uint256 fg1) = poolManager.getFeeGrowthGlobals(poolId);
+    if (ghost_prevFeeGrowth0 > 0) {
+        // In unchecked math, wrapping is expected. But rapid growth indicates attack.
+        uint256 delta0;
+        unchecked { delta0 = fg0 - ghost_prevFeeGrowth0; }
+        // Flag if delta exceeds reasonable bounds (e.g., > 2^200)
+        if (delta0 > (1 << 200)) {
+            t(false, "CLPM-F10: feeGrowthGlobal0 spike detected — possible donate attack");
+        }
+    }
+    ghost_prevFeeGrowth0 = fg0;
+    ghost_prevFeeGrowth1 = fg1;
+  ghost_vars:
+    - uint256 internal ghost_prevFeeGrowth0;
+    - uint256 internal ghost_prevFeeGrowth1;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    The code explicitly acknowledges this in CLPool.sol:52-54. The question is
+    whether the Uniswap V3 "designed to overflow" approach actually works
+    safely in PancakeSwap's context. In Uniswap V3, fee growth wrapping is
+    safe because all fee calculations use unchecked subtraction, and positions
+    are updated when interacted with. BUT: positions that are never interacted
+    with (abandoned positions) accumulate wrapping risk. This needs fork
+    testing with real positions to determine practical impact.
+
+###############################################################################
+# FLASH LOAN HYPOTHESIS — Per-Function Analysis
+###############################################################################
+# FUNCTION: swap()
+# 1. Reads state manipulable? YES — slot0 (price, tick), liquidity
+# 2. Affects fund movement? YES — delta determines token flows
+# 3. Same-tx read+consume? YES — within vault.lock()
+# 4. Post-action verification? YES — vault.lock() checks all deltas settle to 0
+# 5. Reentrancy guard? NO explicit guard — relies on vault single-locker
+# 6. Callback initiator check? N/A (hooks are pool-selected, not user callbacks)
+# 7. Spot vs TWAP? Uses spot price (sqrtPriceX96) — manipulable within lock
+# 8. Reward by instant balance? YES — feeGrowthGlobal updated during swap
+# 9. Cap/threshold crossable atomically? NO liquidation mechanics
+# 10. Self-liquidation? N/A
+# 11. Fee rounding to zero? YES — with tiny swap amounts, fee can round to 0
+# 12. Checkpoint: storage (feeGrowthGlobal persists)
+# RISK: Questions 1+2+3 = YES → strong flash loan candidate.
+#        BUT vault settlement check (Q4) prevents theft. The risk is
+#        manipulation of PRICE state during a lock for external protocols
+#        that read this pool's price (read-only reentrancy pattern).
+#
+# FUNCTION: donate()
+# 1. Reads state: YES — liquidity (to distribute fees)
+# 2. Affects funds: YES — feeGrowthGlobal inflation
+# 3. Same-tx: YES
+# 4. Post-action: vault settlement only (no donate-specific check)
+# 5. Reentrancy: vault single-locker
+# 6. N/A
+# 7. N/A
+# 8. YES — fees distributed by liquidity ratio
+# 9. N/A
+# 10. N/A
+# 11. YES — small donation with high liquidity rounds feeGrowthGlobal to 0
+# 12. Storage (feeGrowthGlobal)
+# RISK: Q1+Q2+Q3 = YES. Donate can inflate feeGrowthGlobal for free.
+#        Combined with flash loan (vault.take), this is the CLPM-F10 vector.
+#
+# FUNCTION: modifyLiquidity()
+# 1. YES — reads feeGrowthGlobal, tick, positions
+# 2. YES — delta includes tokens + fees
+# 3. YES — within lock
+# 4. YES — vault settlement
+# 5. vault single-locker
+# 6. N/A
+# 7. N/A
+# 8. YES — fee collection based on feeGrowthInside (manipulable via donate)
+# 9. NO
+# 10. N/A
+# 11. YES — small positions can have zero fee accrual
+# 12. Storage
+# RISK: Q1+Q2+Q3 = YES. Combined with donate manipulation: add liquidity,
+#        donate, remove liquidity = fee extraction cycle (CLPM-F05/F10).
+
+false_positives:
+- hunter: FlowHunter
+  id: CLPM-FP-01
+  reason: >
+    Considered whether hook delta sign convention allows a hook to claim tokens
+    it doesn't owe. Analysis: callerDelta = delta - hookDelta; if hookDelta is
+    negative (hook receives), callerDelta increases (user pays more). The vault
+    then debits the user and credits the hook. The hook must SETTLE its delta
+    (via vault.settle or vault.burn). If it doesn't, the lock reverts. So the
+    hook cannot steal without sourcing the tokens from somewhere. This is
+    by design — the settlement guard prevents theft.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Hook delta sign convention: negative hookDelta = hook receives tokens.
+      callerDelta = delta - hookDelta. Vault settlement guard ensures all
+      deltas net to zero. Hooks cannot steal without settling — but they CAN
+      redirect value from users to themselves within the settlement constraint.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: CLPM-FP-02
+  reason: >
+    Investigated whether protocol fees could be double-counted (once in
+    the swap delta, once in protocolFeesAccrued). Analysis: pool.swap()
+    returns a balanceDelta that INCLUDES the total swap fee (LP fee +
+    protocol fee). The protocol fee is then separately tracked in
+    protocolFeesAccrued. But the pool's reserves (via vault.reservesOfApp)
+    include both the LP and protocol portions. When collectProtocolFees
+    is called, it decrements reservesOfApp. So there's no double-counting;
+    the protocol fee is carved from the existing reserves, not added on top.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Protocol fee is included in swap delta (user pays it as part of the
+      total fee). protocolFeesAccrued is a separate tracker for how much
+      of the reserve belongs to the protocol. collectProtocolFees deducts
+      from reservesOfApp — no double counting.
+    briefing_update_applied: false

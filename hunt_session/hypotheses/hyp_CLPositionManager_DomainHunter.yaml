@@ -1,0 +1,550 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: CLPM-01
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock lacks deadline protection, enabling stale-price execution by hooks or external callers"
+  attack_scenario: >
+    modifyLiquidities() enforces checkDeadline(deadline), but modifyLiquiditiesWithoutLock()
+    has NO deadline check. A hook contract calling modifyLiquiditiesWithoutLock can execute
+    liquidity modifications with arbitrarily stale prices. An attacker deploys a malicious hook
+    that delays execution (e.g., via a timelock or conditional trigger). The user's mint/increase
+    action is submitted in block N at price P, but the hook delays execution to block N+K where
+    price has moved to P'. The user adds liquidity at the wrong price ratio, losing value to
+    impermanent loss immediately. This is especially dangerous for _mintFromDeltas and
+    _increaseFromDeltas which compute liquidity from current sqrtPriceX96 — the price read
+    at execution time may differ drastically from when the user intended to act.
+  impact: "Users lose funds through impermanent loss from liquidity added at stale/manipulated prices. Loss proportional to price movement during delay."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // This is a design-level invariant — verify that modifyLiquiditiesWithoutLock
+    // is ONLY callable from trusted hooks during vault.lock() callback context.
+    // The isNotLocked modifier ensures only one entry at a time, but does NOT
+    // enforce a deadline. Check: can an external EOA call this without a deadline?
+    // If vault.getLocker() == address(0) when calling, it would pass onlyIfVaultUnlocked
+    // checks inside (for transferFrom), but the core liquidity ops don't check vault lock.
+    // The real test: call modifyLiquiditiesWithoutLock from an EOA with stale params.
+    bool calledWithoutDeadline = true; // conceptual — needs integration test
+    t(!calledWithoutDeadline, "CLPM-01: modifyLiquiditiesWithoutLock has no deadline");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    modifyLiquiditiesWithoutLock is designed for hooks to call during their callback.
+    The isNotLocked modifier prevents re-entrancy from outside, but inside a lock callback
+    context the locker is already set. Need to verify if hooks can delay execution or if
+    the atomic tx guarantees make this a non-issue. If the hook is trusted, this is by-design.
+    If arbitrary hooks can be set, this is a real issue.
+
+- id: CLPM-02
+  tier: 1
+  type: property
+  description: "Burn of position with zero liquidity skips slippage check and fee collection, but subscriber notification still fires with zero feesAccrued"
+  attack_scenario: >
+    When _burn() is called on a position with liquidity == 0, the entire modifyLiquidity
+    block is skipped (lines 378-394). This means: (1) fees accrued since last interaction
+    are NOT collected — they are forfeited, (2) slippage validation is skipped, and
+    (3) if the position has a subscriber, _removeSubscriberAndNotifyBurn is called with
+    feesAccrued = 0 (the default). A subscriber contract relying on feesAccrued in
+    notifyBurn to update its accounting will have incorrect state.
+    Attack: User has a position with 0 liquidity but uncollected fees (possible if they
+    previously decreased to 0 without collecting). They burn the position. The fees are
+    permanently locked in the pool manager because the position info is cleared and the
+    NFT is burned — no way to call modifyLiquidity to collect them afterward.
+  impact: "Permanent loss of uncollected fees for positions burned with zero liquidity. Subscriber contracts receive incorrect fee data."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before burn: check if position has uncollected fees even with 0 liquidity
+    // In concentrated liquidity, fees accrue based on feeGrowthInside, not liquidity.
+    // A 0-liquidity position CAN have uncollected fees if liquidity was removed
+    // but fees weren't collected in the same tx.
+    //
+    // To test:
+    // 1. Mint position with liquidity
+    // 2. Swaps happen, fees accrue
+    // 3. Decrease liquidity to 0 (collects fees up to that point)
+    // 4. More swaps happen — but with 0 liquidity, no new fees accrue
+    // 5. Burn — should be safe since no new fees accrued
+    //
+    // Counter-scenario (actual risk):
+    // 1. Mint with liquidity L
+    // 2. Swaps happen, fees accrue
+    // 3. Transfer NFT (which unsubscribes but does NOT collect fees)
+    // 4. Decrease to 0 (this DOES collect fees via modifyLiquidity)
+    // 5. Burn — liquidity=0, skip modifyLiquidity, fees already collected in step 4
+    //
+    // The real check: does modifyLiquidity with delta=0 collect fees?
+    // Yes — "Calling decrease with 0 liquidity will credit the caller with fees"
+    // So the only risk is if someone calls burn directly without first collecting.
+    // But burn with liquidity>0 calls modifyLiquidity which collects.
+    // Risk: burn with liquidity=0 AND uncollected fees. Is this reachable?
+    // After decrease to 0, fees ARE collected. After that, 0 liq = 0 new fees.
+    // Likely safe by design, but edge case with hooks modifying fee state.
+    uint256 tokenId_test = 1; // placeholder
+    t(true, "CLPM-02: need to verify fee collection on zero-liq burn");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    After deeper analysis, this is likely safe by design: decreasing to 0 liquidity
+    collects all accrued fees via modifyLiquidity. A subsequent burn with 0 liquidity
+    has no new fees to collect. However, if a hook somehow credits fees to the position
+    AFTER liquidity reaches 0 but BEFORE burn, those fees would be lost. Mark as
+    validated:false pending hook interaction analysis.
+
+- id: CLPM-03
+  tier: 1
+  type: property
+  description: "transferFrom forces unsubscribe without notifying the subscriber about the transfer recipient, breaking subscriber accounting"
+  attack_scenario: >
+    When transferFrom() is called (line 488-491), it: (1) transfers the NFT, (2) if the
+    position has a subscriber, calls _unsubscribe(id). The _unsubscribe function calls
+    notifyUnsubscribe on the subscriber with a gas limit. However, the subscriber is NOT
+    told WHO the new owner is. If the subscriber was tracking rewards/incentives per owner,
+    it loses the ability to attribute the position to the new owner.
+
+    More critically: the unsubscribe uses a gas-limited call. If the subscriber's
+    notifyUnsubscribe needs more gas than unsubscribeGasLimit, it silently fails (try/catch
+    on line 79 of CLNotifier). The subscriber thinks it's still subscribed, but the position
+    manager has cleared the subscription. State desync between subscriber and position manager.
+
+    Attack vector: An attacker creates a subscriber that requires >unsubscribeGasLimit gas
+    in notifyUnsubscribe. They subscribe a position. When transferFrom is called, the
+    unsubscribe notification silently fails. The subscriber's internal state is now desynced.
+    If the subscriber holds funds or tracks rewards, this can lead to locked funds or
+    double-claiming.
+  impact: "Subscriber state desync on transfer. If subscriber manages rewards/staking, funds could be locked or double-claimed."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track: after transferFrom, subscriber[tokenId] should be NO_SUBSCRIBER
+    // AND the external subscriber contract should have consistent state
+    // The position manager side is always consistent (it deletes subscriber[tokenId])
+    // The risk is on the subscriber side — it may think it's still subscribed
+    //
+    // Invariant: if subscriber mapping was cleared, the external subscriber
+    // contract's internal tracking should also be cleared
+    // This is NOT enforceable on-chain since we can't read arbitrary subscriber state
+    //
+    // What we CAN check: did the gas-limited call succeed?
+    // Unfortunately the try/catch swallows the failure silently
+    //
+    // Practical test: deploy a subscriber that reverts in notifyUnsubscribe
+    // -> transfer the position -> verify subscriber[tokenId] == address(0)
+    // -> verify subscriber contract still thinks it's subscribed
+    address sub = address(0); // placeholder
+    t(sub == address(0), "CLPM-03: subscriber cleared after transfer");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    The silent failure in _unsubscribe is by design (gas-limited try/catch), but
+    the consequence for subscriber contracts is real. The mitigation is that subscribers
+    are expected to handle this gracefully, but a poorly written subscriber could
+    lock user funds. This is more of a composability risk than a direct vulnerability
+    in CLPositionManager itself. Need to check what actual subscribers exist in the
+    PancakeSwap ecosystem.
+
+- id: CLPM-04
+  tier: 1
+  type: property
+  description: "initializePool swallows ALL errors including legitimate ones, returning type(int24).max as a silent failure indicator"
+  attack_scenario: >
+    initializePool (line 113-121) wraps clPoolManager.initialize() in a try/catch that
+    catches ALL errors and returns type(int24).max. This means:
+    1. If the pool is already initialized, it silently returns type(int24).max
+    2. If currencyOutOfOrder, it silently returns type(int24).max
+    3. If the sqrtPriceX96 is invalid, it silently returns type(int24).max
+
+    A user calling modifyLiquidities with [initializePool, mintPosition] as a batch:
+    - initializePool fails silently (pool already exists at different price)
+    - mintPosition proceeds with the EXISTING pool's price, not the intended price
+    - User's liquidity is minted at wrong tick range relative to actual price
+
+    This is especially dangerous when combined with front-running: attacker initializes
+    the pool at a skewed price BEFORE the victim's tx. The victim's initializePool
+    silently fails, and their mint uses the attacker's skewed price.
+  impact: "Users can be front-run on pool initialization. Their liquidity is minted at attacker-controlled prices, leading to immediate extractable value."
+  impact_rating: High
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Test: call initializePool on already-initialized pool
+    // Verify return value is type(int24).max
+    // Then verify that a subsequent mint in the same batch uses the OLD pool price
+    // not the user's intended price
+    //
+    // The fix would be: if initializePool fails, revert the entire batch
+    // OR: check return value and handle appropriately
+    //
+    // Invariant: if user intends to initialize at price P and mint,
+    // the mint should happen at price P or revert
+    int24 result = type(int24).max; // simulated failed init
+    t(result != type(int24).max, "CLPM-04: initializePool must not silently fail");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    This is a known pattern from Uniswap V4 PositionManager. The design intent is that
+    initializePool is a convenience function and callers should check the return value.
+    However, in a multicall/batch context, there's no way to conditionally branch based
+    on the return value. The front-running vector on pool initialization is well-documented
+    in Uniswap V4 audits. Need to verify if PancakeSwap has additional mitigations.
+
+- id: CLPM-05
+  tier: 1
+  type: property
+  description: "poolKeys mapping uses truncated 25-byte poolId — collision between different PoolKeys maps them to the same entry, corrupting position data"
+  attack_scenario: >
+    CLPositionInfoLibrary truncates the full bytes32 poolId to bytes25 (200 bits) for storage
+    efficiency (line 97: bytes25 _poolId = bytes25(PoolId.unwrap(_poolKey.toId()))).
+    The poolKeys mapping (line 64) uses this truncated bytes25 as key.
+
+    If two different PoolKeys produce poolIds that share the same upper 200 bits but differ
+    in the lower 56 bits, they would map to the same bytes25 key. The first pool to be used
+    would set poolKeys[poolId] = poolKey1. The second pool's positions would use poolKey1's
+    data (wrong pool parameters, wrong fee, wrong hook, wrong currencies).
+
+    The probability of a natural collision in 200 bits is astronomically low (birthday bound
+    ~2^100). However, an attacker can grind PoolKeys (varying hook address, fee, tickSpacing)
+    to find a collision with a target pool. With 200 bits this is still computationally
+    infeasible with current technology.
+
+    More realistic concern: the truncation is at bytes25 boundary. The full poolId is
+    keccak256(abi.encode(poolKey)). Truncating keccak256 to 200 bits from 256 bits reduces
+    collision resistance from 2^128 to 2^100. Still safe in practice.
+  impact: "Theoretical: if poolId collision found, all positions in colliding pools share wrong pool parameters. Practical probability near zero."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For any two different poolKeys used in the system,
+    // their truncated poolIds must be different
+    // This is a statistical property, not easily testable with fuzzing
+    // But we can verify the truncation doesn't lose critical bits
+    bytes25 pid1 = positionInfo[tokenId1].poolId();
+    bytes25 pid2 = positionInfo[tokenId2].poolId();
+    // If tokens are in different pools, their poolIds must differ
+    // Can't easily assert this without knowing which pools they belong to
+    t(true, "CLPM-05: poolId truncation collision check");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    200-bit truncation of keccak256 is practically safe. This is an informational
+    observation, not a real vulnerability. Included for completeness since the pattern
+    of truncating hashes is a known audit concern, but the math says it's fine.
+
+- id: CLPM-06
+  tier: 1
+  type: property
+  description: "_mintFromDeltas and _increaseFromDeltas use spot sqrtPriceX96 for liquidity calculation — manipulable via sandwich"
+  attack_scenario: >
+    Both _mintFromDeltas (line 346) and _increaseFromDeltas (line 264) read the current
+    sqrtPriceX96 from clPoolManager.getSlot0() and use it to compute liquidity from the
+    available token credits via LiquidityAmounts.getLiquidityForAmounts().
+
+    Attack:
+    1. Victim has credits (from previous SETTLE actions) and calls _mintFromDeltas
+    2. Attacker front-runs with a large swap that moves sqrtPriceX96 significantly
+    3. getLiquidityForAmounts computes liquidity based on the manipulated price
+    4. At the manipulated price, one token contributes more to liquidity than the other
+    5. The victim's position is minted with suboptimal liquidity distribution
+    6. Attacker back-runs to restore the price, profiting from the inefficient position
+
+    The slippage check (amount0Max/amount1Max) only limits how much is SPENT, not the
+    liquidity amount received. The victim gets less liquidity per token spent because
+    the price was skewed.
+
+    This is the classic sandwich attack on liquidity provision, made worse because the
+    liquidity amount is computed from spot price rather than specified by the user.
+  impact: "Sandwich attack on liquidity provision. Victims receive less liquidity than optimal, losing value to MEV extractors."
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Compare liquidity received with and without price manipulation
+    // ghost_liquidityExpected tracks what liquidity SHOULD be at fair price
+    // ghost_liquidityActual tracks what was actually minted
+    //
+    // In a fork test:
+    // 1. Record sqrtPriceX96 before
+    // 2. Simulate swap to move price
+    // 3. Call _mintFromDeltas
+    // 4. Check: liquidity minted < expected by more than dust
+    //
+    // The amountMax slippage check passes because the AMOUNT spent is within bounds,
+    // but the LIQUIDITY received is suboptimal
+    //
+    // Invariant: liquidity minted should be >= min(liqAtPriceBefore, liqAtPriceAfter)
+    // This is hard to enforce on-chain without a price oracle
+    uint256 liquidityActual = 100; // placeholder
+    uint256 liquidityExpected = 100; // placeholder
+    gte(liquidityActual, liquidityExpected * 99 / 100, "CLPM-06: liquidity sandwich loss > 1%");
+  ghost_vars:
+    - "uint256 internal ghost_liquidityExpected;"
+    - "uint256 internal ghost_liquidityActual;"
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The amountMax slippage protection limits token input but not liquidity output.
+    This is a known DEX pattern. The question is whether PancakeSwap considers this
+    acceptable (users should set tight amountMax) or if there should be a minimum
+    liquidity parameter. Uniswap V4 has the same pattern. Likely "by design" but
+    worth flagging as the impact on users is real.
+
+- id: CLPM-07
+  tier: 1
+  type: property
+  description: "Asymmetry: _burn clears positionInfo BEFORE modifyLiquidity call, allowing hook to read stale/zero position data during the burn callback"
+  attack_scenario: >
+    In _burn() (lines 361-397), the execution order is:
+    1. Get pool and position info (line 365)
+    2. Get liquidity (line 367)
+    3. Get owner (line 369)
+    4. Clear positionInfo[tokenId] = EMPTY_POSITION_INFO (line 372)
+    5. Burn the NFT token (line 374)
+    6. Call clPoolManager.modifyLiquidity with negative delta (line 380)
+
+    Steps 4-5 happen BEFORE step 6. This means during the modifyLiquidity call, if a
+    hook reads positionInfo[tokenId], it gets EMPTY_POSITION_INFO. The hook also cannot
+    call ownerOf(tokenId) because the NFT is already burned.
+
+    Symmetric analysis vs _decrease():
+    - _decrease: calls _modifyLiquidity first, THEN returns (no state cleared)
+    - _burn: clears state FIRST, then calls modifyLiquidity
+
+    If a hook in the pool's beforeModifyLiquidity or afterModifyLiquidity callback
+    queries CLPositionManager.positionInfo or ownerOf, it gets incorrect data during
+    burn but correct data during decrease. This asymmetry can cause hooks to make
+    wrong decisions (e.g., reward distribution, access control).
+  impact: "Hooks reading position state during burn callback see zeroed data. Could cause incorrect reward calculations or access control decisions in hook contracts."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // During modifyLiquidity callback (hook execution), verify positionInfo is still valid
+    // This requires a hook contract that reads positionInfo during afterModifyLiquidity
+    //
+    // Test setup:
+    // 1. Deploy hook that logs positionInfo[tokenId] in afterModifyLiquidity
+    // 2. Call _burn
+    // 3. Verify hook received EMPTY_POSITION_INFO (the bug)
+    //
+    // Compare with _decrease:
+    // 1. Same hook
+    // 2. Call _decrease
+    // 3. Verify hook received valid positionInfo (correct behavior)
+    //
+    // Invariant: during modifyLiquidity callback, positionInfo[tokenId] should be valid
+    // This breaks for burn, not for decrease
+    CLPositionInfo info_during_callback = CLPositionInfo.wrap(0); // placeholder
+    t(CLPositionInfo.unwrap(info_during_callback) != 0, "CLPM-07: positionInfo cleared before hook callback");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 72
+  notes: >
+    This is a real ordering issue. The question is whether any hooks in the PancakeSwap
+    ecosystem actually read positionInfo during modifyLiquidity callbacks. If they do,
+    this is a confirmed bug. The fix would be to move the positionInfo clear and NFT
+    burn to AFTER the modifyLiquidity call. Uniswap V4's PositionManager has the same
+    pattern — need to check if it's an intentional design choice or inherited bug.
+
+- id: CLPM-08
+  tier: 2
+  type: property
+  description: "permit2.transferFrom in _pay truncates amount to uint160, silently losing funds if amount > type(uint160).max"
+  attack_scenario: >
+    In _pay() (line 472), the amount is cast to uint160:
+      permit2.transferFrom(payer, address(vault), uint160(amount), Currency.unwrap(currency))
+
+    If amount > type(uint160).max (~1.46e48), the cast truncates silently (Solidity 0.8.26
+    does NOT check unchecked casts between uint sizes — only int/uint sign changes are checked).
+
+    In practice, type(uint160).max is ~1.46e48. For an 18-decimal token, this is ~1.46e30
+    tokens. No real token has this supply, so this is practically unreachable.
+
+    However, for tokens with very high decimal counts (e.g., 36 decimals, which some
+    exotic tokens use), the threshold becomes ~1.46e12 tokens — more reachable.
+
+    If truncation occurs, the user pays less than intended, but the vault's delta
+    accounting expects the full amount. The delta would remain unsettled, and the
+    vault.lock() would revert at the end. So this is self-correcting.
+  impact: "Theoretical: truncation could cause underpayment, but vault delta accounting would catch it. No practical fund loss."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: amount fits in uint160 before _pay is called
+    // In practice, settled amounts come from vault deltas which are int256
+    // but represent token amounts that should fit in uint160
+    uint256 amount = 2**160; // edge case
+    uint160 truncated = uint160(amount);
+    eq(uint256(truncated), amount, "CLPM-08: amount truncated in _pay");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    Practically unreachable due to token supply limits. The vault's delta accounting
+    would catch any discrepancy anyway. Included as a completeness observation.
+    SafeCast is used elsewhere but not here.
+
+- id: CLPM-09
+  tier: 1
+  type: property
+  description: "nextTokenId uses unchecked increment — overflow at type(uint256).max wraps to 0, creating tokenId=0 which is the 'uninitialized' sentinel"
+  attack_scenario: >
+    In _mint() (lines 313-315):
+      unchecked { tokenId = nextTokenId++; }
+
+    If nextTokenId reaches type(uint256).max, the post-increment wraps to 0. The next
+    mint would get tokenId = type(uint256).max (correct), but nextTokenId becomes 0.
+    The NEXT mint after that gets tokenId = 0.
+
+    tokenId = 0 is problematic because CLPositionInfo.unwrap(info) == 0 is used as the
+    "invalid/uninitialized" check (line 522). A position with tokenId=0 would have valid
+    positionInfo, but the validity check treats it as invalid.
+
+    This is purely theoretical — reaching 2^256 mints is physically impossible.
+  impact: "Theoretical overflow wrapping tokenId to 0 breaks the uninitialized sentinel check. Physically unreachable."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // nextTokenId should never be 0 after incrementing
+    // and tokenId should never be 0
+    uint256 currentNextId = 1; // placeholder for nextTokenId
+    t(currentNextId > 0, "CLPM-09: nextTokenId wrapped to zero");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 20
+  notes: >
+    Physically impossible to reach 2^256 mints. This is informational only.
+    The unchecked block is gas optimization, and the overflow scenario is not
+    practically exploitable.
+
+- id: CLPM-10
+  tier: 1
+  type: property
+  description: "Constraint inference: subscribe() uses msg.sender for onlyIfApproved but _increase/_decrease/_burn use msgSender() (the locker) — inconsistent caller resolution"
+  attack_scenario: >
+    Constraint inference across the codebase reveals an asymmetry:
+
+    - subscribe() and unsubscribe() in CLNotifier use msg.sender for the onlyIfApproved check
+      (line 44 of CLNotifier: onlyIfApproved(msg.sender, tokenId))
+    - _increase(), _decrease(), _burn() use msgSender() which returns _getLocker()
+      (line 247: onlyIfApproved(msgSender(), tokenId))
+
+    msgSender() returns the address stored in the transient LOCKED_BY_SLOT, which is set
+    to msg.sender of the modifyLiquidities/modifyLiquiditiesWithoutLock call.
+
+    subscribe/unsubscribe are called directly (not through the action router), so they
+    use msg.sender directly. This is correct BUT creates a composability gap:
+
+    If a user approves a contract C to manage their position, and C calls modifyLiquidities
+    (so C is the locker = msgSender()), C can increase/decrease/burn. But if C tries to
+    call subscribe(), the check uses msg.sender which IS C, so it also works.
+
+    However, if subscribe/unsubscribe were called from within a vault.lock() callback
+    (via modifyLiquiditiesWithoutLock from a hook), msg.sender would be the hook contract,
+    not the original user. The hook would need separate approval.
+
+    This asymmetry means: a hook that has modifyLiquidity permissions (via the locker pattern)
+    does NOT automatically have subscribe/unsubscribe permissions. This could lock positions
+    into subscription states that the hook cannot manage.
+  impact: "Hooks with liquidity modification permissions cannot manage subscriptions. Could lead to stuck subscription state in hook-managed positions."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify: in the context of a vault.lock() callback,
+    // the address authorized for _increase (msgSender/locker)
+    // is the SAME as the address authorized for subscribe (msg.sender)
+    //
+    // If they differ, there's an authorization gap
+    address locker = address(0); // placeholder for _getLocker()
+    address directCaller = msg.sender;
+    // In a hook callback context, these WILL differ:
+    // locker = original modifyLiquidities caller
+    // msg.sender = vault (via lockAcquired) or hook
+    eq(uint160(locker), uint160(directCaller), "CLPM-10: caller resolution mismatch between subscribe and modify");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    This is a real asymmetry but may be by design — subscribe/unsubscribe are meant to
+    be called outside of lock context (they have onlyIfVaultUnlocked modifier). The
+    question is whether hook contracts need to manage subscriptions and whether the
+    current design prevents legitimate use cases.
+
+false_positives:
+- hunter: DomainHunter
+  id: CLPM-FP-01
+  reason: >
+    _sweep() allows anyone to sweep tokens left in the contract to any address via the
+    SWEEP action. Initially appeared dangerous, but _sweep is only callable through
+    _handleAction which requires going through modifyLiquidities (with lock) or
+    modifyLiquiditiesWithoutLock (requires isNotLocked). The recipient is mapped through
+    _mapRecipient which converts MSG_SENDER to the locker. Any tokens in the contract
+    are dust from previous operations. The lock ensures atomicity. By design.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "sweep() in position managers is typically safe — protected by lock/reentrancy guards and only sweeps dust left from atomic operations"
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: CLPM-FP-02
+  reason: >
+    _clearOrTake() allows forfeiting positive deltas (credits) to the vault. Initially
+    appeared as a griefing vector (someone could forfeit another user's credits), but
+    the caller specification through the action router means only the locker (who initiated
+    the batch) controls which actions are in the batch. A user can only forfeit their own
+    credits. By design — it's a gas optimization to avoid claiming small dust amounts.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "clearOrTake pattern in Uniswap V4 / PCS Infinity position managers is safe — users can only forfeit their own credits via the action batch they submit"
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: CLPM-FP-03
+  reason: >
+    Investigated whether the ERC721 transferFrom -> _unsubscribe -> notifyUnsubscribe
+    gas-limited call could be used to prevent transfers (griefing). The answer is no:
+    _unsubscribe uses try/catch, so even if notifyUnsubscribe reverts or runs out of gas,
+    the transfer and unsubscribe still succeed. The only risk is subscriber state desync
+    (covered in CLPM-03). The transfer itself cannot be blocked by the subscriber.
+    The gasleft() < unsubscribeGasLimit check exists to prevent a different attack:
+    calling transfer with just enough gas for the transfer but not enough for notification,
+    which would silently skip the notification. With this check, either there's enough gas
+    for the notification attempt OR the entire transaction reverts.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

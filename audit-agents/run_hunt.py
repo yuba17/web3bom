@@ -11,6 +11,8 @@ Uso:
     python3 run_hunt.py --status                    # estado del hunt actual
     python3 run_hunt.py --complete GaugeManager     # marca componente como completo
     python3 run_hunt.py --init-ficha GaugeManager   # crea ficha vacía para el componente
+    python3 run_hunt.py --map-components            # escanea repo, genera component_map
+    python3 run_hunt.py --map-components --force     # regenera component_map existente
 
 Salida:
     - hunt_session/context/{Component}_context.md  (contexto para hunters)
@@ -45,6 +47,8 @@ HUNTER_DOMAINS = {
     "DomainHunter":  ("domain",  "Protocol-specific invariants, cross-component interactions, economic attacks"),
     "WildcardHunter":("wildcard","Novel bugs, unconventional vectors, assumption violations, composability risks"),
     "TrustBoundaryHunter":("trust","Trust boundary analysis: token quirks (ERC777, fee-on-transfer, rebasing, pausable), external call trust (reverts, unexpected returns, delegatecall), proxy/upgrade patterns (uninitialized, storage collision), compiler/EVM assumptions, cross-contract trust assumptions"),
+    "SignatureHunter":("signature","Signature replay, permit abuse, EIP-712 issues, nonce handling, ecrecover validation, approval/allowance patterns, Permit2, meta-transactions"),
+    "DoSHunter":     ("dos",      "Denial of service, gas griefing, unbounded loops, blocked withdrawals, revert-based DoS, resource exhaustion, emergency function blocking"),
 }
 
 DOMAIN_BRIEFING = {
@@ -310,8 +314,12 @@ def find_contract(component: str, repo_path: str) -> Path | None:
         if c.exists():
             return c
 
-    # Búsqueda recursiva
-    matches = list(repo.glob(f"**/{component}.sol"))
+    # Búsqueda recursiva (excluir out/, forge-cache/, dependencies/, lib/, node_modules/)
+    skip_dirs = {"out", "forge-cache", "dependencies", "lib", "node_modules", "artifacts"}
+    matches = [
+        m for m in repo.glob(f"**/{component}.sol")
+        if m.is_file() and not any(part in skip_dirs for part in m.relative_to(repo).parts)
+    ]
     if matches:
         return matches[0]
 
@@ -813,28 +821,52 @@ Si una función responde "sí" a las preguntas 1+2+3, es un candidato fuerte.
 | ETH nativo | transfer, call{value} | receive(), fallback() |
 
 ⚠ Las funciones "safe" son PARADÓJICAMENTE más peligrosas — ejecutan callbacks al receptor.
-⚠ Read-only reentrancy: funciones view que leen state de un pool durante callback cuando el state es inconsistente (ChainSecurity/Curve)."""
+⚠ Read-only reentrancy: funciones view que leen state de un pool durante callback cuando el state es inconsistente (ChainSecurity/Curve).
+
+## State Machine Model (OBLIGATORIO — output incluido en hyp_*.yaml)
+Modela el componente como una máquina de estados finita (FSM). Este output es CRÍTICO — lo usará DeepDiveHunter.
+
+**Paso 1 — Identificar estados:**
+Lista TODOS los estados posibles del contrato/posición/usuario. Ejemplos:
+  - Vault: EMPTY → ACTIVE → PAUSED → MIGRATING
+  - Position: OPEN → HEALTHY → UNDERWATER → LIQUIDATABLE → LIQUIDATED → CLOSED
+  - Order: PENDING → FILLED → PARTIALLY_FILLED → CANCELLED → EXPIRED
+
+**Paso 2 — Mapear transiciones:**
+Para CADA par de estados, identifica qué función(es) ejecutan la transición:
+```
+HEALTHY → UNDERWATER: price drop (oracle update, no función directa)
+UNDERWATER → LIQUIDATABLE: cuando ltv > lltv (automático por precio)
+LIQUIDATABLE → LIQUIDATED: liquidate() / preLiquidate()
+OPEN → CLOSED: withdraw() con amount=totalBalance
+```
+
+**Paso 3 — Buscar anomalías (AQUÍ ESTÁN LOS BUGS):**
+1. **Transiciones ilegales**: ¿Se puede ir de LIQUIDATED → ACTIVE? ¿De CLOSED → OPEN sin nuevo depósito?
+2. **Estados stuck (fondos atrapados)**: ¿Hay algún estado sin transición de salida? ¿Puede un usuario quedar atrapado?
+3. **Race conditions**: ¿Dos transiciones concurrentes pueden dejar el estado inconsistente?
+4. **Transiciones faltantes**: ¿Debería existir PAUSED → EMERGENCY_WITHDRAW pero no existe?
+5. **Bypass de estados**: ¿Se puede saltar de PENDING directamente a FILLED sin validación intermedia?
+
+**Output requerido en el YAML:**
+```yaml
+state_machine:
+  states: [EMPTY, ACTIVE, UNDERWATER, LIQUIDATABLE, LIQUIDATED]
+  transitions:
+    - from: EMPTY, to: ACTIVE, via: "deposit()", guard: "amount > 0"
+    - from: ACTIVE, to: UNDERWATER, via: "oracle price drop", guard: "none (automatic)"
+  anomalies:
+    - type: stuck_state, state: LIQUIDATED, description: "residual dust puede quedar atrapado"
+    - type: illegal_transition, from: LIQUIDATED, to: ACTIVE, via: "deposit() no verifica estado"
+```
+
+Bug real: Rari Fuse — posición liquidada podía re-depositarse y crear deuda fantasma.
+Bug real: Compound v2 — cToken stuck en PAUSED sin función de unpause por admin key loss."""
 
     elif hunter_name == "OracleHunter":
-        return """## Flash Loan Hypothesis (OBLIGATORIO — responde para CADA función que modifica estado)
-Después de tu análisis libre, pasa por estas 12 preguntas para cada función relevante:
-1. ¿Lee estado manipulable? (getReserves, slot0, balanceOf, get_virtual_price)
-2. ¿Ese estado afecta movimiento de fondos?
-3. ¿Se puede leer y consumir en la misma tx? (sin delays/timelocks)
-4. ¿Hay verificación post-acción? (patrón FREI-PI)
-5. ¿Tiene reentrancy guard?
-6. ¿Si es callback, verifica initiator? (no solo msg.sender == pool)
-7. ¿Usa spot price (manipulable) o TWAP (más seguro)?
-8. ¿Reward/share se calcula por balance instantáneo?
-9. ¿Hay cap/threshold cruzable atómicamente? (pasar de "sano" a "liquidable" en 1 tx)
-10. ¿Permite self-liquidation con bonus > flash fee?
-11. ¿Fee rounding a zero con montos pequeños?
-12. ¿Checkpoint usa storage (persistente) o memory (se pierde)?
-
->80% de los exploits flash loan siguen: FLASH → MANIPULATE STATE → EXTRACT VALUE → RESTORE → REPAY.
-Si una función responde "sí" a las preguntas 1+2+3, es un candidato fuerte.
-
-## Oracle Deep Check (OBLIGATORIO — para cada fuente de precio)
+        return """## Oracle Deep Check (OBLIGATORIO — para cada fuente de precio)
+NOTA: Flash Loan Hypothesis (12 preguntas) es responsabilidad de FlowHunter. NO la dupliques aquí.
+Enfócate en tu especialidad: ORÁCULOS y fuentes de precio.
 Para CADA llamada a latestRoundData() o equivalente:
 1. ¿Se verifica updatedAt contra un heartbeat? ¿El heartbeat es ESPECÍFICO por feed o genérico?
 2. ¿Se chequea answeredInRound >= roundId?
@@ -936,7 +968,58 @@ Para CADA función external/public, clasifica en estas 10 categorías de confian
 ## Complete Mediation (0xRajeev #196 — MENTALIDAD)
 CADA path de acceso debe verificar autorización. No solo los paths obvios.
 Pregunta: "¿Hay ALGÚN camino para llegar a esta operación crítica SIN pasar por el modifier/check?"
-Busca: funciones internas que hacen lo mismo que la pública pero sin el modifier, delegatecall que bypasea modifiers, paths via callback."""
+Busca: funciones internas que hacen lo mismo que la pública pero sin el modifier, delegatecall que bypasea modifiers, paths via callback.
+
+## REGLA CRÍTICA: Generar Solidity Assertions (OBLIGATORIO — sin excepciones)
+AccessHunter DEBE producir assertions Solidity fuzzeables para CADA hipótesis. NO texto descriptivo solo.
+
+**Patrones de assertion para access control:**
+
+1. **Role check invariant** — verifica que solo el rol correcto puede ejecutar:
+```solidity
+// Probar que un usuario sin rol NO puede ejecutar la función
+try target.protectedFunction{gas: 100000}(args) {
+    // Si no revierte, el access control falla
+    t(false, "AC-XX: protectedFunction callable without role");
+} catch {}
+```
+
+2. **Authorization bypass** — verifica que no hay paths alternativos:
+```solidity
+// Después de llamar a functionA (que podría escalar privilegios)
+bool hasRoleBefore = target.hasRole(ROLE, attacker);
+target.functionA(maliciousArgs);
+bool hasRoleAfter = target.hasRole(ROLE, attacker);
+t(hasRoleBefore == hasRoleAfter, "AC-XX: privilege escalation via functionA");
+```
+
+3. **State-dependent access** — verifica que el estado no bypasea checks:
+```solidity
+// Verificar que paused/emergency state bloquea correctamente
+target.pause();
+try target.sensitiveFunction{gas: 100000}(args) {
+    t(false, "AC-XX: sensitiveFunction callable when paused");
+} catch {}
+```
+
+4. **Initialization guard** — verifica que no se puede re-inicializar:
+```solidity
+// Después de init, no se puede re-init
+try target.initialize{gas: 100000}(newArgs) {
+    t(false, "AC-XX: contract re-initializable");
+} catch {}
+```
+
+5. **Self-authorization** — verifica que un usuario no puede autorizarse a sí mismo:
+```solidity
+uint256 balBefore = token.balanceOf(attacker);
+// Intentar operación que requiere autorización de otro
+target.executeOnBehalf(victim, attacker, amount);
+uint256 balAfter = token.balanceOf(attacker);
+t(balAfter <= balBefore, "AC-XX: self-authorization extracts value");
+```
+
+**CADA invariante en tu YAML DEBE tener un campo `solidity:` con código real.** Si no puedes escribir el assertion, la hipótesis es demasiado vaga — descártala o concretiza."""
 
     elif hunter_name == "TrustBoundaryHunter":
         return """## Compiler Version Check (OBLIGATORIO)
@@ -956,8 +1039,366 @@ Para cada token que el contrato maneja, verificar:
 
 Si el contrato asume comportamiento estándar ERC-20 y acepta tokens arbitrarios → HIGH risk."""
 
+    elif hunter_name == "SignatureHunter":
+        return """## Signature & Permit Deep Check (OBLIGATORIO — para CADA uso de firma/permit en el contrato)
+
+### Checklist ecrecover / ECDSA (7 items):
+1. ¿`ecrecover` valida que el resultado NO es `address(0)`? (firma inválida retorna 0)
+2. ¿Se usa OpenZeppelin ECDSA.recover() o se llama ecrecover directamente? (OZ previene malleable sigs)
+3. ¿Se normaliza el valor `s`? (EIP-2: s debe estar en lower half → previene signature malleability)
+4. ¿El `v` se valida como 27 o 28? (valores inválidos = comportamiento indefinido)
+5. ¿Se usa `abi.encodePacked` con tipos de longitud variable? (collision: abi.encodePacked("ab","c") == abi.encodePacked("a","bc"))
+6. ¿Hay protección contra front-running de la firma? (otro usuario puede ver la firma en mempool y usarla primero)
+7. ¿La firma tiene deadline/expiry? (firma sin expiración = válida eternamente)
+
+### Checklist EIP-712 / Domain Separator (5 items):
+1. ¿El `DOMAIN_SEPARATOR` incluye `chainId`? (sin chainId → replay cross-chain post-fork)
+2. ¿Se recalcula el `DOMAIN_SEPARATOR` si `chainId` cambia? (o está cacheado inmutablemente?)
+3. ¿El `DOMAIN_SEPARATOR` incluye `address(this)`? (sin → replay en otro contrato del mismo protocolo)
+4. ¿Los typeHash son correctos y únicos por función? (copy-paste de typeHash = replay entre funciones)
+5. ¿Se hashea TODO el struct (no campos parciales)?
+
+### Checklist Nonce (4 items):
+1. ¿El nonce se incrementa ANTES del efecto? (si se incrementa después y hay revert parcial → replay)
+2. ¿El nonce es per-address o global? (global = DoS: alguien consume tu nonce)
+3. ¿Se puede usar nonce=0 como primer valor? (algunos contratos empiezan en 1, skip del 0 = confusión)
+4. ¿Hay nonce-gap attack? (saltar nonces para invalidar firmas legítimas de otros usuarios)
+
+### Checklist Permit / Permit2 (6 items):
+1. ¿`permit()` puede ser front-runned? (atacante ve permit en mempool, lo ejecuta antes, luego hace transferFrom)
+   → Mitigación: usar try/catch en permit, verificar allowance después
+2. ¿Se verifica que el `permit` fue exitoso? (algunos tokens no implementan permit correctamente)
+3. ¿Hay interacción con Permit2 (Uniswap)? Si sí: ¿se valida que la allowance de Permit2 es correcta?
+4. ¿Approval infinita (`type(uint256).max`) se usa sin necesidad? (riesgo si el contrato es comprometido)
+5. ¿Se revocan approvals después de usarlas? (allowance residual = attack surface)
+6. ¿transferFrom puede ser llamada por alguien que NO debería tener acceso a los fondos?
+   Bug real: Morpho Bundler3 ($2.6M) — approve iba al adapter en vez de al Bundler → cualquiera podía usar la allowance.
+
+### Checklist Meta-Transactions / Gasless (3 items):
+1. ¿El relayer puede censurar transacciones? (no reenviar la meta-tx)
+2. ¿Se valida que msg.sender en el contexto correcto? (ERC-2771: _msgSender() vs msg.sender confusion)
+3. ¿El gas price de la meta-tx puede ser manipulado para hacer DoS?
+
+### Attack Patterns de Alta Prioridad:
+- **Permit front-run**: usuario firma permit → atacante la usa primero → drains funds
+- **Cross-chain replay**: firma válida en L1 reusada en L2 (o viceversa)
+- **Same-chain replay**: firma sin nonce o con nonce reutilizable
+- **Signature phishing**: usuario firma algo que parece inocuo pero autoriza transfer
+- **Approval confusion**: approve va a contrato equivocado (Morpho Bundler3)
+- **Deadline bypass**: firmas sin expiración usadas meses después en condiciones diferentes"""
+
+    elif hunter_name == "DoSHunter":
+        return """## DoS / Griefing Deep Check (OBLIGATORIO — la clase de vuln MÁS IGNORADA, 2,279 findings en Solodit)
+
+### Sección 1: Unbounded Loops & Gas Exhaustion (8 items)
+Para CADA loop (for, while) en el contrato:
+1. ¿El loop itera sobre un array cuyo tamaño puede crecer sin límite? (usuarios, tokens, markets, orders)
+2. ¿Hay un cap máximo en el tamaño del array? ¿Es razonable para el gas limit del bloque?
+3. ¿Hay operaciones storage-write DENTRO del loop? (cada SSTORE = 5K-20K gas)
+4. ¿Hay external calls DENTRO del loop? (cada call = variable gas, puede revert y bloquear el loop)
+5. ¿La función afectada es una función CRÍTICA? (withdraw, liquidate, claim, emergencyWithdraw)
+6. ¿Un atacante puede inflar el array a bajo costo? (crear muchas posiciones pequeñas, registrar muchos tokens)
+7. ¿El patrón pull-over-push se usa correctamente? (no enviar a N usuarios en 1 tx → dejar que cada uno retire)
+8. ¿Hay paginación o batch limits para operaciones sobre colecciones grandes?
+
+Bug real: GovernorBravo — iteración sobre todas las proposals sin límite → gas DoS.
+Bug real: Nouns DAO — iteración sobre voters bloqueó settleAuction().
+
+### Sección 2: Revert-Based DoS — Bloqueo de Funciones Críticas (7 items)
+1. ¿Alguna función de SALIDA (withdraw, repay, unstake, emergencyWithdraw) hace external call que puede revert?
+   - ¿La función envía ETH con transfer/send a una dirección que puede ser un contrato sin receive()?
+   - ¿La función llama a un token que puede pausarse/bloquearse? (USDC blocklist, pausable tokens)
+2. ¿Una función de liquidación depende de que el liquidado coopere? (callback, approve, token transfer)
+3. ¿Hay un require/assert en una función de emergencia que puede fallar en condiciones extremas?
+4. ¿Un oracle caído (reverts) bloquea withdrawals? (Chainlink puede revert si no hay respuesta)
+5. ¿Un safety check (health factor, collateral ratio) puede impedir que un usuario repague su deuda?
+6. ¿Hay try/catch alrededor de calls que pueden fallar? ¿O un revert en el call propaga y bloquea todo?
+7. ¿Funciones de governance/timelock pueden quedar permanentemente bloqueadas? (propuesta que revierte en execute)
+
+Bug real: Akutars — $34M bloqueados porque refund() dependía de transfer() a contratos sin receive().
+Bug real: Safety margin en repay impedía repago → usuarios forzados a liquidación ($3M Rari Fuse).
+
+### Sección 3: Front-Running & Grief (5 items)
+1. ¿Un atacante puede front-run una transacción para hacerla revert? (sandwich the tx, manipular estado previo)
+2. ¿Hay operaciones donde el first-mover gana y puede bloquear a otros? (claim, initialize, createPool)
+3. ¿Se puede inflar el gas cost de una transacción ajena? (returnbomb: retornar datos enormes en un callback)
+4. ¿Existe donation attack que cambia el estado para hacer revert la tx de la víctima?
+5. ¿Un atacante puede crear dust positions para bloquear operaciones batch?
+
+Bug real: ERC-4626 inflation — first depositor envía dust para hacer revert todos los deposits siguientes.
+Bug real: returnbomb — contrato malicioso retorna 2MB de datos en callback, agotando gas del caller.
+
+### Sección 4: Resource Exhaustion & State Bloat (5 items)
+1. ¿Se pueden crear entidades (positions, orders, tokens) sin costo mínimo? → spam attack
+2. ¿Hay storage que crece sin mecanismo de limpieza? (mappings que solo crecen, nunca se borran)
+3. ¿El protocolo depende de un keeper/relayer? ¿Qué pasa si el keeper no actúa? (liquidaciones pendientes)
+4. ¿Hay rate limiting en funciones que consumen recursos? (createMarket, addToken, registerOracle)
+5. ¿Deadline/expiry de operaciones pendientes? ¿O quedan en pending para siempre?
+
+### Sección 5: Emergency & Recovery Blocking (4 items)
+1. ¿La función pause() puede ser llamada pero unpause() no existe o requiere multisig con keys perdidas?
+2. ¿El modo emergencia permite SIEMPRE retirar fondos? ¿O el emergency también se puede bloquear?
+3. ¿Hay timelock que puede quedar permanentemente en estado pendiente? (no se puede cancelar ni ejecutar)
+4. ¿Shutdown/migration path funciona si el contrato principal está en un estado inesperado?
+
+Bug real: Compound cETH — admin key loss + pause sin unpause alternativo = fondos bloqueados.
+Bug real: Wormhole — guardian set update bloqueado por quorum issue → bridge congelado.
+
+### Solidity Assertion Patterns para DoS
+
+1. **Unbounded loop gas check:**
+```solidity
+// Verificar que la función no excede gas razonable para N entradas
+uint256 gasBefore = gasleft();
+target.processAll();
+uint256 gasUsed = gasBefore - gasleft();
+// Si gasUsed crece linealmente con N, escalar a 100+ entradas bloqueará la tx
+t(gasUsed < 5_000_000, "DOS-XX: processAll exceeds 5M gas");
+```
+
+2. **Revert-based withdrawal block:**
+```solidity
+// Crear un contrato que revierte en receive()
+RevertOnReceive blocker = new RevertOnReceive();
+// Depositar como blocker, luego intentar withdraw
+target.deposit{value: 1 ether}(address(blocker));
+try target.withdraw(address(blocker), 1 ether) {
+    // Si withdraw tiene try/catch o pull pattern, OK
+} catch {
+    t(false, "DOS-XX: withdraw blocked by reverting receiver");
+}
+```
+
+3. **Emergency function always callable:**
+```solidity
+// Poner el contrato en el peor estado posible
+_putContractInBadState();
+// emergencyWithdraw DEBE funcionar siempre
+try target.emergencyWithdraw{gas: 500000}() {
+    // OK — emergency funciona
+} catch {
+    t(false, "DOS-XX: emergencyWithdraw blocked in bad state");
+}
+```
+
+4. **Array growth → gas DoS:**
+```solidity
+// Añadir N elementos y medir gas de operación afectada
+for (uint i = 0; i < 100; i++) {
+    target.addElement(i);
+}
+uint256 gasBefore = gasleft();
+target.processElements();
+uint256 gasFor100 = gasBefore - gasleft();
+// Proyectar: si 100 elem = X gas, 10K elem = 100X gas > block limit
+t(gasFor100 < 500_000, "DOS-XX: processElements scales linearly — DoS at ~10K elements");
+```
+
+5. **Oracle failure doesn't block withdrawals:**
+```solidity
+// Simular oracle caído (reverts)
+mockOracle.setShouldRevert(true);
+// Withdraw DEBE funcionar aún sin oracle
+try target.withdraw{gas: 300000}(user, amount) {
+    // OK — withdraw no depende de oracle
+} catch {
+    t(false, "DOS-XX: withdraw blocked when oracle is down");
+}
+```
+
+**CADA invariante en tu YAML DEBE tener un campo `solidity:` con código real.** Los DoS bugs son los más fuzzeables — gas measurements + try/catch patterns son directos."""
+
     else:
         return ""
+
+
+def _extract_public_signatures(contract_path: Path) -> list[str]:
+    """Extrae firmas de funciones public/external de un contrato Solidity.
+
+    Devuelve líneas tipo: 'function vaultInfo() external view returns (uint256, uint256, ...)'
+    para que los hunters sepan qué getters existen y no se los inventen.
+    """
+    if not contract_path or not contract_path.exists():
+        return []
+
+    src = contract_path.read_text()
+    sigs = []
+    # Match function declarations that are public or external
+    for m in re.finditer(
+        r'function\s+(\w+)\s*\(([^)]*)\)\s+'
+        r'((?:(?:public|external|view|pure|payable|virtual|override|returns\s*\([^)]*\))\s*)+)',
+        src
+    ):
+        fn_name = m.group(1)
+        params = m.group(2).strip()
+        modifiers = m.group(3).strip()
+        # Only include public/external
+        if 'public' in modifiers or 'external' in modifiers:
+            # Clean up: keep just the essential signature
+            sig = f"function {fn_name}({params}) {modifiers}"
+            # Normalize whitespace
+            sig = re.sub(r'\s+', ' ', sig).strip()
+            sigs.append(f"  {sig};")
+    return sigs
+
+
+def _extract_state_vars_from_setup(chimera_dir: Path) -> list[str]:
+    """Extrae state variables de TODOS los archivos *Setup*.sol del directorio chimera."""
+    state_vars = []
+    seen = set()
+
+    for setup_file in sorted(chimera_dir.glob("*Setup*.sol")):
+        src = setup_file.read_text()
+        for line in src.split("\n"):
+            stripped = line.strip()
+            # Skip comments and empty lines
+            if stripped.startswith("//") or stripped.startswith("/*") or not stripped:
+                continue
+            # Match state variable declarations (broad regex)
+            if re.match(
+                r'(\w+(?:\[\])?)\s+(public|internal)\s+\w+',
+                stripped
+            ) and not stripped.startswith("function") and not stripped.startswith("constructor"):
+                if stripped not in seen:
+                    seen.add(stripped)
+                    state_vars.append(f"  {stripped}")
+            # Also match 'address public alice' style
+            elif re.match(r'address\s+(public|internal)?\s*(alice|bob|carol|owner|deployer)', stripped):
+                if stripped not in seen:
+                    seen.add(stripped)
+                    state_vars.append(f"  {stripped}")
+
+    return state_vars
+
+
+def _extract_ghost_vars(chimera_dir: Path) -> list[str]:
+    """Extrae ghost variables de TODOS los Properties*.sol del directorio chimera."""
+    ghosts = []
+    seen = set()
+
+    for props_file in sorted(chimera_dir.glob("Properties*.sol")):
+        src = props_file.read_text()
+        for line in src.split("\n"):
+            stripped = line.strip()
+            if "ghost_" in stripped and not stripped.startswith("//"):
+                if any(t in stripped for t in ("uint256", "int256", "mapping", "bool", "address", "bytes")):
+                    if stripped not in seen:
+                        seen.add(stripped)
+                        ghosts.append(f"  {stripped}")
+
+    return ghosts
+
+
+def _extract_setup_helpers(chimera_dir: Path) -> list[str]:
+    """Extrae funciones helper (internal) de Setup y TargetFunctions."""
+    helpers = []
+    seen = set()
+
+    for sol_file in [chimera_dir / "TargetFunctions.sol"] + list(chimera_dir.glob("*Setup*.sol")):
+        if not sol_file.exists():
+            continue
+        src = sol_file.read_text()
+        for m in re.finditer(
+            r'function\s+(_\w+)\s*\(([^)]*)\)\s+(internal[^{]*)',
+            src
+        ):
+            fn_name = m.group(1)
+            params = m.group(2).strip()
+            modifiers = m.group(3).strip()
+            sig = f"{fn_name}({params}) {modifiers}"
+            sig = re.sub(r'\s+', ' ', sig).strip()
+            if fn_name not in seen:
+                seen.add(fn_name)
+                helpers.append(f"  {sig};")
+
+    return helpers
+
+
+def generate_chimera_context(repo_path: Path, contract_path: Path = None) -> str:
+    """Extrae un snippet completo del setup Chimera para que los hunters escriban Solidity compilable.
+
+    Busca TODOS los *Setup*.sol y Properties*.sol, extrae:
+    - State variables (contratos, tokens, actores)
+    - Ghost variables existentes
+    - Funciones públicas/external del contrato target (getters!)
+    - Internal helpers disponibles
+    - Assertion helpers
+
+    Si no existe test/chimera/, devuelve string vacío.
+    """
+    chimera_dir = repo_path / "test" / "chimera"
+    if not chimera_dir.exists():
+        return ""
+
+    snippet_lines = [
+        "## Contexto Chimera (OBLIGATORIO — lee antes de escribir Solidity)",
+        "",
+        "Tu código se insertará en un archivo `PropertiesX.sol` que hereda de `Properties.sol`.",
+        "Properties.sol hereda del Setup (variables de estado, contratos, actores).",
+        "NO escribas `function invariant_...()` — solo el BODY. merge_invariants.py genera el wrapper.",
+        "",
+    ]
+
+    # 1. State variables from ALL Setup files
+    state_vars = _extract_state_vars_from_setup(chimera_dir)
+    if state_vars:
+        snippet_lines.append("### Variables y contratos disponibles (heredados de Setup):")
+        snippet_lines.append("```solidity")
+        snippet_lines.extend(state_vars[:50])
+        snippet_lines.append("```")
+
+    # 2. Public/external function signatures from the target contract
+    if contract_path:
+        pub_sigs = _extract_public_signatures(contract_path)
+        if pub_sigs:
+            snippet_lines.append("")
+            snippet_lines.append("### Funciones públicas del contrato target (getters y setters disponibles):")
+            snippet_lines.append("```solidity")
+            snippet_lines.extend(pub_sigs[:80])
+            snippet_lines.append("```")
+
+    # 3. Ghost variables from ALL Properties*.sol files
+    ghosts = _extract_ghost_vars(chimera_dir)
+    if ghosts:
+        snippet_lines.append("")
+        snippet_lines.append("### Ghost variables existentes (ya declaradas, puedes usarlas):")
+        snippet_lines.append("```solidity")
+        snippet_lines.extend(ghosts[:40])
+        snippet_lines.append("```")
+
+    # 4. Internal helpers
+    helpers = _extract_setup_helpers(chimera_dir)
+    if helpers:
+        snippet_lines.append("")
+        snippet_lines.append("### Helpers internos disponibles:")
+        snippet_lines.append("```solidity")
+        snippet_lines.extend(helpers[:20])
+        snippet_lines.append("```")
+
+    # 5. Assertion helpers (siempre presentes en Chimera)
+    snippet_lines.extend([
+        "",
+        "### Assertion helpers (de chimera/Asserts.sol):",
+        "```solidity",
+        "t(bool condition, string memory msg)    // assert true",
+        "eq(uint256 a, uint256 b, string memory msg)  // assert ==",
+        "gte(uint256 a, uint256 b, string memory msg) // assert >=",
+        "lte(uint256 a, uint256 b, string memory msg) // assert <=",
+        "gt(uint256 a, uint256 b, string memory msg)  // assert >",
+        "lt(uint256 a, uint256 b, string memory msg)  // assert <",
+        "```",
+        "",
+        "### REGLAS para tu código Solidity:",
+        "1. **Solo el body** — NO escribas `function invariant_...()`. Solo las líneas internas.",
+        "2. **Usa EXACTAMENTE las variables de arriba** — NO inventes nombres. Si no está listado, NO existe.",
+        "3. **Usa los getters listados arriba** — Si necesitas un valor del contrato, busca en la lista de funciones públicas.",
+        "4. **Usa helpers Chimera** — `t()`, `eq()`, `gte()`, NO `require()` ni `assert()`.",
+        "5. **Sin caracteres unicode** en strings — usa `--` en vez de `—`, ASCII puro.",
+        "6. **Si necesitas ghost vars nuevas**, declara en el campo `ghost_vars` del YAML, NO en el body.",
+        "7. **Si una función no está en la lista de arriba, NO LA USES.** Compilará mal.",
+    ])
+
+    return "\n".join(snippet_lines)
 
 
 def generate_hunter_prompt(
@@ -991,6 +1432,17 @@ def generate_hunter_prompt(
     # Generate asset flow map
     asset_flow_map = generate_asset_flow_map(contract_path)
 
+    # Generate Chimera context snippet (detect repo root from contract_path)
+    chimera_ctx = ""
+    if contract_path:
+        # Walk up to find test/chimera/
+        repo_candidate = contract_path.parent
+        for _ in range(6):
+            if (repo_candidate / "test" / "chimera").exists():
+                chimera_ctx = generate_chimera_context(repo_candidate, contract_path)
+                break
+            repo_candidate = repo_candidate.parent
+
     return f"""# {hunter_name} — {component} Analysis
 
 ## Tu Identidad
@@ -1016,10 +1468,12 @@ No busques bugs genéricos. Busca bugs que nazcan de la lógica ESPECÍFICA de e
 ## Briefing del Dominio ({domain})
 {briefing_excerpt or "Sin briefing disponible"}
 
+{chimera_ctx}
+
 ## Tu Proceso
 1. **Lee CADA línea** del contrato — no te saltes nada
 2. **Identifica** las funciones donde tu especialidad ({focus.split(',')[0]}) es relevante
-3. **Genera 5-10 invariantes** — específicos, no genéricos
+3. **Genera MÍNIMO 5 invariantes (sin límite superior)** — específicos, no genéricos. 5 es el PISO, no el techo. Si el contrato es complejo, genera 15-20+.
 4. **Para cada invariante, lista TODAS las formas de ROMPERLO.** No verifiques que se cumple — asume que NO se cumple y busca CÓMO. Algunos ángulos que NO debes olvidar (pero no te limites a estos):
    - Manipular el estado ANTES de que se evalúe (donation, front-running, flash loan, oracle manipulation)
    - Encontrar otro path que no pasa por el check (otra función, callback, delegatecall, contrato externo)
@@ -1165,8 +1619,12 @@ Eres el **DeepDiveHunter** del equipo de bug hunting de {protocol}.
 No escaneas patrones — PIENSAS como samczsun. Trazas hacia atrás desde puntos de salida de valor.
 
 ## Tu Input
-Tienes los resultados de 7 hunters que ya analizaron este componente.
+Tienes los resultados de 9 hunters que ya analizaron este componente.
 Tu trabajo: encontrar lo que ELLOS NO VIERON. Profundidad, no amplitud.
+**IMPORTANTE**: FlowHunter incluye un State Machine Model (FSM) en su output. ÚSALO:
+- Busca transiciones ilegales que los otros hunters no detectaron
+- Busca estados stuck donde fondos quedan atrapados
+- Busca bypasses de estados intermedios (saltar validaciones)
 
 ## Contrato
 ```solidity
@@ -1193,7 +1651,14 @@ Para cada PAR de funciones críticas: ¿qué pasa si se llaman en orden inespera
 Identifica TODOS los puntos donde sale valor del protocolo.
 Para CADA uno, traza HACIA ATRÁS: ¿qué condiciones deben cumplirse? ¿se pueden manipular?
 
-### Sección 4: Convergence Deep-Dive
+### Sección 4: State Machine Attack Paths
+Usa el FSM del FlowHunter. Para cada anomalía reportada:
+- ¿El stuck state puede causar pérdida de fondos? ¿Cuánto?
+- ¿La transición ilegal se puede explotar con una secuencia concreta de txs?
+- ¿Hay un ataque de 2+ pasos que abuse del orden de transiciones?
+Si FlowHunter NO incluyó FSM, constrúyelo tú a partir del código.
+
+### Sección 5: Convergence Deep-Dive
 Donde 2+ hunters señalaron lo mismo: ¿hay un bug más profundo detrás?
 
 ## Output
@@ -1362,6 +1827,119 @@ def init_ficha(component: str, domain: str, protocol: str, repo_path: str) -> Pa
     return ficha_path
 
 
+def generate_component_map(state: dict) -> list[dict]:
+    """
+    Escanea el repo del hunt activo y genera un mapa de componentes con:
+    - name, files (paths relativos), loc, priority, reason, depends_on, status
+
+    Persiste el mapa en current_hunt.json bajo 'component_map'.
+    Si ya existe, lo devuelve sin regenerar (usar --map-components --force para regenerar).
+    """
+    repo_path = state.get("repo_path", "")
+    if not repo_path:
+        print("✗ No hay repo_path en current_hunt.json")
+        return []
+
+    repo = Path(repo_path)
+    if not repo.exists():
+        print(f"✗ Repo no existe: {repo}")
+        return []
+
+    # Buscar todos los .sol en src/ o contracts/ (excluyendo test/, lib/, interfaces/)
+    sol_files = []
+    for pattern in ["src/**/*.sol", "contracts/**/*.sol"]:
+        sol_files.extend(repo.glob(pattern))
+
+    # Filtrar: excluir tests, libraries, interfaces, mocks
+    exclude_patterns = ["test/", "lib/", "node_modules/", "mock/", "Mock",
+                        "script/", "interface/", "interfaces/"]
+    filtered = []
+    for f in sol_files:
+        rel = str(f.relative_to(repo))
+        if any(ex in rel for ex in exclude_patterns):
+            continue
+        # Excluir interfaces puras (archivos que empiezan con I + mayúscula)
+        if f.stem.startswith("I") and len(f.stem) > 1 and f.stem[1].isupper():
+            continue
+        filtered.append(f)
+
+    # Agrupar por componente (nombre del archivo sin extensión)
+    # Si hay múltiples repos (e.g., PancakeSwap), escanear todos
+    extra_repos = state.get("extra_repos", [])
+    for extra in extra_repos:
+        extra_repo = Path(extra)
+        if extra_repo.exists():
+            for pattern in ["src/**/*.sol", "contracts/**/*.sol"]:
+                for f in extra_repo.glob(pattern):
+                    rel = str(f.relative_to(extra_repo))
+                    if any(ex in rel for ex in exclude_patterns):
+                        continue
+                    if f.stem.startswith("I") and len(f.stem) > 1 and f.stem[1].isupper():
+                        continue
+                    filtered.append(f)
+
+    # Construir componentes: agrupar archivos relacionados
+    # Un "componente" = un contrato principal + sus libraries internas
+    components_done = set(state.get("components_done", []))
+    components_remaining = state.get("components_remaining", [])
+
+    component_map = []
+    seen_names = set()
+
+    for f in sorted(filtered, key=lambda x: x.stat().st_size, reverse=True):
+        name = f.stem
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+
+        loc = count_locs(f)
+        if loc < 10:  # Ignorar archivos triviales
+            continue
+
+        # Determinar status
+        if name in components_done:
+            status = "done"
+        elif name in components_remaining:
+            status = "pending"
+        else:
+            status = "unmapped"
+
+        # Path relativo para portabilidad
+        try:
+            rel_path = str(f.relative_to(repo))
+        except ValueError:
+            # Archivo de otro repo
+            rel_path = str(f)
+
+        # Detectar dependencias leyendo imports
+        depends_on = []
+        try:
+            src = f.read_text()
+            imports = re.findall(r'import\s+.*?["\'].*?/(\w+)\.sol["\']', src)
+            depends_on = [imp for imp in imports
+                         if imp in seen_names or imp in [x.stem for x in filtered]]
+            depends_on = list(set(depends_on) - {name})[:5]  # max 5
+        except Exception:
+            pass
+
+        component_map.append({
+            "name": name,
+            "files": [rel_path],
+            "loc": loc,
+            "status": status,
+            "depends_on": depends_on,
+        })
+
+    # Ordenar por LOC descendente (mayor primero = mayor prioridad)
+    component_map.sort(key=lambda c: c["loc"], reverse=True)
+
+    # Asignar prioridad
+    for i, comp in enumerate(component_map):
+        comp["priority"] = i + 1
+
+    return component_map
+
+
 def print_status(state: dict):
     """Imprime el estado del hunt activo."""
     if not state:
@@ -1399,6 +1977,16 @@ def print_status(state: dict):
             except:
                 print(f"    {ficha_path.stem}: (error leyendo)")
 
+    # Component map
+    cmap = state.get("component_map", [])
+    if cmap:
+        print(f"\n  Component Map ({len(cmap)} componentes):")
+        for c in cmap:
+            icon = "✓" if c.get("status") == "done" else "→" if c.get("status") == "pending" else "○"
+            deps = f" ← {', '.join(c['depends_on'])}" if c.get("depends_on") else ""
+            files = ", ".join(c.get("files", []))
+            print(f"    {icon} [{c.get('priority', '?')}] {c['name']} ({c.get('loc', '?')} LOC) {files}{deps}")
+
     # Check hypotheses
     hyps = list((HUNT_SESSION_DIR / "hypotheses").glob(f"hyp_*.yaml"))
     if hyps:
@@ -1425,6 +2013,10 @@ def main():
     parser.add_argument("--complete", type=str, metavar="COMPONENT", help="Marca componente como completo")
     parser.add_argument("--no-solodit", action="store_true", help="Omitir búsqueda en Solodit")
     parser.add_argument("--print-prompts", action="store_true", help="Imprime prompts de hunters a stdout")
+    parser.add_argument("--map-components", action="store_true",
+                        help="Escanea el repo y genera component_map en current_hunt.json")
+    parser.add_argument("--force", action="store_true",
+                        help="Regenerar component_map aunque ya exista")
     args = parser.parse_args()
 
     state = load_hunt_state()
@@ -1440,8 +2032,57 @@ def main():
         init_ficha(args.init_ficha, domain, protocol, repo)
         return 0
 
+    if args.map_components:
+        existing = state.get("component_map", [])
+        if existing and not args.force:
+            print(f"✓ component_map ya existe ({len(existing)} componentes). Usa --force para regenerar.")
+            # Mostrar el mapa existente
+            for c in existing:
+                icon = "✓" if c.get("status") == "done" else "→" if c.get("status") == "pending" else "○"
+                print(f"  {icon} [{c.get('priority', '?')}] {c['name']} ({c.get('loc', '?')} LOC) {', '.join(c.get('files', []))}")
+            return 0
+
+        cmap = generate_component_map(state)
+        if not cmap:
+            print("✗ No se pudo generar component_map")
+            return 1
+
+        state["component_map"] = cmap
+
+        # Auto-poblar components_remaining si está vacío
+        if not state.get("components_remaining") and not state.get("components_done"):
+            state["components_remaining"] = [c["name"] for c in cmap if c["loc"] >= 50]
+            print(f"\n  Auto-poblado components_remaining: {len(state['components_remaining'])} componentes (>= 50 LOC)")
+
+        save_hunt_state(state)
+        print(f"\n✓ component_map generado: {len(cmap)} componentes")
+        for c in cmap:
+            icon = "✓" if c.get("status") == "done" else "→" if c.get("status") == "pending" else "○"
+            deps = f" ← {', '.join(c['depends_on'])}" if c.get("depends_on") else ""
+            print(f"  {icon} [{c['priority']}] {c['name']} ({c['loc']} LOC) {', '.join(c['files'])}{deps}")
+        return 0
+
     if args.complete:
         comp = args.complete
+        # ── GATE CHECK: pipeline_gate must pass before marking complete ──
+        gate_script = AUDIT_AGENTS_DIR / "pipeline_gate.py"
+        if gate_script.exists():
+            print(f"  Verificando pipeline gates para {comp}...")
+            gate_result = subprocess.run(
+                [sys.executable, str(gate_script), "--component", comp, "--gate", "all"],
+                capture_output=True, text=True, timeout=30
+            )
+            if gate_result.returncode != 0:
+                print(f"\n⛔ NO se puede marcar {comp} como completo — pipeline gates fallan:\n")
+                print(gate_result.stdout)
+                print(f"\nArregla los gates que fallan y vuelve a intentar.")
+                print(f"Para bypass (SOLO si sabes lo que haces): --force")
+                if not args.force:
+                    return 1
+                print(f"\n⚠ BYPASS FORZADO por --force — marcando como completo sin gates")
+            else:
+                print(f"  ✅ Todos los pipeline gates pasaron")
+
         if comp in state.get("components_remaining", []):
             state["components_remaining"].remove(comp)
         if comp not in state.get("components_done", []):
@@ -1449,6 +2090,11 @@ def main():
         # Avanzar current_component al siguiente pendiente
         remaining = state.get("components_remaining", [])
         state["current_component"] = remaining[0] if remaining else None
+        # Sincronizar status en component_map
+        for c in state.get("component_map", []):
+            if c["name"] == comp:
+                c["status"] = "done"
+                break
         state["last_session"] = datetime.utcnow().isoformat() + "Z"
         save_hunt_state(state)
         print(f"✓ {comp} marcado como completado")

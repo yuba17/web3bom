@@ -1,0 +1,182 @@
+component: AbstractMultisigIsm
+hunter: OracleHunter
+date: '2026-03-24'
+overall_assessment: |
+  Este componente NO tiene dependencias de oracles de precio (Chainlink, Uniswap TWAP, etc.).
+  Los "oracles" aqui son los validators -- entidades off-chain que firman checkpoints.
+  El analisis de OracleHunter se enfoca en: staleness del validator set, immutability
+  del MetaProxy, y la confiabilidad de los inputs externos en metadata.
+
+  VEREDICTO HONESTO: Este contrato tiene superficie de ataque minima desde la perspectiva
+  de oracle/external data. La matematica es pura (merkle proofs, ECDSA), los validators
+  son la unica fuente de "verdad externa", y su compromiso esta fuera del threat model
+  del contrato (se maneja con slashing off-chain).
+
+invariants:
+- id: ISM-ORC-01
+  title: "MetaProxy bakes validator set at deploy time -- immutable and potentially stale"
+  tier: 2
+  type: property
+  confidence: 50
+  severity: medium
+  description: |
+    En StaticMultisigIsm (via AbstractMetaProxyMultisigIsm), el validator set y threshold
+    se encodean en el bytecode del MetaProxy al momento del deploy. validatorsAndThreshold()
+    lee estos valores del bytecode via MetaProxy.metadata(). Son INMUTABLES.
+
+    Implicaciones:
+    1. Si un validator key es comprometido, NO se puede actualizar el ISM sin deployar uno nuevo
+       y reconfigurar el Mailbox para usarlo. Esto introduce latencia en la respuesta.
+    2. Si el threshold era 3-of-5 y 3 validators son comprometidos, pueden firmar mensajes
+       arbitrarios hasta que el ISM sea reemplazado.
+    3. La inmutabilidad es un trade-off consciente: simplifica el contrato, elimina riesgos
+       de admin key, pero sacrifica agilidad de rotacion.
+
+    MITIGACION EXISTENTE: El protocolo puede deployar un nuevo ISM y apuntar el Mailbox
+    al nuevo. Esto es una operacion de governance/admin, no instantanea.
+
+    CONCLUSION: Riesgo operacional conocido, no un bug del contrato. La inmutabilidad
+    es by design para el tipo "Static". Hyperlane tambien ofrece ISMs dinamicos.
+  attack_scenario: |
+    Escenario: 3 de 5 validator keys comprometidos. Atacante firma checkpoints falsos
+    para mensajes que mueven fondos cross-chain. Los mensajes se verifican exitosamente
+    en destino hasta que el admin reemplaza el ISM.
+    PERO: esto requiere comprometer m-of-n keys, que es el threat model base de cualquier
+    multisig. No es un bug del contrato.
+  solidity: |
+    // Verificar que el validator set no cambia entre calls (inmutabilidad)
+    // No directamente testable sin acceso al MetaProxy, marcado conceptual
+    t(true, "ISM-ORC-01: static validator set is immutable by design -- not a contract bug");
+  validated: false
+  status: investigated_safe
+
+- id: ISM-ORC-02
+  title: "No staleness check on validator signatures / checkpoints"
+  tier: 2
+  type: property
+  confidence: 35
+  severity: low
+  description: |
+    El contrato NO verifica timestamps ni "frescura" de las firmas. Un checkpoint firmado
+    hace 1 ano es tan valido como uno de hace 1 segundo, siempre que las firmas sean de
+    validators en el set actual.
+
+    ANALISIS: En el contexto de interchain messaging, esto es correcto:
+    1. Los checkpoints son sobre estado del merkle tree (root + index). Un checkpoint
+       viejo es valido si el mensaje esta incluido en ese root.
+    2. Agregar timestamp checks introduciria complejidad y dependencia de block.timestamp
+       (manipulable por miners).
+    3. El merkle tree es append-only; un checkpoint viejo no puede contener mensajes futuros.
+
+    RIESGO TEORICO: Si un validator set fue reemplazado pero un ISM viejo con el set
+    anterior sigue activo, las firmas del set anterior siguen siendo validas en ese ISM.
+    Pero esto requiere que el admin no haya actualizado la configuracion del Mailbox.
+
+    CONCLUSION: No es un bug. La frescura se gestiona off-chain y via governance.
+  attack_scenario: |
+    NO EXPLOTABLE en practica. Las firmas son sobre contenido especifico (root + index +
+    messageId), no sobre tiempo. Un checkpoint viejo no permite fabricar mensajes nuevos.
+  solidity: |
+    t(true, "ISM-ORC-02: no timestamp validation on signatures -- by design for merkle tree model");
+  validated: false
+  status: investigated_safe
+
+- id: ISM-ORC-03
+  title: "Metadata fields (root, index, proof) are relayer-controlled but cryptographically bound"
+  tier: 2
+  type: property
+  confidence: 80
+  severity: low
+  description: |
+    Toda la metadata (originMerkleTreeHook, root, index, proof, signatures) viene del
+    relayer. Esto parece peligroso pero cada campo esta cryptographically bound:
+
+    1. originMerkleTreeHook -> forma parte del digest que validators firman
+    2. root (MessageId) / signedRoot (MerkleRoot) -> parte del digest
+    3. index -> parte del digest
+    4. proof (MerkleRoot) -> verificado contra message.id() y el root
+    5. signatures -> verificadas contra el digest via ECDSA.recover
+
+    Un relayer malicioso puede proporcionar metadata arbitraria, pero:
+    - Si cambia cualquier campo del digest, necesita firmas validas para el nuevo digest
+    - No puede fabricar firmas sin las private keys de los validators
+    - Si proporciona un proof invalido, branchRoot computa un root diferente, el digest
+      cambia, y las firmas no matchean
+
+    CONCLUSION: Seguro por diseno criptografico. La metadata del relayer es "untrusted
+    input" pero todo esta verificado cryptograficamente.
+  attack_scenario: |
+    NO EXPLOTABLE. Cada campo de metadata esta atado al digest via hash o merkle proof.
+    Modificar cualquier campo invalida las firmas.
+  solidity: |
+    t(true, "ISM-ORC-03: relayer-controlled metadata is cryptographically bound to validator signatures");
+  validated: true
+  status: investigated_safe
+
+- id: ISM-ORC-04
+  title: "ECDSA.recover depends on OZ implementation correctness"
+  tier: 2
+  type: property
+  confidence: 90
+  severity: low
+  description: |
+    El contrato usa OpenZeppelin ECDSA.recover(), que es una dependencia externa critica.
+    En OZ v4.9.3+:
+    - recover() reverts si la firma es invalida (no retorna address(0))
+    - Protege contra signature malleability (s-value check)
+    - No retorna address(0) para firmas malformadas
+
+    Esto es importante porque el two-pointer loop compara _signer con validators.
+    Si ECDSA.recover retornara address(0) para una firma invalida, Y address(0) estuviera
+    en el validator set, un atacante podria fabricar firmas "validas".
+
+    PERO: OZ ECDSA.recover reverts en firma invalida, asi que esto no es un vector.
+
+    CONCLUSION: Seguro. La dependencia en OZ ECDSA es una eleccion solida.
+  attack_scenario: |
+    NO EXPLOTABLE con OZ v4.9.3+. ECDSA.recover reverts on invalid signature,
+    never returns address(0).
+  solidity: |
+    t(true, "ISM-ORC-04: ECDSA.recover reverts on invalid sig -- no address(0) return risk");
+  validated: true
+  status: investigated_safe
+
+- id: ISM-ORC-05
+  title: "CheckpointLib.digest uses abi.encodePacked -- no oracle-like variable-length inputs"
+  tier: 2
+  type: property
+  confidence: 90
+  severity: low
+  description: |
+    CheckpointLib.digest: keccak256(abi.encodePacked(_domainHash, _checkpointRoot, _checkpointIndex, _messageId))
+    Tipos: bytes32, bytes32, uint32, bytes32 = todos fixed-size.
+    Total: 32 + 32 + 4 + 32 = 100 bytes, siempre.
+
+    domainHash: keccak256(abi.encodePacked(_origin, _merkleTreeHook, "HYPERLANE"))
+    Tipos: uint32, bytes32, string literal = todos fixed-size.
+    Total: 4 + 32 + 9 = 45 bytes, siempre.
+
+    No hay riesgo de abi.encodePacked collision porque todos los tipos son fijos.
+    No hay inputs de tamano variable que pudieran causar ambiguedad.
+
+    CONCLUSION: Seguro. El uso de encodePacked aqui es correcto y eficiente.
+  attack_scenario: |
+    NO EXPLOTABLE. Todos los campos de encodePacked son de tamano fijo.
+    No hay posibilidad de collision por concatenacion ambigua.
+  solidity: |
+    t(true, "ISM-ORC-05: encodePacked with all fixed-size types -- no collision risk");
+  validated: true
+  status: investigated_safe
+
+false_positives:
+- title: "Validators are oracles that can be manipulated"
+  reason: |
+    Los validators son la fuente de verdad off-chain, pero su compromiso esta fuera del
+    threat model del contrato. El contrato asume correctamente que m-of-n validators son
+    honestos. Esto es equivalente a decir "Chainlink puede ser manipulado si los nodos
+    son comprometidos" -- verdadero pero fuera del scope del smart contract audit.
+- title: "No freshness check on checkpoints"
+  reason: |
+    Los checkpoints son sobre estado inmutable (merkle tree es append-only). Un checkpoint
+    viejo sigue siendo valido para los mensajes que contiene. No hay concepto de "stale
+    checkpoint" en este modelo, a diferencia de price feeds donde la informacion caduca.

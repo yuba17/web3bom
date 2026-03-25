@@ -1,0 +1,700 @@
+protocol: morpho-pre-liquidation
+component: PreLiquidation
+file: src/PreLiquidation.sol
+domain: liquidation-mechanics
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+
+# ─────────────────────────────────────────────────────────────────────
+# PROTOCOL MODEL
+# ─────────────────────────────────────────────────────────────────────
+# PreLiquidation es un contrato permisionless que wrappea Morpho Blue
+# para ofrecer pre-liquidaciones parciales ANTES de que una posición
+# alcance el LLTV de liquidación normal.
+#
+# FLUJO DE DINERO:
+#   preLiquidate() → MORPHO.accrueInterest() → lee market+position →
+#   calcula LTV con PRE_LIQUIDATION_ORACLE → verifica preLLTV < LTV <= LLTV →
+#   calcula preLIF/preLCF lineales → calcula seizedAssets/repaidShares →
+#   MORPHO.repay(shares) → [Morpho reduce borrowShares, totalBorrow*] →
+#   callback onMorphoRepay → MORPHO.withdrawCollateral(seizedAssets, borrower, liquidator) →
+#   [Morpho reduce collateral, health check con MARKET oracle] →
+#   callback onPreLiquidate(liquidator) → ERC20.safeTransferFrom(liquidator → this)
+#
+# DOS ORACLES:
+#   - PRE_LIQUIDATION_ORACLE: usado en preLiquidate() para calcular LTV, preLIF, seizedAssets
+#   - ORACLE (market oracle): usado por Morpho en withdrawCollateral._isHealthy()
+#
+# PARÁMETROS CLAVE:
+#   - preLLTV < LLTV: zona de pre-liquidación = [preLLTV, LLTV]
+#   - preLCF = linear(preLCF1→preLCF2) según quotient = (LTV-preLLTV)/(LLTV-preLLTV)
+#   - preLIF = linear(preLIF1→preLIF2) según quotient. preLIF ∈ [1, 1/LLTV]
+#   - preLCF puede ser > WAD (100%) — documented in L167-168
+#
+# TRUST BOUNDARIES:
+#   - Borrower MUST call Morpho.setAuthorization(preLiquidation, true) para opt-in
+#   - Cualquiera puede deployar PreLiquidation con parámetros arbitrarios (permisionless)
+#   - El constructor valida bounds matemáticos pero NO valida que el oracle sea "safe"
+#
+# INVARIANTE CENTRAL DEL PROTOCOLO:
+#   Post pre-liquidación: la posición NO puede quedar liquidable en Morpho
+#   (garantizado por withdrawCollateral → _isHealthy con MARKET oracle, L337 Morpho.sol)
+# ─────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════
+# SYMMETRIC INSPECTION
+# ═══════════════════════════════════════════════════════════════════════
+# Par: preLiquidate ↔ Morpho.liquidate
+#   1. State: ambas reducen borrowShares y collateral via Morpho internals.
+#      Morpho.liquidate maneja bad debt (collateral=0 → socializa, L391-401).
+#      PreLiquidation NO maneja bad debt — withdrawCollateral reverts si position unhealthy.
+#   2. Validaciones: Morpho.liquidate requiere !_isHealthy. PreLiquidation requiere
+#      preLLTV < LTV <= LLTV (two-sided check). ASIMETRÍA: Morpho.liquidate no tiene
+#      close factor limit. PreLiquidation sí (preLCF), pero puede ser > 100%.
+#   3. Rounding: Morpho.liquidate L371-378 usa EXACTAMENTE las mismas fórmulas de rounding
+#      que PreLiquidation L156-165. Misma dirección (Up/Down) en ambas ramas. SIMÉTRICO.
+#   4. Events: Morpho.liquidate incluye badDebtAssets/Shares. PreLiquidation no. OK — no aplica.
+#   5. Modifiers: NINGUNA tiene nonReentrant ni whenNotPaused. Morpho Blue es deliberadamente
+#      sin reentrancy guards — usa checks-effects-interactions (CEI).
+#
+# Par: seizedAssets-branch ↔ repaidShares-branch (dentro de preLiquidate)
+#   seizedAssets > 0 (L156-161):
+#     seizedAssetsQuoted = seizedAssets.mulDivUp(price, SCALE) → rounds UP (against liquidator)
+#     repaidShares = seizedAssetsQuoted.wDivUp(preLIF).toSharesUp(...) → rounds UP (against liquidator)
+#   repaidShares > 0 (L162-165):
+#     seizedAssets = repaidShares.toAssetsDown(...).wMulDown(preLIF).mulDivDown(SCALE, price) → all DOWN (against liquidator)
+#   BOTH branches round AGAINST the liquidator. Consistent and safe for borrower.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONSTRAINT INFERENCE (0xRajeev)
+# ═══════════════════════════════════════════════════════════════════════
+# 1. Morpho.repay: no close factor check. PreLiquidation: has preLCF check (L172).
+#    → preLCF is the ONLY constraint on how much can be repaid. If bypassed via iteration, no other guard.
+# 2. Morpho.withdrawCollateral: requires _isSenderAuthorized(onBehalf) (L331).
+#    PreLiquidation calls this with onBehalf=borrower. Borrower must have authorized PreLiquidation.
+#    → authorization is the trust gate. No per-call approval, it's blanket.
+# 3. Morpho._isHealthy uses MARKET oracle (L517,533). PreLiquidation uses PRE_LIQUIDATION_ORACLE.
+#    → TWO different price feeds for eligibility vs safety. This is the primary attack surface.
+# 4. preLIF2 <= WAD.wDivDown(LLTV) ensures post-pre-liq position is healthy IF same oracle used.
+#    With different oracles, this guarantee does NOT hold.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
+# TRAZA HACIA ATRÁS (samczsun)
+# ═══════════════════════════════════════════════════════════════════════
+# Exit point 1: MORPHO.withdrawCollateral(seizedAssets, borrower, liquidator) — L190
+#   ← called from onMorphoRepay ← called from MORPHO.repay ← called from preLiquidate
+#   Conditions: borrower authorized PreLiquidation, position in pre-liq zone per PRE_LIQUIDATION_ORACLE,
+#   seizedAssets calculated from preLIF * repaidValue, health check passes with MARKET oracle.
+#   Manipulation: can PRE_LIQUIDATION_ORACLE be manipulated? Can preLIF be inflated?
+#   Can seizedAssets exceed what's "fair"?
+#
+# Exit point 2: ERC20.safeTransferFrom(liquidator, this, repaidAssets) — L196
+#   This pulls loan tokens FROM the liquidator. If liquidator doesn't have them, reverts.
+#   No manipulation possible here — it's the liquidator paying.
+#
+# Exit point 3: IPreLiquidationCallback(liquidator).onPreLiquidate — L193-195
+#   Called AFTER withdrawCollateral, BEFORE safeTransferFrom. The liquidator gets collateral
+#   first, then must provide loan tokens. In this callback, the liquidator has the collateral
+#   and hasn't paid yet → can re-enter preLiquidate.
+# ═══════════════════════════════════════════════════════════════════════
+
+invariants:
+
+- id: PL-D-01
+  tier: 1
+  type: property
+  description: >
+    Iterative pre-liquidation via callback reentrancy: preLIF >= 1.0 (constructor enforced)
+    means each pre-liquidation removes MORE collateral value than debt value. Therefore,
+    after a pre-liquidation, the borrower's LTV INCREASES (gets worse). If the LTV remains
+    above PRE_LLTV, the position is STILL pre-liquidatable. A liquidator contract can use
+    the onPreLiquidate callback (L193-195) to re-enter preLiquidate() for the same borrower.
+    Morpho Blue has NO reentrancy guard (deliberate CEI design). The state IS correctly updated
+    (Morpho.repay updates borrowShares before callback, withdrawCollateral updates collateral
+    before callback), so each re-entrant call sees correct state. The bug is NOT a classic
+    reentrancy with stale state — it's that the CLOSE FACTOR (preLCF) protection is per-call,
+    not per-tx, and iteration bypasses the intended limit on how much collateral is seized at once.
+    Each successive call has higher LTV → higher quotient → higher preLCF AND higher preLIF,
+    creating an escalating feedback loop that extracts more collateral per iteration.
+  attack_scenario: >
+    Setup: LLTV=0.80e18, PRE_LLTV=0.75e18, PRE_LCF1=0.3e18, PRE_LCF2=1.0e18,
+    PRE_LIF1=1.01e18, PRE_LIF2=1.25e18 (max=1/0.80=1.25).
+    Borrower: 1000 USDC collateral value, 760 USDC debt (LTV=0.76).
+
+    Iteration 1: quotient=(0.76-0.75)/0.05=0.20, preLCF=0.44, preLIF=1.058
+      Repay: 0.44*760=334.4 debt. Seize: 334.4*1.058=353.8 collateral value.
+      New: debt=425.6, collateral=646.2, LTV=0.6587 → BELOW PRE_LLTV. STOPS.
+
+    BUT with LTV closer to LLTV:
+    Borrower: LTV=0.79. quotient=0.80, preLCF=0.86, preLIF=1.202
+      Repay: 0.86*790=679.4. Seize: 679.4*1.202=816.6 collateral value.
+      New: debt=110.6, collateral=183.4, LTV=0.603 → BELOW PRE_LLTV. STOPS.
+
+    In this case a SINGLE call already seizes 81.7% of collateral because preLCF=0.86.
+    The preLCF close factor ALREADY allows huge seizure near LLTV. The iteration adds
+    marginal damage only when LTV is in the lower part of the pre-liq zone.
+
+    REVISED ANALYSIS: With preLIF2=1/LLTV, the math guarantees that after a pre-liq
+    near LLTV, the position typically drops below PRE_LLTV (LTV improves significantly
+    because the large debt reduction outweighs the over-seizure at high preLIF).
+    Iteration is only possible with moderate LTV where preLIF is small enough that
+    LTV increases slightly. Let me verify with LTV=0.76, preLIF=1.058:
+      New LTV = (760-334.4)/(1000-353.8) = 425.6/646.2 = 0.659 < PRE_LLTV=0.75. STOPS.
+
+    Wait — 0.659 < 0.75, so it STOPS. Let me try with tighter params:
+    PRE_LLTV=0.70, LLTV=0.80, PRE_LIF1=1.0e18, PRE_LIF2=1.25e18.
+    LTV=0.71, quotient=0.10, preLCF=0.10*0.7+0.3=0.37, preLIF=1.0+0.10*0.25=1.025.
+      Repay: 0.37*710=262.7. Seize: 262.7*1.025=269.3 value.
+      New debt: 447.3, new collat: 730.7, new LTV: 447.3/730.7=0.6122 < PRE_LLTV=0.70. STOPS.
+
+    The math analysis shows that for reasonable parameters, pre-liquidation ALWAYS brings
+    the LTV well below PRE_LLTV in a single call. Iteration is NOT productive because
+    the debt reduction is substantial. The preLIF over-seizure is bounded by 1/LLTV which
+    ensures post-pre-liq health improvement. This looks like it's BY DESIGN and not exploitable.
+
+    HOWEVER: with PRE_LCF1 very small (e.g., 0.01e18) and PRE_LIF very close to LTV,
+    the small amount repaid with tiny over-seizure might keep LTV above PRE_LLTV.
+    With 1% close factor and 1.01x LIF: repay 1% of debt, seize 1.01% of debt in collateral.
+    The 0.01% extra seizure vs 1% debt reduction → LTV decreases by ~0.99%. If original
+    LTV was 0.751 (barely above PRE_LLTV=0.75), after 1 iteration LTV ≈ 0.751 - 0.0074 = 0.7436.
+    STILL below PRE_LLTV. Even 1% close factor brings LTV below threshold.
+
+    CONCLUSION: Iterative pre-liquidation is NOT viable because even minimal debt repayment
+    improves LTV more than the preLIF over-seizure worsens it. This is because:
+      LTV_new = (D - repaid) / (C - seized) = (D - repaid) / (C - repaid*preLIF)
+    For LTV_new > LTV_old = D/C: need (D-repaid)/(C-repaid*preLIF) > D/C
+    → C*(D-repaid) > D*(C-repaid*preLIF) → CD - C*repaid > DC - D*repaid*preLIF
+    → D*repaid*preLIF > C*repaid → D*preLIF > C → preLIF > C/D = 1/LTV.
+    So LTV worsens IFF preLIF > 1/LTV. Since LTV > PRE_LLTV and preLIF <= 1/LLTV < 1/PRE_LLTV < 1/LTV,
+    we have preLIF < 1/LTV always in the pre-liq zone. Therefore LTV ALWAYS IMPROVES.
+    The iteration hypothesis is MATHEMATICALLY IMPOSSIBLE given the constructor constraints.
+  impact: >
+    NO IMPACT — mathematically proven impossible. preLIF <= 1/LLTV < 1/LTV for any LTV
+    in the pre-liquidation zone [PRE_LLTV, LLTV]. Since preLIF < 1/LTV, every pre-liquidation
+    IMPROVES the LTV. Iteration cannot escalate.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that after every preLiquidate call, the borrower's LTV decreases
+    // (this should ALWAYS hold given preLIF < 1/LTV in the pre-liq zone)
+    if (ghost_ltv_before > 0 && ghost_was_preliquidated) {
+        Position memory pos = MORPHO.position(ID, borrower);
+        Market memory mkt = MORPHO.market(ID);
+        uint256 price = IOracle(PRE_LIQUIDATION_ORACLE).price();
+        uint256 colQuoted = uint256(pos.collateral).mulDivDown(price, ORACLE_PRICE_SCALE);
+        uint256 borrowed = uint256(pos.borrowShares).toAssetsUp(mkt.totalBorrowAssets, mkt.totalBorrowShares);
+        uint256 ltv_after = colQuoted > 0 ? borrowed.wDivUp(colQuoted) : type(uint256).max;
+        // LTV must decrease after pre-liquidation
+        lt(ltv_after, ghost_ltv_before, "PL-D-01: LTV did not improve after pre-liquidation");
+    }
+  ghost_vars:
+    - uint256 internal ghost_ltv_before;
+    - bool internal ghost_was_preliquidated;
+  validated: true
+  priority: high
+  confidence: 90
+  notes: >
+    PROVEN FALSE via mathematical analysis. preLIF <= 1/LLTV (constructor constraint) and
+    LTV > PRE_LLTV ≥ some value > 0. In the pre-liq zone, LTV ∈ (PRE_LLTV, LLTV].
+    preLIF ∈ [PRE_LIF_1, PRE_LIF_2] ⊆ [1, 1/LLTV]. For LTV > PRE_LLTV > 0:
+    1/LTV < 1/PRE_LLTV. And preLIF <= 1/LLTV < 1/LTV. Therefore preLIF < 1/LTV → LTV improves.
+    Wait, that's wrong. 1/LLTV < 1/PRE_LLTV because LLTV > PRE_LLTV. And preLIF <= 1/LLTV.
+    But LTV ∈ (PRE_LLTV, LLTV], so 1/LTV ∈ [1/LLTV, 1/PRE_LLTV).
+    So preLIF <= 1/LLTV <= 1/LTV. With equality only when LTV = LLTV and preLIF = 1/LLTV.
+    At the boundary LTV=LLTV and preLIF=1/LLTV=preLIF2, LTV stays the same (neutral).
+    For any LTV < LLTV, preLIF < 1/LTV → LTV improves strictly.
+    STILL: the invariant is worth fuzz-testing to confirm the math holds with rounding.
+
+- id: PL-D-02
+  tier: 1
+  type: property
+  description: >
+    Dual-oracle divergence exploitation: PRE_LIQUIDATION_ORACLE determines eligibility
+    (is position pre-liquidatable?) and seized collateral amount. MARKET oracle (ORACLE)
+    determines post-withdrawal health check in Morpho. If PRE_LIQUIDATION_ORACLE reports
+    collateral price LOWER than MARKET oracle, then:
+    (a) Position appears to have HIGHER LTV per PRE_LIQUIDATION_ORACLE → eligible for pre-liq
+    (b) preLIF is higher (higher quotient) → more collateral seized per unit of debt
+    (c) seizedAssets is larger (lower price → more tokens needed to match value)
+    (d) Morpho health check uses MARKET oracle (higher price) → position still healthy → passes
+    Result: liquidator receives more collateral than warranted by market conditions.
+    HOWEVER: the borrower opt-in means the borrower accepted this oracle. The question is
+    whether the design allows for unfair value extraction even within "legitimate" oracle divergence.
+  attack_scenario: >
+    Scenario 1 — Malicious oracle:
+    1. Attacker deploys PreLiquidation with preLiquidationOracle = AttackerOracle.
+    2. AttackerOracle.price() initially returns same as market oracle.
+    3. Victim borrower authorizes this PreLiquidation (tricked via UI or social engineering).
+    4. Attacker sets AttackerOracle to return price 20% lower.
+    5. Victim's position now appears pre-liquidatable with high quotient.
+    6. Attacker calls preLiquidate, seizes extra collateral.
+    7. Morpho health check with real oracle: position still healthy (reduced debt helps).
+
+    Scenario 2 — Legitimate oracle lag:
+    1. PreLiquidation uses Chainlink (1h heartbeat). Market uses Uniswap TWAP (5min).
+    2. Collateral drops 10% suddenly. TWAP reflects it in 5min. Chainlink in 1h.
+    3. During the lag, PRE_LIQUIDATION_ORACLE (Chainlink) shows higher price,
+       MARKET oracle (TWAP) shows lower price. OPPOSITE direction.
+    4. In this case, PreLiquidation thinks LTV is LOWER → less aggressive pre-liq → BORROWER IS PROTECTED.
+    5. But if inverted (TWAP as preLiqOracle, Chainlink as market): pre-liq oracle shows
+       lower price → higher LTV → more aggressive seizure → market oracle says healthy.
+  impact: >
+    Scenario 1: total loss of collateral excess = debt * (preLIF_diverged - preLIF_fair).
+    With 20% price divergence and preLIF max 1.25, excess could be ~5-15% of seized value.
+    Scenario 2: depends on volatility and heartbeat differences. Typically 1-5% for major assets.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Compare seized collateral value (at MARKET oracle price) vs repaid debt value.
+    // The ratio should not exceed preLIF + rounding tolerance.
+    uint256 marketPrice = IOracle(ORACLE).price();
+    uint256 preLiqPrice = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    // If prices diverge, the effective seizure ratio differs from intended preLIF
+    if (ghost_seized > 0 && ghost_repaid > 0) {
+        uint256 seizedValueMarket = ghost_seized.mulDivDown(marketPrice, ORACLE_PRICE_SCALE);
+        // Effective LIF at market price should not exceed PRE_LIF_2
+        uint256 effectiveLIF = seizedValueMarket.wDivUp(ghost_repaid);
+        lte(effectiveLIF, PRE_LIF_2 + 1e15, "PL-D-02: effective LIF exceeds PRE_LIF_2 due to oracle divergence");
+    }
+  ghost_vars:
+    - uint256 internal ghost_seized;
+    - uint256 internal ghost_repaid;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    The core question for reportability: is oracle divergence between PRE_LIQUIDATION_ORACLE
+    and MARKET oracle a known/accepted risk that borrowers take on when they authorize a
+    PreLiquidation? If yes → informational. If the protocol should enforce same oracle → Medium.
+    Need to check documentation/README for stated assumptions about oracle consistency.
+    The constructor does NOT require preLiquidationOracle == marketParams.oracle.
+    The factory (if any) might enforce it — check PreLiquidationFactory.
+
+- id: PL-D-03
+  tier: 1
+  type: property
+  description: >
+    Dust positions cannot be pre-liquidated: when a position has very small borrowShares
+    or very small collateral, the rounding in seizedAssets/repaidShares calculations can
+    produce 0 for one of the values. Specifically:
+    - repaidShares=1: toAssetsDown(1, totalBorrowAssets, totalBorrowShares) can be 0 when
+      totalBorrowShares >> totalBorrowAssets + VIRTUAL_ASSETS (with virtual shares 1e6).
+      If toAssetsDown returns 0, then wMulDown(0, preLIF)=0, mulDivDown(0,...)=0 → seizedAssets=0.
+      MORPHO.withdrawCollateral(0,...) reverts with ZERO_ASSETS (L328 Morpho.sol).
+    - seizedAssets=1: mulDivUp(1, price, ORACLE_PRICE_SCALE) can be 0 when
+      price < ORACLE_PRICE_SCALE. But ORACLE_PRICE_SCALE = 1e36, and typical prices are ~1e36,
+      so mulDivUp(1, 1e36, 1e36) = 1. Then wDivUp(1, preLIF) where preLIF ≈ 1e18: = ceil(1e18/1e18) = 1.
+      toSharesUp(1, totalBorrowAssets, totalBorrowShares) = ceil(1*(totalShares+1e6)/(totalAssets+1)) ≥ 1.
+      So seizedAssets=1 works. repaidShares ≥ 1. MORPHO.repay(0, repaidShares≥1,...) works.
+    Main risk: repaidShares=1 branch where seizedAssets rounds to 0.
+    This means dust positions with very small debt are impossible to pre-liquidate,
+    potentially accumulating bad micro-debt if borrower abandons position.
+  attack_scenario: >
+    1. Borrower creates position with 1 wei of collateral and 1 borrowShare.
+    2. Interest accrues, LTV crosses PRE_LLTV.
+    3. Liquidator tries preLiquidate(borrower, 0, 1, "") → repaidShares=1.
+    4. toAssetsDown(1, totalBorrowAssets, totalBorrowShares) → depends on share price.
+       With virtualShares=1e6 and virtualAssets=1: = 1*(totalBorrowAssets+1)/(totalBorrowShares+1e6).
+       If totalBorrowAssets=1e18 and totalBorrowShares=1e24: = 1e18/1e24 ≈ 0. seizedAssets=0.
+       BUT: totalBorrowShares is in shares with virtual offset. In Morpho Blue, first borrow of
+       1e18 assets gets ~1e24 shares (1e18 * (0+1e6) / (0+1) = 1e24). So ratio is 1:1e6.
+       toAssetsDown(1, 1e18, 1e24) = 1*(1e18+1)/(1e24+1e6) ≈ 0. seizedAssets=0. REVERTS.
+    5. Even with seizedAssets=1: works (as analyzed above). But withdrawCollateral(1,...) is 1 wei.
+       If 1 wei of collateral doesn't bring position healthy, revert. So: need to analyze if
+       repaying 1 share while seizing 1 wei actually improves health.
+    6. Dust position stuck: not pre-liquidatable, not worth normal liquidation gas.
+  impact: >
+    Micro bad debt accumulation. Each dust position is trivial (<$0.01), but if protocol
+    allows permisionless position creation, thousands of dust positions could be created
+    as griefing to accumulate bad debt that gets socialized to lenders. However, gas cost
+    of creating each position likely exceeds the bad debt created.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that any pre-liquidatable position can actually be pre-liquidated
+    // with some nonzero seizedAssets and repaidShares
+    Position memory pos = MORPHO.position(ID, borrower);
+    Market memory mkt = MORPHO.market(ID);
+    if (pos.borrowShares > 0 && pos.collateral > 0) {
+        uint256 price = IOracle(PRE_LIQUIDATION_ORACLE).price();
+        uint256 colQuoted = uint256(pos.collateral).mulDivDown(price, ORACLE_PRICE_SCALE);
+        uint256 bor = uint256(pos.borrowShares).toAssetsUp(mkt.totalBorrowAssets, mkt.totalBorrowShares);
+        bool inPreLiqZone = bor > colQuoted.wMulDown(PRE_LLTV) && bor <= colQuoted.wMulDown(LLTV);
+        if (inPreLiqZone) {
+            // Try pre-liquidating with seizedAssets=1 (more likely to work than repaidShares=1)
+            try preLiquidation.preLiquidate(borrower, 1, 0, "") returns (uint256 s, uint256 r) {
+                gt(s, 0, "PL-D-03: seized 0 on dust pre-liq");
+                gt(r, 0, "PL-D-03: repaid 0 on dust pre-liq");
+            } catch {
+                // If it reverts, check if it's because of health check failure vs zero amounts
+                t(false, "PL-D-03: dust position in pre-liq zone cannot be pre-liquidated");
+            }
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The main question is whether Morpho Blue allows creation of dust positions at all.
+    In Morpho Blue, borrow() requires assets > 0 OR shares > 0, but no minimum amount.
+    supplyCollateral requires assets > 0 but no minimum. So yes, dust positions are possible.
+    The practical risk is low because gas cost of creating positions far exceeds micro bad debt.
+    But on L2s (Base, Arbitrum) with low gas, this could be more viable.
+
+- id: PL-D-04
+  tier: 1
+  type: property
+  description: >
+    Interest accrual timing — triple accrueInterest in single tx: PreLiquidation calls
+    MORPHO.accrueInterest(marketParams()) at L138. Then MORPHO.repay() internally calls
+    _accrueInterest at L281. Then MORPHO.withdrawCollateral() internally calls _accrueInterest
+    at L333. The second and third calls are no-ops because lastUpdate was already set to
+    block.timestamp by the first call. This is correct behavior.
+    HOWEVER: what if a third party calls MORPHO.accrueInterest BETWEEN the PreLiquidation
+    call reading market state (L140-141) and the MORPHO.repay call (L175)? This is impossible
+    within a single tx (atomic). But what about the CALLBACK at L193-195?
+    During onPreLiquidate callback, the liquidator has received collateral but not yet paid
+    loan tokens. At this point Morpho.repay has ALREADY executed (state updated). The callback
+    cannot affect the current pre-liquidation's calculations. BUT: if the liquidator calls
+    some OTHER Morpho function (e.g., supply, borrow) during the callback, it could modify
+    totalBorrowAssets/totalBorrowShares. This doesn't affect the current pre-liquidation
+    (calculations already done), but could affect a SUBSEQUENT pre-liquidation in the same tx
+    (if re-entering preLiquidate). The subsequent call would read the modified state.
+    KEY INSIGHT: the accrueInterest at L138 of the re-entrant call would be a no-op
+    (same block), so the state read would reflect changes made by the liquidator's callback.
+    This could be used to manipulate totalBorrowAssets/totalBorrowShares to get favorable
+    share conversion rates on the re-entrant pre-liquidation.
+  attack_scenario: >
+    1. Liquidator calls preLiquidate(borrower, ..., callbackData).
+    2. Morpho.repay reduces totalBorrowAssets and totalBorrowShares.
+    3. In onMorphoRepay, withdrawCollateral sends collateral to liquidator.
+    4. In onPreLiquidate callback, liquidator:
+       a. Calls MORPHO.supply() to inject a large amount of loan tokens → increases totalSupplyAssets
+          (but doesn't change totalBorrowAssets/totalBorrowShares directly).
+       b. Actually: supply/withdraw don't change totalBorrow. Only borrow/repay do.
+       c. Liquidator calls MORPHO.borrow() to increase totalBorrowAssets/totalBorrowShares.
+          This changes the share price for the re-entrant preLiquidate.
+    5. Re-entrant preLiquidate reads modified totalBorrowAssets/totalBorrowShares.
+    6. The modified share price could cause:
+       - borrowed (L145) = borrowShares.toAssetsUp(modified_total) → different value
+       - LTV changes → different preLIF/preLCF
+       - repaidShares (L159-160) conversion rate changes
+
+    BUT: the liquidator borrowing from Morpho requires collateral. The liquidator just received
+    collateral from withdrawCollateral. They could use it as collateral to borrow from the SAME
+    market, changing totalBorrowAssets. This is a complex multi-step attack.
+
+    PRACTICAL ASSESSMENT: the share price changes from a single borrow are proportional
+    to the borrow amount vs total market size. For a $10M market, a $100K borrow changes
+    share price by 1%. The effect on preLIF/preLCF calculation is marginal. Not practical.
+  impact: >
+    Theoretical only. The share price manipulation via callback borrow/repay is bounded by
+    the collateral available to the liquidator and the relative size vs total market.
+    In practice, the manipulation would cost more (gas + capital) than the marginal gain
+    in collateral seized.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track totalBorrowAssets/totalBorrowShares before and after preLiquidate
+    // to detect manipulation during callback
+    Market memory mktBefore = MORPHO.market(ID);
+    ghost_totalBorrowBefore = mktBefore.totalBorrowAssets;
+    ghost_totalSharesBefore = mktBefore.totalBorrowShares;
+    // After preLiquidate completes:
+    Market memory mktAfter = MORPHO.market(ID);
+    // totalBorrowAssets should only decrease by repaidAssets (nothing else changed)
+    // If it changed by more, something happened in the callback
+    uint256 expectedDecrease = ghost_repaidAssets;
+    uint256 actualDecrease = ghost_totalBorrowBefore > mktAfter.totalBorrowAssets
+        ? ghost_totalBorrowBefore - mktAfter.totalBorrowAssets : 0;
+    // Allow 1 wei tolerance (Morpho note: repaidAssets may be > totalBorrowAssets by 1)
+    lte(actualDecrease, expectedDecrease + 1, "PL-D-04: totalBorrowAssets changed by unexpected amount");
+  ghost_vars:
+    - uint256 internal ghost_totalBorrowBefore;
+    - uint256 internal ghost_totalSharesBefore;
+    - uint256 internal ghost_repaidAssets;
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    This is highly theoretical. The callback manipulation requires the liquidator to have
+    capital to borrow, and the effect on share price is marginal relative to total market size.
+    Lower priority than oracle divergence (PL-D-02) and dust positions (PL-D-03).
+
+- id: PL-D-05
+  tier: 1
+  type: property
+  description: >
+    quotient rounding exceeds WAD: in L152, ltv = borrowed.wDivUp(collateralQuoted).
+    In L148, the require checks borrowed <= collateralQuoted.wMulDown(LLTV).
+    wMulDown truncates: collateralQuoted * LLTV / WAD (floor).
+    wDivUp rounds up: borrowed * WAD / collateralQuoted (ceil).
+    If borrowed = collateralQuoted.wMulDown(LLTV) = floor(collateralQuoted * LLTV / WAD),
+    then ltv = ceil(borrowed * WAD / collateralQuoted).
+    = ceil(floor(collateralQuoted * LLTV / WAD) * WAD / collateralQuoted).
+    If collateralQuoted * LLTV is not divisible by WAD, then floor removes a remainder r,
+    so borrowed = (collateralQuoted * LLTV - r) / WAD where 0 < r < WAD.
+    ltv = ceil((collateralQuoted * LLTV - r) * WAD / (WAD * collateralQuoted))
+        = ceil(LLTV - r/collateralQuoted).
+    For large collateralQuoted, r/collateralQuoted ≈ 0, so ltv ≈ LLTV.
+    But ceil can push it to LLTV. Can it push to LLTV + 1?
+    ceil(LLTV - epsilon) = LLTV when epsilon < 1. And epsilon = r/collateralQuoted.
+    Since r < WAD and collateralQuoted ≥ 1, epsilon < WAD. So ceil(LLTV - epsilon) could be
+    LLTV (when epsilon > 0) or LLTV (when epsilon = 0).
+    Wait: ceil is the ceiling in integer division. ltv = (x * WAD + y - 1) / y where
+    x = borrowed, y = collateralQuoted. The key question: can ltv > LLTV?
+    borrowed <= collateralQuoted * LLTV / WAD. ltv = ceil(borrowed * WAD / collateralQuoted).
+    borrowed * WAD <= collateralQuoted * LLTV. So ltv = ceil(something <= LLTV).
+    ceil(x) > x only when x is not integer. ltv = ceil(borrowed * WAD / collateralQuoted).
+    borrowed * WAD / collateralQuoted <= LLTV (from require). ceil(≤ LLTV) could be LLTV + 1
+    ONLY if LLTV is not an integer... but LLTV IS an integer (it's a uint256 in WAD scale).
+    So ceil(x) where x <= LLTV (integer): if x < LLTV, ceil(x) <= LLTV. If x = LLTV, ceil = LLTV.
+    WAIT: x = borrowed * WAD / collateralQuoted is not necessarily an integer.
+    ceil(x) ≤ LLTV when x ≤ LLTV - 1 + fraction. But x can be LLTV - epsilon for tiny epsilon.
+    ceil(LLTV - epsilon) = LLTV for any epsilon ∈ (0, 1). So ltv = LLTV.
+    Can ltv = LLTV + 1? Only if x > LLTV, i.e., borrowed * WAD > LLTV * collateralQuoted.
+    But require says borrowed <= collateralQuoted * LLTV / WAD, i.e., borrowed * WAD <= LLTV * collateralQuoted.
+    Hmm, not exactly: borrowed <= floor(collateralQuoted * LLTV / WAD).
+    borrowed * WAD <= floor(collateralQuoted * LLTV / WAD) * WAD.
+    floor(collateralQuoted * LLTV / WAD) * WAD <= collateralQuoted * LLTV.
+    So borrowed * WAD <= collateralQuoted * LLTV. Hence x = borrowed * WAD / collateralQuoted <= LLTV.
+    ceil(x) = ceil(y/collateralQuoted) where y = borrowed * WAD.
+    In Solidity: (y + collateralQuoted - 1) / collateralQuoted. Since y <= LLTV * collateralQuoted:
+    (LLTV * collateralQuoted + collateralQuoted - 1) / collateralQuoted
+    = LLTV + (collateralQuoted - 1) / collateralQuoted. For collateralQuoted ≥ 2, this < LLTV + 1.
+    Integer division: = LLTV. So ltv <= LLTV always. quotient <= WAD.
+    BUT: for collateralQuoted = 1 (1 wei worth of collateral):
+    (LLTV * 1 + 1 - 1) / 1 = LLTV. Still LLTV.
+    CONCLUSION: quotient cannot exceed WAD. The math is tight.
+  attack_scenario: >
+    After thorough mathematical analysis, quotient = (ltv - PRE_LLTV) / (LLTV - PRE_LLTV)
+    where ltv <= LLTV (proven above). So quotient = (ltv - PRE_LLTV) / (LLTV - PRE_LLTV) <= 1.
+    But wDivDown rounds DOWN, so quotient <= WAD. No overflow possible.
+    The only edge case: when ltv = LLTV exactly, quotient = WAD exactly. preLIF = PRE_LIF_2.
+    preLCF = PRE_LCF_2. These are the maximum configured values. Working as designed.
+  impact: >
+    No impact. quotient is bounded by WAD. preLIF and preLCF are bounded by constructor limits.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify quotient <= WAD after every pre-liquidation
+    Market memory mkt = MORPHO.market(ID);
+    Position memory pos = MORPHO.position(ID, borrower);
+    uint256 price = IOracle(PRE_LIQUIDATION_ORACLE).price();
+    uint256 colQuoted = uint256(pos.collateral).mulDivDown(price, ORACLE_PRICE_SCALE);
+    uint256 bor = uint256(pos.borrowShares).toAssetsUp(mkt.totalBorrowAssets, mkt.totalBorrowShares);
+    if (bor > colQuoted.wMulDown(PRE_LLTV) && bor <= colQuoted.wMulDown(LLTV) && colQuoted > 0) {
+        uint256 ltv = bor.wDivUp(colQuoted);
+        uint256 quotient = (ltv - PRE_LLTV).wDivDown(LLTV - PRE_LLTV);
+        lte(quotient, WAD, "PL-D-05: quotient exceeds WAD");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 90
+  notes: >
+    Mathematically proven: quotient <= WAD. The require(borrowed <= collateralQuoted.wMulDown(LLTV))
+    combined with wDivUp for ltv still yields ltv <= LLTV due to Solidity integer arithmetic.
+    This is a solid invariant for fuzz-testing to confirm the proof computationally.
+
+- id: PL-D-06
+  tier: 2
+  type: property
+  description: >
+    No borrower slippage protection: there is no minCollateralRemaining, maxRepaidShares,
+    or cooldown mechanism. The borrower's only protection is the authorization gate
+    (setAuthorization). Once authorized, ANY pre-liquidation within the math bounds is
+    permitted at any time. Combined with MEV, a liquidator can front-run a borrower's
+    collateral supply or debt repayment to seize collateral unnecessarily.
+  attack_scenario: >
+    1. Borrower at LTV=0.76 (PRE_LLTV=0.75). Sends tx to supplyCollateral to drop to LTV=0.70.
+    2. MEV bot front-runs with preLiquidate, seizing max allowed collateral.
+    3. Borrower's supplyCollateral executes after, but collateral already seized.
+    4. Borrower paid incentive (preLIF-1) * repaid unnecessarily.
+    With preLIF=1.05 and $100K repaid: $5K lost to MEV bot.
+    But: this is the INTENDED behavior of pre-liquidation — someone is supposed to reduce risk.
+    The "front-running" is actually the mechanism working correctly, just faster than the borrower.
+    The real question: is the borrower adequately informed that authorization = permanent until revoked?
+  impact: >
+    Loss limited to incentive excess (preLIF - 1) * amount repaid. Typically 1-5% of
+    pre-liquidated amount. This is by-design economic cost of being in the pre-liq zone.
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Track total collateral loss per borrower across multiple pre-liquidations
+    // to detect excessive cumulative extraction
+    ghost_totalCollateralSeized[borrower] += seizedAssets;
+    // The total seized should be proportional to total debt reduction
+    uint256 totalDebtReduced = ghost_totalDebtRepaid[borrower];
+    if (totalDebtReduced > 0) {
+        uint256 effectiveRatio = ghost_totalCollateralSeized[borrower].mulDivUp(
+            IOracle(PRE_LIQUIDATION_ORACLE).price(), ORACLE_PRICE_SCALE
+        ).wDivUp(totalDebtReduced);
+        // Effective ratio should not exceed PRE_LIF_2 (max incentive)
+        lte(effectiveRatio, PRE_LIF_2 + 1e15, "PL-D-06: cumulative seizure ratio exceeds max preLIF");
+    }
+  ghost_vars:
+    - mapping(address => uint256) internal ghost_totalCollateralSeized;
+    - mapping(address => uint256) internal ghost_totalDebtRepaid;
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    Likely by-design. Pre-liquidation IS the mechanism to reduce risk before full liquidation.
+    The borrower opted in. The MEV front-running is the market working as intended.
+    Informational at best. Do not spend time fuzzing this unless other hypotheses are exhausted.
+
+- id: PL-D-07
+  tier: 1
+  type: property
+  description: >
+    Rounding asymmetry between seizedAssets and repaidShares branches enables extracting
+    1 wei advantage: in the seizedAssets > 0 branch, repaidShares is calculated with
+    wDivUp and toSharesUp (rounds UP → liquidator pays more). In the repaidShares > 0 branch,
+    seizedAssets is calculated with toAssetsDown, wMulDown, mulDivDown (rounds DOWN →
+    liquidator gets less). Both branches round AGAINST the liquidator, which is correct.
+    BUT: Morpho.repay() converts shares→assets using toAssetsUp (L284), meaning the actual
+    repaidAssets (loan tokens the liquidator must pay) is rounded UP. And the seizedAssets
+    sent to the liquidator is exact (no rounding in transfer). So the liquidator always
+    "overpays" slightly in both branches. Is there a way to exploit this?
+    If the liquidator ALTERNATES between branches strategically (seizedAssets=X in one call,
+    repaidShares=Y in next call), can they accumulate rounding in their favor?
+    ANALYSIS: In each call, all roundings go against the liquidator. Alternating doesn't help.
+    The borrower is always at least as well off as the exact (infinite precision) calculation.
+    This is CORRECT BEHAVIOR. Not a bug.
+  attack_scenario: >
+    No viable attack. All rounding directions favor the borrower/protocol, not the liquidator.
+    The 1-wei rounding in Morpho.repay's toAssetsUp means the liquidator pays 1 wei extra
+    per pre-liquidation call. This is standard and intentional.
+  impact: >
+    No impact. Rounding is consistently in favor of the borrower.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify rounding consistency: seized collateral value <= repaid debt * preLIF
+    // (liquidator never gets more than they should)
+    if (ghost_seized > 0 && ghost_repaid > 0) {
+        uint256 price = IOracle(PRE_LIQUIDATION_ORACLE).price();
+        uint256 seizedValue = ghost_seized.mulDivUp(price, ORACLE_PRICE_SCALE);
+        uint256 maxValue = ghost_repaid.wMulDown(ghost_preLIF);
+        lte(seizedValue, maxValue + 2, "PL-D-07: seized value exceeds repaid * preLIF");
+    }
+  ghost_vars:
+    - uint256 internal ghost_preLIF;
+  validated: true
+  priority: low
+  confidence: 85
+  notes: >
+    Confirmed safe by code analysis. All mulDiv and wDiv operations round against the
+    liquidator in both branches. The +2 tolerance accounts for the interaction between
+    Up rounding in seizedAssetsQuoted.mulDivUp and share conversion rounding.
+    This is a good sanity-check invariant but unlikely to break.
+
+false_positives:
+
+- hunter: DomainHunter
+  id: PL-D-FP-01
+  reason: >
+    Iterative pre-liquidation (PL-D-01): mathematically proven impossible given constructor
+    constraints. preLIF <= 1/LLTV and LTV ∈ (PRE_LLTV, LLTV], which means preLIF < 1/LTV
+    always (except at the exact boundary LTV=LLTV where preLIF=1/LTV, neutral).
+    Since preLIF < 1/LTV, each pre-liquidation IMPROVES the LTV strictly.
+    The position exits the pre-liquidation zone after a single call.
+    Callback reentrancy to preLiquidate would fail the require(borrowed > collateralQuoted.wMulDown(PRE_LLTV))
+    check because LTV dropped below PRE_LLTV.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      In Morpho PreLiquidation, iterative pre-liquidation via callback reentrancy is NOT possible.
+      The constraint preLIF2 <= 1/LLTV ensures preLIF < 1/LTV for all positions in the pre-liq zone.
+      This means each pre-liquidation strictly improves the borrower's LTV, pushing it below PRE_LLTV
+      and making the position ineligible for further pre-liquidation. Mathematical proof:
+      LTV_new < LTV_old iff preLIF < 1/LTV. Given preLIF <= 1/LLTV and LTV < LLTV: 1/LLTV < 1/LTV → QED.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: PL-D-FP-02
+  reason: >
+    Share price manipulation via donation (considered and rejected): Morpho Blue uses internal
+    counters (totalBorrowAssets, totalBorrowShares, totalSupplyAssets, totalSupplyShares) that
+    are only modified by protocol functions (supply, withdraw, borrow, repay, liquidate, accrueInterest).
+    Direct ERC20 transfers to Morpho do NOT change these counters. balanceOf is never used for
+    accounting. Donation attacks that work against ERC4626 vaults do NOT work against Morpho Blue.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Morpho Blue is immune to donation/direct-transfer attacks on share price because it uses
+      internal state counters, not balanceOf, for all accounting. Only protocol functions modify
+      totalBorrowAssets/totalBorrowShares.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: PL-D-FP-03
+  reason: >
+    quotient exceeding WAD (PL-D-05): mathematically proven impossible. The require at L148
+    ensures borrowed * WAD <= collateralQuoted * LLTV. Therefore ltv = ceil(borrowed * WAD / collateralQuoted) <= LLTV.
+    And quotient = (ltv - PRE_LLTV) / (LLTV - PRE_LLTV) <= (LLTV - PRE_LLTV) / (LLTV - PRE_LLTV) = 1.
+    With wDivDown rounding, quotient <= WAD. Confirmed.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      In Morpho PreLiquidation, the quotient for linear interpolation of preLIF/preLCF is bounded
+      by WAD (1e18). The require(borrowed <= collateralQuoted.wMulDown(LLTV)) ensures ltv <= LLTV,
+      and wDivDown for quotient ensures quotient <= WAD. preLIF and preLCF stay within constructor bounds.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: PL-D-FP-04
+  reason: >
+    Rounding asymmetry (PL-D-07): all rounding in both seizedAssets and repaidShares branches
+    consistently favors the borrower/protocol over the liquidator. wDivUp/toSharesUp for
+    repaidShares (liquidator pays more), toAssetsDown/wMulDown/mulDivDown for seizedAssets
+    (liquidator receives less). This is intentional and standard in Morpho Blue's design.
+    No value extraction possible by alternating branches.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      In Morpho PreLiquidation, rounding direction is consistently AGAINST the liquidator in
+      both input branches (seizedAssets > 0 and repaidShares > 0). Up-rounding for liquidator
+      cost, down-rounding for liquidator receipt. This is standard Morpho Blue design.
+    briefing_update_applied: false
+
+# ─────────────────────────────────────────────────────────────────────
+# RESUMEN DE PRIORIDADES PARA FUZZING (v2 — refined)
+# ─────────────────────────────────────────────────────────────────────
+# TIER 1 — CONFIRMED WORTH TESTING:
+#   PL-D-01: LTV always improves after pre-liq (SANITY CHECK — should hold, fuzz to confirm)
+#   PL-D-02: Oracle divergence → excess seizure (PRIMARY FINDING CANDIDATE — needs fork test)
+#   PL-D-03: Dust positions not pre-liquidatable (edge case — L2 gas economics make it plausible)
+#   PL-D-05: quotient <= WAD (SANITY CHECK — math proven, fuzz to confirm)
+#
+# TIER 2 — INVESTIGATE IF TIME:
+#   PL-D-04: Share price manipulation via callback (highly theoretical, low confidence)
+#   PL-D-06: No slippage protection (likely by-design, informational)
+#   PL-D-07: Rounding consistency (confirmed safe, sanity check only)
+#
+# HIGHEST PRIORITY FINDING:
+#   PL-D-02 (Oracle divergence) is the only finding with meaningful exploit potential.
+#   All other hypotheses were either proven false (PL-D-01, PL-D-05, PL-D-07) or
+#   are edge cases with limited impact (PL-D-03, PL-D-04, PL-D-06).
+#   The reportability of PL-D-02 depends entirely on whether the dual-oracle design
+#   is an acknowledged risk or a missing validation in the factory/constructor.
+# ─────────────────────────────────────────────────────────────────────

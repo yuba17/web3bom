@@ -1,0 +1,383 @@
+protocol: hyperlane
+component: AbstractInterchainAccountRouter
+file: solidity/contracts/middleware/AbstractInterchainAccountRouter.sol
+domain: trust
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: AIAR-TB-01
+  tier: 1
+  type: property
+  description: "_dispatchMessageWithValue does safeTransferFrom(msg.sender, router, _fee) then forceApprove(hook, max) -- if feeToken is fee-on-transfer, router receives less than _fee but approves max to hook"
+  attack_scenario: |
+    The flow in _dispatchMessageWithValue (line 258-268):
+    1. _fee = _Router_quoteDispatch(...) -- quotes the fee amount
+    2. safeTransferFrom(msg.sender, address(this), _fee) -- pulls _fee from user
+    3. forceApprove(address(_hook), type(uint256).max) -- approves hook for unlimited pull
+    4. mailbox.dispatch{value: _value}(...) -- mailbox pulls fee from router via hook
+
+    If feeToken is a fee-on-transfer token, the router receives (_fee - feeOnTransfer) tokens.
+    But the forceApprove is type(uint256).max, so the hook can still pull up to _fee. If the
+    hook tries to pull _fee tokens and the router only has (_fee - feeOnTransfer), the hook's
+    transferFrom will either:
+    a) Revert (DoS on dispatch), or
+    b) Pull less than _fee (if hook handles partial amounts)
+
+    In scenario (a), ALL dispatches using this feeToken are permanently DoS'd.
+    In scenario (b), the hook gets underpaid, potentially stalling message relay.
+
+    More critically: if there were pre-existing feeToken balance in the router (from previous
+    operations or donations), the fee-on-transfer shortfall is covered by those existing tokens,
+    effectively stealing previous deposits.
+  impact: "Medium -- fee-on-transfer tokens either DoS all dispatches or cause router to subsidize fees from its own balance"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After a dispatch with feeToken, the router's feeToken balance should not decrease
+    // below what it held before the dispatch (the fee should come from the caller, not router)
+    uint256 routerBalAfter = feeToken.balanceOf(address(originRouter));
+    lte(
+        ghost_routerBalanceBefore,
+        routerBalAfter + 1,
+        "AIAR-TB-01: router feeToken balance decreased -- fee subsidization"
+    );
+  ghost_vars:
+  - "uint256 internal ghost_routerFeeTokenBalanceBefore;"
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: |
+    The feeToken is specified in hookMetadata by the caller. If Hyperlane only supports
+    standard ERC20s as fee tokens, this is a non-issue. But the contract does not validate
+    the feeToken address, so any ERC20 could be specified.
+  poc_sketch: |
+    1. Deploy a fee-on-transfer token with 1% fee
+    2. Set hookMetadata to use this FoT token as feeToken
+    3. Call callRemoteWithOverrides -- safeTransferFrom pulls 100, router gets 99
+    4. Hook tries to pull 100 from router -- reverts (DoS) or pulls from router reserves
+  call_stack: "_dispatchMessageWithValue line 266-267"
+
+- id: AIAR-TB-02
+  tier: 1
+  type: property
+  description: "MinimalProxy deployed ICA has immutable owner=router -- but getDeployedInterchainAccount is permissionless and does not call initialize() on the proxy"
+  attack_scenario: |
+    getDeployedInterchainAccount (line 154-182) deploys a MinimalProxy via Create2. The
+    MinimalProxy delegates all calls to the implementation (OwnableMulticall). OwnableMulticall's
+    constructor sets owner=_owner (the router address). But wait -- MinimalProxy does NOT run
+    the implementation's constructor. It's a proxy.
+
+    Looking at OwnableMulticall: owner is declared as `address public immutable owner`. Immutable
+    variables are stored in the bytecode, not in storage. For a MinimalProxy, the proxy has its
+    OWN bytecode (the minimal proxy bytecode), and delegatecalls to the implementation. When
+    delegatecall reads an immutable variable, it reads from the IMPLEMENTATION's bytecode, not
+    the proxy's.
+
+    This means: ALL MinimalProxy ICAs share the SAME owner value (the implementation's owner,
+    set during the implementation's deployment). The implementation contract's owner is set to
+    the router address that deployed it (from the constructor). So the owner IS the router.
+
+    Key question: is the implementation deployed with the correct router as owner? The
+    implementation is set in the constructor and is immutable. If the implementation was deployed
+    with router=address(X), then ALL ICAs deployed by this router instance treat X as owner.
+    If X != address(this_router), the ICAs have the WRONG owner.
+
+    This is safe IF the implementation is deployed correctly (owner=router). But there is no
+    on-chain validation that implementation.owner() == address(this).
+  impact: "High -- if implementation was deployed with wrong router address, ALL ICAs are owned by wrong entity"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that the implementation's owner matches the router
+    // OwnableMulticall(implementation).owner() should equal the router address
+    address implOwner = OwnableMulticall(payable(destRouter.implementation())).owner();
+    eq(
+        uint256(uint160(implOwner)),
+        uint256(uint160(address(destRouter))),
+        "AIAR-TB-02: implementation owner does not match router -- all ICAs compromised"
+    );
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: |
+    MinimalProxy uses DELEGATECALL. Immutable variables in Solidity are stored in the runtime
+    bytecode of the contract, not in storage. When a MinimalProxy does DELEGATECALL to the
+    implementation, `owner` is read from the implementation's bytecode. So ALL proxies share
+    the same owner. This is the intended behavior for ICA -- the router IS the owner of all ICAs.
+    The risk is only during deployment if implementation was deployed incorrectly.
+  poc_sketch: ''
+  call_stack: "getDeployedInterchainAccount -> Create2.deploy(MinimalProxy) -> delegatecall to implementation -> owner is in implementation bytecode"
+
+- id: AIAR-TB-03
+  tier: 2
+  type: property
+  description: "callRemoteWithOverrides passes user-supplied _router directly to _dispatchMessageWithValue which passes it to mailbox.dispatch as the recipient -- no validation against enrolled routers"
+  attack_scenario: |
+    callRemoteWithOverrides (line 217-245) takes _router as a parameter and passes it directly
+    to _dispatchMessageWithValue without checking if it matches the enrolled router for
+    _destination. The only check is _router != bytes32(0) (line 255).
+
+    This means ANY caller can send a cross-chain message to ANY address on ANY enrolled domain.
+    The message body encodes msg.sender as the ICA owner. On the destination:
+    - If _router is the actual enrolled router: Router.handle() checks sender == enrolled router
+      for the origin. This would pass if the origin router IS the enrolled router on the
+      destination.
+    - If _router is NOT the enrolled router: the message goes to an arbitrary address which
+      is NOT a router. That address receives raw calldata and may execute it.
+
+    Wait -- mailbox.dispatch sends the message cross-chain. The destination mailbox delivers
+    it to the _router address via process(). If _router is not a legitimate recipient, the
+    message either fails silently or the arbitrary contract processes it.
+
+    For the ICA use case: the destination router validates the sender in handle(). But the
+    message is sent TO _router, not to the enrolled destination router. So if _router is the
+    legitimate destination router, it works. If not, the message goes elsewhere.
+
+    The impact: users intentionally use overrides for custom routing. But an attacker could
+    send a message to a contract that accepts IMessageRecipient.handle() and processes the
+    ICA-formatted body, potentially executing arbitrary calls on the destination chain
+    through a non-ICA-router recipient.
+  impact: "Low to Medium -- user can send ICA-formatted messages to arbitrary recipients, but the recipient must implement handle() and process the body"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // callRemoteWithOverrides should work with the enrolled router
+    bytes32 enrolledRouter = originRouter.routers(DESTINATION);
+    // Verify that using the enrolled router does not revert
+    if (enrolledRouter != bytes32(0)) {
+        t(true, "AIAR-TB-03: enrolled router exists for destination");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: |
+    This is by design -- callRemoteWithOverrides is intentionally flexible to allow users
+    to specify custom routers. The destination side validates the sender. The main risk is
+    sending to non-router contracts, which is the user's own loss (they pay the gas/fee).
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-TB-04
+  tier: 1
+  type: property
+  description: "forceApprove(hook, type(uint256).max) in _dispatchMessageWithValue accumulates max approvals to the hook for EVERY distinct feeToken ever used -- no revocation"
+  attack_scenario: |
+    Each time _dispatchMessageWithValue is called with a different feeToken in hookMetadata,
+    the router grants forceApprove(hook, type(uint256).max) for that token. Over time, the
+    hook accumulates unlimited allowance on potentially many different tokens.
+
+    The approvals are NEVER revoked. Even if the hook is later changed (via setHook or admin
+    function), the OLD hook retains its approvals. If the old hook's address is later reused
+    (e.g., via CREATE2 redeployment by an attacker), the new contract at that address inherits
+    the existing approvals.
+
+    This is a trust boundary issue: the router's token approvals outlive the trust relationship
+    with the hook. The contract should approve only the exact amount needed, not type(uint256).max,
+    or should revoke after the dispatch completes.
+  impact: "Medium -- residual unlimited approvals to hooks across all fee tokens ever used, exploitable if hook address is compromised or reused"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After dispatch, the hook should not have unlimited allowance on the feeToken
+    address hookAddr = address(originRouter.hook());
+    uint256 allowance = feeToken.allowance(address(originRouter), hookAddr);
+    // The allowance should ideally be 0 after dispatch (tokens already pulled by hook)
+    // type(uint256).max means no revocation happened
+    if (allowance == type(uint256).max) {
+        // This is the vulnerable state -- unlimited permanent allowance
+        uint256 routerBal = feeToken.balanceOf(address(originRouter));
+        eq(routerBal, 0, "AIAR-TB-04: router has tokens AND hook has max allowance -- drain risk");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 75
+  notes: |
+    The forceApprove pattern is common in DeFi for gas efficiency, but in a cross-chain
+    context where hooks may change over time, permanent max approvals are risky.
+    The mitigation would be to approve only _fee amount, or to revoke after dispatch.
+  poc_sketch: |
+    1. Router dispatches with feeTokenA -- hook gets max approval on feeTokenA
+    2. Router dispatches with feeTokenB -- hook gets max approval on feeTokenB
+    3. Hook contract is upgraded/replaced -- old hook retains approvals
+    4. Old hook address is redeployed by attacker via CREATE2
+    5. Attacker's contract at old hook address calls transferFrom(router, attacker, all_tokens)
+  call_stack: "_dispatchMessageWithValue line 267"
+
+- id: AIAR-TB-05
+  tier: 2
+  type: property
+  description: "Create2 ICA address is deterministic and predictable -- ETH/tokens can be sent to the ICA address before deployment, and will be accessible by whoever deploys/controls the ICA"
+  attack_scenario: |
+    The ICA address is computed via Create2.computeAddress(salt, bytecodeHash). The address
+    is deterministic based on (origin, owner, router, ism, userSalt). Anyone can compute
+    this address before the ICA is deployed.
+
+    If tokens or ETH are sent to this address before the ICA proxy is deployed:
+    1. After deployment, the ICA (OwnableMulticall) can execute arbitrary calls including
+       token transfers
+    2. The ICA is owned by the router, and the router executes calls on behalf of the
+       encoded owner from the cross-chain message
+    3. Only the legitimate owner (from the origin chain) can instruct the ICA to move funds
+
+    The risk: if an attacker can compute the ICA address for a known user, they could
+    front-run the ICA creation and send phishing tokens to the address, creating a social
+    engineering setup. But this is a standard Create2 property, not a contract bug.
+
+    More interesting: getDeployedInterchainAccount is permissionless. An attacker can
+    deploy the ICA at the deterministic address by calling getDeployedInterchainAccount
+    with the right parameters. If the ICA's owner (from implementation's immutable) is
+    the router, and only the router can call multicall, then the deployment front-running
+    is harmless -- the attacker deployed it but cannot control it.
+  impact: "Low -- predictable address allows pre-funding but not unauthorized access"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that the predicted ICA address matches the deployed address
+    address predicted = address(destRouter.getLocalInterchainAccount(
+        ORIGIN, USER1, address(originRouter), address(destRouter)
+    ));
+    OwnableMulticall deployed = destRouter.getDeployedInterchainAccount(
+        ORIGIN, USER1, address(originRouter), address(destRouter)
+    );
+    eq(
+        uint256(uint160(predicted)),
+        uint256(uint160(address(deployed))),
+        "AIAR-TB-05: predicted ICA address must match deployed address"
+    );
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 85
+  notes: "Standard Create2 behavior. The ICA is controlled by the router, not by whoever deploys it."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-TB-06
+  tier: 1
+  type: property
+  description: "_enrollRemoteRouterAndIsm immutability check can be circumvented if Router._enrollRemoteRouter (parent) is called directly, which does NOT check isms"
+  attack_scenario: |
+    _enrollRemoteRouterAndIsm checks BOTH routers(dest) == EMPTY_SALT AND isms[dest] == EMPTY_SALT.
+    But the overridden _enrollRemoteRouter calls _enrollRemoteRouterAndIsm with ISM=EMPTY_SALT.
+
+    The parent Router has enrollRemoteRouter (external onlyOwner) which calls _enrollRemoteRouter.
+    AbstractInterchainAccountRouter overrides _enrollRemoteRouter to route through
+    _enrollRemoteRouterAndIsm.
+
+    BUT: Router also has enrollRemoteRouters (plural, external onlyOwner) which calls
+    _enrollRemoteRouter in a loop. This IS the overridden version, so the immutability check
+    applies.
+
+    However, the REAL issue is the unenrollRemoteRouter path. Router.unenrollRemoteRouter
+    calls _unenrollRemoteRouter which does _routers.remove(domain). This only clears the
+    router mapping, NOT the isms mapping. After unenroll:
+    - routers(domain) == bytes32(0) == EMPTY_SALT
+    - isms[domain] == previousIsm (NOT cleared)
+
+    Now _enrollRemoteRouterAndIsm will FAIL because isms[domain] != EMPTY_SALT.
+    The domain is permanently bricked: no router, but ISM prevents re-enrollment.
+
+    There is NO unenrollRemoteIsm function in the abstract contract. The isms mapping
+    has no removal mechanism. This is a permanent DoS of the domain's routing.
+  impact: "High -- owner can permanently brick a domain by unenrolling its router (ISM remains, prevents re-enrollment). No recovery path exists."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After enrolling a domain, unenrolling the router should also clear the ISM
+    // OR re-enrollment should be possible
+    bytes32 routerVal = originRouter.routers(DESTINATION);
+    bytes32 ismVal = originRouter.isms(DESTINATION);
+    // Invariant: if router is zero (unenrolled), ISM should also be zero
+    // Otherwise the domain is bricked
+    if (routerVal == bytes32(0)) {
+        eq(
+            uint256(ismVal),
+            uint256(0),
+            "AIAR-TB-06: domain bricked -- router unenrolled but ISM persists, no re-enrollment possible"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: |
+    This is the same finding as AIAR-AC-02 but from the trust boundary perspective.
+    The trust boundary violation is: Router.unenrollRemoteRouter (inherited) breaks the
+    invariant that router and ISM are always set/unset together. The immutability pattern
+    assumes they are always paired, but unenroll only removes one side.
+  poc_sketch: |
+    1. Owner calls enrollRemoteRouterAndIsm(42, routerA, ismA) -- success
+    2. Owner calls unenrollRemoteRouter(42) -- success (only removes router)
+    3. routers(42) == 0, isms[42] == ismA
+    4. Owner calls enrollRemoteRouterAndIsm(42, routerB, ismB) -- REVERTS
+    5. "router and ISM defaults are immutable once set" because isms[42] != EMPTY_SALT
+    6. Domain 42 is permanently bricked
+  call_stack: "unenrollRemoteRouter -> _unenrollRemoteRouter (Router.sol:132) -- only removes from _routers"
+
+- id: AIAR-TB-07
+  tier: 2
+  type: property
+  description: "OwnableMulticall.revealAndExecute has no access control -- anyone can execute committed calls if they know the salt and calls preimage"
+  attack_scenario: |
+    OwnableMulticall.revealAndExecute (line 52-71) is external payable with NO onlyOwner
+    modifier. Anyone who knows (or can compute) the salt and calls that produce a valid
+    commitmentHash can execute the committed calls.
+
+    The commitment is set via setCommitment (which IS onlyOwner). But the reveal is
+    permissionless. The commitment hash = keccak256(abi.encodePacked(salt, abi.encode(calls))).
+
+    If the calls are known (e.g., from observing the origin chain's callRemoteCommitReveal
+    transaction), anyone can front-run the legitimate reveal by calling revealAndExecute first.
+    Since the commitment is deleted after execution, the legitimate reveal will fail.
+
+    This is ALREADY KNOWN as IAR-DD-04. But from the abstract base perspective: the base
+    class deploys OwnableMulticall as ICAs, and the OwnableMulticall contract is the one
+    with the missing ACL. So this is inherent to any router using this base class.
+
+    SKIPPING -- already IAR-DD-04.
+  impact: "Already covered by IAR-DD-04"
+  impact_rating: High
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Already covered by IAR-DD-04 -- not duplicating
+    t(true, "AIAR-TB-07: revealAndExecute ACL -- see IAR-DD-04");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: "SKIP -- this is IAR-DD-04. Documented here only for completeness."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: AIAR-TB-FP-01
+  reason: |
+    Compiler version ^0.8.13 -- no known critical compiler bugs affecting this code.
+    Checked overflow protection (built-in since 0.8.x), abi.encodePacked with fixed types (safe).
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null
+- hunter: TrustBoundaryHunter
+  id: AIAR-TB-FP-02
+  reason: |
+    SafeERC20 is used for all token interactions (safeTransferFrom, forceApprove). The
+    contract handles non-standard return values correctly. Not a vulnerability.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null
+- hunter: TrustBoundaryHunter
+  id: AIAR-TB-FP-03
+  reason: |
+    __GAP[47] storage gap is present for upgrade safety. Combined with Router's __GAP[48],
+    total reserved slots are adequate. No storage collision risk identified.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null

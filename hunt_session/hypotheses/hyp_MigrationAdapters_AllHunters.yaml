@@ -1,0 +1,801 @@
+protocol: morpho-bundler3
+component: MigrationAdapters
+files:
+  - src/adapters/migration/AaveV2MigrationAdapter.sol
+  - src/adapters/migration/AaveV3MigrationAdapter.sol
+  - src/adapters/migration/AaveV3OptimizerMigrationAdapter.sol
+  - src/adapters/migration/CompoundV3MigrationAdapter.sol
+  - src/adapters/CoreAdapter.sol
+domain: migration
+hunters:
+  - AccessHunter
+  - FlowHunter
+  - MathHunter
+  - DomainHunter
+  - TrustBoundaryHunter
+  - WildcardHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ============================================================================
+# RESUMEN EJECUTIVO
+# ============================================================================
+# Los 4 adaptadores de migracion son thin wrappers (~65 LOC cada uno) que:
+#   1. Reciben tokens/aTokens previamente enviados al adapter
+#   2. Aprueban el pool externo (Aave/Compound)
+#   3. Llaman repay/withdraw en el pool externo
+#   4. Revocan aprobacion (patron approve-max -> action -> approve-zero)
+#
+# Patron de seguridad comun:
+#   - Todas las funciones tienen onlyBundler3 (sin excepciones)
+#   - No hay estado mutable (solo immutables)
+#   - El flujo de fondos es unidireccional dentro de cada operacion
+#
+# DIFERENCIAS CLAVE entre adaptadores:
+#   - AaveV2/V3 withdraw: usa msg.sender (adapter) como "from" implicitamente
+#     porque los aTokens fueron transferidos al adapter previamente
+#   - AaveV3Optimizer withdraw: usa initiator() como "onBehalf" — el usuario
+#     debe haber aprobado al adapter como manager en el Optimizer
+#   - CompoundV3 withdraw: usa initiator() como "src" via withdrawFrom — el
+#     usuario debe haber dado allowance al adapter en Compound
+#   - CompoundV3 repay: usa supplyTo (signed accounting), NO repay directo
+#   - CompoundV3 repay: hace min(amount, borrowBalanceOf) — doble cap EXPLICITO
+#     AaveV2/V3 repay: delegan el cap a Aave internamente
+# ============================================================================
+
+invariants:
+
+# ============================================================================
+# ACCESS HUNTER
+# ============================================================================
+
+- id: MIG-ACC-01
+  tier: 2
+  type: property
+  hunter: AccessHunter
+  component: ALL
+  description: >
+    Todas las funciones externas de los 4 adaptadores (excepto receive() y los
+    getters immutable) tienen el modifier onlyBundler3. No existen funciones
+    externas sin proteccion de acceso.
+  attack_scenario: >
+    Si existiera una funcion sin onlyBundler3, un atacante podria llamarla
+    directamente para drenar tokens que esten temporalmente en el adapter
+    durante un bundle de otro usuario.
+  impact: "Robo directo de tokens en transito durante migracion"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificacion estatica — no se puede fuzzear, se verifica por inspeccion:
+    // AaveV2: aaveV2Repay(onlyBundler3), aaveV2Withdraw(onlyBundler3) — OK
+    // AaveV3: aaveV3Repay(onlyBundler3), aaveV3Withdraw(onlyBundler3) — OK
+    // AVO: aaveV3OptimizerRepay(onlyBundler3), aaveV3OptimizerWithdraw(onlyBundler3),
+    //       aaveV3OptimizerWithdrawCollateral(onlyBundler3) — OK
+    // CV3: compoundV3Repay(onlyBundler3), compoundV3WithdrawFrom(onlyBundler3) — OK
+    // CoreAdapter: nativeTransfer(onlyBundler3), erc20Transfer(onlyBundler3) — OK
+    // receive() — sin proteccion pero solo acepta ETH, no drena nada
+    // RESULTADO: 100% cobertura de onlyBundler3 en funciones mutables
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 99
+  notes: >
+    Verificado por lectura manual exhaustiva. No hay funciones ocultas ni
+    fallbacks peligrosos. receive() solo acepta ETH pasivamente.
+
+- id: MIG-ACC-02
+  tier: 2
+  type: property
+  hunter: AccessHunter
+  component: ALL
+  description: >
+    CoreAdapter.receive() es payable sin restriccion — cualquiera puede enviar
+    ETH al adapter. Esto es by-design para recibir unwrapped ETH del WETH
+    contract, pero significa que ETH puede quedar atrapado si no se recoge.
+  attack_scenario: >
+    Un atacante envia dust ETH al adapter antes de un bundle de un usuario. El
+    usuario hace nativeTransfer(type(uint256).max) esperando recibir solo SU
+    ETH, pero recibe el extra del atacante. Impacto: grief de dust, no es
+    explotable para robo.
+  impact: "Grief de dust — no explotable para robo"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // El adapter no guarda estado de "quien envio que" — los tokens que estan
+    // en el adapter al momento de un erc20Transfer/nativeTransfer van al receiver.
+    // Esto es by-design: el adapter es stateless entre bundles.
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    No es un finding. El patron stateless es intencional — el adapter se limpia
+    al final de cada bundle via erc20Transfer/nativeTransfer. Si queda algo,
+    cualquiera con acceso via bundler3 puede reclamarlo en un bundle posterior.
+
+# ============================================================================
+# FLOW HUNTER
+# ============================================================================
+
+- id: MIG-FLOW-01
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  component: AV2, AV3, AVO
+  description: >
+    Patron approve-max -> action -> approve-zero es CONSISTENTE en las 3
+    funciones de repay (aaveV2Repay, aaveV3Repay, aaveV3OptimizerRepay) y en
+    compoundV3Repay. Cada repay sigue: forceApprove(max) -> call -> forceApprove(0).
+  attack_scenario: >
+    Si el approve(0) final faltara en alguna funcion, el pool externo retendria
+    allowance infinita sobre el adapter. Un atacante podria explotar esto en un
+    bundle posterior donde el adapter contenga tokens del mismo tipo.
+  impact: "Tokens del adapter drenados via allowance residual"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificacion por inspeccion:
+    // AaveV2Repay L44: forceApprove(max) -> L46: repay -> L48: forceApprove(0) — OK
+    // AaveV3Repay L45: forceApprove(max) -> L47: repay -> L49: forceApprove(0) — OK
+    // AVORepay L40: forceApprove(max) -> L42: repay -> L44: forceApprove(0) — OK
+    // CV3Repay L36: forceApprove(max) -> L39: supplyTo -> L41: forceApprove(0) — OK
+    // RESULTADO: Patron consistente en los 4 adaptadores. Sin allowance residual.
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 99
+  notes: >
+    Importante: si el repay/supplyTo revierte internamente, la ejecucion entera
+    revierte y el approve(0) no se ejecuta — pero el approve(max) tampoco
+    persiste porque toda la tx revierte. Seguro.
+
+- id: MIG-FLOW-02
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  component: AV2, AV3
+  description: >
+    aaveV2Withdraw y aaveV3Withdraw NO hacen approve antes del withdraw. Esto es
+    CORRECTO porque Aave V2/V3 withdraw quema aTokens del msg.sender (el adapter),
+    no necesita approval del underlying — el pool envia el underlying al receiver.
+  attack_scenario: >
+    Si se anadiera un approve innecesario al pool para withdraw, se expondria
+    una allowance sin necesidad. La ausencia de approve aqui es la decision
+    correcta de seguridad.
+  impact: "N/A — comportamiento correcto"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // AaveV2 withdraw flow:
+    // 1. Usuario transfiere aTokens al adapter (via bundle anterior)
+    // 2. Adapter llama AAVE_V2_POOL.withdraw(token, amount, receiver)
+    // 3. Aave quema aTokens del msg.sender (adapter) y envia underlying a receiver
+    // No necesita approval porque Aave quema del caller, no hace transferFrom.
+    //
+    // AaveV3 withdraw: identico patron.
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 99
+  notes: >
+    Confirmado leyendo los contratos de Aave V2 LendingPool.withdraw() y
+    Aave V3 Pool.withdraw() — ambos queman aTokens del msg.sender.
+
+- id: MIG-FLOW-03
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  component: AVO
+  description: >
+    aaveV3OptimizerWithdraw y aaveV3OptimizerWithdrawCollateral usan initiator()
+    como onBehalf para el withdraw. El Optimizer hace withdraw DESDE la posicion
+    del initiator (no del adapter). Esto requiere que el initiator haya aprobado
+    al adapter como manager en el Optimizer previamente.
+  attack_scenario: >
+    Si initiator() devolviera address(0) o un valor incorrecto fuera de un
+    bundle context, el withdraw se haria desde una posicion incorrecta. Pero
+    onlyBundler3 garantiza que estamos en un bundle, y Bundler3.initiator()
+    devuelve el msg.sender original del multicall.
+  impact: "Retiro de fondos de la posicion incorrecta"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // initiator() en CoreAdapter L77-79:
+    //   return IBundler3(BUNDLER3).initiator();
+    // Bundler3 setea initiator al msg.sender del multicall().
+    // onlyBundler3 garantiza que solo Bundler3 puede llamar.
+    // => initiator() siempre es el usuario que inicio el bundle.
+    //
+    // El usuario DEBE haber llamado approveManager(adapter, true)
+    // en el Optimizer ANTES del bundle de migracion.
+    // Si no lo hizo, el withdraw revierte en el Optimizer — fallo seguro.
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 95
+  notes: >
+    initiator() NO es spoofable: solo Bundler3 puede llamar al adapter
+    (onlyBundler3), y Bundler3 solo setea initiator al msg.sender real del
+    multicall. No hay forma de inyectar un initiator falso.
+
+- id: MIG-FLOW-04
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  component: CV3
+  description: >
+    compoundV3WithdrawFrom usa initiator() como src para withdrawFrom. El adapter
+    retira tokens DE la posicion del initiator en Compound V3. Requiere que el
+    initiator haya llamado allow(adapter, true) en Compound V3 previamente.
+  attack_scenario: >
+    Si un usuario aprueba al adapter en Compound V3 y luego no la revoca,
+    cualquier futuro bundle que incluya compoundV3WithdrawFrom con el mismo
+    instance podria retirar de su posicion. Pero solo el propio usuario (como
+    initiator de un nuevo multicall) puede triggerear esto.
+  impact: "N/A si initiator() es correcto — solo el propio usuario puede retirar"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // CompoundV3WithdrawFrom L56: address initiator = initiator();
+    // L65: ICompoundV3(instance).withdrawFrom(initiator, receiver, asset, amount);
+    // Compound V3 verifica internamente que msg.sender (adapter) tiene
+    // allowance de initiator. Sin allowance -> revert.
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 95
+  notes: >
+    La allowance en Compound V3 es persistente (no se revoca automaticamente).
+    El usuario deberia revocar despues de la migracion, pero eso esta fuera del
+    scope del adapter — es responsabilidad del bundle designer incluir un
+    allow(adapter, false) al final.
+
+- id: MIG-FLOW-05
+  tier: 2
+  type: property
+  hunter: FlowHunter
+  component: ALL
+  description: >
+    Si amount=0 pasa la condicion type(uint256).max (no es max), las 4 funciones
+    de repay y las funciones de withdraw hacen require(amount != 0). No hay path
+    donde se ejecute un repay/withdraw con amount=0.
+  attack_scenario: >
+    Un repay/withdraw con amount=0 podria tener efectos secundarios inesperados
+    en algunos protocolos (e.g., Compound V3 podria actualizar estado sin mover
+    fondos). El require(amount != 0) elimina este vector.
+  impact: "Prevencion de interacciones sin fondos con protocolos externos"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // AaveV2Repay L42: require(amount != 0, ErrorsLib.ZeroAmount());
+    // AaveV3Repay L43: require(amount != 0, ErrorsLib.ZeroAmount());
+    // AVORepay L38: require(amount != 0, ErrorsLib.ZeroAmount());
+    // CV3Repay L34: require(amount != 0, ErrorsLib.ZeroAmount());
+    // AaveV2Withdraw L59: require(amount != 0, ErrorsLib.ZeroAmount());
+    // AaveV3Withdraw L60: require(amount != 0, ErrorsLib.ZeroAmount());
+    // AVOWithdraw L59: require(amount != 0, ErrorsLib.ZeroAmount());
+    // AVOWithdrawCollateral L75: require(amount != 0, ErrorsLib.ZeroAmount());
+    // CV3WithdrawFrom L63: require(amount != 0, ErrorsLib.ZeroAmount());
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 99
+  notes: Verificacion exhaustiva — todos los paths estan cubiertos.
+
+# ============================================================================
+# MATH HUNTER
+# ============================================================================
+
+- id: MIG-MATH-01
+  tier: 1
+  type: property
+  hunter: MathHunter
+  component: CV3
+  description: >
+    CompoundV3 repay hace un DOBLE cap: primero cap al balance del adapter
+    (si amount==max), luego cap al borrowBalanceOf(onBehalf). Esto es MAS
+    conservador que AaveV2/V3 que solo hacen cap al balance y delegan el cap
+    de deuda a Aave internamente.
+  attack_scenario: >
+    Si el doble cap tuviera un off-by-one, el adapter podria intentar repagar
+    mas de lo que el usuario debe, y Compound V3 supplyTo convertiria el exceso
+    en un deposito (no un repay). Pero MorphoUtilsLib.min() es correcto.
+  impact: "Deposito accidental en Compound V3 en lugar de repay"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // CompoundV3Repay L30: if (max) amount = balance
+    // L32: amount = MorphoUtilsLib.min(amount, borrowBalanceOf(onBehalf))
+    // supplyTo con signed accounting: si amount > debt, el exceso se deposita.
+    // El min() previene esto.
+    //
+    // Edge case: borrowBalanceOf cambia entre el read (L32) y el supplyTo (L39)
+    // si hay un bloque intermedio — pero todo esto es en la misma tx, asi que
+    // borrowBalanceOf es estable EXCEPTO si hay un reentrancy que modifique
+    // la deuda entre L32 y L39. Compound V3 supplyTo no tiene callbacks.
+    // => No hay reentrancy posible aqui.
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: >
+    El edge case de "exceso se deposita" esta mitigado por el min(). Pero si
+    Compound V3 accrues interest entre operaciones del mismo bundle (time=0
+    entre calls, asi que no hay accrual), no hay riesgo.
+
+- id: MIG-MATH-02
+  tier: 2
+  type: property
+  hunter: MathHunter
+  component: AV2, AV3
+  description: >
+    AaveV2/V3 repay con amount=type(uint256).max en el adapter se traduce a
+    amount=balanceOf(adapter). Luego Aave internamente caps esto al debt del
+    usuario. Si balance < debt, se repaga parcialmente. Si balance > debt, Aave
+    solo toma lo necesario y devuelve el exceso al adapter (NO al usuario).
+  attack_scenario: >
+    Si el usuario envia mas tokens de los necesarios al adapter para el repay,
+    el exceso queda en el adapter despues del repay. Si el bundle no incluye un
+    erc20Transfer para recoger el exceso, los tokens quedan en el adapter y
+    el siguiente usuario que haga un bundle podria reclamarlos.
+  impact: "Perdida de tokens excedentes si el bundle esta mal construido"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Scenario:
+    // 1. User sends 1000 USDC to adapter (via erc20TransferFrom in bundle)
+    // 2. User calls aaveV3Repay(USDC, type(uint256).max, 2, user)
+    // 3. Adapter sets amount = balanceOf(adapter) = 1000 USDC
+    // 4. Aave V3 repay: user debt = 800 USDC, so Aave takes 800, returns 200
+    // 5. 200 USDC remain in adapter
+    // 6. If bundle doesn't include erc20Transfer(USDC, user, type(uint256).max)
+    //    the 200 USDC are stranded
+    //
+    // Aave V2 repay: devuelve exceso? Depende de la version. En V2 el repay
+    // caps internamente y solo toma lo necesario — el exceso queda en el caller.
+    // Resultado identico: exceso queda en adapter.
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 85
+  notes: >
+    Esto es responsabilidad del bundle designer, no del adapter. Pero es un
+    vector real de perdida de fondos si el bundle esta mal construido.
+    Clasificacion: documentar como QA / informational. El adapter es correcto;
+    el riesgo esta en la capa de bundle composition.
+
+- id: MIG-MATH-03
+  tier: 2
+  type: property
+  hunter: MathHunter
+  component: CV3
+  description: >
+    CompoundV3 withdraw hace cap al balance del usuario (baseToken balance o
+    collateral balance segun el asset). Si el usuario no tiene posicion, el
+    require(amount != 0) despues del min() revierte limpiamente.
+  attack_scenario: >
+    Si userCollateral retornara un struct con balance=0 para un asset no
+    depositado, min(amount, 0) = 0, y require(0 != 0) revierte. Seguro.
+    No hay forma de extraer mas de lo que el usuario tiene.
+  impact: "N/A — comportamiento correcto"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // CV3WithdrawFrom L57-59:
+    // uint256 balance = asset == baseToken
+    //     ? balanceOf(initiator)
+    //     : userCollateral(initiator, asset).balance;
+    // L61: amount = min(amount, balance);
+    // L63: require(amount != 0);
+    //
+    // Para base token: balanceOf devuelve el supply balance (lending position)
+    // Para collateral: userCollateral.balance devuelve el collateral depositado
+    // Ambos son 0 si no hay posicion => require falla => revert limpio
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: El cap explicito es mas seguro que delegar al protocolo externo.
+
+# ============================================================================
+# DOMAIN HUNTER
+# ============================================================================
+
+- id: MIG-DOM-01
+  tier: 2
+  type: property
+  hunter: DomainHunter
+  component: ALL
+  description: >
+    Si el pool externo (Aave/Compound) esta pausado, la llamada a repay/withdraw
+    revierte. El adapter no tiene logica de fallback ni manejo de pausas. El
+    bundle entero falla a menos que el Call tenga skipRevert=true.
+  attack_scenario: >
+    Un usuario construye un bundle de migracion completo: repay deuda en Aave ->
+    withdraw collateral en Aave -> supply en Morpho. Si Aave se pausa entre la
+    creacion del bundle y su ejecucion, TODO el bundle revierte. El usuario no
+    pierde fondos (tx revierte atomicamente), pero la migracion falla.
+  impact: "DoS temporal de migracion — no hay perdida de fondos"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Aave V2: pool.paused() => todas las operaciones revierten
+    // Aave V3: reserve puede estar frozen/paused individualmente
+    // Compound V3: pauseGuardian puede pausar supply/withdraw
+    //
+    // El adapter no puede hacer nada — es un thin wrapper.
+    // El bundle es atomico: si cualquier paso falla (sin skipRevert),
+    // todo revierte y el usuario esta exactamente como antes.
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Not a finding. La atomicidad del bundle protege al usuario. skipRevert=true
+    en una call de migracion seria PELIGROSO (dejar al usuario con deuda
+    repagada pero sin migrar el collateral).
+
+- id: MIG-DOM-02
+  tier: 1
+  type: property
+  hunter: DomainHunter
+  component: ALL
+  description: >
+    Migracion parcial: si el bundle solo repaga deuda pero no retira collateral
+    (o viceversa), el usuario queda en un estado intermedio donde tiene deuda
+    parcialmente repagada en Aave pero el collateral sigue ahi. No hay mecanismo
+    de rollback parcial dentro del adapter.
+  attack_scenario: >
+    El bundle repaga 100% de la deuda en Aave (paso 1), luego intenta retirar
+    collateral (paso 2) pero falla porque el aToken transfer al adapter no se
+    completo. Con skipRevert=false, todo revierte — seguro. Con skipRevert=true
+    en el paso 2, la deuda se repago pero el collateral quedo en Aave — el
+    usuario perdio los tokens usados para repagar sin obtener el collateral.
+  impact: "Perdida de tokens de repay si skipRevert=true en withdraw que falla"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Si skipRevert=true en la call de withdraw:
+    //   Paso 1: repay exitoso — tokens salen del adapter a Aave
+    //   Paso 2: withdraw falla — skipRevert=true, bundle continua
+    //   Paso 3: supply a Morpho — no hay tokens, falla (o skipRevert tambien)
+    //   Resultado: deuda repagada, collateral no migrado, tokens de repay gastados
+    //
+    // Mitigacion: NO usar skipRevert=true en bundles de migracion.
+    // Esto es responsabilidad del bundle designer, no del adapter.
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: >
+    Es un riesgo de composability, no un bug del adapter. Pero es un escenario
+    real si el frontend genera bundles incorrectos. Clasificar como informational
+    para el bundle design guide.
+
+- id: MIG-DOM-03
+  tier: 2
+  type: property
+  hunter: DomainHunter
+  component: AV2, AV3
+  description: >
+    En Aave V2/V3, el interestRateMode parametro (1=stable, 2=variable) lo pasa
+    el usuario sin validacion en el adapter. Si el usuario tiene deuda variable
+    pero pasa interestRateMode=1 (stable), Aave V3 repay revertira porque no
+    hay deuda stable que repagar. Fallo seguro.
+  attack_scenario: >
+    Un bundle mal construido pasa el interestRateMode incorrecto. El repay
+    revierte en Aave. Si skipRevert=false, el bundle entero falla. Fallo seguro
+    pero UX confusa.
+  impact: "Fallo de migracion por parametro incorrecto — sin perdida de fondos"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // El adapter no valida interestRateMode. Aave lo valida internamente.
+    // Si el modo no matchea la deuda, Aave revierte.
+    // El adapter confia en que el caller (bundle designer) pasa el modo correcto.
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: Informational — validacion delegada al protocolo externo.
+
+# ============================================================================
+# TRUST BOUNDARY HUNTER
+# ============================================================================
+
+- id: MIG-TRUST-01
+  tier: 1
+  type: property
+  hunter: TrustBoundaryHunter
+  component: ALL
+  description: >
+    Los pools de Aave V2, Aave V3, Aave V3 Optimizer son IMMUTABLES seteados en
+    el constructor. No pueden ser cambiados post-deployment. Un pool malicioso
+    solo podria inyectarse si el deployer pasa una direccion maliciosa al
+    constructor — lo cual es un ataque al deployment, no al adapter.
+  attack_scenario: >
+    Si los pools NO fueran immutables, un atacante podria cambiar AAVE_V2_POOL
+    a un contrato malicioso que roba los tokens aprobados con forceApprove(max).
+    Dado que son immutables, este vector esta eliminado.
+  impact: "N/A — pools son immutables"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // AaveV2: IAaveV2 public immutable AAVE_V2_POOL; (L13)
+    // AaveV3: IAaveV3 public immutable AAVE_V3_POOL; (L13)
+    // AVO: IAaveV3Optimizer public immutable AAVE_V3_OPTIMIZER; (L13)
+    // CV3: NO tiene pool immutable — recibe `instance` como parametro!
+    //
+    // ATENCION: CompoundV3 es diferente — el instance se pasa por parametro
+    // en cada llamada, no es immutable. Ver MIG-TRUST-02.
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 99
+  notes: >
+    AaveV2/V3/AVO son seguros por immutability. CV3 tiene un modelo diferente.
+
+- id: MIG-TRUST-02
+  tier: 1
+  type: property
+  hunter: TrustBoundaryHunter
+  component: CV3
+  description: >
+    CompoundV3MigrationAdapter NO tiene un pool immutable. El parametro `instance`
+    se pasa en CADA llamada a compoundV3Repay y compoundV3WithdrawFrom. Esto
+    permite flexibilidad (multiples Comet markets) pero abre un vector: el
+    bundle designer puede pasar un `instance` arbitrario.
+  attack_scenario: >
+    Un atacante construye un bundle que pasa un contrato malicioso como `instance`
+    en compoundV3Repay. El adapter hace forceApprove(asset, instance, max), luego
+    llama instance.supplyTo(). El contrato malicioso podria hacer un
+    transferFrom del adapter durante supplyTo, robando los tokens aprobados.
+    PERO: el atacante es el initiator del bundle — solo puede robar tokens que
+    EL MISMO envio al adapter. No puede robar tokens de OTROS usuarios porque
+    onlyBundler3 previene llamadas fuera de un bundle.
+  impact: >
+    Bajo — el atacante solo puede manipular su propio bundle. Si el bundle es
+    construido por un frontend malicioso que inyecta un instance falso, el
+    usuario del frontend perderia sus tokens.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // compoundV3Repay flujo con instance malicioso:
+    // 1. User envia tokens al adapter (via bundle)
+    // 2. Adapter: forceApprove(asset, MALICIOUS_INSTANCE, max)
+    // 3. Adapter: MALICIOUS_INSTANCE.supplyTo(onBehalf, asset, amount)
+    //    -> MALICIOUS_INSTANCE podria llamar asset.transferFrom(adapter, attacker, max)
+    //    porque tiene approval
+    // 4. Adapter: forceApprove(asset, MALICIOUS_INSTANCE, 0) — pero tokens ya robados
+    //
+    // PERO: esto solo funciona si el USUARIO (via su bundle) pasa el instance malicioso.
+    // El adapter no puede distinguir un Comet real de uno falso.
+    //
+    // Mitigacion: el frontend deberia validar que instance es un Comet conocido.
+    // A nivel de adapter, esta es una decision de diseno explicita (soportar
+    // multiples Comet markets sin re-deploy).
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: >
+    VECTOR INTERESANTE pero la responsabilidad es del bundle designer, no del
+    adapter. El adapter asume que el caller sabe lo que hace (patron comun en
+    bundler architectures). Documentar como informational — el frontend es la
+    linea de defensa. Si el frontend es comprometido, este es un path de ataque.
+
+- id: MIG-TRUST-03
+  tier: 2
+  type: property
+  hunter: TrustBoundaryHunter
+  component: AVO, CV3
+  description: >
+    Las funciones de withdraw del Optimizer y CompoundV3 dependen de que el
+    usuario haya dado permisos previos (approveManager para AVO, allow para CV3).
+    Estos permisos son PERSISTENTES — no se revocan automaticamente despues de
+    la migracion.
+  attack_scenario: >
+    Si el usuario aprueba al adapter como manager en AaveV3 Optimizer y luego no
+    la revoca, el adapter retiene la capacidad de retirar de su posicion
+    indefinidamente. Sin embargo, solo puede ser trigereado via un bundle donde
+    el usuario es el initiator — nadie mas puede activar un withdraw en nombre
+    del usuario.
+  impact: "Riesgo de persistencia de permisos — no explotable directamente"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // AVO: AAVE_V3_OPTIMIZER.withdraw(underlying, amount, initiator(), receiver, maxIterations)
+    //   -> Optimizer verifica que msg.sender (adapter) es manager de initiator()
+    //   -> Si el usuario no revoco approveManager, el adapter puede seguir retirando
+    //
+    // CV3: ICompoundV3(instance).withdrawFrom(initiator, receiver, asset, amount)
+    //   -> Compound verifica que msg.sender (adapter) tiene allowance de initiator
+    //
+    // En ambos casos, solo un bundle con el usuario como initiator puede triggear.
+    // Un tercero no puede explotar esto.
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Best practice: incluir una call de revocacion al final del bundle de migracion.
+    Informational — no es un bug del adapter.
+
+# ============================================================================
+# WILDCARD HUNTER
+# ============================================================================
+
+- id: MIG-WILD-01
+  tier: 1
+  type: property
+  hunter: WildcardHunter
+  component: CV3
+  description: >
+    CompoundV3 repay usa supplyTo (signed accounting) en lugar de repay().
+    En Compound V3, un supply a una cuenta con deuda REDUCE la deuda. Pero si
+    onBehalf NO tiene deuda y el cap min(amount, borrowBalanceOf) produce 0,
+    require(amount != 0) revierte. No hay path donde un supply sin deuda se
+    ejecute exitosamente.
+  attack_scenario: >
+    Que pasa si un usuario llama compoundV3Repay para una cuenta SIN deuda?
+    borrowBalanceOf = 0, min(amount, 0) = 0, require(0 != 0) revierte.
+    No se puede usar compoundV3Repay para depositar en Compound V3 como efecto
+    secundario del signed accounting.
+  impact: "N/A — el min() cap previene depositos accidentales"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // L32: amount = MorphoUtilsLib.min(amount, ICompoundV3(instance).borrowBalanceOf(onBehalf));
+    // Si borrowBalanceOf == 0: amount = 0
+    // L34: require(amount != 0, ErrorsLib.ZeroAmount()); -> REVERT
+    //
+    // No hay forma de llegar a supplyTo con amount > 0 si onBehalf no tiene deuda.
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 95
+  notes: Buen diseno — el doble cap (balance + debt) elimina el edge case de signed accounting.
+
+- id: MIG-WILD-02
+  tier: 1
+  type: property
+  hunter: WildcardHunter
+  component: ALL
+  description: >
+    Cross-protocol interaction: un bundle de migracion tipicamente hace
+    repay-on-source + withdraw-on-source + supply-on-morpho + borrow-on-morpho.
+    Si el repay excede lo necesario en la source, el exceso queda en el adapter.
+    Si el supply-on-morpho asume que TODO el balance del adapter son tokens del
+    withdraw, la contabilidad puede desviarse.
+  attack_scenario: >
+    Bundle: (1) enviar 1000 USDC al adapter, (2) aaveV3Repay(USDC, max, 2, user)
+    — Aave toma 800, devuelve 200 al adapter, (3) aaveV3Withdraw(WETH, max, adapter)
+    — adapter recibe 5 WETH, (4) morphoSupply(WETH, max, ...) — OK,
+    (5) erc20Transfer(USDC, user, max) — recoge los 200 USDC sobrantes.
+    Si paso 5 se omite, los 200 USDC se pierden.
+  impact: "Perdida de tokens si el bundle no recoge excedentes"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // El adapter es stateless — no trackea "quien puso que".
+    // Todos los tokens en el adapter al momento de una operacion son accesibles.
+    // Es responsabilidad del bundle incluir pasos de limpieza al final.
+    //
+    // El riesgo es real pero esta en la capa de composability, no en el adapter.
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 85
+  notes: >
+    Consistente con el diseno de Bundler3 — el adapter es un tool, no un vault.
+    Documentar como informational para bundle designers.
+
+- id: MIG-WILD-03
+  tier: 2
+  type: property
+  hunter: WildcardHunter
+  component: AV2, AV3
+  description: >
+    Si un aToken tiene un mecanismo de fee-on-transfer o rebasing que cambia el
+    balance entre el transfer al adapter y el withdraw call, el amount calculado
+    podria ser incorrecto. Los aTokens standard de Aave son rebasing (balance
+    aumenta con interes acumulado) pero el rebasing ocurre por bloque — dentro
+    de la misma tx es estable.
+  attack_scenario: >
+    Un token exotico listado en Aave que cobra fee-on-transfer causaria que el
+    adapter reciba menos aTokens de los esperados. El withdraw intentaria
+    retirar mas de lo que el adapter tiene en aTokens, y Aave revertiria.
+    Fallo seguro pero inesperado.
+  impact: "Fallo de migracion con tokens exoticos — sin perdida de fondos"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Los aTokens standard de Aave NO cobran fee-on-transfer.
+    // El rebasing ocurre via scaledBalanceOf * liquidityIndex, pero dentro
+    // de la misma tx el liquidityIndex es constante tras el primer accrue.
+    // Edge case: si hay un accrue entre el transfer-to-adapter y el withdraw,
+    // el balance podria cambiar minimamente. Pero Aave's withdraw con
+    // type(uint256).max retira todo — no hay over-withdraw posible.
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: Teorico — no hay aTokens con fee-on-transfer en produccion.
+
+- id: MIG-WILD-04
+  tier: 1
+  type: property
+  hunter: WildcardHunter
+  component: CV3
+  description: >
+    CompoundV3 userCollateral(initiator, asset).balance usa uint128 internamente.
+    Si el balance real excede uint128.max (~3.4e38), habria truncamiento. En
+    practica, ningun token tiene supply cercano a uint128.max, asi que es
+    seguro.
+  attack_scenario: >
+    Overflow en UserCollateral.balance causaria que el adapter retire menos de
+    lo esperado. Pero uint128.max para un token de 18 decimales equivale a
+    ~3.4e20 tokens — imposible en practica.
+  impact: "N/A — overflow teorico imposible en practica"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // UserCollateral struct: uint128 balance; uint128 _reserved;
+    // Max uint128 = 340282366920938463463374607431768211455
+    // Para USDC (6 decimals): ~3.4e32 USDC — varios ordenes de magnitud mas
+    // que todo el supply de USDC existente.
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 99
+  notes: No es un finding.
+
+# ============================================================================
+# CONCLUSION GENERAL
+# ============================================================================
+#
+# Los 4 adaptadores de migracion son SOLIDOS. Son thin wrappers con:
+# - Access control uniforme (onlyBundler3 en todas las funciones mutables)
+# - Approve-revoke pattern consistente en todos los repay
+# - No hay estado mutable (no storage writes, solo immutables)
+# - Caps apropiados en amounts
+#
+# FINDINGS POTENCIALES (todos Informational/Low):
+#
+# 1. MIG-TRUST-02 (CV3 instance arbitrario): El mas interesante.
+#    CompoundV3 no tiene pool immutable — acepta cualquier `instance`.
+#    Un frontend malicioso podria inyectar un Comet falso que robe tokens.
+#    Severidad: Informational/Low (responsabilidad del frontend, no del adapter)
+#
+# 2. MIG-MATH-02 / MIG-WILD-02 (tokens excedentes en adapter): Tokens
+#    sobrantes post-repay quedan en el adapter si el bundle no los recoge.
+#    Severidad: Informational (bundle design responsibility)
+#
+# 3. MIG-TRUST-03 (permisos persistentes): AVO y CV3 requieren approvals
+#    que no se revocan automaticamente post-migracion.
+#    Severidad: Informational (best practice to revoke)
+#
+# VEREDICTO: No hay findings Medium+ reportables en estos 4 adaptadores.
+# Son contratos simples, bien escritos, con patrones de seguridad consistentes.
+# El riesgo real esta en la COMPOSICION de bundles, no en los adapters.
+
+false_positives: []

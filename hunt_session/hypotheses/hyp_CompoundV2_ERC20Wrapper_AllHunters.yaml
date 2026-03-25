@@ -1,0 +1,672 @@
+protocol: morpho-bundler3
+components:
+  - CompoundV2MigrationAdapter
+  - ERC20WrapperAdapter
+files:
+  - src/adapters/migration/CompoundV2MigrationAdapter.sol
+  - src/adapters/ERC20WrapperAdapter.sol
+domain: migration-adapters
+generated_at: '2026-03-22T00:00:00Z'
+
+# ============================================================================
+# CompoundV2MigrationAdapter — 109 LOC
+# ============================================================================
+
+invariants:
+
+# ---------------------------------------------------------------------------
+# MathHunter — Foco: delta entre received calculado y received real
+# ---------------------------------------------------------------------------
+
+- id: CV2-01
+  tier: 1
+  type: property
+  hunter: MathHunter
+  description: >
+    compoundV2RedeemErc20 calcula received = wMulDown(exchangeRateCurrent, amount)
+    ANTES del redeem. Si Compound V2 internamente redondea de forma distinta a
+    wMulDown (mulDivDown(x, y, 1e18)), el adapter puede intentar transferir MAS
+    tokens de los que realmente recibio del redeem, causando revert o robo de
+    tokens residuales de otros usuarios en el adapter.
+  attack_scenario: >
+    1. Atacante u otro usuario deja dust de underlying en el adapter (de una operacion previa).
+    2. Un usuario llama compoundV2RedeemErc20 con N cTokens.
+    3. exchangeRateCurrent devuelve R. El adapter calcula received = R*N/1e18 (round down).
+    4. Compound V2 internamente hace truncate(Exp({mantissa: R}) * N) que puede dar
+       un resultado X donde X < received (rounding difference de 1-2 wei).
+    5. El adapter transfiere `received` al receiver, pero solo recibio X del redeem.
+    6. Delta (received - X) se toma del dust residual, robando fondos de otro usuario.
+    Alternativamente, si no hay dust, la transferencia revierte silenciosamente dejando
+    tokens stuck.
+  impact: "Robo de dust residual de otros usuarios o tokens stuck en el adapter"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Pre-redeem: snapshot balances
+    uint256 underlyingBefore = IERC20(underlying).balanceOf(address(adapter));
+    uint256 cTokenAmount = ICToken(cToken).balanceOf(address(adapter));
+    uint256 exchangeRate = ICToken(cToken).exchangeRateCurrent();
+    uint256 calculatedReceived = MathLib.wMulDown(exchangeRate, cTokenAmount);
+
+    // Execute redeem
+    adapter.compoundV2RedeemErc20(cToken, cTokenAmount, receiver);
+
+    uint256 underlyingAfter = IERC20(underlying).balanceOf(address(adapter));
+    uint256 actualReceived = underlyingAfter - underlyingBefore + calculatedReceived; // what was sent out
+
+    // The adapter must never transfer more than it actually received from redeem
+    // actualReceived from Compound >= calculatedReceived transferido
+    gte(actualReceived, calculatedReceived, "CV2-01: adapter transferred more than received from redeem");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 75
+  notes: >
+    Compound V2 usa Exp math con truncate (CarefulMath.sol). wMulDown usa
+    mulDivDown(x, y, WAD). Ambos redondean abajo pero las implementaciones
+    internas pueden diferir por 1 wei en edge cases. El riesgo es real cuando
+    hay dust residual de operaciones previas. Necesita fork test con cUSDC/cDAI
+    reales para confirmar si hay delta.
+
+- id: CV2-02
+  tier: 1
+  type: property
+  hunter: MathHunter
+  description: >
+    compoundV2RedeemEth tiene el mismo problema que CV2-01 pero con ETH.
+    received = wMulDown(exchangeRateCurrent, amount) puede diferir del ETH
+    realmente recibido del redeem de cETH. sendValue transfiere received,
+    no el ETH real recibido.
+  attack_scenario: >
+    Identico a CV2-01 pero con ETH. Si received > actual ETH del redeem,
+    sendValue puede usar ETH residual del adapter de otra operacion,
+    o revertir si no hay suficiente.
+  impact: "Robo de ETH residual o operacion stuck"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 ethBefore = address(adapter).balance;
+    uint256 cEthAmount = ICEth(cEth).balanceOf(address(adapter));
+    uint256 exchangeRate = ICEth(cEth).exchangeRateCurrent();
+    uint256 calculatedReceived = MathLib.wMulDown(exchangeRate, cEthAmount);
+
+    adapter.compoundV2RedeemEth(cEthAmount, receiver);
+
+    uint256 ethAfter = address(adapter).balance;
+    // adapter should not have lost more ETH than it gained from redeem
+    gte(ethBefore + calculatedReceived - ethAfter, calculatedReceived,
+        "CV2-02: adapter sent more ETH than received from cETH redeem");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 75
+  notes: Misma raiz que CV2-01, aplicada a la variante ETH.
+
+- id: CV2-03
+  tier: 2
+  type: property
+  hunter: MathHunter
+  description: >
+    borrowBalanceCurrent() accrues interest como side-effect. Si se llama
+    multiples veces en la misma transaccion, el balance puede cambiar entre
+    llamadas. En compoundV2RepayErc20, amount se capea al borrowBalance
+    en L46, pero el repay en L52 podria ver un balance ligeramente diferente
+    si hay interacciones intermedias.
+  attack_scenario: >
+    En una misma transaccion bundled: (1) accion que causa interest accrual
+    en el cToken, (2) compoundV2RepayErc20. El borrowBalanceCurrent en paso 2
+    ya accrued en paso 1, pero si el order of operations causa un segundo accrual
+    el amount podria ser incorrecto.
+  impact: "Repay parcial inesperado, dust de deuda residual"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // En la misma tx: verificar que el amount repaid == amount calculado
+    uint256 debtBefore = ICToken(cToken).borrowBalanceCurrent(onBehalf);
+    adapter.compoundV2RepayErc20(cToken, type(uint256).max, onBehalf);
+    uint256 debtAfter = ICToken(cToken).borrowBalanceCurrent(onBehalf);
+    // Debt should be fully repaid when passing max
+    eq(debtAfter, 0, "CV2-03: debt not fully repaid with max amount");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    borrowBalanceCurrent es idempotente dentro del mismo bloque (accrueInterest
+    se ejecuta una vez por bloque en Compound V2). Probablemente no explotable,
+    pero necesita verificacion en fork.
+
+# ---------------------------------------------------------------------------
+# FlowHunter — Foco: approve windows, fee-on-transfer, flujo de fondos
+# ---------------------------------------------------------------------------
+
+- id: CV2-04
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  description: >
+    compoundV2RedeemErc20 transfiere `received` (pre-calculado) no el balance
+    real recibido. Con fee-on-transfer tokens como underlying, el adapter
+    recibe menos que `received` del redeem, pero intenta transferir `received`
+    al receiver — tomando fondos residuales o revertiendo.
+  attack_scenario: >
+    1. cToken tiene un fee-on-transfer token como underlying (ej: USDT con fee activado).
+    2. Usuario llama compoundV2RedeemErc20 con N cTokens.
+    3. Compound redeem entrega X underlying al adapter, pero fee-on-transfer
+       causa que adapter reciba X - fee.
+    4. adapter.safeTransfer(receiver, received) donde received > X - fee.
+    5. Si hay dust de otro usuario: robo. Si no: revert.
+  impact: "Robo de fondos residuales o DoS en redeem de tokens con fee"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Con fee-on-transfer token:
+    uint256 balBefore = IERC20(underlying).balanceOf(address(adapter));
+    adapter.compoundV2RedeemErc20(cToken, amount, receiver);
+    uint256 balAfter = IERC20(underlying).balanceOf(address(adapter));
+    // Adapter balance should never decrease (no funds should be taken from residual)
+    gte(balAfter, balBefore, "CV2-04: adapter lost residual funds on redeem");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Depende de si Compound V2 lista tokens con fee-on-transfer como cToken
+    underlying. USDT tiene un mecanismo de fee (actualmente 0% pero puede
+    activarse). Si algun cToken tiene un underlying con fee, esto es explotable.
+
+- id: CV2-05
+  tier: 2
+  type: property
+  hunter: FlowHunter
+  description: >
+    compoundV2RepayErc20 hace forceApprove(max) antes del repay y
+    forceApprove(0) despues. Si repayBorrowBehalf revierte internamente
+    pero no devuelve error code (devuelve 0 incorrectamente), la aprobacion
+    max queda activa. Riesgo bajo porque require chequea el return value.
+  attack_scenario: >
+    Escenario teorico: cToken malicioso que acepta el repay sin error pero no
+    reduce deuda, y luego drena via la aprobacion residual. Pero el
+    forceApprove(0) post-repay mitiga esto en el path normal.
+  impact: "Approval residual si repay revierte entre approve(max) y approve(0)"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que despues de repay, la allowance es 0
+    adapter.compoundV2RepayErc20(cToken, amount, onBehalf);
+    uint256 allowance = IERC20(underlying).allowance(address(adapter), cToken);
+    eq(allowance, 0, "CV2-05: allowance not reset after repay");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    El pattern approve(max)->action->approve(0) es seguro si la accion no
+    revierte. Si revierte, toda la tx revierte. Solo seria problema con
+    try/catch, que no se usa aqui.
+
+- id: CV2-06
+  tier: 2
+  type: property
+  hunter: FlowHunter
+  description: >
+    Despues de compoundV2RedeemErc20, no deberia quedar underlying stuck
+    en el adapter (asumiendo receiver != adapter). Todo el `received`
+    calculado debe llegar al receiver.
+  attack_scenario: >
+    Si received < actual redeem output, tokens quedan stuck en el adapter
+    disponibles para el siguiente caller. Esto es el reverso de CV2-01:
+    si Compound da MAS que wMulDown calcula, el exceso queda stuck.
+  impact: "Tokens stuck en adapter, accesibles por siguiente usuario"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 balBefore = IERC20(underlying).balanceOf(address(adapter));
+    adapter.compoundV2RedeemErc20(cToken, amount, receiver);
+    uint256 balAfter = IERC20(underlying).balanceOf(address(adapter));
+    // No underlying should remain stuck (beyond pre-existing balance)
+    eq(balAfter, balBefore, "CV2-06: underlying stuck in adapter after redeem");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Complemento de CV2-01. Si wMulDown subestima, tokens quedan stuck.
+    Si sobreestima, toma dust de otros. Ambos direcciones son problematicas.
+    Fork test con exchangeRates reales determinara cual direccion prevalece.
+
+# ---------------------------------------------------------------------------
+# DomainHunter — Foco: estado de Compound V2, pausas, edge cases de protocolo
+# ---------------------------------------------------------------------------
+
+- id: CV2-07
+  tier: 2
+  type: property
+  hunter: DomainHunter
+  description: >
+    Si el cToken esta pausado en Compound V2 (comptroller.redeemGuardianPaused),
+    redeem() revierte. Pero exchangeRateCurrent() ya se ejecuto y accrued
+    interest (side effect). No causa perdida de fondos pero gasta gas
+    innecesariamente y el error message puede ser confuso.
+  attack_scenario: >
+    Usuario intenta migrar de Compound V2 pausado. exchangeRateCurrent
+    ejecuta accrueInterest (exito), luego redeem falla. La tx revierte
+    limpiamente gracias al require, pero el usuario paga gas por el
+    accrueInterest innecesario.
+  impact: "Gas waste, no perdida de fondos"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Si cToken esta pausado, la funcion debe revertir limpiamente
+    // No hay invariante de Solidity util aqui, es un test de integracion
+    // Verificar que no queda estado corrupto tras revert
+    uint256 cBal = ICToken(cToken).balanceOf(address(adapter));
+    // intentar redeem (esperamos revert si pausado)
+    // post-revert: balance de cToken sin cambio
+    eq(ICToken(cToken).balanceOf(address(adapter)), cBal,
+       "CV2-07: cToken balance changed despite paused redeem");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    Compound V2 pausa via comptroller. El revert es limpio y no deja
+    estado inconsistente. Informational.
+
+- id: CV2-08
+  tier: 2
+  type: property
+  hunter: DomainHunter
+  description: >
+    compoundV2RepayErc20 usa borrowBalanceCurrent que accrues interest.
+    En un bundle con multiples repays al mismo cToken/onBehalf, el segundo
+    repay veria deuda ya reducida. Esto es correcto pero podria sorprender
+    al usuario si pasa amounts fijos en vez de type(uint256).max.
+  attack_scenario: >
+    Bundle: [repay(cToken, 100, alice), repay(cToken, 100, alice)].
+    Si alice tiene 150 de deuda: primer repay paga 100, segundo intenta
+    pagar 100 pero deuda restante es 50, asi que paga 50. 50 tokens del
+    underlying quedan stuck en el adapter.
+  impact: "Tokens residuales stuck en adapter si usuario pasa amounts fijos"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Doble repay con amounts fijos — verificar no hay tokens stuck
+    uint256 totalSent = amount1 + amount2;
+    uint256 debtBefore = ICToken(cToken).borrowBalanceCurrent(onBehalf);
+    // ... execute both repays ...
+    uint256 debtAfter = ICToken(cToken).borrowBalanceCurrent(onBehalf);
+    uint256 actualRepaid = debtBefore - debtAfter;
+    uint256 residual = totalSent - actualRepaid;
+    // residual tokens stuck in adapter
+    eq(IERC20(underlying).balanceOf(address(adapter)), residual,
+       "CV2-08: unexpected residual after double repay");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 55
+  notes: >
+    No es un bug per se — el min() cap protege contra overpay. Pero tokens
+    residuales quedan en el adapter y podrian ser tomados por el siguiente
+    usuario del bundler.
+
+# ---------------------------------------------------------------------------
+# WildcardHunter — Foco: vectores no convencionales
+# ---------------------------------------------------------------------------
+
+- id: CV2-09
+  tier: 1
+  type: property
+  hunter: WildcardHunter
+  description: >
+    compoundV2RedeemErc20 no verifica que el underlying del cToken sea un
+    ERC20 estandar. Si un cToken wrappea un token que tiene un callback
+    en transfer (ERC777, hooks), el safeTransfer en L90 podria causar
+    reentrancy al receiver. El modifier onlyBundler3 no protege contra
+    reentrancy dentro del bundle.
+  attack_scenario: >
+    1. cToken tiene underlying ERC777.
+    2. Atacante crea un bundle que incluye compoundV2RedeemErc20.
+    3. En safeTransfer, el ERC777 callback tokensReceived() se ejecuta
+       en el receiver (controlado por atacante).
+    4. En el callback, atacante llama al bundler para ejecutar otra accion
+       que consume los tokens que estan en transito.
+  impact: "Reentrancy potencial si underlying es ERC777"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // No hay invariante directo — requiere test con ERC777 mock
+    // Verificar que no hay reentrancy guard
+    // Ghost: track re-entrance count
+    ghost_reentranceCount++;
+    lte(ghost_reentranceCount, 1, "CV2-09: reentrancy detected in redeem flow");
+  ghost_vars:
+    - uint256 internal ghost_reentranceCount;
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    Compound V2 no lista ERC777 tokens como mercados. Probabilidad muy baja.
+    Pero el adapter no tiene proteccion propia contra reentrancy, depende
+    del bundler. Verificar si Bundler3 tiene reentrancy guard.
+
+# ============================================================================
+# ERC20WrapperAdapter — 62 LOC
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# FlowHunter — Foco: round-trip transfer, fee-on-transfer
+# ---------------------------------------------------------------------------
+
+- id: EW-01
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  description: >
+    erc20WrapperWithdrawTo L57-58 hace un round-trip: adapter->initiator->adapter.
+    Con fee-on-transfer wrapped tokens, el safeTransferFrom en L58 recibiria
+    menos que `amount`, causando que withdrawTo(receiver, amount) falle o
+    queme mas tokens wrapped de los que el adapter tiene.
+  attack_scenario: >
+    1. Wrapper token tiene fee-on-transfer (o el wrapper mismo aplica fee).
+    2. Usuario llama erc20WrapperWithdrawTo con amount N.
+    3. L57: adapter transfiere N wrapped tokens al initiator (initiator recibe N-fee1).
+    4. L58: safeTransferFrom(initiator, adapter, N) — pero initiator solo tiene N-fee1.
+    5. Revert por insufficient balance, o si initiator tenia tokens extra,
+       se transfieren mas tokens de los esperados.
+  impact: "DoS permanente para unwrap de wrapped tokens con fee, o perdida de tokens del initiator"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 initBalBefore = IERC20(wrapper).balanceOf(initiator);
+    uint256 adapterBalBefore = IERC20(wrapper).balanceOf(address(adapter));
+
+    adapter.erc20WrapperWithdrawTo(wrapper, receiver, amount);
+
+    uint256 initBalAfter = IERC20(wrapper).balanceOf(initiator);
+    // Initiator should not lose any wrapped tokens in the round-trip
+    eq(initBalAfter, initBalBefore, "EW-01: initiator lost tokens in round-trip");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 60
+  notes: >
+    El round-trip existe para compliance con permissioned wrappers que verifican
+    msg.sender. Si el wrapped token tiene fee-on-transfer, el flujo se rompe.
+    La pregunta clave: existen ERC20 wrappers permissioned que tambien tienen
+    fee-on-transfer? Si si, esto es un bug real.
+
+- id: EW-02
+  tier: 1
+  type: property
+  hunter: FlowHunter
+  description: >
+    erc20WrapperDepositFor hace forceApprove(max) antes del depositFor y
+    forceApprove(0) despues. Con fee-on-transfer underlying, el wrapper
+    recibe menos que `amount`, pero depositFor podria mintear wrapped
+    tokens basado en el amount parametro, no el amount recibido.
+    Resultado: inflacion del wrapped token.
+  attack_scenario: >
+    1. Underlying tiene 1% fee-on-transfer.
+    2. Usuario deposita 1000 tokens via erc20WrapperDepositFor.
+    3. Wrapper recibe 990 tokens pero mintea 1000 wrapped tokens al initiator.
+    4. Wrapper tiene mas wrapped supply que underlying backing → insolvencia.
+  impact: "Insolvencia del wrapper si el underlying tiene fee-on-transfer"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 underlyingInWrapper = underlying.balanceOf(address(wrapper));
+    uint256 wrappedSupply = IERC20(wrapper).totalSupply();
+
+    adapter.erc20WrapperDepositFor(wrapper, amount);
+
+    uint256 underlyingInWrapperAfter = underlying.balanceOf(address(wrapper));
+    uint256 wrappedSupplyAfter = IERC20(wrapper).totalSupply();
+
+    uint256 underlyingDelta = underlyingInWrapperAfter - underlyingInWrapper;
+    uint256 wrappedDelta = wrappedSupplyAfter - wrappedSupply;
+
+    // Wrapped minted should not exceed underlying actually received
+    lte(wrappedDelta, underlyingDelta,
+        "EW-02: wrapper minted more than underlying received (fee-on-transfer)");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    Esto es un bug del WRAPPER, no del adapter. Pero el adapter facilita
+    el path. OZ ERC20Wrapper.depositFor() usa _mint(account, amount) directamente
+    sin verificar balance delta. Si el underlying tiene fee, el wrapper es
+    insolvente. El adapter es el vector de ataque, el wrapper es el vulnerable.
+
+# ---------------------------------------------------------------------------
+# TrustBoundaryHunter — Foco: wrapper malicioso, initiator hardcoded
+# ---------------------------------------------------------------------------
+
+- id: EW-03
+  tier: 1
+  type: property
+  hunter: TrustBoundaryHunter
+  description: >
+    erc20WrapperDepositFor L35 deposita al initiator() hardcoded. Esto es
+    correcto para el uso normal, pero wrapper es user-supplied. Un wrapper
+    malicioso podria: (a) no mintear nada, robando el underlying, (b) mintear
+    a otra direccion, (c) hacer reentrancy via depositFor callback.
+  attack_scenario: >
+    1. Atacante crea un contrato malicioso que implementa la interfaz ERC20Wrapper.
+    2. underlying() devuelve USDC real.
+    3. depositFor() roba los USDC aprobados (forceApprove(max) en L33) y no mintea nada.
+    4. Victima llama erc20WrapperDepositFor con el wrapper malicioso.
+    5. USDC del adapter van al wrapper malicioso via transferFrom (el wrapper tiene approval).
+    NOTA: Esto requiere que la victima pase un wrapper malicioso como parametro.
+    En Bundler3, el initiator es quien construye el bundle, asi que se estaria
+    atacando a si mismo. Solo explotable si el bundle se construye por un
+    frontend comprometido.
+  impact: "Perdida total del underlying si el usuario interactua con wrapper malicioso"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // El adapter no valida que wrapper sea un contrato confiable
+    // No hay whitelist ni registry check
+    // Invariante: underlying balance del adapter no debe disminuir mas que amount
+    uint256 balBefore = underlying.balanceOf(address(adapter));
+    adapter.erc20WrapperDepositFor(wrapper, amount);
+    uint256 balAfter = underlying.balanceOf(address(adapter));
+    // Should have decreased by exactly amount (sent to wrapper)
+    eq(balBefore - balAfter, amount,
+       "EW-03: unexpected underlying loss in depositFor");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    El riesgo es mitigado porque el initiator construye su propio bundle.
+    Un usuario no pasaria un wrapper malicioso a menos que el frontend
+    este comprometido o sea un ataque de phishing. Probablemente by design
+    (el bundler es permissionless y el usuario es responsable de los params).
+
+- id: EW-04
+  tier: 2
+  type: property
+  hunter: TrustBoundaryHunter
+  description: >
+    erc20WrapperWithdrawTo L58 hace safeTransferFrom(initiator, adapter, amount).
+    Esto requiere que el initiator haya aprobado al adapter para el wrapped token.
+    Si el initiator no aprobo, la tx revierte. Esto podria ser un DoS si el
+    usuario no sabe que necesita aprobar.
+  attack_scenario: >
+    1. Usuario llama erc20WrapperWithdrawTo sin haber aprobado al adapter.
+    2. L57: adapter transfiere wrapped tokens al initiator (exito).
+    3. L58: safeTransferFrom(initiator, adapter, amount) revierte por falta de approval.
+    4. Toda la tx revierte, incluyendo L57, asi que no hay perdida.
+    Pero: si el bundle tenia acciones previas con side-effects externos
+    (ej: ya repago deuda en Compound), esas acciones se revierten tambien.
+  impact: "DoS si usuario no pre-aprueba. No perdida directa por atomicidad."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que el adapter tiene approval del initiator para el wrapped token
+    uint256 allowance = IERC20(wrapper).allowance(initiator, address(adapter));
+    gte(allowance, amount,
+        "EW-04: initiator has not approved adapter for wrapped token withdrawTo");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    El bundler probablemente incluye un paso de approval previo en el bundle.
+    Pero si se omite, todo el bundle revierte. Verificar si hay documentacion
+    que lo aclare. Probablemente known behavior / by design.
+
+# ---------------------------------------------------------------------------
+# WildcardHunter — Foco: edge cases, permissioned tokens, callbacks
+# ---------------------------------------------------------------------------
+
+- id: EW-05
+  tier: 1
+  type: property
+  hunter: WildcardHunter
+  description: >
+    erc20WrapperWithdrawTo: si el wrapped token es permissioned (ej: requiere
+    KYC whitelist), el safeTransfer en L57 al initiator puede fallar si
+    el initiator no esta whitelisted. Pero el safeTransferFrom en L58
+    desde initiator de vuelta al adapter tambien puede fallar si el adapter
+    no esta whitelisted. Resultado: el unwrap es imposible para ciertos
+    tokens permissioned.
+  attack_scenario: >
+    1. Wrapped token requiere whitelist para transferencias.
+    2. Adapter no esta whitelisted (es un contrato generico).
+    3. L57 safeTransfer revierte porque el adapter no puede enviar.
+    4. O L58 safeTransferFrom revierte porque el adapter no puede recibir.
+    5. Resultado: DoS permanente para unwrap de este token via el adapter.
+  impact: "DoS para tokens permissioned si adapter no esta whitelisted"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // No hay invariante directo — requiere integracion con token permissioned
+    // Verificar que ambas transferencias succedan
+    bool transferOk = true;
+    try IERC20(wrapper).transfer(initiator, 1) {} catch { transferOk = false; }
+    t(transferOk, "EW-05: adapter cannot transfer wrapped token (permissioned?)");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Ironia: el adapter existe PARA tokens permissioned, pero el round-trip
+    L57-L58 puede fallar si el token permissioned no whitelistea al adapter.
+    Esto seria un deployment/configuration issue, no un code bug. Pero vale
+    investigar si hay wrappers reales donde esto ocurre.
+
+- id: EW-06
+  tier: 2
+  type: property
+  hunter: WildcardHunter
+  description: >
+    erc20WrapperDepositFor: si underlying.balanceOf(adapter) == 0 cuando
+    amount == type(uint256).max, el require(amount != 0) revierte. Esto es
+    correcto pero puede causar confusion si el usuario espera un no-op.
+  attack_scenario: >
+    No es un ataque. Es un UX edge case. Si el bundle envia tokens al adapter
+    en un paso previo que falla silenciosamente, el depositFor revierte con
+    ZeroAmount() en vez de un error mas descriptivo.
+  impact: "UX confuso, no perdida de fondos"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simplemente verificar que amount 0 revierte
+    // vm.expectRevert(ErrorsLib.ZeroAmount.selector);
+    // adapter.erc20WrapperDepositFor(wrapper, 0);
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: Informational. ZeroAmount revert es el comportamiento correcto.
+
+# ---------------------------------------------------------------------------
+# Optimization functions — Echidna
+# ---------------------------------------------------------------------------
+
+- id: CV2-OPT-01
+  tier: 3
+  type: optimize
+  hunter: MathHunter
+  description: >
+    Maximizar la diferencia entre received (calculado por wMulDown) y el
+    underlying realmente recibido del redeem de Compound V2.
+  attack_scenario: >
+    Si el delta es positivo, el adapter transfiere mas de lo recibido (roba dust).
+    Si es negativo, tokens quedan stuck.
+  solidity: |
+    uint256 balBefore = IERC20(underlying).balanceOf(address(adapter));
+    uint256 exchangeRate = ICToken(cToken).exchangeRateCurrent();
+    uint256 calculated = MathLib.wMulDown(exchangeRate, cTokenAmount);
+    ICToken(cToken).redeem(cTokenAmount);
+    uint256 actualReceived = IERC20(underlying).balanceOf(address(adapter)) - balBefore;
+    // Maximize the absolute difference
+    int256 delta = int256(calculated) - int256(actualReceived);
+    return delta > 0 ? delta : -delta;
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: Requiere fork con cTokens reales para que exchangeRateCurrent sea significativo.
+
+- id: EW-OPT-01
+  tier: 3
+  type: optimize
+  hunter: FlowHunter
+  description: >
+    Maximizar la perdida del initiator en el round-trip de
+    erc20WrapperWithdrawTo (L57-L58) con fee-on-transfer tokens.
+  attack_scenario: >
+    Si el wrapped token tiene fee-on-transfer, el initiator pierde tokens
+    en cada round-trip. Maximizar esa perdida.
+  solidity: |
+    uint256 initBalBefore = IERC20(wrapper).balanceOf(initiator);
+    adapter.erc20WrapperWithdrawTo(wrapper, receiver, amount);
+    uint256 initBalAfter = IERC20(wrapper).balanceOf(initiator);
+    return int256(initBalBefore) - int256(initBalAfter);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: Solo relevante si existen wrapped tokens con fee-on-transfer.
+
+# ============================================================================
+# False positives anticipados
+# ============================================================================
+
+false_positives:
+- hunter: DomainHunter
+  id: CV2-FP-01
+  reason: >
+    borrowBalanceCurrent() accrues interest como side-effect, pero es
+    idempotente dentro del mismo bloque. No causa inconsistencia en una
+    sola transaccion.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: TrustBoundaryHunter
+  id: EW-FP-01
+  reason: >
+    Wrapper malicioso (EW-03) es probablemente by-design. El bundler es
+    permissionless y el usuario controla los parametros del bundle.
+    Un wrapper malicioso solo afecta al mismo usuario que lo paso como parametro.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

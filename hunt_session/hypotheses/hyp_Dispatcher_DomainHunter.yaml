@@ -1,0 +1,429 @@
+protocol: pancakeswap-infinity
+component: Dispatcher
+file: src/base/Dispatcher.sol
+domain: dex
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: D-01
+  tier: 1
+  type: property
+  description: >
+    INFI_CL_POSITION_CALL forwards entire ETH balance to position manager — an attacker can
+    sequence commands to first deposit ETH (WRAP_ETH with ADDRESS_THIS or raw msg.value), fail
+    the wrap intentionally (FLAG_ALLOW_REVERT), and then trigger INFI_CL_POSITION_CALL or
+    INFI_BIN_POSITION_CALL which sends address(this).balance to the position manager. If the
+    position manager returns excess ETH to the router, subsequent SWEEP by attacker drains it.
+    More critically: if user A's tx leaves ETH residue in the router (e.g., overpaid msg.value
+    without final SWEEP), user B can craft a tx with INFI_CL_POSITION_CALL that forwards that
+    residue into B's own position.
+  attack_scenario: >
+    1. User A calls execute() with msg.value=1 ETH, does a V2 swap but doesn't sweep leftover ETH.
+    2. Router now holds residual ETH (e.g., 0.01 ETH from rounding or overpayment).
+    3. Attacker B calls execute() with INFI_CL_POSITION_CALL — line 312 sends
+       address(this).balance (including A's residue) as value to INFI_CL_POSITION_MANAGER.
+    4. B's mint receives extra ETH at A's expense.
+  impact: "Direct theft of ETH residue left in the router between transactions"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track ETH balance before and after INFI_CL_POSITION_CALL
+    uint256 ethBefore = address(router).balance;
+    // Execute a INFI_CL_POSITION_CALL command
+    // The call forwards address(this).balance — verify no third-party ETH is forwarded
+    uint256 ethSent = ethBefore; // all ETH is forwarded
+    // Invariant: ethSent should be <= msg.value of current tx
+    lte(ethSent, msg.value, "D-01: forwarded more ETH than caller sent");
+  ghost_vars:
+    - uint256 internal ghost_ethSentToPositionManager;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Both INFI_CL_POSITION_CALL (line 312) and INFI_BIN_POSITION_CALL (line 316) use
+    address(this).balance as the value. This is a known pattern from Uniswap UR but
+    PancakeSwap adds two position managers (CL + Bin) that both do this. Need to verify
+    if the position managers refund excess ETH back to the router.
+
+- id: D-02
+  tier: 1
+  type: property
+  description: >
+    EXECUTE_SUB_PLAN bypasses the isNotLocked modifier via self-call. The sub-plan calls
+    execute() via address(this).call, which re-enters execute(). The Lock.isNotLocked modifier
+    allows self-reentrancy (msg.sender == address(this) skips lock check). This means the
+    sub-plan runs with the original locker's identity (msgSender() returns _getLocker()). An
+    attacker could craft a sub-plan where an inner command fails with FLAG_ALLOW_REVERT, and
+    the outer plan continues — potentially using stale state from a partially-failed inner
+    swap sequence (e.g., tokens transferred to router but swap reverted after the transfer).
+  attack_scenario: >
+    1. Attacker crafts execute() with commands: [PERMIT2_TRANSFER_FROM (token A to router),
+       EXECUTE_SUB_PLAN].
+    2. Sub-plan contains: [V3_SWAP_EXACT_IN with FLAG_ALLOW_REVERT (fails), SWEEP token A
+       to attacker].
+    3. The V3 swap fails but FLAG_ALLOW_REVERT means execution continues.
+    4. Token A is still in the router (transferred in step 1), SWEEP sends it to attacker.
+    5. This is "by design" for the user's own tokens, but if combined with a batched permit
+       from another user's approval, the attacker could drain tokens.
+  impact: "Potential token theft if permit2 approvals can be replayed within sub-plans"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After EXECUTE_SUB_PLAN with a failed inner command, router balance should not
+    // contain tokens from a different user's permit2 transfer
+    uint256 balAfter = ERC20(token).balanceOf(address(router));
+    eq(balAfter, 0, "D-02: tokens stuck in router after sub-plan with partial failure");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The self-reentrancy pattern is intentional. The risk is in combining FLAG_ALLOW_REVERT
+    with sub-plans to create partial-execution states. Need to verify that permit2TransferFrom
+    always uses msgSender() correctly even in nested sub-plans.
+
+- id: D-03
+  tier: 1
+  type: property
+  description: >
+    Cross-protocol swap token residue: when chaining V2 → V3 → Infinity swaps in a single
+    execute(), intermediate tokens pass through the router (recipient=ADDRESS_THIS for
+    intermediate hops, payerIsUser=false for subsequent hops). If any intermediate swap
+    fails with FLAG_ALLOW_REVERT, tokens from earlier successful swaps remain in the router.
+    A subsequent SWEEP or PAY_PORTION by the same user recovers them, but if the user
+    doesn't include a final SWEEP, the tokens are stuck and can be stolen by anyone via
+    SWEEP in their own transaction.
+  attack_scenario: >
+    1. User executes: V2_SWAP_EXACT_IN (ETH→USDC, recipient=ADDRESS_THIS),
+       V3_SWAP_EXACT_IN (USDC→WBTC, payerIsUser=false, FLAG_ALLOW_REVERT).
+    2. V2 swap succeeds: USDC now in router. V3 swap fails (e.g., slippage): silently ignored.
+    3. USDC remains in router.
+    4. Attacker front-runs the next block with SWEEP(USDC, attacker, 0) and takes the USDC.
+  impact: "Theft of intermediate swap tokens left in router after partial execution with FLAG_ALLOW_REVERT"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After execute() completes, the router should hold zero balance of any swap token
+    // unless the user intentionally left it there (recipient = ADDRESS_THIS on final command)
+    uint256 routerBal = ERC20(intermediateToken).balanceOf(address(router));
+    eq(routerBal, 0, "D-03: intermediate tokens stuck in router after cross-protocol swap");
+  ghost_vars:
+    - uint256 internal ghost_intermediateTokenBalance;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is the classic Universal Router token residue problem. PancakeSwap's version adds
+    StableSwap and Infinity pool types, increasing the number of possible partial-failure
+    paths. The FLAG_ALLOW_REVERT bit (0x80) on any command byte allows silent failure.
+    Key question: does the frontend always append SWEEP? If so, this is a UX bug, not a
+    contract bug — but bots/integrators may not.
+
+- id: D-04
+  tier: 1
+  type: property
+  description: >
+    Infinity position manager action allow-list bypass in _checkInfiBinPositionManagerCall.
+    The function only blocks Actions.BIN_REMOVE_LIQUIDITY but does NOT block BIN_DONATE_LIQUIDITY
+    or other potentially dangerous actions. Compare with _checkInfiClPositionManagerCall which
+    blocks CL_INCREASE_LIQUIDITY, CL_DECREASE_LIQUIDITY, and CL_BURN_POSITION explicitly.
+    The Bin check is an allow-list-by-exclusion (blocklist) which is weaker than a true allowlist.
+    If new Actions are added to the Bin position manager, they would automatically be allowed.
+  attack_scenario: >
+    1. Infinity Bin position manager gets a new action added (e.g., BIN_TRANSFER_POSITION,
+       BIN_COLLECT_FEES, or any future action).
+    2. The Dispatcher's _checkInfiBinPositionManagerCall only blocks BIN_REMOVE_LIQUIDITY.
+    3. Attacker uses INFI_BIN_POSITION_CALL with the new action to manipulate positions
+       that the router has been approved for.
+    4. More immediately: if BIN_DONATE is a valid action, attacker could donate to manipulate
+       bin pricing through the router.
+  impact: "Unauthorized position manipulation via actions not in the blocklist"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that _checkInfiBinPositionManagerCall blocks ALL actions except BIN_ADD_LIQUIDITY
+    // Currently it only blocks BIN_REMOVE_LIQUIDITY — asymmetric with CL check
+    // For each action in Bin position manager, only BIN_ADD_LIQUIDITY should pass
+    // bool passed = tryCall(INFI_BIN_POSITION_CALL, encodeAction(action));
+    // if (action != Actions.BIN_ADD_LIQUIDITY) {
+    //     assertFalse(passed, "D-04: non-add action allowed through bin position check");
+    // }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    CRITICAL asymmetry: CL check blocks INCREASE/DECREASE/BURN (allowlist-by-exclusion of 3
+    actions). BIN check blocks only REMOVE (exclusion of 1 action). The CL check also misses
+    CL_MINT_POSITION in its blocklist — but that's the intended allowed action. However, the
+    CL check does NOT block SETTLE, TAKE, CLOSE_CURRENCY, CLEAR_OR_TAKE, etc. — these are
+    non-position-altering actions. The question is whether any of those settlement actions
+    can be abused when called through the router's context.
+
+- id: D-05
+  tier: 2
+  type: property
+  description: >
+    PERMIT2_TRANSFER_FROM truncates amount to uint160 but the TRANSFER command uses full
+    uint256. An amount above type(uint160).max passed to PERMIT2_TRANSFER_FROM would be
+    silently truncated by the assembly calldataload (reads 32 bytes but stores in uint160
+    variable). However, the assembly reads into a uint160 variable so Solidity's type system
+    should handle this. But the raw calldataload reads 32 bytes — need to verify if the
+    upper 96 bits are cleaned.
+  attack_scenario: >
+    1. Attacker crafts PERMIT2_TRANSFER_FROM with amount = (1 << 160) + smallAmount.
+    2. Assembly reads full 32 bytes into uint160 — if upper bits are not cleaned, the
+       amount could wrap or be misinterpreted.
+    3. Permit2.transferFrom receives a different amount than intended.
+  impact: "Incorrect transfer amount due to dirty upper bits in assembly"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that amount is properly cleaned to uint160
+    // uint160 amount loaded via calldataload should have upper 96 bits zeroed
+    // In Solidity, `uint160 x := calldataload(offset)` should auto-clean
+    // BUT: calldataload always loads 32 bytes. Assignment to uint160 in Yul may not clean.
+    uint256 rawAmount = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF;
+    uint160 cleanedAmount = uint160(rawAmount);
+    // cleanedAmount should be type(uint160).max, not the full value
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    In Yul/assembly, `amount := calldataload(offset)` loads 32 bytes. The Solidity declaration
+    `uint160 amount` means Solidity will clean the value when used in a non-assembly context.
+    But the variable is declared as uint160 OUTSIDE the assembly block, then assigned INSIDE.
+    Solidity 0.8.26 should handle this correctly, but worth verifying with a concrete test.
+
+- id: D-06
+  tier: 1
+  type: property
+  description: >
+    BALANCE_CHECK_ERC20 can be used as an oracle by anyone. It checks if `owner` has at least
+    `minBalance` of `token`. Combined with FLAG_ALLOW_REVERT, an attacker can create conditional
+    execution paths: "if target has X tokens, execute swap A; otherwise do nothing". This enables
+    on-chain balance-conditional attacks — the attacker can front-run and check if a victim's
+    balance meets a threshold before deciding whether to sandwich them.
+  attack_scenario: >
+    1. Attacker wants to sandwich a user but only if the user's pending swap is large enough.
+    2. Attacker uses EXECUTE_SUB_PLAN containing: BALANCE_CHECK_ERC20(victim, USDC, threshold)
+       followed by sandwich commands. If the check fails, the sub-plan fails but
+       FLAG_ALLOW_REVERT on the EXECUTE_SUB_PLAN means the outer tx succeeds (no gas wasted
+       on revert).
+    3. This creates a gas-efficient conditional sandwich bot.
+  impact: "Enables gas-efficient conditional sandwich attacks using balance checks as oracles"
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // BALANCE_CHECK_ERC20 returns success=false if balance < minBalance
+    // When combined with EXECUTE_SUB_PLAN + FLAG_ALLOW_REVERT, creates conditional execution
+    // This is informational — the balance is public data anyway via balanceOf()
+    // The concern is the atomicity: check + act in one tx without revert cost
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    This is likely "by design" — BALANCE_CHECK_ERC20 is meant for users to verify output
+    amounts. The conditional execution via FLAG_ALLOW_REVERT is a feature. However, the
+    combination with sub-plans creates a new MEV primitive worth documenting. Likely QA/Info.
+
+- id: D-07
+  tier: 1
+  type: property
+  description: >
+    StableSwap exactOut uses a two-step process: first calculates amountIn via
+    stableSwapExactOutputAmountIn(), then executes stableSwapExactOutput() with that amount.
+    If the StableSwap pool state changes between the amountIn calculation and the actual swap
+    (e.g., via a hook callback, another command in the same execute(), or flash loan), the
+    calculated amountIn may be stale, leading to either overpayment by the user or the swap
+    failing. Unlike V2/V3 exactOut which use on-chain callback patterns, StableSwap does
+    a read-then-write which is not atomic within the pool itself.
+  attack_scenario: >
+    1. Attacker monitors mempool for StableSwap exactOut transactions.
+    2. Attacker front-runs with a large swap in the same StableSwap pool, moving the price.
+    3. Victim's stableSwapExactOutputAmountIn() calculates a higher amountIn due to worse rate.
+    4. The swap executes at the worse rate. Attacker back-runs to profit.
+    5. The amountInMax check should protect, but if it's set loosely, the user overpays.
+  impact: "User overpays on StableSwap exactOut due to non-atomic amountIn calculation"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that stableSwapExactOutput uses the amountIn from stableSwapExactOutputAmountIn
+    // and that amountIn <= amountInMax
+    uint256 amountIn = stableSwapExactOutputAmountIn(amountOut, amountInMax, path, flag);
+    // amountIn is already bounded by amountInMax in the function
+    // But: is the pool state consistent between the two calls?
+    lte(amountIn, amountInMax, "D-07: amountIn exceeds amountInMax in stable exactOut");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The two-step pattern (calculate then execute) is inherently non-atomic WITHIN the same
+    transaction only if pool state can change between the two calls. Within a single external
+    call, this should be safe unless there's a callback or re-entrancy. Need to check if
+    stableSwapExactOutputAmountIn is a view function or if it modifies state. Also need to
+    check if amountInMax is enforced inside stableSwapExactOutputAmountIn.
+
+- id: D-08
+  tier: 1
+  type: property
+  description: >
+    The _checkInfiClPositionManagerCall allow-list only checks three specific action bytes
+    (CL_INCREASE_LIQUIDITY, CL_DECREASE_LIQUIDITY, CL_BURN_POSITION) and blocks them.
+    But it does NOT check for SETTLE, TAKE, CLOSE_CURRENCY, CLEAR_OR_TAKE, or SWEEP actions
+    within the modifyLiquidities call. These settlement actions could allow an attacker to
+    settle or take tokens from the pool manager in the router's context. Since the router
+    may hold approvals or have token balances, SETTLE could be used to settle debts with
+    the router's tokens, and TAKE could extract tokens from the pool manager.
+  attack_scenario: >
+    1. Router has been approved by a user or holds tokens from a previous (same-tx) command.
+    2. Attacker crafts INFI_CL_POSITION_CALL with modifyLiquidities containing actions:
+       [CL_MINT_POSITION (allowed), SETTLE (not blocked), TAKE (not blocked)].
+    3. SETTLE uses the router's token balance to settle a debt.
+    4. TAKE extracts tokens from the pool manager to an attacker-controlled address.
+    5. The settlement/take actions operate in the router's context since the call originates
+       from the router.
+  impact: "Unauthorized token extraction via settlement actions not in the action blocklist"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After INFI_CL_POSITION_CALL, verify router balance hasn't decreased for any token
+    // that wasn't explicitly part of the mint operation
+    uint256 balBefore = ERC20(token).balanceOf(address(router));
+    // Execute INFI_CL_POSITION_CALL with TAKE action
+    uint256 balAfter = ERC20(token).balanceOf(address(router));
+    gte(balAfter, balBefore, "D-08: router lost tokens via position manager call");
+  ghost_vars:
+    - uint256 internal ghost_routerBalanceBefore;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This is the most promising hypothesis. The position manager check functions are meant to
+    prevent users who approved the router from having their positions drained. But the checks
+    only block position-altering actions, not settlement actions. The key question is: do
+    SETTLE/TAKE in modifyLiquidities operate with the caller's context (the router) or the
+    original msg.sender? If the router, then the router's token balances are at risk.
+    INFI_CL_POSITION_CALL sends address(this).balance as value — combined with TAKE this
+    could drain the router's ETH.
+
+- id: D-09
+  tier: 2
+  type: property
+  description: >
+    PAY_PORTION uses bips (basis points, presumably out of 10000) to calculate how much of
+    the router's balance to send. If bips > 10000, the calculation could overflow or send
+    more than the balance. The assembly block reads bips as uint256 without validation.
+    The calculatePortion function in BipsLibrary should validate, but if it doesn't, an
+    attacker could specify bips=20000 to get 200% of the balance.
+  attack_scenario: >
+    1. Router holds 100 USDC from a previous swap command.
+    2. Attacker calls PAY_PORTION with bips=20000 (200%).
+    3. If calculatePortion doesn't cap at 10000, it calculates amount = 100 * 20000 / 10000 = 200.
+    4. Transfer of 200 USDC would fail (insufficient balance), but if there are 200 USDC
+       from another user's concurrent tx, the attacker gets double.
+  impact: "Over-extraction of router balance via uncapped bips parameter"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify PAY_PORTION with bips > 10000 reverts
+    // uint256 bips = 20000;
+    // payPortion(token, recipient, bips);
+    // Should revert if BipsLibrary.calculatePortion validates bips <= 10000
+    uint256 routerBal = ERC20(token).balanceOf(address(router));
+    uint256 amount = routerBal * bips / 10000;
+    lte(amount, routerBal, "D-09: PAY_PORTION calculated amount exceeds router balance");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    BipsLibrary.calculatePortion likely validates bips <= 10_000. Need to read the library
+    source to confirm. If it doesn't validate, this is a real bug. If it does, this is a
+    false positive.
+
+- id: D-10
+  tier: 1
+  type: property
+  description: >
+    V3_POSITION_MANAGER_CALL forwards raw calldata to V3_POSITION_MANAGER via low-level call.
+    The _checkV3PositionManagerCall validates: (a) selector is decreaseLiquidity, collect, or
+    burn, and (b) caller is authorized for the tokenId. But the tokenId is extracted at offset
+    0x04 from inputs. If the attacker crafts inputs where the first 4 bytes are a valid
+    selector but the actual calldata encodes a different function (selector collision or
+    calldata manipulation), the check could pass but a different function executes.
+    Also: the check validates authorization for ONE tokenId but the actual call could batch
+    multiple tokenIds if the V3 position manager supports batching via a single selector.
+  attack_scenario: >
+    1. Attacker finds a V3 NFT position where the router has approval (from migration flow).
+    2. Attacker crafts V3_POSITION_MANAGER_CALL with decreaseLiquidity selector + own tokenId
+       (passes auth check) but manipulates calldata to also affect another tokenId.
+    3. The _checkV3PositionManagerCall only checks the tokenId at offset 0x04.
+    4. If the V3 position manager's decreaseLiquidity can be tricked by extra calldata, the
+       attacker could drain another user's position.
+  impact: "Unauthorized V3 position manipulation via calldata crafting"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that V3_POSITION_MANAGER_CALL only affects the tokenId checked by
+    // _checkV3PositionManagerCall
+    // After the call, the position at the checked tokenId should be the only one modified
+    // Ghost: track all positions affected by the call
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    The V3 position manager (NonfungiblePositionManager) uses tokenId as the first parameter
+    for decreaseLiquidity, collect, and burn. Each function only operates on one tokenId.
+    This makes the attack scenario unlikely for the standard V3 NFT PM. However, if PancakeSwap
+    uses a custom V3 position manager with different behavior, this could be exploitable.
+    Also check if the raw .call(inputs) could hit a fallback function if inputs are crafted.
+
+false_positives:
+- hunter: DomainHunter
+  id: D-FP-01
+  reason: >
+    SWEEP command allows anyone to sweep router balance to any recipient. This is by design —
+    the router is not meant to hold tokens between transactions. Users must SWEEP at the end
+    of their execute() call. Front-running a SWEEP is not a vulnerability in the router, it's
+    a user error (not including SWEEP in their command sequence). This is well-documented in
+    Uniswap Universal Router and applies here too.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Universal Router SWEEP is permissionless by design — router should never hold tokens
+      between transactions. Not a bug, not reportable.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: D-FP-02
+  reason: >
+    The isNotLocked modifier allows self-reentrancy (msg.sender == address(this)). This is
+    intentional for EXECUTE_SUB_PLAN to work. The Lock contract explicitly documents this.
+    The locker identity is preserved (msgSender() returns original caller), so the sub-plan
+    cannot impersonate a different user. This is the same pattern as Uniswap Universal Router.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Universal Router self-reentrancy via EXECUTE_SUB_PLAN is by design. Lock preserves
+      original caller identity via Locker storage. Not a reentrancy vulnerability.
+    briefing_update_applied: false

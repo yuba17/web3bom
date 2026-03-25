@@ -1,0 +1,447 @@
+protocol: pancakeswap-infinity
+component: BinPoolManager
+file: src/pool-bin/BinPoolManager.sol
+domain: trust-boundary
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: BPM-TB-01
+  tier: 1
+  type: property
+  description: "Hook afterSwap/afterMint/afterBurn hookDelta conservation: callerDelta + hookDelta must equal the raw pool delta — vault settles them independently, so violation means fund extraction"
+  attack_scenario: >
+    In BinHooks.afterSwap (line 213): delta = delta - hookDelta. The vault then settles
+    callerDelta for msg.sender and hookDelta for hook address independently via
+    accountAppDeltaWithHookDelta. The conservation holds algebraically because
+    callerDelta = rawDelta - hookDelta, so callerDelta + hookDelta = rawDelta.
+    BUT: the vault.accountAppBalanceDelta with hookDelta sums (delta0 + hookDelta0)
+    for _accountDeltaForApp (reservesOfApp), which IS conserved. The separate
+    SettlementGuard.accountDelta calls track (settler, delta) and (hook, hookDelta)
+    independently. The settlement invariant requires ALL deltas to net zero at lock release.
+    A malicious hook can return arbitrary hookDelta, but the caller must pay the difference.
+    Real risk: if hookDelta is crafted so that caller gets a credit (positive delta, meaning
+    vault owes caller) while hook also gets credit, the pool's reservesOfApp would underflow
+    (revert). If hookDelta is negative (hook pays), it must be settled by the hook or the
+    lock release will revert on unsettled deltas. The invariant is: for each operation,
+    sum of all delta0 changes to _accountDeltaForApp == 0.
+  impact: "Hook could attempt fund extraction but vault's reservesOfApp arithmetic underflow protects against it"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Conservation invariant: after swap/mint/burn, the pool's reservesOfApp
+    // must not decrease by more than what was actually withdrawn
+    uint256 vaultReserve0_before = vault.reservesOfApp(address(binPoolManager), currency0);
+    uint256 vaultReserve0_after = vault.reservesOfApp(address(binPoolManager), currency0);
+    // delta + hookDelta applied to reservesOfApp must conserve
+    // The vault does: _accountDeltaForApp(currency0, delta0 + hookDelta0)
+    // So if delta0 + hookDelta0 > 0 (pool is owed), reservesOfApp decreases
+    // If delta0 + hookDelta0 < 0 (pool owes), reservesOfApp increases
+    // Conservation: sum(bin reserves) <= reservesOfApp always
+    t(true, "BPM-TB-01: delta conservation check requires pre/post operation snapshot");
+  ghost_vars:
+    - "uint256 internal ghost_vaultReserve0_before;"
+    - "uint256 internal ghost_vaultReserve1_before;"
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Algebraically, the delta conservation holds because callerDelta = rawDelta - hookDelta.
+    The vault sums delta + hookDelta for reservesOfApp, which equals rawDelta.
+    The individual settlement tracking (caller vs hook) is separate.
+    The real protection is that the vault's reservesOfApp uses uint256, so underflow reverts.
+    A hook cannot extract more than what the pool has. BUT: the hook can shift costs from
+    itself to the caller (caller pays more, hook pays less). This is by-design for hooks.
+
+- id: BPM-TB-02
+  tier: 1
+  type: property
+  description: "beforeSwap hook can reduce amountToSwap to exactly zero, bypassing the amountSpecified==0 early check and producing a no-op swap that still emits events and triggers afterSwap"
+  attack_scenario: >
+    BinPoolManager.swap() line 164 checks amountSpecified==0 and reverts. But after
+    beforeSwap hook (line 170), amountToSwap can be modified. In BinHooks.beforeSwap
+    line 180: amountToSwap += hookDeltaSpecified. Line 181 only reverts if the sign
+    flips (exactInput becomes positive, or exactOutput becomes negative). amountToSwap==0
+    exactly passes through. BinPool.swap line 132 returns early with zero delta.
+    The hook's beforeSwapDelta is then processed in afterSwap, where hookDeltaSpecified
+    contributes to hookDelta. Net effect: hook absorbs the full swap amount via
+    beforeSwapDelta, pool does nothing, caller pays the hook's delta. A malicious hook
+    could use this to steal the full swap input with no actual swap execution.
+    However: hooks are trusted by design. The question is whether this creates an
+    unexpected asymmetry vs the documented behavior.
+  impact: "Hook can intercept full swap amount with no pool execution — trusted hook design issue"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After swap, if amountToSwap was zeroed by hook, the pool delta is zero
+    // but the hook delta may be non-zero — verify accounting
+    if (ghost_amountSpecified != 0) {
+        // If delta is zero but amountSpecified was non-zero, hook absorbed everything
+        bool deltaIsZero = (delta.amount0() == 0 && delta.amount1() == 0);
+        if (deltaIsZero) {
+            // This is only OK if hookDelta accounts for the full amount
+            t(false, "BPM-TB-02: zero pool delta with non-zero amountSpecified — hook intercept");
+        }
+    }
+  ghost_vars:
+    - "int128 internal ghost_amountSpecified;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is by-design for hooks — the HOOKS_BEFORE_SWAP_RETURNS_DELTA_OFFSET flag
+    explicitly allows hooks to modify swap amounts. Users interacting with a pool
+    that has this flag enabled accept the trust assumption. However, this creates a
+    non-obvious attack surface if users don't understand the hook permissions.
+
+- id: BPM-TB-03
+  tier: 2
+  type: property
+  description: "burn() lacks whenNotPaused modifier — attackers can withdraw manipulated positions during emergency pause, after swap/mint are blocked"
+  attack_scenario: >
+    swap() (line 161), mint() (line 209), donate() (line 263) have whenNotPaused.
+    burn() (line 249) does NOT. Scenario: 1) Attacker manipulates oracle/reserves
+    via swap. 2) Owner detects and pauses contract. 3) Attacker still calls burn()
+    to withdraw inflated share value. Since swap is paused, no further manipulation
+    is possible, but the already-inflated positions can still be cashed out.
+    Counter: this is likely by-design (users should always exit). The question is
+    whether the emergency response model accounts for this gap.
+  impact: "Attacker can cash out manipulated positions even after owner pauses the contract"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    bool isPaused = binPoolManager.paused();
+    if (isPaused) {
+        // burn should be callable (by design) — but verify reserves are not inflated
+        // In practice, this is a design review point, not a runtime invariant
+        t(true, "BPM-TB-03: burn callable while paused — design review needed");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Likely by-design (same as Uniswap v4 removeLiquidity). Users should always be
+    able to exit. The real mitigation is that pausing stops further manipulation
+    (no more swaps to inflate reserves). Existing positions reflect actual reserves.
+
+- id: BPM-TB-04
+  tier: 1
+  type: property
+  description: "protocolFeeController can be changed instantly by owner without timelock — new controller can immediately set max fees (0.4%) and drain accumulated fees via collectProtocolFees"
+  attack_scenario: >
+    1) Owner calls setProtocolFeeController(maliciousController). No timelock.
+    2) maliciousController calls setProtocolFee(key, maxFee=4000|4000<<12) on every pool.
+    3) All subsequent swaps pay 0.4% protocol fee.
+    4) maliciousController calls collectProtocolFees() to drain fees.
+    Impact limited by MAX_PROTOCOL_FEE = 0.4%. But with sufficient volume,
+    this is a significant revenue extraction. Also: the old controller's accumulated
+    fees are still claimable by the old controller because collectProtocolFees checks
+    msg.sender == protocolFeeController, so after the change, only the new controller
+    can claim. If the old controller had uncollected fees, they're effectively locked
+    (can only be claimed by the new controller).
+  impact: "Owner/compromised-key can extract 0.4% of all swap volume without timelock delay"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify protocol fee never exceeds MAX_PROTOCOL_FEE per direction
+    (uint24 activeId, uint24 protocolFee, uint24 lpFee) = binPoolManager.getSlot0(poolId);
+    uint16 fee0 = uint16(protocolFee & 0xfff);
+    uint16 fee1 = uint16(protocolFee >> 12);
+    lte(uint256(fee0), 4000, "BPM-TB-04: protocol fee 0->1 exceeds max");
+    lte(uint256(fee1), 4000, "BPM-TB-04: protocol fee 1->0 exceeds max");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Standard centralization risk. MAX_PROTOCOL_FEE limits damage to 0.4% per swap.
+    Verify if owner has timelock in deployment — if yes, this is mitigated.
+    If no timelock, this is a valid centralization finding (likely Low/Info on most platforms).
+
+- id: BPM-TB-05
+  tier: 1
+  type: property
+  description: "beforeDonate hook executes BEFORE minBinShareForDonate check — hook could manipulate active bin shares between hook call and validation, either DoSing donations or bypassing the protection"
+  attack_scenario: >
+    donate() execution order: 1) checkPoolInitialized (line 288). 2) BinHooks.beforeDonate
+    (line 290). 3) Read pool.shareOfBin[activeId] and check >= minBinShareForDonate (lines 293-296).
+    4) pool.donate (line 298). If the beforeDonate hook can trigger a burn of the active bin's
+    shares (reentrancy), the share could drop below minBinShareForDonate between steps 2 and 3.
+    However: vault locking prevents reentrancy. The hook runs within the same lock context,
+    and vault.lock enforces single-entrant. But the hook COULD call burn() on the pool manager
+    directly (it's within the same lock). BinPoolManager.burn has no reentrancy guard beyond
+    the vault lock (which is already held). So: hook calls BinPoolManager.burn() in
+    beforeDonate → shares decrease → donate's share check fails → DoS.
+    Conversely: hook mints before the check → shares increase → bypasses minimum.
+  impact: "Hook can DoS donations by burning active bin shares, or bypass minBinShareForDonate by minting"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track active bin shares before and after donate to detect hook manipulation
+    uint24 activeId = pools[poolId].slot0.activeId();
+    uint256 sharesBefore = pools[poolId].shareOfBin[activeId];
+    // ... donate happens ...
+    uint256 sharesAfter = pools[poolId].shareOfBin[activeId];
+    // shares should only change by the donate itself (donate doesn't change shares)
+    eq(sharesBefore, sharesAfter, "BPM-TB-05: active bin shares changed during donate");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    Key question: can a hook call BinPoolManager.burn() within the beforeDonate callback?
+    The vault lock is already held (single-entrant), but BinPoolManager functions don't
+    check if they're being called recursively — they only need the vault to be locked.
+    If the hook IS the msg.sender of the outer vault.lock(), it can call BinPoolManager
+    functions directly. But hooks are trusted by design, so this is expected behavior.
+    The finding is that the ordering (hook before check) creates an exploitable window,
+    but only for the trusted hook. For pools without hooks, this is not relevant.
+
+- id: BPM-TB-06
+  tier: 1
+  type: property
+  description: "initialize() lacks whenNotPaused — new pools can be created during emergency pause, potentially creating state that interacts with the paused condition"
+  attack_scenario: >
+    During a pause (active emergency), anyone can still call initialize() to create
+    new pools. While mint (which requires whenNotPaused) would prevent adding liquidity,
+    the pool state exists. If the pause is due to a bug in pool initialization logic
+    itself, the owner cannot prevent creation of malicious pools.
+    Additional vector: poolIdToPoolKey mapping grows unboundedly during pause, creating
+    state pollution. When the owner unpauses, these pools are immediately available.
+  impact: "State pollution during emergency — new pools created but can't receive liquidity until unpause"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    bool isPaused = binPoolManager.paused();
+    if (isPaused) {
+        // Verify initialize is callable (or blocked) during pause
+        t(true, "BPM-TB-06: initialize callable during pause — review if intentional");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    Limited impact because mint is paused, so new pools can't get liquidity.
+    Creating an empty pool has minimal risk. Likely informational at best.
+
+- id: BPM-TB-07
+  tier: 2
+  type: property
+  description: "updateDynamicLPFee has no rate-limiting — a hook can change LP fees unlimited times per block, enabling per-transaction fee discrimination"
+  attack_scenario: >
+    updateDynamicLPFee (line 323) validates msg.sender == hook and fee <= 10%, but
+    has no cooldown, rate limit, or per-block cap. A malicious hook can:
+    1) Set fee to 0% for its own swap (via beforeSwap callback calling updateDynamicLPFee)
+    2) Set fee to 10% for victim's swap
+    3) Repeat within the same block
+    This enables MEV-style fee discrimination. The hook can also combine this with
+    beforeSwap's lpFeeOverride for double control. However: updateDynamicLPFee changes
+    the STORED fee (slot0), while lpFeeOverride is per-swap. A savvy hook uses
+    lpFeeOverride (which is transient) rather than updateDynamicLPFee (which persists).
+  impact: "Hook can discriminate LP fees per-transaction with no rate limit"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track fee changes per block
+    if (ghost_lastFeeChangeBlock == block.number) {
+        ghost_feeChangesInBlock++;
+    } else {
+        ghost_lastFeeChangeBlock = block.number;
+        ghost_feeChangesInBlock = 1;
+    }
+    lte(ghost_feeChangesInBlock, 2, "BPM-TB-07: excessive fee changes in single block");
+  ghost_vars:
+    - "uint256 internal ghost_lastFeeChangeBlock;"
+    - "uint256 internal ghost_feeChangesInBlock;"
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    By-design for hooks. Users who choose a pool with a dynamic fee hook accept
+    this trust assumption. The hook already has lpFeeOverride via beforeSwap which
+    is more powerful (per-swap override). updateDynamicLPFee changes the default,
+    lpFeeOverride overrides per-swap. Both are hook-controlled by design.
+
+- id: BPM-TB-08
+  tier: 1
+  type: property
+  description: "Solidity 0.8.26 compiler check — verify no known compiler bugs affect BinPoolManager patterns"
+  attack_scenario: >
+    BinPoolManager.sol uses pragma solidity 0.8.26. BinPool.sol uses pragma ^0.8.0
+    (compiled with 0.8.26). Checked https://docs.soliditylang.org/en/latest/bugs.html:
+    - No VerbatimInvalidDeduplication (only affects Yul optimizer with verbatim)
+    - No FullInliner issues (only affects deeply nested function calls in Yul)
+    - No ABI encoding issues for this contract's patterns
+    The contract uses assembly("memory-safe") blocks extensively, which is safe in 0.8.26.
+    The unchecked blocks are used for uint256 protocol fee accumulation (overflow impossible)
+    and int128 negation (safe for negative values). No Vyper code present.
+  impact: "No known compiler bugs affect this contract"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Compiler version check — manual verification, not runtime invariant
+    t(true, "BPM-TB-08: Solidity 0.8.26 — no known compiler bugs for these patterns");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Manual verification complete. Solidity 0.8.26 has no known bugs affecting
+    the patterns used here (assembly memory-safe, unchecked uint256, mapping, struct storage).
+
+- id: BPM-TB-09
+  tier: 1
+  type: property
+  description: "Vault↔PoolManager trust boundary: BinPoolManager reports deltas to vault without vault cross-checking against pool reserves — a bug in BinPool math could report incorrect deltas"
+  attack_scenario: >
+    BinPoolManager calls vault.accountAppDeltaWithHookDelta or vault.accountAppBalanceDelta
+    after each operation. The vault trusts the reported deltas entirely — it only checks:
+    1) msg.sender is registered app (onlyRegisteredApp)
+    2) vault is locked (isLocked)
+    The vault does NOT verify that the reported delta matches the actual pool state change.
+    If BinPool.swap has a math bug in getAmountsOut/getAmountsIn (e.g., overflow in
+    PackedUint128Math operations, incorrect price calculation), the delta reported to
+    vault could give the trader more tokens than the pool actually has.
+    The vault's reservesOfApp[poolManager] would decrease (underflow protection via uint256
+    arithmetic), but individual bins could have their reserves drained beyond what was
+    actually deposited. Critical invariant: for every currency, sum of all bin reserves
+    for that currency across all pools <= vault.reservesOfApp[binPoolManager][currency].
+  impact: "Math bug in BinPool could cause incorrect deltas, draining pool reserves via vault settlement"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Fundamental solvency invariant: vault reserves >= sum of all bin reserves
+    // This requires iterating all bins which is gas-prohibitive on-chain
+    // Approximate: after each operation, vault reserves should not decrease more than the delta
+    uint256 vaultRes0 = vault.reservesOfApp(address(binPoolManager), currency0);
+    uint256 vaultRes1 = vault.reservesOfApp(address(binPoolManager), currency1);
+    gte(vaultRes0, 0, "BPM-TB-09: vault reserves for currency0 should be non-negative");
+    gte(vaultRes1, 0, "BPM-TB-09: vault reserves for currency1 should be non-negative");
+  ghost_vars:
+    - "uint256 internal ghost_cumulativeSwapIn0;"
+    - "uint256 internal ghost_cumulativeSwapOut0;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is the fundamental trust boundary between Vault and PoolManager.
+    The Vault's reservesOfApp underflow protection (uint256) is the last line of defense.
+    If a BinPool math function returns inflated output amounts, the vault will attempt
+    to reduce reservesOfApp by that amount — if it underflows, the tx reverts.
+    So the system fails-safe (revert) rather than fails-open (drain).
+    The real risk is subtle bugs that don't cause underflow but shift value unfairly.
+
+- id: BPM-TB-10
+  tier: 2
+  type: property
+  description: "minBinShareForDonate default (2^128) is settable by owner to 0 — if reduced, first-depositor donation attack becomes viable on bins with only MINIMUM_SHARE"
+  attack_scenario: >
+    Default minBinShareForDonate = 2^128, making donate() practically unusable on normal bins.
+    Owner can call setMinBinSharesForDonate(0) to allow donations to any bin.
+    Attack if minBinShareForDonate is lowered:
+    1) Wait for a bin where all LPs withdrew, leaving only MINIMUM_SHARE (1e3) locked.
+    2) Donate a large amount to that bin, inflating reserves per share enormously.
+    3) When a new user mints into that bin, their shares are calculated based on
+       inflated reserves, giving them far fewer shares than expected.
+    4) The locked MINIMUM_SHARE absorbs all the donated value.
+    The BinPool._addShare deducts MINIMUM_SHARE (1e3) from first depositor (line 503),
+    which is the existing mitigation against share inflation.
+    Question: is MINIMUM_SHARE = 1e3 sufficient protection against donation attacks
+    when combined with lowered minBinShareForDonate?
+  impact: "If owner reduces minBinShareForDonate, share inflation attack via donate becomes viable"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 minShare = binPoolManager.minBinShareForDonate();
+    // Default is 2^128 — very protective
+    // If reduced below a safe threshold, donation attacks are possible
+    gte(minShare, 1e3, "BPM-TB-10: minBinShareForDonate dangerously low");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The MINIMUM_SHARE = 1e3 deduction in _addShare is designed to prevent share inflation.
+    Whether 1e3 is sufficient depends on token decimals. For 18-decimal tokens,
+    1e3 shares represent 1e-15 tokens — trivially small. A donation of 1e18 tokens
+    to a bin with 1e3 shares would create 1e15 value per share, making new depositors
+    receive dust shares for significant deposits. The current 2^128 threshold prevents
+    this entirely. The finding is about the owner's ability to lower it.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-01
+  reason: >
+    Hooks are fully trusted by design in PCS Infinity (same as Uniswap v4).
+    A malicious hook can manipulate fees, deltas, and state. This is the intended
+    trust model — users who enter a hooked pool accept the hook's trust assumptions.
+    The hook address determines permissions via shouldCall() and the bitmap in parameters.
+    Do not report hook trust as a finding.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      In PCS Infinity / Uniswap v4, hooks are FULLY TRUSTED — do not report hook trust as finding.
+      Hook address determines permisos via shouldCall() and bitmap in parameters.
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-02
+  reason: >
+    activeId=0 as initialization sentinel is safe. initialize() calls
+    PriceHelper.getPriceFromId(0, binStep) which computes base.pow(-8388608).
+    In Uint128x128Math.pow(), absY >= 0x100000, the bit-shifting loop is skipped,
+    result stays 0, and line 153 reverts with Uint128x128Math__PowUnderflow.
+    Therefore activeId=0 cannot be set, and the sentinel is safe.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-03
+  reason: >
+    ERC-20 weird token concerns (fee-on-transfer, rebasing, no-return) are NOT directly
+    relevant to BinPoolManager because it never handles token transfers. All token
+    accounting is via BalanceDelta + vault settlement. BinPoolManager only tracks
+    internal accounting (reserves, shares). Token transfer issues are vault-level concerns.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      PCS Infinity BinPoolManager does not handle token transfers — all settlement
+      is via vault. Weird ERC-20 issues are vault-level concerns, not pool manager.
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-04
+  reason: >
+    PoolKey passed by memory in swap/mint/burn — seems like caller could falsify the key.
+    But PoolId = keccak256(abi.encode(key)), so any modification produces a different PoolId
+    pointing to a non-initialized pool (reverts on checkPoolInitialized). Not exploitable.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-05
+  reason: >
+    Reentrancy via hook callbacks into BinPoolManager: hooks execute within the vault lock
+    context. The vault enforces single-entrant locking (LockerAlreadySet revert). However,
+    within the SAME lock context, the hook CAN call BinPoolManager functions directly
+    (they only check isLocked, not reentrancy). This is by-design — hooks are trusted
+    and expected to interact with the pool manager. The settlement invariant at lock
+    release ensures all accounting nets to zero regardless of call ordering.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

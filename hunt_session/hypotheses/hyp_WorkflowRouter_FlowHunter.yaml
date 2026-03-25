@@ -1,0 +1,633 @@
+protocol: chainlink-pa-v2
+component: WorkflowRouter
+file: src/WorkflowRouter.sol
+domain: flow
+hunter: FlowHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ══════════════════════════════════════════════════════════════════
+#  ANÁLISIS DE FLUJO — FlowHunter
+#  Foco: onReport decode chain, selector extraction from assembly,
+#        empty-data edge case, reentrancy via _call, removal
+#        completeness, double-removal, state consistency across
+#        s_allowlistedWorkflowIds / allowlistedTargets / allowlistedSelectors
+#
+#  STATE MAPS (3 structures that MUST stay in sync):
+#    s_allowlistedWorkflowIds           — EnumerableSet.Bytes32Set
+#    s_workflowInfos[wfId].allowlistedTargets    — EnumerableSet.AddressSet per wfId
+#    s_workflowInfos[wfId].allowlistedSelectors[target] — EnumerableSet.Bytes32Set per (wfId, target)
+#
+#  CRITICAL FLOWS ANALYZED:
+#    1. onReport() — L86-118: metadata decode → allowlist check → report decode → selector extract → _call
+#    2. applyAllowlistedWorkflowsUpdates — L134-162: batch add/remove workflows
+#    3. _applyAllowlistedTargetsUpdates — L184-221: cascading removal of targets+selectors
+#    4. _applyAllowlistedSelectorsUpdates — L251-287: add/remove selectors with bytes4↔bytes32 casting
+#    5. Caller._call — L21-44: raw external call, no reentrancy guard
+#
+#  METADATA COMMENT vs CODE MISMATCH (L90-94):
+#    Comment says "Offset 32, size 32: workflow_id" but code uses
+#    metadata[:32] — i.e., offset 0, size 32. Tests confirm the code
+#    is correct (encodePacked starts with workflowId). The comment
+#    describes byte offsets within the metadata blob, not Solidity
+#    memory offsets. Still, confusing documentation — QA item only.
+#
+#  SELECTOR EXTRACTION (L106-108):
+#    assembly { selector := mload(add(data, 32)) }
+#    For a bytes memory `data`, mload at data+32 loads the first 32
+#    bytes of content. Assignment to bytes4 takes the top 4 bytes.
+#    This is correct for data.length >= 4. For data.length < 4,
+#    reads zero-padded memory — yields a partial selector. The
+#    bytes4(0) cannot be allowlisted (L279 check), so empty data
+#    cannot pass. Data of length 1-3 would yield selectors like
+#    0xAB000000 which could theoretically be allowlisted but this
+#    requires admin misconfiguration.
+# ══════════════════════════════════════════════════════════════════
+
+invariants:
+
+- id: WR-F-01
+  tier: 2
+  type: property
+  description: >
+    Empty calldata via onReport: if `data` decoded from `report` has
+    length 0, the assembly selector extraction reads zero-initialized
+    memory yielding selector 0x00000000. Since bytes4(0) cannot be
+    added to the allowlist (L279 reverts on zero selector), this call
+    MUST revert at the selector check (L110). If it does NOT revert,
+    a call to `target` with empty data (a plain ETH transfer / fallback)
+    would execute.
+  attack_scenario: >
+    Forwarder sends report = abi.encode(targetAddr, bytes("")). Selector
+    extracted is 0x00000000. If somehow 0x00000000 was in the allowlist
+    (bypassing the add check), _call(target, "") executes target's
+    fallback/receive. This would allow arbitrary calls without function
+    specification. HOWEVER: the add check at L279 prevents adding
+    bytes4(0), so this path is blocked. Confidence is low because the
+    protection exists but relies on a single check.
+  impact: >
+    If the zero-selector guard is bypassed, arbitrary fallback calls
+    to any allowlisted target become possible. Could trigger ETH
+    transfers or fallback logic.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that bytes4(0) can never be in the allowlist
+    // After any applyAllowlistedSelectorsUpdates call:
+    bytes32[] memory sels = workflowRouter.getAllowlistedSelectors(workflowId, target);
+    for (uint256 i; i < sels.length; i++) {
+        t(sels[i] != bytes32(0), "WR-F-01: zero selector in allowlist");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 25
+  notes: >
+    Protected by L279 check. Would require a separate bug in
+    _applyAllowlistedSelectorsUpdates to bypass. Defense-in-depth
+    concern only.
+
+- id: WR-F-02
+  tier: 1
+  type: property
+  description: >
+    No reentrancy guard on onReport. The _call at L117 performs a raw
+    external call to `target`. If `target` can call back into the
+    WorkflowRouter (directly or through the forwarder), onReport can
+    be re-entered. The contract has no ReentrancyGuard, no lock, and
+    no reentrancy check. The only protection is the FORWARDER_ROLE
+    access control — re-entry requires the target to have or route
+    through an address with FORWARDER_ROLE.
+  attack_scenario: >
+    1. Forwarder calls onReport(metadata1, report1) where target is
+       a malicious contract with FORWARDER_ROLE (or that can call
+       through the forwarder).
+    2. Target's function calls back onReport(metadata2, report2) with
+       a different workflowId/target/selector.
+    3. Inner onReport executes before outer completes.
+    Since onReport is purely a routing function with no mutable state
+    between the allowlist check and _call (no balance updates, no
+    nonce increments), re-entry does not directly corrupt WorkflowRouter
+    state. The REAL risk is at the TARGET level — if the target has
+    state assumptions about single-call atomicity.
+  impact: >
+    WorkflowRouter itself is stateless during onReport execution (no
+    writes between check and call), so direct state corruption of the
+    router is unlikely. However, if the same target is called twice
+    in a re-entrant fashion, the target's own reentrancy assumptions
+    may break. The impact depends entirely on the target contract.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Ghost tracking for reentrancy detection
+    // In handler_onReport:
+    ghost_onReportDepth++;
+    t(ghost_onReportDepth <= 1, "WR-F-02: onReport re-entered");
+    // ... execute onReport ...
+    ghost_onReportDepth--;
+  ghost_vars:
+    - uint256 internal ghost_onReportDepth;
+  validated: false
+  priority: high
+  confidence: 40
+  notes: >
+    Reentrancy through onReport requires the target (or a contract it
+    calls) to have FORWARDER_ROLE. This is an admin configuration
+    issue, but if the forwarder is a generic relay (e.g., Keystone
+    forwarder), the attack surface depends on what gets FORWARDER_ROLE.
+    The lack of any reentrancy guard is notable for a routing contract
+    that performs arbitrary external calls.
+
+- id: WR-F-03
+  tier: 2
+  type: property
+  description: >
+    State consistency after workflow removal: when a workflowId is
+    removed via applyAllowlistedWorkflowsUpdates (L142-150), the code
+    first calls _applyAllowlistedTargetsUpdates to remove all targets
+    (which cascades to remove all selectors), then removes the
+    workflowId from s_allowlistedWorkflowIds. After removal, there
+    must be NO orphaned entries in s_workflowInfos[wfId].
+  attack_scenario: >
+    Admin removes workflowId W. If the cascading removal misses any
+    selectors (e.g., due to concurrent modification or a bug in the
+    iteration), the next time W is re-added, stale selectors from the
+    previous configuration would be active — allowing calls to
+    targets/selectors that the admin did not explicitly re-authorize.
+  impact: >
+    Stale allowlist entries could permit unauthorized function calls
+    after a workflowId is recycled. This violates the principle of
+    least privilege.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After removeWorkflow(wfId):
+    bytes32[] memory wfIds = workflowRouter.getAllowlistedWorkflowIds();
+    for (uint256 i; i < wfIds.length; i++) {
+        t(wfIds[i] != removedWfId, "WR-F-03: removed wfId still in set");
+    }
+    // Check targets are empty for removed wfId
+    address[] memory targets = workflowRouter.getAllowlistedTargets(removedWfId);
+    eq(targets.length, 0, "WR-F-03: orphaned targets after removal");
+  ghost_vars:
+    - bytes32 internal ghost_lastRemovedWorkflowId;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The removal logic at L142-150 looks correct: it fetches all current
+    targets via .values(), passes them as removes to
+    _applyAllowlistedTargetsUpdates (which cascades to selectors), then
+    removes the workflowId. The iteration over .values() returns a
+    memory copy so concurrent modification of the set during iteration
+    is not an issue. However, verifying this invariant via fuzzing
+    would confirm no edge cases.
+
+- id: WR-F-04
+  tier: 2
+  type: property
+  description: >
+    Selector bytes4-to-bytes32 storage consistency: selectors are stored
+    as bytes32 in EnumerableSet.Bytes32Set but are bytes4 values. The
+    add path (L283) does `add(bytes32(selector))` where selector is
+    bytes4, producing left-aligned 0-padded bytes32. The contains check
+    in onReport (L110) does `contains(bytes32(selector))` where selector
+    is extracted via assembly as bytes4 from mload. Both paths MUST
+    produce identical bytes32 representations for the same function
+    selector.
+  attack_scenario: >
+    If the bytes4→bytes32 casting differs between the add path and the
+    check path, a selector could be allowlisted but never match (DoS:
+    legitimate calls rejected), or never allowlisted but always match
+    (bypass: unauthorized calls accepted). The latter would be critical.
+    In Solidity, `bytes32(bytes4(x))` is left-aligned, and assembly
+    `selector := mload(add(data,32))` also takes the leftmost 4 bytes
+    then `bytes32(selector)` is left-aligned. So they should match.
+  impact: >
+    If they mismatch: either permanent DoS for a workflow, or complete
+    allowlist bypass. Both are severe.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For every allowlisted selector, verify round-trip consistency
+    bytes4[] memory sels = workflowRouter.getAllowlistedSelectors(wfId, target);
+    for (uint256 i; i < sels.length; i++) {
+        bytes4 sel = sels[i];
+        bytes memory data = abi.encodeWithSelector(sel);
+        bytes4 extracted;
+        assembly { extracted := mload(add(data, 32)) }
+        eq(bytes32(extracted), bytes32(sel), "WR-F-04: selector round-trip mismatch");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 15
+  notes: >
+    After manual analysis, both paths use consistent left-aligned
+    bytes4→bytes32 conversion. This is very likely safe. The invariant
+    is included for completeness and fuzz verification but expected
+    to hold.
+
+- id: WR-F-05
+  tier: 2
+  type: property
+  description: >
+    Metadata truncation: onReport extracts workflowId as
+    bytes32(metadata[:32]). If metadata has fewer than 32 bytes, the
+    Solidity slice metadata[:32] will revert with an out-of-bounds
+    error. This is correct behavior (fail-safe). However, if metadata
+    has exactly 32 bytes but the caller intended the layout described
+    in the comment (workflowId at offset 32), the wrong bytes would
+    be interpreted as workflowId.
+  attack_scenario: >
+    The NatSpec comment states "Offset 32, size 32: workflow_id" but
+    the code reads metadata[:32] (offset 0). If a forwarder
+    implementation follows the comment rather than the code and places
+    workflowId at byte offset 32, the router would extract the wrong
+    workflowId — likely bytes32(0) or unrelated data from another
+    metadata field. This would either revert (zero check at L95-97)
+    or match a different workflowId, potentially routing the call
+    through the wrong allowlist.
+  impact: >
+    If a forwarder follows the misleading comment, calls would be
+    routed with the wrong workflowId. Best case: revert (wrong ID not
+    allowlisted). Worst case: matches a different allowlisted workflow,
+    allowing the call through an unintended allowlist — potentially
+    calling a target/selector the admin did not authorize for this
+    workflow.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify metadata[:32] matches expected workflowId
+    // This is a documentation/integration issue, not fuzzable in isolation
+    bytes memory metadata = abi.encodePacked(expectedWfId, bytes10(0), bytes20(0));
+    bytes32 extracted = bytes32(metadata[:32]);
+    eq(extracted, expectedWfId, "WR-F-05: metadata extraction mismatch");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    The comment at L90-93 is MISLEADING. It says "Offset 32" but the
+    code uses offset 0. Tests confirm offset 0 is correct. This is a
+    documentation bug, not a code bug. However, if a NEW forwarder
+    implementation follows the NatSpec comment literally, it would
+    produce incorrect metadata. Low severity because this is an
+    integration concern, not a vulnerability in WorkflowRouter itself.
+    Worth flagging as QA/informational.
+
+- id: WR-F-06
+  tier: 2
+  type: property
+  description: >
+    Short data selector extraction: if the decoded `data` from the
+    report has length between 1 and 3 bytes (valid but atypical), the
+    assembly mload at L107 reads data content plus zero-padded memory.
+    The resulting selector has real bytes in the high positions and
+    zeros in the low positions (e.g., data=0xAB → selector=0xAB000000).
+    This selector CAN be legitimately allowlisted and would pass the
+    check. However, _call(target, data) would then call the target
+    with only 1-3 bytes of calldata — which most contracts interpret
+    as a fallback call (no matching selector), not as the intended
+    function.
+  attack_scenario: >
+    1. Admin allowlists selector 0xAB000000 for target T under wfId W
+       (perhaps a real function selector that starts with 0xAB).
+    2. Forwarder sends report = abi.encode(T, hex"AB") — data is 1 byte.
+    3. Assembly extracts selector 0xAB000000 — matches allowlist.
+    4. _call(T, hex"AB") sends 1 byte of calldata to T.
+    5. T's function dispatch fails to match any selector → hits
+       fallback/receive function instead of the intended function.
+    This effectively bypasses function-level access control: the
+    admin intended to allow calls to function 0xAB000000 but the
+    actual execution hits the fallback.
+  impact: >
+    Allows execution of a target's fallback function when the admin
+    only authorized a specific function selector. Impact depends on
+    what the fallback does (could be a no-op, could accept ETH,
+    could have side effects).
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // In handler: craft report with short data
+    bytes memory shortData = hex"AB";
+    bytes memory report = abi.encode(target, shortData);
+    // Verify the selector extraction
+    bytes4 selector;
+    assembly { selector := mload(add(shortData, 32)) }
+    // selector == 0xAB000000 — matches if allowlisted
+    // But _call(target, hex"AB") hits fallback, not 0xAB000000
+    t(shortData.length >= 4, "WR-F-06: data too short for valid selector");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    This is a real edge case. The allowlist check passes for a matching
+    selector, but the actual call sends fewer than 4 bytes of calldata,
+    so the target's function dispatch cannot match the selector. The
+    call hits the fallback instead. This is a semantic mismatch between
+    "what was authorized" (function 0xAB000000) and "what executes"
+    (fallback). Requires admin to have allowlisted a selector that
+    collides with truncated short data. Realistic exploitation is
+    unlikely but the logic gap is real. The fix would be to require
+    data.length >= 4 before selector extraction.
+
+- id: WR-F-07
+  tier: 2
+  type: property
+  description: >
+    Target removal does not verify target is no longer referenced by
+    active selectors in other workflows. When a target is removed from
+    workflow W1 via _applyAllowlistedTargetsUpdates, the removal is
+    scoped to W1. If the same target is allowlisted under W2, it
+    remains active for W2. This is correct behavior (per-workflow
+    allowlisting). However, the selector storage at
+    s_workflowInfos[W1].allowlistedSelectors[target] is cleaned up
+    during target removal (L196-209 cascades). Verify no cross-
+    workflow state leakage.
+  attack_scenario: >
+    Admin adds target T under W1 with selectors [A, B] and under W2
+    with selectors [C, D]. Admin removes T from W1. Selectors A, B
+    are removed from W1's mapping. W2's selectors C, D must remain
+    intact. If the removal code accidentally clears a shared storage
+    slot (it doesn't — mappings are keyed by workflowId), this would
+    be a critical bug.
+  impact: >
+    If cross-workflow selector leakage occurs, removing a target from
+    one workflow could delete selectors from another workflow, causing
+    DoS for legitimate calls.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After removing target T from W1:
+    // Verify W2's selectors for T are unchanged
+    bytes4[] memory w2Sels = workflowRouter.getAllowlistedSelectors(w2Id, target);
+    eq(w2Sels.length, ghost_w2SelectorCount, "WR-F-07: cross-workflow selector leakage");
+  ghost_vars:
+    - uint256 internal ghost_w2SelectorCount;
+  validated: false
+  priority: medium
+  confidence: 15
+  notes: >
+    After analysis, the storage is cleanly separated by workflowId in
+    the mapping key: s_workflowInfos[workflowId].allowlistedSelectors[target].
+    Two different workflowIds use completely separate storage slots.
+    No cross-workflow leakage is possible. This invariant is included
+    for fuzz verification but expected to hold.
+
+- id: WR-FL-01
+  tier: 1
+  type: property
+  description: >
+    _call en Caller.sol no limita el gas pasado al target: `target.call(data)` delega
+    todo el gas disponible. Si el target consume todo el gas (loop costoso, operación
+    irrazonablemente cara), onReport revierte por OOG con success=false y response.length=0,
+    propagando LowLevelCallFailed. El FORWARDER pierde el gas de la tx sin lograr el
+    efecto del reporte. En el contexto de Chainlink Automation, el gas es pagado con
+    LINK del upkeep — un target malicioso puede vaciar el balance de LINK del upkeep
+    a lo largo del tiempo.
+  attack_scenario: >
+    Precondición: un target allowlisteado es comprometido o upgradeable (proxy con admin
+    separado del admin de WorkflowRouter).
+    1. Atacante actualiza la implementación del target para incluir un loop de alto costo
+       en la función allowlisteada.
+    2. El FORWARDER llama onReport → _call → target consume todo el gas → OOG.
+    3. onReport revierte. El FORWARDER no procesa el reporte.
+    4. Repetido en cada upkeep: el balance LINK del upkeep se vacía gradualmente.
+    5. El atacante nunca necesita tener FORWARDER_ROLE ni DEFAULT_ADMIN_ROLE.
+    Escenario alternativo: target upgradeable cuyos dueños no están alineados con Chainlink.
+    La mitigación obvia es añadir un gas stipend: `target.call{gas: MAX_GAS}(data)`.
+  impact: >
+    DoS sobre workflows específicos + pérdida de LINK en upkeeps de Chainlink Automation.
+    Un atacante con control sobre un target allowlisteado puede bloquear indefinidamente
+    el procesamiento de un workflow y drenar el balance LINK del registro de Automation.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que el gas consumido por _call no excede un umbral razonable.
+    // Body de property_wr_fl_01() en el contexto del handler:
+    uint256 gasBefore = gasleft();
+    // [el handler ejecuta onReport aquí]
+    uint256 gasUsed = gasBefore - gasleft();
+    // 500_000 como umbral conservador — ajustar según el protocolo real
+    lte(gasUsed, 500_000, "WR-FL-01: _call consumio mas gas del esperado (posible DoS)");
+  ghost_vars:
+    - uint256 internal ghost_maxGasPerCall;
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    Este es el único vector de ataque en WorkflowRouter que NO requiere compromiso del
+    FORWARDER_ROLE ni del DEFAULT_ADMIN_ROLE — solo control sobre un target allowlisteado
+    (que puede ser un proxy con dueño distinto). Tier 1: el impacto económico (pérdida
+    de LINK en Automation) es real y cuantificable si el target puede ser upgradeable.
+    La severidad depende de si los targets deployados en producción son upgradeables o
+    inmutables.
+
+- id: WR-FL-02
+  tier: 2
+  type: property
+  description: >
+    DoS por revert explícito del target (complemento de WR-FL-01): si el target revierte
+    con un mensaje de error, _call hace bubble-up del revert y onReport revierte completo.
+    A diferencia del DoS por OOG (WR-FL-01), aquí el gas no se agota pero el reporte
+    tampoco se procesa. El FORWARDER pierde el gas de la tx y la acción queda sin ejecutar.
+    Distinción del escenario de upgrade: el target puede pasar de funcionar a revocar
+    sin necesidad de cambiar código — basta con que modifique estado interno que causa
+    revert (ej: una flag de pausa propia, o un estado de inicialización).
+  attack_scenario: >
+    Target allowlisteado tiene su propio mecanismo de pausa (distinto del pause del
+    WorkflowRouter). Si el admin del target pausa el target, todos los onReport dirigidos
+    a ese target revierten. WorkflowRouter no tiene forma de distinguir "revert legítimo"
+    de "revert malicioso" — ambos bloquean el workflow.
+    Resolución: admin de WorkflowRouter debe remover el target de la allowlist.
+    En sistemas de pago automatizados (Chainlink PA), esto puede resultar en pagos
+    no procesados durante el tiempo entre el DoS y la intervención del admin.
+  impact: >
+    Interrupción de workflows de pago. Según el valor de los pagos no procesados,
+    el impacto puede ser significativo. La resolución requiere intervención manual
+    del admin de WorkflowRouter.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el estado de la allowlist permanece inalterado si _call revierte.
+    // Body de property_wr_fl_02():
+    bytes32[] memory wfIdsBefore = workflowRouter.getAllowlistedWorkflowIds();
+    // [el handler ejecuta onReport con un target que revierte]
+    bytes32[] memory wfIdsAfter = workflowRouter.getAllowlistedWorkflowIds();
+    eq(wfIdsBefore.length, wfIdsAfter.length,
+      "WR-FL-02: allowlist modificada tras revert en _call");
+  ghost_vars:
+    - uint256 internal ghost_allowlistSizeBefore;
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    El estado de la allowlist NO se modifica si _call revierte (correcto por diseño —
+    no hay writes entre el check y el _call). El invariante es verificar esta propiedad
+    en fuzzing. La confianza en que se mantiene es alta. El finding real es el DoS
+    operacional, no corrupción de estado. Relacionado con WR-FL-01.
+
+- id: WR-FL-03
+  tier: 1
+  type: property
+  description: >
+    Metadata offset documentation mismatch: el NatSpec en onReport (líneas 106-109)
+    documenta la estructura de metadata como:
+      Offset 32, size 32: workflow_id
+      Offset 64, size 10: workflow_name
+      Offset 74, size 20: workflow_owner
+    Pero el código usa `metadata[:32]` — es decir, offset 0. Esta discrepancia no es
+    un bug en WorkflowRouter (el código extrae el workflowId correcto desde el offset 0),
+    sino un bug de documentación que afecta a integradores que implementen forwarders
+    basándose en el NatSpec. Un forwarder que construya metadata según los offsets
+    documentados colocaría workflowId en offset 32 (bytes 32-63), no en bytes 0-31.
+    Cuando WorkflowRouter procese esa metadata, extraería los primeros 32 bytes (que
+    serían datos no relacionados o ceros), y o bien revertiría con InvalidZeroValue o
+    evaluaría el workflowId incorrecto.
+  attack_scenario: >
+    Escenario de integración incorrecta (no un ataque activo):
+    1. Desarrollador de forwarder implementa metadata según NatSpec comentado.
+    2. metadata = abi.encodePacked(bytes32(padding), workflowId, bytes10(name), bytes20(owner))
+    3. WorkflowRouter extrae metadata[:32] = padding (ceros) → revert InvalidZeroValue.
+    4. Ningún reporte puede ser procesado para ese forwarder.
+    Si el padding no es cero sino datos de otra fuente, WorkflowRouter evaluaría un
+    workflowId incorrecto — potencialmente allowlisteado como workflowId diferente,
+    causando routing hacia el allowlist incorrecto.
+  impact: >
+    DoS de reportes + potencial routing hacia allowlist incorrecto si el padding
+    casualmente corresponde a un workflowId allowlisteado diferente. En producción,
+    Chainlink controla el forwarder, por lo que este bug es principalmente un riesgo
+    de integración para terceros que construyan forwarders custom.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que metadata[:32] extrae el workflowId en la posición 0, no en 32.
+    // Este test documenta el comportamiento esperado:
+    bytes32 expectedWorkflowId = keccak256("test-workflow");
+    bytes memory metadata_correct = abi.encodePacked(
+      expectedWorkflowId,       // offset 0 — lo que el código espera
+      bytes10("workflow-name"),
+      bytes20(address(0x1234))
+    );
+    bytes32 extracted = bytes32(metadata_correct[:32]);
+    eq(extracted, expectedWorkflowId,
+      "WR-FL-03: workflowId debe estar en offset 0 de metadata, no en offset 32");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Este es un finding de documentación/QA confirmado. El código es correcto (offset 0),
+    el comentario es incorrecto (dice "Offset 32"). La confianza en el finding de
+    documentación es 90%. Como bug de seguridad ejecutable es de severidad informacional.
+    Sin embargo, merece mención en un reporte porque puede afectar a integradores.
+    Relacionado con WR-F-05 del análisis previo (que llega a la misma conclusión).
+
+false_positives:
+
+- hunter: FlowHunter
+  id: WR-FP-01
+  reason: >
+    Double-removal of workflowId in applyAllowlistedWorkflowsUpdates:
+    if the same workflowId appears twice in `removes[]`, the first
+    removal succeeds and calls _applyAllowlistedTargetsUpdates (which
+    checks contains() at L189). The workflowId is then removed from
+    s_allowlistedWorkflowIds at L147. The second iteration calls
+    _applyAllowlistedTargetsUpdates again, which reverts at L189
+    because the workflowId is no longer in the set. So double-removal
+    is naturally prevented by the contains() check — NOT a bug.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: WR-FP-02
+  reason: >
+    EnumerableSet.remove() return value not checked at L147
+    (s_allowlistedWorkflowIds.remove(workflowId)). This is safe
+    because _applyAllowlistedTargetsUpdates (called at L144-146)
+    already verifies the workflowId is in the set (L189 contains()
+    check). If the workflowId was not in the set, execution would
+    have already reverted before reaching L147. The unchecked return
+    value is dead code, not a bug.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: WR-FP-03
+  reason: >
+    Callback state modification: onReport calls _call(target, data)
+    which performs an external call. The target could theoretically
+    call back into WorkflowRouter admin functions if it has
+    DEFAULT_ADMIN_ROLE. However, this is an admin configuration issue
+    — a target with admin role is a trust assumption violation, not a
+    code bug. The WorkflowRouter correctly delegates all state
+    mutation to admin-gated functions.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: WR-FL-FP-01
+  reason: >
+    REENTRANCY CLÁSICA (target llama back a onReport) DESCARTADA:
+    La preocupación inicial era que el target pudiera re-entrar a onReport durante _call.
+    Sin embargo, onReport tiene onlyRole(FORWARDER_ROLE). Para que el target re-entre
+    directamente, el target mismo necesitaría tener FORWARDER_ROLE.
+    En el diseño de Chainlink PA v2, el FORWARDER_ROLE es asignado a contratos del sistema
+    Keystone de Chainlink, no a targets de workflow arbitrarios. La reentrancy directa de
+    target → onReport es imposible sin configuración de roles inusual (y en sí mismo un
+    problema de configuración, no de código).
+    Investigado y descartado como vector de ataque para un adversario externo.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: access.md
+    content: >
+      WorkflowRouter.onReport tiene onlyRole(FORWARDER_ROLE) — la reentrancy clásica
+      requiere que el target tenga FORWARDER_ROLE, lo cual es by design improbable.
+      Verificar restricción de rol antes de asumir reentrancy posible en routing contracts.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: WR-FL-FP-02
+  reason: >
+    MODIFICACIÓN DE ALLOWLIST DURANTE _CALL DESCARTADA:
+    Se evaluó si el target podría llamar a applyAllowlistedWorkflowsUpdates,
+    applyAllowlistedTargetsUpdates, o applyAllowlistedSelectorsUpdates durante la
+    ejecución de _call para modificar la allowlist en mid-flight.
+    Estas funciones requieren DEFAULT_ADMIN_ROLE (via onlyRole(DEFAULT_ADMIN_ROLE)).
+    El target de un workflow no tiene DEFAULT_ADMIN_ROLE en el diseño esperado.
+    Descartado: la separación de roles previene esta modificación.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: WR-FL-FP-03
+  reason: >
+    CHECK DE ALLOWLIST ANTES DE _CALL — NO HAY WINDOW DE RACE CONDITION:
+    Se evaluó si había una "ventana" entre el check de allowlist (líneas 115-131) y
+    el _call (línea 133) donde la allowlist podría ser modificada (race condition
+    intra-transacción). En EVM, las transacciones son atómicas — no hay concurrencia
+    real. La allowlist no puede cambiar entre el check y el _call en la misma tx a
+    menos que _call mismo la modifique (ya descartado en WR-FL-FP-02). No hay race
+    condition intra-transacción. Descartado.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

@@ -1,0 +1,930 @@
+protocol: variational
+component: Oracle + SettlementPool + SettlementPoolFactory
+file: src/Oracle.sol, src/SettlementPool.sol, src/SettlementPoolFactory.sol
+domain: settlement
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-23T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════════════
+# TRUST BOUNDARY MAP — Complete Provider Capability Analysis
+# ═══════════════════════════════════════════════════════════════════════
+#
+# TRUST CHAIN: User → Provider (PROVIDER_ROLE) → Oracle → Factory → Pool
+#
+# PROVIDER_ROLE can:
+#   1. createPool          — create pools with arbitrary creator/other addresses, set feePaidBy/feeAmount
+#   2. depositUSDC         — deposit on behalf of any sender (requires sender's approval to pool)
+#   3. withdrawUSDC        — withdraw from pool to any requestor who is a party (no approval needed, pool sends)
+#   4. atomicDeposit       — transfer from parties to pool (requires approval)
+#   5. batchAtomicDeposit  — batch version of above
+#   6. collectFees         — withdraw fees to msg.sender (the provider) from any pool
+#   7. processTreasuryManagementDeposits — deposit from requestor to pools (requires requestor approval)
+#   8. processTreasuryManagementWithdrawals — withdraw from pools to requestor (requestor must be party)
+#   9. transferFromOLPToPool — transfer from olpWallet to ANY address (requires olpWallet approval to Oracle)
+#  10. addOtherParty       — add arbitrary address as party to any pool
+#
+# KEY QUESTION: Is PROVIDER_ROLE trusted?
+#   Immunefi says "Settlement Pool Factory owner" is trusted. PROVIDER_ROLE trust is UNCLEAR.
+#   Provider is added by DEFAULT_ADMIN_ROLE (Oracle deployer), so it's likely semi-trusted (backend service).
+#   BUT: if provider key is compromised, the attack surface is MASSIVE.
+#
+# ADMIN (DEFAULT_ADMIN_ROLE) can:
+#   1. addProvider / removeProvider — manage providers
+#   2. setSettlementPoolFactory — change factory address (and indirectly change which pools are recognized)
+#   3. pause / unpause
+#   4. grantRole / revokeRole — OZ AccessControl
+#
+# FACTORY OWNER can:
+#   1. setOracleAddress — change which oracle controls ALL pools
+#   2. createPool — directly (bypassing Oracle)
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+invariants:
+
+# ─────────────────────────────────────────────────────────────────────
+# H-01: grantRole PROVIDER_ROLE bypasses duplicate check (BUG — CONFIRMED)
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-01
+  tier: 1
+  type: property
+  description: >
+    Oracle.grantRole() for PROVIDER_ROLE has a dead-code duplicate check.
+    Line 442: require(!hasRole(PROVIDER_ROLE, account), ...) executes AFTER
+    super.grantRole() on line 439 which already granted the role. So the
+    require on L442 will ALWAYS revert if the account didn't already have the role
+    (because super.grantRole just granted it, so hasRole returns true), and will
+    never revert if the account already had the role (because super.grantRole is
+    a no-op for existing holders, hasRole returns true, and the require reverts).
+
+    Wait — re-analyzing: super.grantRole() calls _grantRole() which sets
+    the role. So after super.grantRole(PROVIDER_ROLE, account):
+    - If account DID NOT have role before: now has it → hasRole = true → !hasRole = false → REVERTS
+    - If account DID have role before: still has it → hasRole = true → !hasRole = false → REVERTS
+
+    This means grantRole(PROVIDER_ROLE, ...) ALWAYS REVERTS. numProviders can
+    never be incremented via grantRole. The only way to add a provider is via
+    addProvider() which uses _grantRole (internal, no override).
+
+    Impact: grantRole for PROVIDER_ROLE is permanently broken. Admin must use
+    addProvider() instead. The OZ AccessControl grantRole path is dead code.
+    This is a LOW severity design inconsistency — the intended path (addProvider)
+    works correctly.
+  attack_scenario: >
+    Admin tries to use standard OZ grantRole(PROVIDER_ROLE, addr) → always reverts.
+    Not exploitable for fund loss, but indicates a logic error in the override.
+    The real risk: if admin expects grantRole to work and it doesn't, providers
+    cannot be added via the standard interface.
+  impact: "Admin cannot use grantRole to add providers — must use addProvider. Functional but inconsistent."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // grantRole(PROVIDER_ROLE, newProvider) should succeed for new providers
+    // but it always reverts because the require is AFTER super.grantRole
+    bool preHasRole = oracle.hasRole(PROVIDER_ROLE, newProvider);
+    try oracle.grantRole(PROVIDER_ROLE, newProvider) {
+        // Should reach here for new providers but won't
+        t(false, "TB-01: grantRole should have reverted");
+    } catch {
+        // Always ends up here
+        t(!preHasRole, "TB-01: grantRole reverted for new provider — bug confirmed");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    The bug is clear from code reading. Line 439 calls super.grantRole which
+    internally calls _grantRole, setting the role. Line 442 then checks
+    !hasRole which is now always true (role was just set), so require always
+    fails. This is a logic error in the override ordering.
+
+    KILL SIGNALS: None — this is a genuine code defect. But severity is Low
+    because addProvider() works correctly as the intended path.
+  poc_sketch: |
+    function test_grantRole_always_reverts() public {
+        address newProvider = makeAddr("provider");
+        // Admin tries grantRole
+        vm.prank(admin);
+        vm.expectRevert("Oracle: Provider already added.");
+        oracle.grantRole(PROVIDER_ROLE, newProvider);
+        // Verify provider was NOT added
+        assertFalse(oracle.hasRole(PROVIDER_ROLE, newProvider));
+    }
+  call_stack: |
+    grantRole(PROVIDER_ROLE, account)
+    → super.grantRole(PROVIDER_ROLE, account)  // L439 — sets the role
+      → _grantRole(PROVIDER_ROLE, account)     // OZ internal — role is now SET
+    → if (role == PROVIDER_ROLE)               // L441
+    → require(!hasRole(PROVIDER_ROLE, account)) // L442 — hasRole=true → !true=false → REVERT
+
+# ─────────────────────────────────────────────────────────────────────
+# H-02: revokeRole has inverse logic error — revokes THEN decrements
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-02
+  tier: 1
+  type: property
+  description: >
+    Oracle.revokeRole() for PROVIDER_ROLE: the logic is correct but the
+    ordering is fragile. Lines 450-456: it checks hasRole and numProviders > 1
+    BEFORE calling super.revokeRole on L456. This is actually correct — the
+    checks happen before the state change. However, note the asymmetry with
+    grantRole (which is broken). revokeRole works correctly.
+
+    BUT: there's a subtle issue. If someone calls revokeRole for a non-PROVIDER_ROLE,
+    it bypasses the PROVIDER_ROLE checks and goes straight to super.revokeRole.
+    This is correct behavior. No bug here upon deeper analysis.
+  attack_scenario: >
+    No direct attack — revokeRole logic is actually correct. The checks
+    (hasRole, numProviders > 1) execute before super.revokeRole.
+  impact: "None — logic is correct for revokeRole"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify revokeRole correctly prevents removing last provider
+    // and correctly decrements numProviders
+    t(true, "TB-02: revokeRole logic is correct — no invariant needed");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    After deeper analysis, revokeRole is correctly ordered. The initial concern
+    was about ordering (like grantRole's bug), but revokeRole does checks FIRST,
+    then calls super. This is correct. Marking as non-issue.
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-03: transferFromOLPToPool sends USDC to arbitrary poolAddress
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-03
+  tier: 1
+  type: property
+  description: >
+    Oracle.transferFromOLPToPool (L267-285): Provider specifies poolAddress
+    as a raw address parameter. There is NO validation that poolAddress is a
+    legitimate pool created by the factory. The function:
+    1. Calls usdc.transferFrom(olpWallet, address(this), amount) — needs OLP approval
+    2. Calls usdc.transfer(poolAddress, amount) — sends to ANY address
+
+    If PROVIDER_ROLE is NOT trusted, a rogue provider can redirect OLP funds
+    to any arbitrary address by setting poolAddress to their own wallet.
+
+    Contrast with other functions like withdrawUSDC which use getPool(poolUuid)
+    to validate the pool address. transferFromOLPToPool bypasses this entirely.
+  attack_scenario: >
+    1. OLP wallet has approved Oracle contract for USDC transfers
+    2. Rogue provider calls transferFromOLPToPool(olpWallet, attackerAddress, amount, ...)
+    3. Oracle pulls USDC from OLP wallet to itself, then transfers to attackerAddress
+    4. Attacker receives all OLP funds that were approved to Oracle
+
+    CRITICAL DEPENDENCY: Requires PROVIDER_ROLE to be untrusted/compromised.
+    If provider IS trusted, this is by design (provider is backend, controls params).
+  impact: "Complete drain of OLP wallet's approved USDC balance. Up to all funds approved to Oracle."
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // transferFromOLPToPool should only send to factory-registered pools
+    address poolAddr = factory.getPool(poolUuid);
+    // But the function uses the raw poolAddress parameter instead
+    // Invariant: poolAddress parameter == factory.getPool(poolUuid)
+    // This cannot be checked as an invariant — it's a code review finding
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    KILL SIGNAL: If PROVIDER_ROLE is explicitly trusted by Immunefi scope, this
+    is invalid. The Immunefi page says "Settlement Pool Factory owner" is trusted
+    but does NOT explicitly state PROVIDER_ROLE is trusted. This ambiguity is
+    the crux.
+
+    Even if provider is trusted, the LACK of validation is a defense-in-depth
+    concern — a compromised provider key can drain all OLP-approved funds.
+
+    The poolUuid parameter is passed but NEVER used to validate poolAddress.
+    It's only used in the event emission. This strongly suggests the validation
+    was forgotten.
+  poc_sketch: |
+    function test_transferToArbitraryAddress() public {
+        address attacker = makeAddr("attacker");
+        address olp = makeAddr("olp");
+        // Setup: OLP approves Oracle
+        vm.prank(olp);
+        usdc.approve(address(oracle), 1000e6);
+        deal(address(usdc), olp, 1000e6);
+        // Provider sends to attacker instead of pool
+        vm.prank(provider);
+        oracle.transferFromOLPToPool(olp, attacker, 1000e6, poolUuid, 0, 0);
+        assertEq(usdc.balanceOf(attacker), 1000e6);
+    }
+  call_stack: |
+    transferFromOLPToPool(olpWallet, poolAddress=ATTACKER, amount, poolUuid, ...)
+    → require(olpWallet != address(0))        // passes
+    → require(poolAddress != address(0))       // passes (attacker != 0)
+    → require(amount > 0)                     // passes
+    → usdc.transferFrom(olpWallet, this, amount) // pulls from OLP
+    → usdc.transfer(poolAddress, amount)       // sends to ATTACKER — no pool validation!
+
+# ─────────────────────────────────────────────────────────────────────
+# H-04: collectFees sends pool USDC to provider (msg.sender)
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-04
+  tier: 1
+  type: property
+  description: >
+    Oracle.collectFees (L28-43): Calls pool.withdrawFees(msg.sender, amount, batchId).
+    The requestor is hardcoded as msg.sender — i.e., the provider themselves.
+    So fees are sent directly to the provider's address.
+
+    SettlementPool.withdrawFees (L247-260): NO check that requestor is a pool
+    party. It just does usdc.transfer(requestor, amountRequested). Any amount
+    can be withdrawn as "fees" as long as the pool has balance and batchId hasn't
+    been processed.
+
+    If provider is NOT trusted: provider can drain ALL pool balances by calling
+    collectFees with arbitrary amounts. The pool has no concept of "fee balance"
+    vs "party balance" — it's just USDC balance.
+  attack_scenario: >
+    1. Pool has 100,000 USDC (deposited by parties for settlement)
+    2. Rogue provider calls collectFees([{poolUuid, amount: 100000e6, batchId: 1}])
+    3. Pool calls usdc.transfer(provider, 100000e6) — no party check, no fee accounting
+    4. Provider drains entire pool
+
+    CRITICAL DEPENDENCY: Same as TB-03 — requires untrusted/compromised provider.
+  impact: "Complete drain of any settlement pool's USDC balance. All user funds at risk."
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // withdrawFees should only send to authorized fee recipients
+    // Currently sends to msg.sender (provider via Oracle) without party check
+    uint256 poolBalBefore = usdc.balanceOf(poolAddress);
+    uint256 providerBalBefore = usdc.balanceOf(provider);
+    // After collectFees, pool balance decreases, provider balance increases
+    // No cap on amount besides pool balance
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    KILL SIGNAL: If provider is trusted, fee collection is an intended
+    provider capability. The system likely works as: off-chain system calculates
+    fees owed, provider submits collection request, on-chain just executes.
+
+    However, the COMPLETE ABSENCE of on-chain fee accounting is notable.
+    There is no mapping of fees accrued vs fees collected. The pool has no
+    concept of fee balance. The batchId replay protection only prevents
+    double-collection of the same batch, not overcollection.
+
+    Defense-in-depth issue even if provider is trusted.
+  poc_sketch: |
+    function test_provider_drains_pool_via_fees() public {
+        // Pool has 100k USDC from party deposits
+        Fees.CollectionRequest[] memory reqs = new Fees.CollectionRequest[](1);
+        reqs[0] = Fees.CollectionRequest(poolUuid, 100000e6, 1);
+        vm.prank(provider);
+        oracle.collectFees(reqs);
+        assertEq(usdc.balanceOf(provider), 100000e6);
+        assertEq(usdc.balanceOf(poolAddress), 0);
+    }
+  call_stack: |
+    collectFees(requests) [provider]
+    → factory.getPool(poolUuid) → poolAddress
+    → pool.withdrawFees(msg.sender=provider, amount, batchId)
+      → require(amount > 0) ✓
+      → require(batchId != 0) ✓
+      → require(!transfers_processed[batchId]) ✓
+      → usdc.transfer(provider, amount) // NO party check, NO fee cap
+
+# ─────────────────────────────────────────────────────────────────────
+# H-05: Factory.setOracleAddress — new oracle controls ALL existing pools
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-05
+  tier: 1
+  type: property
+  description: >
+    SettlementPoolFactory.setOracleAddress (L103-106): Factory owner can change
+    the oracle address at any time. ALL existing pools use factory.oracle() for
+    their onlyOracle modifier (SettlementPool._oracle() at L82-84). So a new
+    oracle instantly controls ALL existing pools' deposits, withdrawals, and fees.
+
+    This is a centralization risk. Factory owner is stated as trusted by Immunefi,
+    so this is likely by design. But the trust chain is: factory owner → sets oracle →
+    oracle controls all pool funds.
+  attack_scenario: >
+    1. Factory owner sets oracle to a malicious contract
+    2. Malicious oracle calls withdrawUSDC/withdrawFees on all pools
+    3. All pool funds drained
+
+    This is a standard admin trust issue. Factory owner is declared trusted.
+  impact: "All pool funds if factory owner is compromised. But factory owner is trusted per scope."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After setOracleAddress, old oracle loses access, new oracle gains access
+    address oldOracle = address(factory.oracle());
+    // factory.setOracleAddress(newOracle)
+    // All pools now obey newOracle
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    KILL SIGNAL: Factory owner is explicitly trusted per Immunefi scope.
+    This is a centralization/admin trust issue, likely out of scope.
+    Documenting for completeness.
+  poc_sketch: ''
+  call_stack: |
+    setOracleAddress(maliciousOracle) [factory owner]
+    → oracle = IOracle(maliciousOracle)
+    → All pools: _oracle() → factory.oracle() → maliciousOracle
+    → maliciousOracle can call all onlyOracle functions on all pools
+
+# ─────────────────────────────────────────────────────────────────────
+# H-06: Provider can withdraw to any pool party without their consent
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-06
+  tier: 2
+  type: property
+  description: >
+    Oracle.withdrawUSDC (L252-265) and processTreasuryManagementWithdrawals
+    (L191-233): Provider specifies the requestor address. The pool's
+    _withdrawUSDCOnBehalf (L262-283) checks that requestor is a party
+    (creatorAddress or otherAddresses), then transfers USDC to that address.
+
+    The party never consented to this specific withdrawal. The provider
+    unilaterally decides when and how much each party receives.
+
+    This is likely by design — the system settles off-chain positions, and
+    the provider (backend) executes the settlement on-chain. But it means
+    parties have NO on-chain control over their funds once deposited.
+  attack_scenario: >
+    1. PartyA has 50k USDC in pool, wants to keep it for ongoing settlement
+    2. Provider calls withdrawUSDC(partyA, 50000e6, poolUuid, transferUuid)
+    3. PartyA receives 50k USDC back but their settlement position is now uncollaralized
+    4. If this is a rogue provider, they could time this to cause party harm
+
+    More realistic concern: USDC blacklisted party — provider tries to withdraw
+    to blacklisted address, transfer fails, but try/catch handles it gracefully.
+  impact: "Provider controls timing and amount of withdrawals. Parties have no on-chain consent mechanism."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    KILL SIGNAL: Almost certainly by design. The entire system is a
+    provider-controlled settlement system. Off-chain matching + on-chain
+    settlement. The provider IS the settlement engine.
+
+    This is how the protocol works — not a bug.
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-07: addOtherParty — provider can add arbitrary address as pool party
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-07
+  tier: 2
+  type: property
+  description: >
+    Oracle.addOtherParty (L382-390): Provider can add ANY address as a party
+    to any pool. Once added, that address can:
+    - Call depositUSDC directly (as onlyParties)
+    - Receive withdrawals (passes _withdrawUSDCOnBehalf party check)
+
+    Combined with TB-04 (collectFees) or TB-06 (provider-controlled withdrawal):
+    Provider adds their own address as otherParty → can now receive withdrawals
+    from the pool as a "legitimate" party.
+
+    Alternatively: provider adds attacker-controlled address → attacker calls
+    depositUSDC (with their own funds, which is harmless) → but now attacker
+    is an authorized party for events/integrations.
+  attack_scenario: >
+    1. Provider adds attackerAddress to pool via addOtherParty
+    2. Provider calls withdrawUSDC(attackerAddress, poolBalance, poolUuid, uuid)
+    3. _withdrawUSDCOnBehalf checks: otherAddresses[attackerAddress] == true ✓
+    4. Pool sends all funds to attacker
+
+    DEPENDENCY: Requires rogue provider (both addOtherParty and withdrawUSDC are provider-only)
+  impact: "Provider can add arbitrary withdrawal destinations. Combined with withdrawal = drain."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After addOtherParty(poolUuid, attackerAddr):
+    bool isParty = pool.checkOtherAddress(attackerAddr);
+    t(isParty == true, "TB-07: attacker is now a party");
+    // Now withdrawUSDC(attackerAddr, ...) will pass party check
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    KILL SIGNAL: If provider is trusted, adding parties is an intended operation.
+    The provider manages pool membership as part of the settlement system.
+
+    The concern is: even with trusted provider, there's no on-chain record of
+    WHY a party was added, no consent from existing parties, and no limit on
+    the number of parties. But this is likely the design.
+  poc_sketch: ''
+  call_stack: |
+    addOtherParty(poolUuid, attackerAddr) [provider]
+    → factory.getPool(poolUuid) → poolAddress
+    → pool.addOtherParty(attackerAddr)
+      → require(!otherAddresses[attackerAddr]) // not already added
+      → otherAddresses[attackerAddr] = true
+
+# ─────────────────────────────────────────────────────────────────────
+# H-08: Implementation contract can be called directly (init protection only)
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-08
+  tier: 2
+  type: property
+  description: >
+    The SettlementPool implementation contract (deployed at constructor, used as
+    EIP-1167 clone source) is a live contract. Its initialize() has the check
+    `require(factory == address(0))` which prevents re-initialization.
+
+    BUT: the implementation contract itself is NEVER initialized (initialize is
+    only called on clones). So factory == address(0) on the implementation.
+    Someone could call initialize() on the implementation contract directly,
+    setting themselves as factory.
+
+    However, after initialization, _oracle() calls factory.oracle() and
+    _usdc() calls factory.usdcAddress(). The attacker-set factory would need
+    to implement these interfaces. Even then, there's no USDC in the
+    implementation contract, so deposits/withdrawals would be on an empty contract.
+
+    The real risk: if someone sends USDC to the implementation contract by mistake
+    (e.g., via transferFromOLPToPool with poolAddress=implementation), the
+    attacker who initialized it could drain those funds.
+  attack_scenario: >
+    1. Attacker deploys a fake factory contract that returns attacker as oracle
+    2. Attacker calls implementation.initialize(attacker, fakeFactory, [], uuid)
+    3. Now attacker controls the implementation contract
+    4. If ANY USDC is accidentally sent to the implementation, attacker can drain it
+    5. Risk amplified by TB-03: transferFromOLPToPool can send to ANY address
+  impact: "Low — requires USDC to be accidentally sent to implementation. But combined with TB-03, possible."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Implementation contract should not be initializable
+    // Check: factory == address(0) on implementation before any interaction
+    address impl = factory.implementation();
+    t(SettlementPool(impl).factory() == address(0), "TB-08: impl not initialized — vulnerable");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 65
+  notes: >
+    Standard EIP-1167 concern. Best practice is to call _disableInitializers()
+    in the implementation constructor, or initialize the implementation in the
+    constructor. Neither is done here.
+
+    KILL SIGNAL: No USDC should ever be in the implementation. The pools are
+    clones with their own addresses. Unless TB-03 is used to send there.
+
+    Combined with TB-03: if a rogue provider uses transferFromOLPToPool with
+    poolAddress=implementation, and someone has initialized the implementation
+    with a fake factory, the USDC could be drained. This is a 2-step attack
+    requiring both a rogue provider AND a pre-initialized implementation.
+  poc_sketch: |
+    function test_initialize_implementation() public {
+        address impl = factory.implementation();
+        // Deploy fake factory
+        FakeFactory fake = new FakeFactory(address(this));
+        address[] memory others = new address[](1);
+        others[0] = makeAddr("other");
+        // Initialize implementation directly
+        SettlementPool(impl).initialize(
+            address(this), address(fake), others, 999
+        );
+        assertEq(SettlementPool(impl).factory(), address(fake));
+    }
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-09: depositUSDCOnBehalfOfParty — no party validation on sender
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-09
+  tier: 2
+  type: property
+  description: >
+    SettlementPool.depositUSDCOnBehalfOfParty (L233-245): Called via Oracle.depositUSDC.
+    The sender parameter is NOT validated as a pool party. Any address can be
+    specified as the depositor — as long as that address has approved the pool
+    for USDC transfers.
+
+    This means the provider can trigger a transferFrom on behalf of ANY address
+    that has approved the SettlementPool contract. The sender doesn't need to
+    be a party in the pool.
+
+    However: the sender must have approved the POOL specifically (not the Oracle).
+    The _depositUSDCOnBehalf checks allowance of sender → pool. Users who
+    approved the pool for one purpose could have their funds pulled for another.
+  attack_scenario: >
+    1. UserA approves PoolX for 1000 USDC (intending to deposit later)
+    2. Provider calls oracle.depositUSDC(userA, 1000e6, poolUuid, uuid)
+    3. Pool pulls 1000 USDC from UserA without UserA initiating the transaction
+    4. UserA's funds are now in the pool — UserA may or may not be a party
+
+    NOTE: If UserA approved the pool, they likely intended to interact with it.
+    The concern is timing and amount control — provider decides when and how much.
+  impact: "Provider can front-run user deposits or pull funds at unexpected times. But user did approve the pool."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 55
+  notes: >
+    KILL SIGNAL: The user approved the pool. The provider is the intermediary.
+    This is the intended flow. The concern (provider timing control) is inherent
+    to the custodial settlement design. Likely by design.
+
+    Note: depositUSDCOnBehalfOfParty does NOT check if sender is a party.
+    Compare with _withdrawUSDCOnBehalf which DOES check party membership.
+    This asymmetry is interesting — anyone can deposit but only parties can withdraw.
+    This is probably intentional (anyone should be able to add collateral).
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-10: Oracle.setSettlementPoolFactory — pool mapping split brain
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-10
+  tier: 1
+  type: property
+  description: >
+    Oracle.setSettlementPoolFactory (L392-398): Admin can change the factory.
+    Oracle maintains its OWN pool mapping (mapping pools at L21) AND uses
+    factory.getPool() for some functions. After factory change:
+
+    - Oracle.getPool(uuid) → uses Oracle.pools[uuid] (OLD pools still accessible)
+    - Functions using factory.getPool(uuid) → uses NEW factory mapping (different pools)
+
+    Functions using Oracle.pools (via getPool):
+    - withdrawUSDC (L258: getPool)
+    - atomicDeposit (L296: getPool)
+    - depositUSDC (L350: getPool)
+
+    Functions using factory.getPool:
+    - collectFees (L103: factory.getPool)
+    - processTreasuryManagementDeposits (L154: factory.getPool)
+    - processTreasuryManagementWithdrawals (L203: factory.getPool)
+    - batchAtomicDeposit (L330: factory.getPool)
+    - addOtherParty (L386: factory.getPool)
+
+    After factory swap, the same poolUuid may resolve to DIFFERENT addresses
+    depending on which function is called. This is a split-brain state.
+  attack_scenario: >
+    1. Admin changes factory to newFactory
+    2. Provider calls withdrawUSDC(user, amount, poolUuid, uuid)
+       → Oracle.getPool(poolUuid) → returns OLD pool address (from Oracle.pools)
+       → withdrawal from old pool works
+    3. Provider calls collectFees([{poolUuid, amount, batchId}])
+       → factory.getPool(poolUuid) → returns NEW factory's pool (or address(0))
+       → if address(0): reverts. If different pool: fees collected from wrong pool
+
+    This creates an inconsistent state where some operations target old pools
+    and others target new pools for the same UUID.
+  impact: "Split-brain pool resolution after factory migration. Fund operations may target wrong pools."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After factory change, getPool should be consistent across all functions
+    address fromOracle = oracle.getPool(poolUuid);
+    address fromFactory = factory.getPool(poolUuid);
+    eq(fromOracle, fromFactory, "TB-10: pool mapping split brain detected");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    This is a genuine design inconsistency. Two different pool resolution paths
+    exist in the same contract. The duplicate mapping (Oracle.pools AND
+    factory.getPool) creates a maintenance hazard.
+
+    KILL SIGNAL: Factory change is an admin operation. Admin is trusted.
+    The admin would presumably handle migration carefully. But the code
+    does not enforce consistency, making it fragile.
+
+    createPool (L359-380) sets BOTH: factory.createPool returns poolAddress,
+    then pools[poolUuid] = poolAddress. But after factory swap, OLD pools
+    exist only in Oracle.pools, not in newFactory.getPool.
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-11: createPool fee extraction — feePaidBy is provider-controlled
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-11
+  tier: 2
+  type: property
+  description: >
+    Oracle.createPool (L359-380): Provider passes feePaidBy and feeAmount to
+    factory.createPool. In the factory (L77-81):
+
+      if (feeAmount > 0) {
+          try usdcAddress.transferFrom(feePaidBy, feeRequestor, feeAmount) {}
+          catch { revert(...) }
+      }
+
+    The feeRequestor in factory.createPool is msg.sender (the Oracle, L375),
+    but in the factory's createPool signature it's the feeRequestor parameter.
+    Looking at Oracle.createPool L369-378: it passes msg.sender as feeRequestor.
+    So msg.sender = provider address.
+
+    Wait — re-reading: Oracle.createPool passes msg.sender (L375) as the
+    feeRequestor parameter to factory.createPool. So feeRequestor = provider.
+    feePaidBy = whatever the provider specifies.
+
+    So: factory does transferFrom(feePaidBy, provider, feeAmount).
+    Provider can set feePaidBy to ANY address that has approved the factory.
+
+    BUT: who approves the factory? Users would need to approve
+    SettlementPoolFactory for USDC. This is unlikely in normal flow (users
+    approve pools, not the factory). So this attack requires a very specific
+    approval state.
+  attack_scenario: >
+    1. Some address has approved SettlementPoolFactory for USDC (unusual)
+    2. Provider calls createPool with feePaidBy=thatAddress, feeAmount=largeAmount
+    3. Factory does transferFrom(thatAddress, provider, largeAmount)
+    4. Provider steals approved funds
+
+    NOTE: feeRequestor is set to msg.sender (the Oracle contract), not the provider.
+    Re-reading Oracle L375: factory.createPool(..., msg.sender, feePaidBy, feeAmount).
+    msg.sender in Oracle.createPool is the PROVIDER (external call from provider).
+    But factory.createPool is called by Oracle, so msg.sender in factory = Oracle.
+
+    CORRECTION: In factory.createPool, msg.sender check is L35: owner() or oracle.
+    The feeRequestor parameter is L375: msg.sender from Oracle context = provider.
+    Wait no — Oracle.createPool L375 passes msg.sender which is the provider
+    (the external caller of Oracle.createPool). This is passed as feeRequestor
+    to factory.createPool.
+
+    So factory does: transferFrom(feePaidBy, provider, feeAmount).
+    Provider receives the fee. But feePaidBy must have approved the FACTORY.
+  impact: "Provider can extract USDC from any address that approved the factory. Requires unusual approval."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    KILL SIGNAL: Factory approval is extremely unlikely in normal user flow.
+    Users approve pools, not the factory. This attack requires a very specific
+    precondition (factory approval) that probably never happens.
+
+    Also if provider is trusted, they control fee params by design.
+  poc_sketch: ''
+  call_stack: |
+    Oracle.createPool(..., feePaidBy, feeAmount) [called by provider]
+    → factory.createPool(creator, others, uuid, rfq, parent, msg.sender=provider, feePaidBy, feeAmount)
+      → if feeAmount > 0:
+        → usdcAddress.transferFrom(feePaidBy, feeRequestor=provider, feeAmount)
+        → feePaidBy needs to have approved factory for >= feeAmount
+
+# ─────────────────────────────────────────────────────────────────────
+# H-12: USDC blacklist — withdrawal failure does not block batch
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-12
+  tier: 2
+  type: property
+  description: >
+    USDC has a blacklist. If a pool party gets blacklisted:
+    - Individual withdrawals (withdrawUSDC): will revert in the pool's
+      try/catch at L275, causing the entire _withdrawUSDCOnBehalf to revert
+      (it re-reverts with the catch message).
+    - Batch withdrawals (processTreasuryManagementWithdrawals): the Oracle
+      wraps each withdrawal in try/catch (L206-225), so one failure doesn't
+      block others. Other parties can still withdraw.
+    - Batch fee collection (collectFees): same try/catch pattern, graceful.
+    - Direct party withdrawals: there is no direct party withdrawal function
+      (all withdrawals go through Oracle). So a blacklisted party cannot
+      withdraw at all.
+
+    The REMAINING concern: if the blacklisted party's share of USDC is stuck
+    in the pool forever. No rescue mechanism exists.
+  attack_scenario: >
+    1. PartyA deposits 50k USDC to pool
+    2. USDC blacklists PartyA
+    3. Provider tries to withdraw to PartyA → fails
+    4. PartyA's 50k USDC is permanently stuck in the pool
+    5. No admin rescue function exists to redirect stuck funds
+
+    This is a known USDC limitation. The protocol has no mitigation.
+  impact: "Permanent fund lock for blacklisted parties. No rescue mechanism."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    KILL SIGNAL: USDC blacklist findings are commonly considered known issues
+    or informational in bug bounties. Most programs explicitly exclude them.
+    Check Immunefi scope for USDC blacklist exclusions.
+
+    The batch operation graceful degradation (try/catch in Oracle) is actually
+    well-implemented. Individual failures don't block batches.
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-13: atomicDeposit — party order validation can be bypassed
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-13
+  tier: 2
+  type: property
+  description: >
+    Oracle.atomicDeposit (L287-322): When partyOneAmountRequested > 0 AND
+    partyTwoAmountRequested == 0 (single-party deposit):
+    - L298-308: Transfers from partyOne to pool (via Oracle as intermediary)
+    - L309-313: Validates party addresses match pool creator/other
+    - L314: Calls pool.depositUSDCAtomic which just emits event (L169-180)
+
+    The address validation (L309-313) checks AFTER the transfer (L301-304).
+    If the transfer succeeds but validation fails, the USDC is already in the
+    Oracle contract. The require on L309 would revert the entire transaction,
+    refunding the transfer. So this is safe due to atomicity.
+
+    BUT: there's a subtle issue. The transferFrom on L301 pulls from partyOne
+    to address(this) (Oracle). Then transfer on L303 sends to poolAddress.
+    If the require on L309 reverts, both transfers are reverted. Safe.
+
+    HOWEVER: the parentQuoteUuid replay protection (L299, L305-307) sets
+    atomic_deposits_processed[parentQuoteUuid] = true BEFORE the address
+    validation. If the address check reverts, the replay flag is also reverted
+    (atomic transaction). So this is safe.
+
+    After deeper analysis: no issue here. Solidity transaction atomicity
+    protects against all ordering concerns.
+  attack_scenario: No attack — transaction atomicity prevents partial execution.
+  impact: "None — false alarm after deeper analysis"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: ''
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    KILL SIGNAL: Solidity atomic transactions. If any step reverts, all state
+    changes revert. The ordering of checks vs effects doesn't matter for
+    correctness within a single transaction (it matters for reentrancy, but
+    ReentrancyGuard is used).
+  poc_sketch: ''
+  call_stack: ''
+
+# ─────────────────────────────────────────────────────────────────────
+# H-14: batchDepositUSDCAtomic — creatorPartyAmountRequested charged N times
+# ─────────────────────────────────────────────────────────────────────
+- id: TB-14
+  tier: 1
+  type: property
+  description: >
+    SettlementPool.batchDepositUSDCAtomic (L122-157): For EACH item in the
+    batch, if creatorPartyAmountRequested > 0, it calls _depositUSDCOnBehalf
+    with creatorPartyAmountRequested. The creator is charged the SAME amount
+    for EVERY item in the batch.
+
+    Example: batch with 3 items, creatorPartyAmountRequested = 100 USDC.
+    Creator is charged 100 USDC * 3 = 300 USDC total.
+
+    The transferUuid for the creator is set to items[i].parentQuoteUuid for
+    each item. After the first deposit, transfers_processed[parentQuoteUuid] = true.
+    For the second item with a DIFFERENT parentQuoteUuid, the duplicate check
+    passes and creator is charged again.
+
+    Question: is this intentional? The creator pays creatorPartyAmountRequested
+    per counterparty in the batch. This might be by design — each batch item
+    represents a separate trade with a different counterparty, and the creator
+    puts up margin for each.
+
+    BUT: the Oracle.batchAtomicDeposit does NOT do a separate transferFrom for
+    the creator (unlike atomicDeposit). It relies on the pool to pull from
+    the creator. So the creator must have approved the pool for
+    creatorPartyAmountRequested * items.length. This could be surprising.
+  attack_scenario: >
+    1. Creator approves pool for 100 USDC (expecting one deposit)
+    2. Provider calls batchAtomicDeposit with 10 items, creatorAmount=100
+    3. Pool tries to pull 100 USDC * 10 = 1000 USDC from creator
+    4. If creator approved enough, they're charged 10x what they expected
+
+    DEPENDENCY: Provider controls the batch. If trusted, this is working as designed.
+    The creator's approval to the pool is the safeguard — they can only be charged
+    up to their approval amount.
+  impact: "Creator may be charged N times the expected amount if batch has N items. Bounded by approval."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After batchDepositUSDCAtomic with N items:
+    // Creator balance should decrease by creatorAmount * N (if approved)
+    uint256 expectedCharge = creatorAmount * items.length;
+    uint256 actualCharge = creatorBalBefore - usdc.balanceOf(creator);
+    eq(actualCharge, expectedCharge, "TB-14: creator charged expected total");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    KILL SIGNAL: This might be intentional design. Each batch item is a separate
+    trade. Creator puts up margin per trade. The approval is the safeguard.
+
+    The naming "creatorPartyAmountRequested" (singular) is misleading if it's
+    charged per item. But the function is "batch" — per-item semantics are expected.
+
+    Need to verify: does the off-chain system expect per-item or total semantics?
+    Without off-chain context, this is ambiguous.
+  poc_sketch: ''
+  call_stack: |
+    batchAtomicDeposit(poolUuid, creator, 100, items[3]) [provider]
+    → pool.batchDepositUSDCAtomic(creator, 100, items[3])
+      → loop i=0: _depositUSDCOnBehalf(creator, 100, items[0].parentQuoteUuid)
+        → transferFrom(creator, pool, 100) ✓
+      → loop i=1: _depositUSDCOnBehalf(creator, 100, items[1].parentQuoteUuid)
+        → transferFrom(creator, pool, 100) ✓ (different uuid, passes dupe check)
+      → loop i=2: _depositUSDCOnBehalf(creator, 100, items[2].parentQuoteUuid)
+        → transferFrom(creator, pool, 100) ✓ (different uuid, passes dupe check)
+      → Total: 300 USDC from creator for "100" requested
+
+# ═══════════════════════════════════════════════════════════════════════
+# SUMMARY — Priority Rankings
+# ═══════════════════════════════════════════════════════════════════════
+#
+# CRITICAL (if PROVIDER_ROLE is NOT trusted):
+#   TB-03: transferFromOLPToPool to arbitrary address (95% confidence if untrusted)
+#   TB-04: collectFees drains pool to provider (90% confidence if untrusted)
+#   TB-07: addOtherParty + withdraw = drain (85% confidence if untrusted)
+#
+# MEDIUM (regardless of trust):
+#   TB-01: grantRole PROVIDER_ROLE always reverts (95% confidence) — code defect
+#   TB-10: Split-brain pool mapping after factory change (80% confidence)
+#   TB-14: Creator charged N times in batch (65% confidence — may be by design)
+#
+# LOW (known issues / by design):
+#   TB-05: Factory owner controls all pools via oracle swap (trusted admin)
+#   TB-08: Implementation contract initializable (standard clone concern)
+#   TB-12: USDC blacklist stuck funds (known limitation)
+#
+# NON-ISSUES after analysis:
+#   TB-02: revokeRole logic is correct
+#   TB-06: Provider-controlled withdrawals (by design)
+#   TB-09: Deposit on behalf without party check (by design — anyone can deposit)
+#   TB-11: createPool fee extraction (requires factory approval, unlikely)
+#   TB-13: atomicDeposit ordering (safe due to tx atomicity)
+#
+# KEY STRATEGIC QUESTION:
+#   The entire severity assessment hinges on PROVIDER_ROLE trust status.
+#   Recommend asking Immunefi/Variational to clarify before reporting.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: TB-FP-01
+  reason: >
+    atomicDeposit party validation order (TB-13) — initially looked like
+    check-after-effect, but Solidity transaction atomicity makes it safe.
+    The entire tx reverts if the address check fails, undoing the transfer.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: settlement.md
+    content: >
+      Check-after-effect within a single transaction is NOT a bug if the function
+      has no external callbacks between effect and check. Solidity atomicity
+      protects. Only a concern with reentrancy vectors.
+    briefing_update_applied: false
+- hunter: TrustBoundaryHunter
+  id: TB-FP-02
+  reason: >
+    depositUSDCOnBehalfOfParty no party check (TB-09) — by design. Anyone can
+    add collateral to a pool. The approval to the pool is the consent mechanism.
+    Asymmetry (deposit: no party check, withdraw: party check) is intentional.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

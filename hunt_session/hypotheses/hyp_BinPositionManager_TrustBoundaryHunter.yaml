@@ -1,0 +1,424 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: BPM-TB-01
+  tier: 1
+  type: property
+  description: "_pay() truncates amount to uint160 via permit2.transferFrom — any settlement amount > type(uint160).max silently pays only the lower 160 bits, creating a delta shortfall that the vault cannot reconcile"
+  attack_scenario: >
+    If a token with very high decimals or a rebasing/inflationary token causes amount > 2^160,
+    the uint160(amount) cast in _pay() (line 394) silently truncates. The vault.sync() + vault.settle()
+    will record less tokens received than the delta requires. The attacker could craft a scenario where
+    the vault believes the debt is settled but only a fraction was actually paid. In practice, uint160 max
+    is ~1.46e48, so with 18-decimal tokens this requires ~1.46e30 tokens — unlikely for standard tokens
+    but possible with custom/high-decimal tokens in permissionless pool creation.
+  impact: "Partial settlement: vault delta remains unsettled, potential insolvency for the pool"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: for any settlement, amount must fit in uint160
+    // Ghost: track all _settle calls and amounts
+    uint256 settleAmount = ghost_lastSettleAmount;
+    lte(settleAmount, type(uint160).max, "BPM-TB-01: settle amount exceeds uint160, truncation will occur");
+  ghost_vars:
+  - uint256 internal ghost_lastSettleAmount;
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The uint160 truncation is in permit2.transferFrom signature. If amount > type(uint160).max,
+    Solidity 0.8.26 will actually revert on the downcast (checked arithmetic). So this is likely
+    safe due to checked math. Needs verification that the cast is indeed checked (not in unchecked block).
+    UPDATE: Looking at the code, `uint160(amount)` in Solidity 0.8.x IS a checked downcast — it will
+    revert if amount > type(uint160).max. So this is a DoS vector (reverts) not a fund loss vector.
+    Downgrading confidence.
+
+- id: BPM-TB-02
+  tier: 1
+  type: property
+  description: "addLiquidity mints ERC1155 tokens to arbitrary 'to' address without requiring msg.sender to pay — a user can mint position tokens to themselves while another user's permit2 approval pays"
+  attack_scenario: >
+    In _addLiquidity, the 'to' parameter receives the minted ERC1155 position tokens (line 306).
+    The payment happens later via SETTLE_PAIR or SETTLE actions, where _settle calls _pay with
+    msgSender() as payer. Since msgSender() returns _getLocker() which is the original msg.sender
+    of modifyLiquidities, the payer is always the caller. So the caller pays and can mint to any
+    'to' address — this is intentional (gifting). However, if combined with
+    modifyLiquiditiesWithoutLock (which requires vault to already be locked), a different trust
+    model applies. If a contract calls modifyLiquiditiesWithoutLock, the locker is still the
+    original external caller. The key question: can an attacker manipulate who the locker is
+    during _executeActionsWithoutLock?
+  impact: "If exploitable: mint position tokens for free to attacker, paid by victim's permit2 allowance"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: the address that receives minted tokens must be either the payer or explicitly authorized
+    // In practice, 'to' can be anyone (by design), but the PAYER must always be msgSender()
+    address payer = _getLocker();
+    address recipient = ghost_lastMintRecipient;
+    // The real invariant: payer == msg.sender of the entry call
+    eq(payer, ghost_originalCaller, "BPM-TB-02: payer differs from original caller");
+  ghost_vars:
+  - address internal ghost_lastMintRecipient;
+  - address internal ghost_originalCaller;
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    After deeper analysis: the ReentrancyLock stores msg.sender in tstore during isNotLocked.
+    modifyLiquiditiesWithoutLock also uses isNotLocked, so the locker is always the direct caller.
+    The real risk would be if someone can call lockAcquired directly (bypassed by onlyByVault).
+    This is likely safe by design, but the Multicall interaction needs investigation (BPM-TB-03).
+
+- id: BPM-TB-03
+  tier: 1
+  type: property
+  description: "Multicall uses delegatecall — msg.sender is preserved, but the ReentrancyLock isNotLocked modifier prevents re-entry. However, multicall itself is NOT protected by isNotLocked, so multiple modifyLiquidities calls via multicall would fail on the second call (locker != address(0)). But multicall(modifyLiquiditiesWithoutLock) could bypass the lock if vault is already locked from the first call."
+  attack_scenario: >
+    User calls multicall([modifyLiquidities(payload1), modifyLiquiditiesWithoutLock(actions2, params2)]).
+    First call: isNotLocked passes, sets locker = msg.sender, calls vault.lock, executes payload1,
+    clears locker. Second call: isNotLocked checks locker == address(0), passes. But
+    modifyLiquiditiesWithoutLock calls _executeActionsWithoutLock which does NOT call vault.lock —
+    it assumes the vault is ALREADY locked. If vault is NOT locked at this point (lock was released
+    after first call), actions execute without vault accounting protection.
+    Actually, _executeActionsWithoutLock just iterates actions and calls _handleAction directly.
+    The actions that interact with the vault (SETTLE, TAKE) will call vault.take/settle which
+    require the vault to be locked (vault checks msg.sender == locker). So this would revert.
+    But the BIN_ADD_LIQUIDITY action calls binPoolManager.mint which also requires vault lock.
+    Net: this path reverts because vault is not locked. Not exploitable.
+  impact: "If vault lock check is missing: arbitrary state manipulation without proper accounting"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: vault must be locked during any pool interaction
+    // This is enforced by the vault itself, but verify at the periphery level
+    bool vaultLocked = vault.getLocker() != address(0);
+    // During any _handleAction execution for liquidity actions, vault must be locked
+    t(vaultLocked, "BPM-TB-03: vault not locked during action execution");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    After analysis, this is safe because: (1) modifyLiquidities locks the vault, (2)
+    modifyLiquiditiesWithoutLock requires the vault to be locked by the caller (checked by vault
+    internally on each operation). The isNotLocked on modifyLiquiditiesWithoutLock is about the
+    PERIPHERY reentrancy lock, not the vault lock. The vault has its own lock mechanism.
+    However, the interesting case is: who is the vault's locker when modifyLiquiditiesWithoutLock
+    is called? If some OTHER contract locked the vault and then calls BinPositionManager, the
+    locker stored by ReentrancyLock is the calling contract, but msgSender() returns that contract.
+    The payer in _settle would then be that contract. This is by design for composability.
+
+- id: BPM-TB-04
+  tier: 1
+  type: property
+  description: "initializePool silently catches ALL reverts via try/catch — a pool initialization that fails for a critical reason (e.g., malicious hook setup, invalid fee) is silently ignored, and subsequent addLiquidity to that pool will interact with an uninitialized pool"
+  attack_scenario: >
+    User calls initializePool with a poolKey containing a malicious hook or invalid parameters.
+    The try/catch on line 123 catches the revert silently. The user then calls addLiquidity
+    thinking the pool was initialized. binPoolManager.mint will revert because the pool doesn't
+    exist. This is a DoS/UX issue, not a fund loss issue — the comment says "follow-up action
+    to the pool will still revert accordingly". However, if there's a case where binPoolManager.mint
+    does NOT revert for an uninitialized pool (returns zero values instead), the user could lose
+    tokens. The real risk: a pool that was ALREADY initialized by someone else with different
+    parameters — the try/catch hides this, and the user may add liquidity to a pool with unexpected
+    hook/fee settings.
+  impact: "User adds liquidity to a pool with unexpected parameters (different hook, different fees) — potential fund loss via malicious hook"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After initializePool, verify the pool actually exists with expected parameters
+    // This tests whether silent failure leads to unexpected state
+    (uint24 activeId,,) = binPoolManager.getSlot0(poolKey.toId());
+    // If pool was not initialized, activeId should be 0 and subsequent operations should revert
+    // The invariant: if initializePool was called, pool MUST be initialized OR next operation MUST revert
+    t(activeId != 0 || ghost_nextOperationReverted, "BPM-TB-04: pool not initialized and next op succeeded");
+  ghost_vars:
+  - bool internal ghost_nextOperationReverted;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    The comment in the code explicitly acknowledges this: "if the pool revert due to other error,
+    then the follow-up action to the pool will still revert accordingly". The real question is whether
+    there's a path where the follow-up does NOT revert. If the pool was already initialized by a
+    front-runner with a malicious hook, the user's addLiquidity would succeed but interact with
+    the attacker's hook. This is a known front-running vector in Uniswap v4 / PCS Infinity.
+
+- id: BPM-TB-05
+  tier: 1
+  type: property
+  description: "ERC1155 position for binId=0 can never have its _positions mapping populated — the check `if (_positions[tokenId].binId == 0)` treats binId=0 as 'uninitialized', but binId=0 is a valid bin in the BinPool (represents a specific price range)"
+  attack_scenario: >
+    If a user adds liquidity to binId=0 (which is valid in the bin pool system — it represents
+    the lowest price bin), the _addLiquidity function mints ERC1155 tokens correctly. However,
+    the positions mapping check on line 308 uses `_positions[tokenId].binId == 0` as the
+    condition to populate the mapping. Since binId IS 0, the condition is true on every call,
+    so it WILL be set. But the issue is that the `positions()` view function on line 109 checks
+    `PoolId.unwrap(position.poolId) == 0` for the invalid check, not binId. So binId=0 positions
+    ARE stored correctly. However, there's a subtlety: after the position is stored, if someone
+    queries `positions(tokenId)`, it returns correctly. But the _positions mapping will be
+    overwritten every time someone adds liquidity to binId=0 for the same pool (the condition
+    `_positions[tokenId].binId == 0` is always true for binId=0). This is harmless because the
+    same tokenId always maps to the same (poolId, binId) pair.
+  impact: "Potential view function confusion for binId=0 positions, but no fund loss"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For every tokenId with binId=0, the _positions mapping is re-written on every addLiquidity
+    // This should be idempotent — verify it doesn't corrupt data
+    uint256 tokenId = poolId.toTokenId(0); // binId = 0
+    (PoolKey memory key, uint24 storedBinId) = positions(tokenId);
+    eq(uint256(storedBinId), 0, "BPM-TB-05: binId=0 position corrupted");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    After analysis: this is benign. The _positions mapping for binId=0 is re-written every time
+    but with the same values (same poolId, same binId=0). The tokenId is deterministic
+    (keccak256(poolId, binId)), so it's always the same entry. No corruption possible.
+    Marking as low confidence — likely false positive but worth documenting.
+
+- id: BPM-TB-06
+  tier: 1
+  type: property
+  description: "removeLiquidity burns ERC1155 tokens from params.from but the vault delta (tokens owed to the user) is not explicitly directed to params.from — the tokens go wherever the caller routes them via TAKE/TAKE_PAIR/CLOSE actions. An approved operator can burn someone's position and route the underlying tokens to themselves."
+  attack_scenario: >
+    Alice approves Bob (isApprovedForAll). Bob calls modifyLiquidities with actions:
+    [BIN_REMOVE_LIQUIDITY, TAKE_PAIR]. In BIN_REMOVE_LIQUIDITY, params.from = Alice (burns
+    Alice's ERC1155 tokens, passes checkApproval). The burn creates a positive vault delta.
+    In TAKE_PAIR, Bob sets recipient = Bob's address. The vault sends the underlying tokens
+    (USDC, WETH, etc.) to Bob, not Alice. Alice lost her position AND the underlying tokens.
+    This is the ERC1155 approval model — isApprovedForAll grants FULL control. The question
+    is whether users understand this. In ERC721/ERC1155, approval means the operator can
+    transfer the token, not extract its underlying value. But here, approval means the operator
+    can liquidate the position AND steal the proceeds.
+  impact: "Approved operator can steal all underlying tokens from position owner by burning and routing to themselves"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track: when burning from address X, the TAKE recipient should be X (or X should have explicitly set another recipient)
+    // Ghost vars track the burn-from address and take-recipient within the same tx
+    if (ghost_burnFrom != address(0) && ghost_takeRecipient != address(0)) {
+        // If the caller is not the position owner, tokens should go to the position owner
+        bool callerIsOwner = (ghost_burnFrom == _getLocker());
+        // This invariant would be violated by design — operators CAN redirect funds
+        // The question is whether this is the intended trust model
+        t(callerIsOwner || ghost_takeRecipient == ghost_burnFrom,
+          "BPM-TB-06: operator redirected burned position tokens to non-owner");
+    }
+  ghost_vars:
+  - address internal ghost_burnFrom;
+  - address internal ghost_takeRecipient;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This is likely "by design" — ERC1155 isApprovedForAll grants full control, and sophisticated
+    users/protocols understand this. However, it's a trust boundary violation from the perspective
+    of a naive user who thinks approval = transfer permission, not extraction permission.
+    The key question for the bounty: does PancakeSwap's documentation clearly state that
+    isApprovedForAll grants the ability to extract underlying tokens? If not, this could be
+    a Medium finding (user trust assumption violation). Compare with Uniswap v4 CLPositionManager
+    which has a subscriber system for additional protection.
+
+- id: BPM-TB-07
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock does NOT have a deadline check — unlike modifyLiquidities which has checkDeadline(deadline). A pending transaction calling modifyLiquiditiesWithoutLock can be executed at any future time, potentially at unfavorable prices."
+  attack_scenario: >
+    A contract or integration calls modifyLiquiditiesWithoutLock to add/remove liquidity. Since
+    there is no deadline parameter, the transaction can sit in the mempool indefinitely and be
+    executed when market conditions have changed significantly. For addLiquidity, the
+    amountMax slippage check provides some protection. For removeLiquidity, amount0Min/amount1Min
+    provide protection. But the activeId slippage check (idSlippage) is based on the activeId
+    at execution time vs activeIdDesired at submission time — without a deadline, the activeId
+    could have moved far beyond idSlippage range and then moved back, making the check pass
+    but at a different price level than intended. However, modifyLiquiditiesWithoutLock is
+    designed for composability (called by other contracts that already have their own deadline).
+  impact: "Stale transactions executed at unfavorable prices, potential value extraction from LP"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // This is a design choice — modifyLiquiditiesWithoutLock trusts the caller to enforce deadlines
+    // Invariant: if modifyLiquiditiesWithoutLock is called directly by an EOA, there's no deadline protection
+    // We can't test this as a property invariant easily — it's a design observation
+    // But we can verify that amountMax/amountMin slippage checks still work
+    t(ghost_slippageCheckPassed, "BPM-TB-07: slippage check must still be enforced without deadline");
+  ghost_vars:
+  - bool internal ghost_slippageCheckPassed;
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    This is likely by design. The function is meant for contract-to-contract composability where
+    the outer contract handles deadline. The isNotLocked modifier ensures it can't be called
+    re-entrantly. However, it CAN be called directly by an EOA — the question is whether PCS
+    considers this a valid use case. In Uniswap v4, the equivalent function also lacks a deadline.
+
+- id: BPM-TB-08
+  tier: 1
+  type: property
+  description: "cachePoolKey only stores the poolKey on first use (when binStep == 0). If the same poolId maps to two different poolKeys (hash collision or a bug in toId()), the second poolKey is silently ignored — positions() returns stale/wrong poolKey data."
+  attack_scenario: >
+    PoolId is computed as keccak256 of the PoolKey struct. If two different PoolKeys hash to the
+    same PoolId (practically impossible with keccak256), the second one's poolKey would not be
+    cached. More realistically: if the pool parameters change (e.g., via governance or pool
+    migration), the cached poolKey would be stale. The getBinStep() == 0 check assumes that
+    a valid pool always has binStep > 0. If a pool could have binStep == 0 (unlikely but
+    depends on BinPoolParametersHelper), the poolKey would be overwritten on every call.
+    The practical risk: the positions() view function returns the cached poolKey, which could
+    be stale if the pool was somehow reconfigured. However, PoolKey in Uniswap v4 / PCS Infinity
+    is immutable for a given pool — pools are not reconfigured.
+  impact: "Stale poolKey in positions() view — integration contracts may use wrong parameters"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: cached poolKey must match the actual pool parameters
+    PoolId poolId = poolKey.toId();
+    PoolKey memory cached = _poolIdToPoolKey[PoolId.unwrap(poolId)];
+    // If cached, it must match
+    if (cached.parameters.getBinStep() != 0) {
+        eq(Currency.unwrap(cached.currency0), Currency.unwrap(poolKey.currency0),
+           "BPM-TB-08: cached poolKey currency0 mismatch");
+        eq(Currency.unwrap(cached.currency1), Currency.unwrap(poolKey.currency1),
+           "BPM-TB-08: cached poolKey currency1 mismatch");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    PoolKey → PoolId is a deterministic hash. Two different PoolKeys cannot have the same PoolId
+    (barring keccak256 collision). This is safe by design. The only edge case is if getBinStep()
+    could return 0 for a valid pool, causing the cache to be refreshed every time. Low priority.
+
+- id: BPM-TB-09
+  tier: 1
+  type: property
+  description: "_sweep sends entire contract balance of any token to any recipient (via _mapRecipient). If tokens are accidentally sent to BinPositionManager (e.g., fee-on-transfer dust, direct transfer), anyone can sweep them by including a SWEEP action in their modifyLiquidities call."
+  attack_scenario: >
+    Step 1: Fee-on-transfer token is used in a pool. During _settle, the actual amount transferred
+    is less than the amount specified (fee-on-transfer). Over many operations, dust accumulates
+    in the BinPositionManager contract. Step 2: Any user calls modifyLiquidities with a SWEEP
+    action, specifying the fee-on-transfer token and their own address as recipient. They receive
+    all accumulated dust. This is intentional behavior (sweep is a cleanup mechanism), but the
+    trust boundary question is: should ANY user be able to sweep ANY token? In Uniswap v4,
+    sweep is similarly permissionless. The risk is if the BinPositionManager ever holds tokens
+    that belong to a specific user (e.g., mid-transaction via multicall).
+  impact: "Theft of accumulated token dust from the contract — Low value in isolation but could be significant over time for high-volume pools"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track: contract balance before and after sweep
+    uint256 balanceBefore = currency.balanceOfSelf();
+    // After sweep:
+    uint256 balanceAfter = currency.balanceOfSelf();
+    eq(balanceAfter, 0, "BPM-TB-09: sweep should drain entire balance");
+    // The question is whether balanceBefore belonged to anyone specific
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    This is by design in Uniswap v4 architecture. The PositionManager should not hold tokens
+    between transactions (all tokens are settled to the vault). Sweep is a safety mechanism
+    for recovering stuck tokens. However, during a multicall, tokens COULD temporarily reside
+    in the contract (e.g., after UNWRAP and before SETTLE). If a malicious second call in
+    multicall sweeps tokens that the first call deposited, there could be an issue. But
+    multicall uses delegatecall so msg.sender is preserved and the locker check prevents
+    interleaving with other users' calls.
+
+- id: BPM-TB-10
+  tier: 2
+  type: property
+  description: "activeIdDesired underflow in slippage check — if activeIdDesired < idSlippage, the subtraction `activeIdDesired - idSlippage` underflows (both are uint256), producing a very large number that will always be > activeId, causing a revert. This means users cannot add liquidity to very low bin IDs with any slippage tolerance."
+  attack_scenario: >
+    User wants to add liquidity around binId=5 with idSlippage=10. activeIdDesired=5, idSlippage=10.
+    Line 276: `activeIdDesired - idSlippage` = 5 - 10 = underflow in uint256 = very large number.
+    This is always > activeId (which is a uint24), so it reverts with IdSlippageCaught.
+    The user cannot add liquidity to low bin IDs with meaningful slippage tolerance.
+    The check on line 266 validates both are <= type(uint24).max, so both fit in uint24, but
+    the subtraction is done on uint256 values. If activeIdDesired=0 and idSlippage=1, the
+    subtraction underflows. This is a DoS for low bin ID pools, not a fund loss.
+    Note: the code checks `activeIdDesired + idSlippage < activeId` first (line 273), and
+    `activeIdDesired - idSlippage > activeId` second (line 276). The underflow on line 276
+    means the second check always reverts for activeIdDesired < idSlippage, even if the
+    first check would have been sufficient to validate the range.
+  impact: "DoS: cannot add liquidity to bins near ID 0 with any slippage tolerance"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Test: addLiquidity with activeIdDesired < idSlippage should not revert if activeId is within valid range
+    // This will demonstrate the underflow DoS
+    uint256 activeIdDesired = 5;
+    uint256 idSlippage = 10;
+    // The subtraction underflows:
+    uint256 lowerBound = activeIdDesired - idSlippage; // UNDERFLOW → huge number
+    // lowerBound > activeId is always true → revert
+    // Expected: should succeed if activeId is between 0 and 15
+    t(false, "BPM-TB-10: cannot test inline, need foundry PoC");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    This is a genuine edge case bug. In Solidity 0.8.26, uint256 subtraction reverts on underflow
+    (checked arithmetic). So `activeIdDesired - idSlippage` when activeIdDesired < idSlippage
+    will REVERT, not wrap around. This means: if a user sets activeIdDesired=5 and idSlippage=10,
+    the transaction reverts even if the actual activeId IS within the intended range [0, 15].
+    The fix would be to cast to int256 or add a conditional check. This is likely a valid Low/QA
+    finding — DoS for a subset of valid inputs. Checking if Uniswap v4 has the same issue in
+    their CL equivalent.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-01
+  reason: >
+    Hook attacks were considered but explicitly excluded from scope per instructions:
+    "Hooks are FULLY TRUSTED — don't report hook attacks". The beforeMint/afterMint hooks
+    could manipulate activeId, steal tokens, or cause reentrancy, but these are by design
+    in the hook trust model.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "PCS Infinity hooks are FULLY TRUSTED by design — no point fuzzing hook attack vectors"
+    briefing_update_applied: false
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-02
+  reason: >
+    Multicall + msg.value duplication was investigated. In Uniswap v4, multicall with
+    msg.value could allow double-spending of ETH across multiple calls. However, the vault's
+    sync/settle mechanism tracks actual balance changes, not msg.value. Each settle call
+    does vault.sync (snapshots balance) then vault.settle (compares current balance to snapshot).
+    So even if msg.value is "reused" across delegatecalls, the vault only credits the actual
+    ETH received. This is safe by design.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Multicall + msg.value is safe in PCS Infinity because vault.sync/settle tracks actual balance, not msg.value"
+    briefing_update_applied: false
+- hunter: TrustBoundaryHunter
+  id: BPM-TB-FP-03
+  reason: >
+    ERC1155 token ID collision was investigated. tokenId = keccak256(poolId, binId). Two different
+    (poolId, binId) pairs cannot produce the same tokenId barring keccak256 collision. This is
+    cryptographically secure.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

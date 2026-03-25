@@ -1,0 +1,515 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: WildcardHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: BPM-W01
+  tier: 1
+  type: property
+  description: "_pay truncates amount to uint160 via permit2.transferFrom — any settlement amount > type(uint160).max silently pays less than owed"
+  attack_scenario: |
+    The _pay function casts `amount` to uint160 when calling permit2.transferFrom:
+      permit2.transferFrom(payer, address(vault), uint160(amount), ...)
+    If amount > type(uint160).max (approx 1.46e48), the upper bits are silently truncated.
+    In practice, token amounts rarely exceed uint160, BUT: the amount comes from vault.currencyDelta
+    which is an int256. If a hook or composability interaction inflates the delta to exceed uint160,
+    the user pays far less than owed. The vault would have an unsettled negative delta that gets
+    absorbed by the next user who settles.
+    Attack: find a path where the delta for a currency exceeds uint160 — e.g., via repeated
+    addLiquidity calls within a single lock session that accumulate debt, or via a malicious hook
+    that amplifies the delta. The truncation means the user underpays.
+  impact: "Vault accounting desync — underpayment by the truncated amount. Other users' settlements cover the gap."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: settle an amount > uint160 max and verify vault receives full amount
+    uint256 largeAmount = uint256(type(uint160).max) + 1e18;
+    uint256 vaultBalBefore = currency.balanceOf(address(vault));
+    // Simulate _pay path with large amount
+    // After settlement:
+    uint256 vaultBalAfter = currency.balanceOf(address(vault));
+    uint256 actualPaid = vaultBalAfter - vaultBalBefore;
+    eq(actualPaid, largeAmount, "BPM-W01: _pay truncated amount via uint160 cast");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: |
+    The uint160 cast in _pay line 378 is a real truncation risk. However, realistic token supplies
+    rarely exceed uint160. The question is whether accumulated deltas within a single lock session
+    can reach that threshold. Likely theoretical but worth verifying. Permit2's transferFrom
+    signature uses uint160 by design, so this may be an inherent limitation acknowledged by the system.
+
+- id: BPM-W02
+  tier: 1
+  type: property
+  description: "Multicall + modifyLiquiditiesWithoutLock allows re-entering the action loop while vault is locked, bypassing isNotLocked"
+  attack_scenario: |
+    Multicall uses delegatecall to this contract. The flow:
+    1. User calls multicall([modifyLiquidities(payload1, deadline), modifyLiquiditiesWithoutLock(actions2, params2)])
+    2. First call: modifyLiquidities passes isNotLocked (locker == address(0)), sets locker = msg.sender,
+       calls vault.lock(payload1), which calls lockAcquired, executes actions, clears locker.
+    3. Second call: modifyLiquiditiesWithoutLock also checks isNotLocked — since the first call
+       cleared the locker, this passes too. BUT this function calls _executeActionsWithoutLock
+       which does NOT acquire a vault lock. It executes actions raw.
+
+    The real question: can modifyLiquiditiesWithoutLock be called when vault is NOT locked?
+    It has isNotLocked but NOT a check that vault IS locked. It's meant for hooks (called during
+    lockAcquired). If called standalone via multicall when vault is unlocked, the actions
+    (BIN_ADD_LIQUIDITY, etc.) call binPoolManager.mint which requires the vault to be locked.
+    So it would revert at the pool manager level. But SETTLE, TAKE, SWEEP, WRAP, UNWRAP actions
+    might succeed without vault lock — specifically SWEEP and WRAP/UNWRAP which don't interact
+    with vault.lock state.
+
+    Exploit: multicall with modifyLiquiditiesWithoutLock containing only SWEEP action to drain
+    any tokens sitting in the BinPositionManager contract.
+  impact: "Theft of any ERC20 tokens stranded in the BinPositionManager contract via SWEEP without lock"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify: can modifyLiquiditiesWithoutLock be called when vault is NOT locked?
+    // And can SWEEP execute successfully in that state?
+    address posManager = address(binPositionManager);
+    // Send some tokens to posManager (simulating stranded tokens)
+    token.transfer(posManager, 1 ether);
+    // Build multicall: modifyLiquiditiesWithoutLock with SWEEP action
+    // If this succeeds, attacker can drain stranded tokens
+    uint256 attackerBalBefore = token.balanceOf(attacker);
+    // execute multicall...
+    uint256 attackerBalAfter = token.balanceOf(attacker);
+    gt(attackerBalAfter, attackerBalBefore, "BPM-W02: SWEEP via modifyLiquiditiesWithoutLock drained tokens");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: |
+    SWEEP (line 386-388) only checks currency.balanceOfSelf() > 0 and transfers. It does NOT
+    interact with the vault at all. If modifyLiquiditiesWithoutLock can be called when vault
+    is not locked, SWEEP would succeed. The isNotLocked modifier only checks the ReentrancyLock
+    (transient storage locker), NOT the vault lock state. However, any tokens stranded in the
+    contract are generally considered "lost" by design in Uniswap v4 architecture. Still, the
+    recipient can be set to attacker via _mapRecipient.
+
+- id: BPM-W03
+  tier: 1
+  type: property
+  description: "Position metadata for binId=0 is never stored — _positions[tokenId].binId == 0 used as 'empty' sentinel collides with actual bin 0"
+  attack_scenario: |
+    In _addLiquidity line 308: `if (_positions[tokenId].binId == 0)` is used as a sentinel to
+    check if the position metadata has been set. But binId=0 is a VALID bin in Bin pools
+    (bins range from 0 to 2^24-1).
+
+    If a user adds liquidity to binId=0 (activeId=0 with deltaIds[i]=0), the position is stored
+    with binId=0. On a SECOND addLiquidity to the same bin, the check `_positions[tokenId].binId == 0`
+    is TRUE again (because binId IS 0), so it overwrites the position data. This is harmless for
+    the same pool, but consider:
+
+    What if two DIFFERENT pools hash to the same tokenId? That's a keccak256 collision (infeasible).
+
+    The real issue: the `positions()` view function (line 109) reverts with InvalidTokenID when
+    `PoolId.unwrap(position.poolId) == 0`. If poolId happens to be bytes32(0), a legitimate
+    position would be unretrievable. PoolId is keccak256(abi.encode(PoolKey)) — getting bytes32(0)
+    is infeasible.
+
+    However, for binId=0: positions() returns the correct data since poolId != 0. The sentinel
+    issue means the position metadata gets re-written on every addLiquidity to bin 0, which is
+    idempotent (same poolId, same binId=0). This is a LOW issue — no fund loss, just a code smell.
+  impact: "No direct fund loss. Position metadata for binId=0 is re-written on every add, which is idempotent."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Add liquidity to binId 0, verify position is queryable
+    // activeId must be 0, deltaIds[0] = 0
+    uint256 tokenId = poolId.toTokenId(0);
+    // After addLiquidity to bin 0:
+    (PoolKey memory key, uint24 binId) = binPositionManager.positions(tokenId);
+    eq(uint256(binId), 0, "BPM-W03: binId 0 position should be retrievable");
+    // Add liquidity again to same bin — position should still be valid
+    // (idempotent overwrite)
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: |
+    The sentinel check uses binId==0 as "empty", but binId=0 is valid. In practice the
+    overwrite is idempotent so no fund loss occurs. The positions() view uses poolId==0
+    as its sentinel, which is safe (keccak256 collision is infeasible).
+
+- id: BPM-W04
+  tier: 1
+  type: property
+  description: "idSlippage underflow — if activeIdDesired < idSlippage, the subtraction activeIdDesired - idSlippage wraps to a huge uint256, making the check always pass"
+  attack_scenario: |
+    Line 260: `if (activeIdDesired - idSlippage > activeId)` — both are uint256. If
+    activeIdDesired < idSlippage, the subtraction underflows (Solidity 0.8.26 will revert
+    on underflow by default). Wait — this IS in unchecked? No, it's in a regular context.
+
+    So if activeIdDesired=5 and idSlippage=10, then `5 - 10` reverts with arithmetic underflow.
+    This means a user who sets idSlippage > activeIdDesired will have their transaction revert
+    even if the activeId is within a valid range. This is a usability issue but not a security bug.
+
+    However, line 257: `activeIdDesired + idSlippage < activeId` — if activeIdDesired + idSlippage
+    overflows uint256, it wraps to a small number, making the check incorrectly PASS when it
+    should fail. Both are bounded to type(uint24).max by the check on line 250, so
+    max sum = 2 * 16777215 = 33554430, which fits in uint256. No overflow possible.
+
+    Verdict: The underflow on line 260 causes unnecessary reverts when idSlippage > activeIdDesired,
+    which is a legitimate user input (e.g., activeIdDesired=0, idSlippage=5 should allow activeId
+    from 0 to 5, but reverts instead). This could prevent adding liquidity near bin 0.
+  impact: "DoS: users cannot add liquidity to low-numbered bins with reasonable idSlippage values"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Try to add liquidity with activeIdDesired=2, idSlippage=5, when activeId=1
+    // This should be within slippage but will revert due to underflow on 2-5
+    // Call _addLiquidity and expect revert
+    // If it reverts with arithmetic underflow (not IdSlippageCaught), it's a bug
+    bool success;
+    try binPositionManager.modifyLiquidities(...) {
+        success = true;
+    } catch {
+        success = false;
+    }
+    t(success, "BPM-W04: underflow prevents valid add liquidity near bin 0");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: |
+    This is a real edge case. Any user trying to add liquidity near bin 0 with a reasonable
+    idSlippage that exceeds the activeIdDesired will get an arithmetic underflow revert
+    instead of the intended IdSlippageCaught error. Bin 0 is rarely used in practice
+    (it represents an extreme price), but it's still a valid bin. The fix is to add
+    a check: if (activeIdDesired >= idSlippage) { check subtraction } else { /* always valid */ }.
+
+- id: BPM-W05
+  tier: 1
+  type: property
+  description: "initializePool silently swallows ALL errors including critical ones — pool can appear initialized but be in broken state"
+  attack_scenario: |
+    Line 121-124: initializePool uses try/catch {} catch {} which swallows ALL reverts from
+    binPoolManager.initialize(). The comment says "if the pool revert due to other error, then
+    the follow-up action to the pool will still revert accordingly."
+
+    But consider this composability attack:
+    1. Attacker calls initializePool with a carefully crafted PoolKey that causes initialize
+       to revert due to an internal error (not currencyOutOfOrder) — e.g., hook deployment issue
+    2. The revert is swallowed. The pool is NOT initialized.
+    3. In a multicall, the next action is BIN_ADD_LIQUIDITY to this pool.
+    4. If binPoolManager.mint reverts for uninitialized pool, the add fails. Fine.
+
+    But the REAL risk: initializePool is external payable. If called with msg.value and the
+    initialize call reverts, the ETH is stranded in the BinPositionManager contract forever
+    (until someone calls SWEEP for native). This is a minor ETH loss vector.
+
+    Also: a front-runner can call initializePool with a different activeId before the victim's
+    tx. The victim's initializePool call gets swallowed (pool already exists), and the pool
+    has the attacker's activeId. The victim then adds liquidity at the wrong price.
+    This is the classic pool initialization front-running attack.
+  impact: "Front-running initializePool to set attacker-chosen activeId, causing victim to add liquidity at wrong price"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Attacker front-runs pool initialization with activeId=1 (extreme price)
+    // Victim's initializePool with activeId=8388608 (fair price) silently fails
+    // Victim's addLiquidity succeeds at the wrong price
+    binPositionManager.initializePool(key, 1); // attacker sets extreme price
+    // Victim's initializePool:
+    binPositionManager.initializePool(key, 8388608); // silently swallowed!
+    (uint24 actualActiveId,,) = binPoolManager.getSlot0(key.toId());
+    eq(uint256(actualActiveId), 1, "BPM-W05: pool initialized at attacker's activeId");
+    // Now victim adds liquidity thinking activeId is 8388608 but it's 1
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: |
+    This is a well-known pattern (pool initialization front-running) but the try/catch {}
+    makes it worse because the victim gets NO feedback that their initialization failed.
+    The idSlippage check in _addLiquidity should catch SOME cases, but if the victim sets
+    wide slippage (common for new pools), the attack succeeds. This is similar to Uniswap v4
+    PoolInitializer.initializePool which also silently catches, but Uniswap v4 docs warn
+    about this. PCS Infinity may have the same acknowledged design.
+
+- id: BPM-W06
+  tier: 2
+  type: property
+  description: "ERC1155 transferBatch requires vault to be unlocked (onlyIfVaultUnlocked) — transfers are blocked during lock callback, preventing composable position transfers"
+  attack_scenario: |
+    batchTransferFrom has the onlyIfVaultUnlocked modifier which checks vault.getLocker() == address(0).
+    During a modifyLiquidities call, the vault IS locked (locker != address(0)). This means:
+
+    1. A hook that tries to transfer BinPositionManager ERC1155 tokens during beforeMint/afterMint
+       will REVERT because vault is locked.
+    2. Any composable protocol that needs to transfer positions atomically within a vault.lock
+       session cannot do so.
+    3. This is likely by design to prevent reentrancy, but it creates a deadlock scenario:
+       - Protocol X needs to transfer position tokens to itself before calling removeLiquidity
+       - removeLiquidity requires vault lock
+       - batchTransferFrom requires vault UNlocked
+       - Protocol X cannot do both atomically
+
+    This is probably by design (positions should be transferred outside of lock sessions),
+    but it's a composability restriction that could surprise integrators.
+  impact: "Composability limitation — integrating protocols cannot transfer ERC1155 positions during vault lock"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // During a modifyLiquidities callback, try to transfer ERC1155 tokens
+    // This should revert with VaultMustBeUnlocked
+    // In handler during lockAcquired:
+    uint256[] memory ids = new uint256[](1);
+    uint256[] memory amounts = new uint256[](1);
+    ids[0] = tokenId;
+    amounts[0] = 1;
+    try binPositionManager.batchTransferFrom(from, to, ids, amounts) {
+        t(false, "BPM-W06: transfer should revert during vault lock");
+    } catch {
+        t(true, "BPM-W06: confirmed - transfers blocked during vault lock");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: |
+    This is almost certainly by design, mirroring Uniswap v4's approach. Including it because
+    integrators might not expect ERC1155 transfers to be blocked during vault operations,
+    and this could cause issues in complex DeFi composability scenarios.
+
+- id: BPM-W07
+  tier: 1
+  type: property
+  description: "Multicall with msg.value allows the same ETH to be reused across multiple delegatecall sub-calls — double-spend of msg.value"
+  attack_scenario: |
+    Multicall uses delegatecall, which preserves msg.value across all iterations. If a user
+    sends 1 ETH and multicalls:
+    1. modifyLiquidities (payload that wraps 1 ETH and adds liquidity to pool A)
+    2. modifyLiquidities (payload that wraps 1 ETH and adds liquidity to pool B)
+
+    Each delegatecall sees msg.value = 1 ETH. However, the actual ETH balance of the contract
+    only has 1 ETH total. The WRAP action calls WETH9.deposit{value: amount}() which will
+    revert if amount > address(this).balance.
+
+    BUT: what about SETTLE with native currency? _settle calls vault.settle{value: amount}().
+    If the contract already has ETH from previous operations (e.g., refunds from WETH unwrap),
+    the settle might succeed using stale ETH balance.
+
+    The _mapSettleAmount with CONTRACT_BALANCE uses currency.balanceOfSelf() which returns
+    the ACTUAL ETH balance. But if amount is specified directly (not CONTRACT_BALANCE), and
+    the contract has enough ETH from previous operations within the multicall, the user
+    can settle more than they sent.
+
+    This is the classic Multicall + msg.value double-spend (SushiSwap MISO vulnerability).
+  impact: "User can potentially settle native currency debts using the same ETH twice across multicall sub-calls"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Send 1 ETH via multicall with two modifyLiquidities calls
+    // Each tries to settle 1 ETH worth of native currency debt
+    // If both succeed, 2 ETH of debt was settled with only 1 ETH
+    uint256 vaultBalBefore = address(vault).balance;
+    // multicall{value: 1 ether}([
+    //   modifyLiquidities(addLiqPool_A_native_1eth),
+    //   modifyLiquidities(addLiqPool_B_native_1eth)
+    // ])
+    uint256 vaultBalAfter = address(vault).balance;
+    uint256 settled = vaultBalAfter - vaultBalBefore;
+    lte(settled, 1 ether, "BPM-W07: more ETH settled than sent via multicall msg.value reuse");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 50
+  notes: |
+    This is the SushiSwap MISO pattern. The key question is whether vault.settle{value: amount}()
+    will succeed if the BinPositionManager doesn't have enough ETH. The vault.sync + vault.settle
+    pattern should protect against this because sync records the balance before, and settle
+    checks the balance after — so the actual ETH must have been received. But the delegatecall
+    preserves msg.value, not actual balance. Need to verify: does vault.settle check
+    address(vault).balance increase, or does it rely on msg.value? If it checks actual balance
+    increase (which is the correct pattern), this is safe. If it uses msg.value, it's exploitable.
+
+- id: BPM-W08
+  tier: 1
+  type: property
+  description: "BIN_ADD_LIQUIDITY_FROM_DELTAS uses _getFullCredit which reverts on negative delta — no graceful handling when credit is zero or negative after hook interaction"
+  attack_scenario: |
+    BIN_ADD_LIQUIDITY_FROM_DELTAS (line 166-183) uses _getFullCredit(currency0/1).toUint128()
+    as the amount0/amount1 for addLiquidity. _getFullCredit (DeltaResolver line 68-73) reverts
+    with DeltaNotPositive if the currency delta is negative.
+
+    Scenario:
+    1. User calls modifyLiquidities with actions: [SETTLE(token0, 100), BIN_ADD_LIQUIDITY_FROM_DELTAS]
+    2. They settle 100 token0, creating a positive delta of 100 for token0 in the vault.
+    3. But they forgot to settle token1 — delta for token1 is 0.
+    4. _getFullCredit for token1 returns 0 (delta == 0, not negative, so no revert).
+    5. amount1 = 0. _addLiquidity is called with amount1=0.
+    6. This could result in a single-sided liquidity add, which is valid in Bin pools.
+
+    BUT: what if a hook in beforeMint takes tokens from the vault (reducing the delta to negative)?
+    The hook executes AFTER the SETTLE action but BEFORE the slippage check. If the hook takes
+    enough that the user's delta goes negative, _getFullCredit would have already been called
+    and passed. The issue is that _getFullCredit is called BEFORE binPoolManager.mint which
+    triggers the hook. So the amounts are fixed before hook interaction.
+
+    This is actually safe by design — amounts are computed pre-hook, and slippage catches post-hook
+    delta inflation. But there's a subtle issue: if amount0 and amount1 from _getFullCredit are
+    both 0 (user settled nothing), the mint is called with amountIn = 0|0. Does binPoolManager.mint
+    handle zero amounts gracefully, or does it mint zero liquidity tokens? If zero liquidity is
+    minted, the _mint(to, tokenId, 0) call creates a position entry with zero balance — polluting
+    the _positions mapping.
+  impact: "Position mapping pollution with zero-balance entries if addLiquidity called with zero amounts"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Call BIN_ADD_LIQUIDITY_FROM_DELTAS with zero credit for both currencies
+    // Check if _positions gets populated with a zero-balance entry
+    uint256 tokenId = poolId.toTokenId(activeId);
+    uint256 balBefore = binPositionManager.balanceOf(address(this), tokenId);
+    // Execute addLiquidity with amount0=0, amount1=0
+    uint256 balAfter = binPositionManager.balanceOf(address(this), tokenId);
+    eq(balBefore, balAfter, "BPM-W08: zero-amount add should not create position");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: |
+    Depends on how binPoolManager.mint handles zero amountIn. If it returns empty mintArrays,
+    the loop doesn't execute and no position is created. Needs fork testing.
+
+- id: BPM-W09
+  tier: 1
+  type: property
+  description: "ERC1155 _mint with unchecked balance increment can overflow if totalSupply overflows first (balance += amount in unchecked block)"
+  attack_scenario: |
+    BinFungibleToken._mint (line 113-118):
+    ```
+    totalSupply[id] += amount;  // checked — reverts on overflow
+    unchecked {
+        balanceOf[to][id] += amount;  // unchecked — wraps on overflow
+    }
+    ```
+    The rationale is: if totalSupply doesn't overflow, balanceOf can't overflow because
+    balanceOf[to][id] <= totalSupply[id]. This holds IF there's only one recipient.
+
+    But consider: _mint is called in a loop for each bin. Different tokenIds have independent
+    totalSupply counters. For a single tokenId, multiple _mint calls to the SAME address
+    accumulate in balanceOf. Since totalSupply is checked, it will revert before balanceOf
+    can overflow. So this is safe.
+
+    However, there's a subtle edge: if _mint is called, then _burn reduces totalSupply (also
+    unchecked!), then _mint again — could totalSupply underflow? _burn line 124:
+    ```
+    unchecked {
+        totalSupply[id] -= amount;  // unchecked
+        balanceOf[from][id] -= amount;  // unchecked
+    }
+    ```
+    The balanceOf check on line 122 prevents underflow of balanceOf. But totalSupply
+    underflow is NOT checked — it relies on totalSupply >= sum(balanceOf) >= amount.
+    If someone burns more than their balance... wait, line 122 prevents that.
+    So totalSupply -= amount is safe because amount <= balanceOf[from][id] <= totalSupply[id].
+
+    This is safe by invariant. Including as validated false positive.
+  impact: "No impact — the checked totalSupply in _mint prevents overflow, and _burn's balance check prevents underflow"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: totalSupply[id] always >= sum of all balanceOf[*][id]
+    uint256 ts = binPositionManager.totalSupply(tokenId);
+    uint256 sumBal = 0;
+    for (uint i = 0; i < actors.length; i++) {
+        sumBal += binPositionManager.balanceOf(actors[i], tokenId);
+    }
+    gte(ts, sumBal, "BPM-W09: totalSupply must >= sum of balances");
+  ghost_vars:
+  - "uint256 internal ghost_totalMinted;"
+  - "uint256 internal ghost_totalBurned;"
+  validated: false
+  priority: low
+  confidence: 30
+  notes: |
+    After analysis, this appears safe. The checked addition on totalSupply in _mint and the
+    balance check in _burn create a valid invariant chain. Including for completeness.
+
+- id: BPM-W10
+  tier: 1
+  type: property
+  description: "cachePoolKey only writes on first call (getBinStep==0 sentinel) — if a pool is re-initialized with different parameters, stale PoolKey is served by positions()"
+  attack_scenario: |
+    cachePoolKey (line 233-239) writes to _poolIdToPoolKey ONLY if the current entry has
+    getBinStep() == 0. Since PoolId = keccak256(abi.encode(PoolKey)), the same PoolKey always
+    produces the same PoolId. Two different PoolKeys cannot produce the same PoolId (collision
+    resistance). So the "stale" scenario cannot happen — the PoolId is deterministic from PoolKey.
+
+    BUT: what if getBinStep() returns 0 for a VALID PoolKey? The prompt says "binStep=0 is
+    invalid for Bin pools", so a stored PoolKey with binStep>0 will never have getBinStep()==0,
+    and the sentinel works correctly.
+
+    The real question: can someone pass a PoolKey with binStep=0 to _addLiquidity? The
+    binPoolManager.mint would reject it (invalid pool). But cachePoolKey would still be
+    called AFTER mint succeeds (line 302). Since mint would revert for binStep=0, the cache
+    is never written with a binStep=0 entry. Safe by design.
+
+    However: what about the case where `parameters` field has other bits set alongside binStep=0?
+    getBinStep() extracts specific bits from the parameters field. If the extraction is wrong
+    or if other bits mask the binStep, a valid pool could have getBinStep()==0 in the cached key.
+    This would cause the PoolKey to be overwritable.
+  impact: "If getBinStep extraction has edge cases, pool key cache could be overwritten, causing positions() to return wrong pool data"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify cachePoolKey is idempotent — second call with same key doesn't change anything
+    PoolId poolId1 = binPositionManager.cachePoolKey(poolKey);
+    PoolKey memory cached1 = _poolIdToPoolKey[PoolId.unwrap(poolId1)];
+    PoolId poolId2 = binPositionManager.cachePoolKey(poolKey);
+    PoolKey memory cached2 = _poolIdToPoolKey[PoolId.unwrap(poolId2)];
+    eq(keccak256(abi.encode(cached1)), keccak256(abi.encode(cached2)), "BPM-W10: cache must be idempotent");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: |
+    After analysis, this appears safe because PoolId is deterministic from PoolKey, and
+    binStep=0 is genuinely invalid for Bin pools. The sentinel works correctly. Low confidence
+    because we haven't verified BinPoolParametersHelper.getBinStep() implementation.
+
+false_positives:
+- hunter: WildcardHunter
+  id: BPM-W-FP01
+  reason: |
+    ERC1155 _mint unchecked balanceOf increment (BPM-W09): Safe because totalSupply is checked
+    first, creating an upper bound. The unchecked block is an intentional gas optimization that
+    is mathematically guaranteed safe by the totalSupply invariant.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "ERC1155 unchecked balance increment in _mint is safe when totalSupply increment is checked — the invariant totalSupply >= balance prevents overflow"
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: BPM-W-FP02
+  reason: |
+    cachePoolKey overwrite risk (BPM-W10): Safe because PoolId = keccak256(PoolKey), so two
+    different PoolKeys cannot produce the same PoolId. The getBinStep()==0 sentinel is valid
+    because binStep=0 is invalid for Bin pools and mint() would revert before cachePoolKey
+    is called.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "cachePoolKey sentinel using getBinStep()==0 is safe for Bin pools where binStep=0 is invalid — PoolId collision is infeasible"
+    briefing_update_applied: false

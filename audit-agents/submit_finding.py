@@ -33,7 +33,20 @@ from constants import (
 BASE_URL   = "https://bugbounty.0mnia.dev"
 STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
-REPO_DIR   = Path.home() / "Documents/Web3/revert-lend"
+REPO_DIR_FALLBACK = Path.home() / "Documents/Web3/revert-lend"
+
+
+def get_repo_dir() -> Path:
+    """Lee repo_path de current_hunt.json. Fallback a REPO_DIR_FALLBACK."""
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            rp = state.get("repo_path", "")
+            if rp and Path(rp).exists():
+                return Path(rp)
+        except Exception:
+            pass
+    return REPO_DIR_FALLBACK
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -106,10 +119,19 @@ def find_in_state(state: dict, finding_id: str) -> dict | None:
 
 def read_poc(poc_file: str) -> str:
     """Lee el PoC del repo."""
-    p = REPO_DIR / poc_file
+    p = get_repo_dir() / poc_file
     if p.exists():
         return p.read_text()
     return ""
+
+
+def _truncate_title(prefix: str, body: str, max_len: int = 120) -> str:
+    """Trunca título a max_len chars, cortando en palabra completa (Cantina limit)."""
+    if len(prefix) + len(body) <= max_len:
+        return f"{prefix}{body}"
+    avail = max_len - len(prefix)
+    truncated = body[:avail].rsplit(' ', 1)[0]
+    return f"{prefix}{truncated}"
 
 
 def build_creation_payload(state: dict, finding: dict, program_id: str,
@@ -146,7 +168,7 @@ def build_creation_payload(state: dict, finding: dict, program_id: str,
     report_file = finding.get("report_file", "")
     report_content = ""
     if report_file:
-        rp = REPO_DIR / report_file
+        rp = get_repo_dir() / report_file
         if rp.exists():
             report_content = rp.read_text()
 
@@ -165,7 +187,7 @@ def build_creation_payload(state: dict, finding: dict, program_id: str,
 
     return {
         "programId":    program_id,
-        "title":        f"[{fid}] {description[:120]}",
+        "title":        _truncate_title(f"[{fid}] ", description),
         "severity":     severity,
         "impact":       impact_val,
         "likelihood":   likelihood_val,

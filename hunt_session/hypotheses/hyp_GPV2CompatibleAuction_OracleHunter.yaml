@@ -1,0 +1,431 @@
+protocol: chainlink-pa-v2
+component: GPV2CompatibleAuction
+file: src/GPV2CompatibleAuction.sol
+domain: dex
+hunter: OracleHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: GPVCA-OR-01
+  tier: 1
+  type: property
+  description: >
+    Staleness window shared between Data Streams and Chainlink feed fallback allows
+    stale Data Streams prices to be used when the Chainlink feed would have fresher data
+    but is not consulted because Data Streams timestamp is within the (generous) staleness
+    threshold. If stalenessThreshold is set to accommodate Chainlink heartbeat (e.g. 3600s),
+    a Data Streams price that is 3500s old will be used without falling back to a potentially
+    fresher Chainlink feed update.
+  attack_scenario: >
+    1. Price of assetIn drops 10% in last 30 minutes.
+    2. Last Data Streams transmit was 50 minutes ago (within 3600s threshold).
+    3. Chainlink feed updated 5 minutes ago with the new (lower) price.
+    4. _getAssetPrice returns the stale (higher) Data Streams price because
+       its timestamp > minTimestamp.
+    5. Bidder calls bid() — gets assetIn valued at the old higher price, pays
+       assetOut based on that higher valuation.
+    6. Bidder receives assetIn worth 10% less than what the contract calculated.
+    7. Net effect: protocol sells assetIn at an inflated price. This could
+       go either way — if price goes UP, bidder profits by getting cheap tokens
+       valued at old lower price.
+    KEY INSIGHT: The fallback only triggers when Data Streams is stale. If it's
+    within threshold but outdated, the stale price is used blindly.
+  impact: >
+    Bidder or protocol loses the delta between stale Data Streams price and
+    actual market price. For a $100K auction with 10% price move, this is $10K.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // In a fork test: compare Data Streams stored price vs Chainlink feed price
+    // when both are within staleness threshold but significantly divergent
+    (uint256 dsPrice, uint256 dsTimestamp,) = auction.getAssetPrice(asset);
+    (, int256 clAnswer,, uint256 clUpdatedAt,) = chainlinkFeed.latestRoundData();
+    uint256 clPrice = uint256(clAnswer) * 1e10; // scale 8->18 decimals
+    // If DS is stale but within threshold, and CL is fresher with different price
+    if (dsTimestamp < clUpdatedAt && clUpdatedAt > dsTimestamp + 300) {
+        uint256 priceDelta = dsPrice > clPrice ?
+            dsPrice - clPrice : clPrice - dsPrice;
+        uint256 pctDiff = (priceDelta * 1e18) / dsPrice;
+        // More than 2% difference means stale price is being used over fresh one
+        lt(pctDiff, 0.02e18, "GPVCA-OR-01: stale DS price used over fresher CL feed");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The severity depends on how stalenessThreshold is configured. If set tight
+    (e.g. 120s for Data Streams), the window for exploitation is small. If set
+    to accommodate Chainlink heartbeat (3600s), the risk is real. Need to check
+    deployment config.
+
+- id: GPVCA-OR-02
+  tier: 2
+  type: property
+  description: >
+    checkUpkeep uses _getAssetPrice(asset, false) — without validation — meaning
+    stale or zero prices can influence auction start/end decisions. An auction
+    could be started for an asset whose price is stale (returning the last known
+    price), and then bid() validates with withValidation=true and reverts,
+    creating a DoS where auctions start but cannot be bid on.
+  attack_scenario: >
+    1. Asset X's Data Streams price becomes stale (transmit hasn't been called).
+    2. Chainlink feed is also stale or returns 0.
+    3. checkUpkeep returns isPriceValid=false for X, so X is NOT eligible
+       for new auctions — this is actually correct behavior.
+    4. BUT: for ending auctions, the code uses the (stale) price to calculate
+       assetBalanceUsdValue. With a stale high price, an auction that should
+       end (balance below minAuctionSize) continues running.
+    5. The auction remains live but bid() reverts on withValidation=true.
+    6. Auction is stuck until duration expires or price is refreshed.
+    Note: This is a DoS vector, not fund loss. The auction eventually expires.
+  impact: >
+    Temporary DoS — auction stuck until duration expires. No direct fund loss
+    but delays the protocol's fee conversion process.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that checkUpkeep doesn't start auctions with invalid prices
+    (uint256 price,, bool isValid) = auction.getAssetPrice(asset);
+    (bool upkeepNeeded, bytes memory performData) = auction.checkUpkeep("");
+    // If price is invalid, no auctions should be started for this asset
+    if (!isValid && upkeepNeeded) {
+        (Common.AssetAmount[] memory eligible,) =
+            abi.decode(performData, (Common.AssetAmount[], address[]));
+        for (uint256 i; i < eligible.length; i++) {
+            neq(eligible[i].asset, asset,
+                "GPVCA-OR-02: auction started with invalid price");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    On closer inspection, checkUpkeep actually checks isPriceValid before
+    adding to eligible assets. The real concern is only for the auction-ending
+    logic where stale prices affect the balance check. Lower confidence.
+
+- id: GPVCA-OR-03
+  tier: 1
+  type: property
+  description: >
+    Chainlink data feed fallback does NOT check answeredInRound >= roundId.
+    The latestRoundData() call only validates staleness via timestamp but a
+    stale round (answeredInRound < roundId) can return an outdated price that
+    still passes the timestamp check. This is a known Chainlink integration
+    anti-pattern.
+  attack_scenario: >
+    1. Chainlink aggregator has a stale round where answeredInRound < roundId.
+    2. The price returned is from a previous round but the updatedAt timestamp
+       is still within the stalenessThreshold.
+    3. Data Streams is stale, fallback to Chainlink fires.
+    4. Stale round price is used for auction pricing.
+    5. If the real market price has diverged, bidder can exploit the difference.
+  impact: >
+    Stale price used for auction valuation. The delta between stale and real
+    price is extractable by the bidder.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check that answeredInRound >= roundId from Chainlink feed
+    (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) =
+        chainlinkFeed.latestRoundData();
+    // answeredInRound should equal roundId for a fresh answer
+    gte(uint256(answeredInRound), uint256(roundId),
+        "GPVCA-OR-03: Chainlink stale round not detected");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    Modern Chainlink aggregators on most chains return answeredInRound == roundId
+    for latestRoundData. This pattern is more relevant for older feeds or
+    multi-hop feeds. Confidence lower because Chainlink team likely reviewed this.
+    However, it IS a missing check in the code — whether exploitable depends on
+    the specific feed used.
+
+- id: GPVCA-OR-04
+  tier: 1
+  type: property
+  description: >
+    Price used in isValidSignature (view, at settlement time) vs price used when
+    bid() was conceptually committed to by the solver may differ. CowSwap
+    settlement happens in a later block than order creation. The order's buyAmount
+    is fixed at creation time, but isValidSignature evaluates the current price
+    at settlement time. If price moves favorably for the solver between order
+    creation and settlement, the solver profits.
+  attack_scenario: >
+    1. Solver sees auction at time T with assetIn priced at $100.
+    2. Solver creates CowSwap order with buyAmount = minBuyAmount at time T.
+    3. Between T and settlement (T+N blocks), assetIn price drops to $90.
+    4. At settlement, isValidSignature calls _getAssetPrice which returns $90.
+    5. minBuyAmount is now LOWER (price dropped → less assetOut required).
+    6. Solver's fixed buyAmount (calculated at $100) is now ABOVE the new
+       minBuyAmount — order validates.
+    7. Solver receives assetIn worth $90 but their buyAmount was priced at $100.
+    8. Net result: solver overpays by $10 per unit — this actually HURTS the solver.
+    CORRECTION: If price INCREASES, the reverse happens. Solver benefits because
+    they committed buyAmount at the lower price but assetIn is now worth more.
+    The Dutch auction's time decay partially compensates but not fully if the
+    price spike is large enough.
+  impact: >
+    Solver can profit from price increases between order creation and settlement.
+    Limited by CowSwap batch timing (typically 30s-5min) and staleness threshold.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Compare price at auction start vs current price
+    // The spread between them should not exceed the auction's price multiplier range
+    uint256 priceAtStart = ghost_priceAtAuctionStart[asset];
+    (uint256 currentPrice,,) = auction.getAssetPrice(asset);
+    if (priceAtStart > 0 && currentPrice > 0) {
+        uint256 priceDelta = currentPrice > priceAtStart ?
+            currentPrice - priceAtStart : priceAtStart - currentPrice;
+        uint256 pctChange = (priceDelta * 1e18) / priceAtStart;
+        // Price change within auction duration should be within multiplier range
+        AssetParams memory params = auction.getAssetParams(asset);
+        uint256 maxMultiplierRange = uint256(params.startingPriceMultiplier) -
+            uint256(params.endingPriceMultiplier);
+        lt(pctChange, maxMultiplierRange,
+            "GPVCA-OR-04: price move exceeds auction multiplier protection");
+    }
+  ghost_vars:
+  - "mapping(address => uint256) internal ghost_priceAtAuctionStart;"
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    This is more of a design consideration than a bug. The Dutch auction's
+    declining price multiplier is supposed to compensate for price movements.
+    The question is whether extreme price moves can exceed the multiplier range.
+    This is "by design" if the admin sets appropriate multiplier ranges.
+
+- id: GPVCA-OR-05
+  tier: 1
+  type: property
+  description: >
+    The Data Streams price stored via transmit() uses observationsTimestamp as
+    the stored timestamp, NOT block.timestamp. A PRICE_ADMIN can submit a report
+    with observationsTimestamp just barely within the staleness threshold at
+    submission time, but by the time bid() or isValidSignature() is called in a
+    subsequent block, the price has crossed the staleness boundary and reverts.
+    More critically: a report with an observationsTimestamp in the FUTURE
+    relative to the report's own validFromTimestamp could extend the apparent
+    freshness of the price beyond what the DON intended.
+  attack_scenario: >
+    1. stalenessThreshold = 3600 seconds.
+    2. PRICE_ADMIN transmits report at block.timestamp=T with
+       observationsTimestamp=T-3590 (10 seconds before staleness).
+    3. 20 seconds later, a bidder calls bid().
+    4. _getAssetPrice checks: T+20 - 3600 = T-3580. Is T-3590 < T-3580? YES.
+    5. Price is now stale — bid reverts.
+    This creates a race condition where prices transmitted near the edge of
+    staleness become unusable almost immediately, reducing auction participation.
+  impact: >
+    Temporary DoS for bids when prices are near staleness boundary. Reduces
+    auction efficiency but no direct fund loss.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After transmit, verify price remains valid for at least N blocks
+    auction.transmit(reports);
+    (uint256 price, uint256 updatedAt, bool isValid) = auction.getAssetPrice(asset);
+    t(isValid, "GPVCA-OR-05: price immediately stale after transmit");
+    // Warp forward a reasonable time (e.g., 60 seconds)
+    vm.warp(block.timestamp + 60);
+    (,, bool stillValid) = auction.getAssetPrice(asset);
+    t(stillValid, "GPVCA-OR-05: price stale within 60s of transmit");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The transmit function already checks staleness at submission time (line 162).
+    The issue is the gap between transmit-time validation and bid-time validation.
+    Real-world impact depends on typical staleness threshold values.
+
+- id: GPVCA-OR-06
+  tier: 2
+  type: property
+  description: >
+    Price scaling truncation for feeds with >18 decimals. When feedDecimals > 18
+    (PRICE_DECIMALS), the code divides: usdPrice / 10**(feedDecimals-18).
+    For a feed with 24 decimals, this divides by 1e6, losing the last 6 digits
+    of precision. Combined with mulDivUp rounding in _getAssetOutAmount, this
+    could create systematic pricing errors.
+  attack_scenario: >
+    1. An asset has a Data Streams feed with 24 decimals.
+    2. Price = 1_234_567_890_123_456_789_012_345 (24 decimals).
+    3. After scaling: 1_234_567_890_123_456_789 (18 decimals) — last 6 digits
+       (012_345) are truncated.
+    4. For a $100K auction, truncation of 0.0001% = $0.10 per trade.
+    5. Over thousands of trades, this systematic error accumulates.
+    NOTE: In practice, most Chainlink feeds use 8 decimals and Data Streams
+    use 8 or 18 decimals. Feeds with >18 decimals are extremely rare.
+  impact: >
+    Minimal — precision loss of a few wei per trade. Only relevant if >18
+    decimal feeds exist, which is unlikely for USD price feeds.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify price scaling preserves value within acceptable tolerance
+    uint256 rawPrice = 1234567890123456789012345; // 24 decimals
+    uint8 feedDecimals = 24;
+    uint256 scaled = rawPrice / (10 ** (feedDecimals - 18));
+    uint256 reconstructed = scaled * (10 ** (feedDecimals - 18));
+    uint256 loss = rawPrice - reconstructed;
+    // Loss should be < 1 USD cent (1e16 in 18 decimals)
+    lt(loss, 1e16, "GPVCA-OR-06: price truncation exceeds 1 cent");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Theoretical concern. Most feeds use 8 or 18 decimals. This invariant
+    is unlikely to fire in practice. Marking as false-positive candidate
+    unless we find >18 decimal feeds in the deployment config.
+
+- id: GPVCA-OR-07
+  tier: 1
+  type: property
+  description: >
+    In _getAssetOutAmount, the assetOut price is fetched SEPARATELY from the
+    assetIn price. The assetIn price is fetched in bid()/isValidSignature()
+    and passed down, while assetOut price is fetched inside _getAssetOutAmount.
+    If the two prices are fetched from different sources (one from Data Streams,
+    one from Chainlink feed fallback) with different staleness, the price ratio
+    used for the swap may not reflect a consistent market state. This is the
+    classic "price oracle sandwich" where two prices from different timestamps
+    create an arbitrage-able discrepancy.
+  attack_scenario: >
+    1. assetIn (e.g., WBTC) has fresh Data Streams price from 10s ago: $60,000.
+    2. assetOut (e.g., LINK) has stale Data Streams, falls back to Chainlink
+       feed from 30 min ago: $15.
+    3. In the last 30 min, LINK rose 5% to $15.75 on market.
+    4. Bidder bids on WBTC auction. Contract calculates:
+       - WBTC value: amount * $60,000 (fresh)
+       - LINK amount owed: WBTC_value / $15 (stale, lower than market)
+       - Bidder pays MORE LINK than market rate.
+    5. Result: protocol receives extra LINK. Bidder is disadvantaged.
+    REVERSE: If assetOut price is stale-HIGH, bidder pays LESS → protocol loses.
+  impact: >
+    The delta between stale and fresh assetOut price is the extractable value.
+    For a $100K trade with 5% price discrepancy in assetOut: ~$5K mispricing.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Both assetIn and assetOut prices should be from similar timestamps
+    (uint256 assetInPrice, uint256 assetInUpdatedAt,) = auction.getAssetPrice(assetIn);
+    (uint256 assetOutPrice, uint256 assetOutUpdatedAt,) = auction.getAssetPrice(assetOut);
+    // Prices used in same calculation should be from within 60s of each other
+    uint256 timeDelta = assetInUpdatedAt > assetOutUpdatedAt ?
+        assetInUpdatedAt - assetOutUpdatedAt :
+        assetOutUpdatedAt - assetInUpdatedAt;
+    lt(timeDelta, 60, "GPVCA-OR-07: assetIn/assetOut price timestamps diverge >60s");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    This is the most interesting oracle finding. The dual-oracle setup
+    (assetIn price + assetOut price) creates a cross-price consistency problem.
+    The Dutch auction multiplier provides SOME protection (starts at premium),
+    but if the price timestamp divergence exceeds the effective premium, there's
+    an arbitrage window. The protocol team likely assumes both prices come from
+    the same PRICE_ADMIN transmit batch, but nothing enforces this.
+
+- id: GPVCA-OR-08
+  tier: 2
+  type: property
+  description: >
+    Negative price from Chainlink feed causes revert via SafeCast.toUint256(),
+    effectively DoS'ing the fallback mechanism. If Data Streams is stale AND
+    Chainlink returns a negative price (malfunction), _getAssetPrice reverts
+    instead of gracefully degrading. With withValidation=true (bid/isValidSignature),
+    this means all bids fail. With withValidation=false (checkUpkeep), the
+    revert propagates up and DoS's the upkeep check.
+  attack_scenario: >
+    1. Data Streams price goes stale (transmit not called).
+    2. Chainlink aggregator malfunctions and returns negative price.
+    3. SafeCast.toUint256(answer) reverts.
+    4. All bid() calls revert — active auctions become unbiddable.
+    5. checkUpkeep also reverts — Chainlink Automation can't process the
+       upkeep and no new auctions can start or end.
+    6. Only recovery: PRICE_ADMIN transmits fresh Data Streams report OR
+       admin pauses contract and waits for Chainlink feed recovery.
+  impact: >
+    Complete DoS of auction system. No fund loss but auction functionality
+    halted until oracle recovery.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // When Chainlink feed returns negative, the fallback should not revert
+    // but should return isValid=false
+    // This is a static analysis finding — SafeCast reverts on negative int
+    // Test: mock Chainlink feed to return -1
+    mockFeed.setAnswer(-1);
+    // This should not revert, should return (0, 0, false)
+    try auction.getAssetPrice(asset) returns (uint256, uint256, bool isValid) {
+        t(!isValid, "GPVCA-OR-08: negative price should be invalid");
+    } catch {
+        t(false, "GPVCA-OR-08: negative Chainlink price causes revert instead of graceful fallback");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    This is a known Chainlink integration pattern — negative prices from
+    aggregators should be handled gracefully. The revert via SafeCast is
+    technically correct (negative USD prices are invalid) but it DoS's the
+    entire price pipeline instead of just marking the price as invalid.
+
+false_positives:
+- hunter: OracleHunter
+  id: GPVCA-FP-01
+  reason: >
+    mulDivUp and mulWadUp rounding direction in _getAssetOutAmount FAVORS the protocol
+    (bidder pays slightly more assetOut). This is by design — the protocol should never
+    give away more than the fair auction price. The rounding is consistently protocol-favorable.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Dutch auction rounding direction: mulDivUp/mulWadUp means bidder pays ceiling
+      of fair price. This is standard practice — not a bug.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: GPVCA-FP-02
+  reason: >
+    priceMultiplier linear decay uses mulDiv (rounds DOWN the decay amount), meaning
+    priceMultiplier is slightly HIGHER than the exact linear interpolation. This means
+    the auction decreases price slightly SLOWER — also protocol-favorable. By design.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Dutch auction price decay rounding: mulDiv rounds decay down, so price multiplier
+      is >= exact linear value. Protocol-favorable — not a bug.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: GPVCA-FP-03
+  reason: >
+    isValidSignature is a view function — it cannot be front-run to change state.
+    The CowSwap settlement contract calls it during batch settlement, and the
+    reentrancy guard (s_entered) prevents re-entering from bid(). The view-only
+    nature means price manipulation between isValidSignature and actual token
+    transfer is handled by CowSwap's settlement contract, not this contract.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

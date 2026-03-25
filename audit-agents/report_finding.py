@@ -24,7 +24,20 @@ BASE_URL   = "https://bugbounty.0mnia.dev"
 STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
 HYP_DIR    = Path.home() / "Documents/Web3/hunt_session/hypotheses"
-REPO_DIR   = Path.home() / "Documents/Web3/revert-lend"
+REPO_DIR_FALLBACK = Path.home() / "Documents/Web3/revert-lend"
+
+
+def get_repo_dir() -> Path:
+    """Lee repo_path de current_hunt.json. Fallback a REPO_DIR_FALLBACK."""
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            rp = state.get("repo_path", "")
+            if rp and Path(rp).exists():
+                return Path(rp)
+        except Exception:
+            pass
+    return REPO_DIR_FALLBACK
 
 # Bug bounty (Immunefi, Sherlock): payout fijo por severidad, tú eres el único reclamando.
 # min% y max% del maxPayout del programa.
@@ -65,6 +78,24 @@ PLATFORM_MAP = {
     "cantina": "CANTINA", "immunefi": "IMMUNEFI",
     "code4rena": "CODE4RENA", "sherlock": "SHERLOCK",
 }
+
+
+def parse_payout(raw: str) -> int:
+    """Parse payout strings like '$100K max (Critical)', '$2.5M', '50000', etc."""
+    if not raw:
+        return 0
+    clean = raw.replace("$", "").replace(",", "").strip()
+    # Extract first number (int or float), handle K/M suffix
+    m = re.match(r'([\d.]+)\s*([KkMm])?', clean)
+    if not m:
+        return 0
+    num = float(m.group(1))
+    suffix = (m.group(2) or "").upper()
+    if suffix == "K":
+        num *= 1_000
+    elif suffix == "M":
+        num *= 1_000_000
+    return int(num)
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -203,11 +234,7 @@ def find_or_create_program(state: dict, sess: requests.Session, dry_run: bool) -
     # No existe — crear
     print(f"  Program '{protocol}' no encontrado en Bounty Radar. Creando...")
 
-    payout_str = state.get("payout", "0").replace("$", "").replace("K", "000").replace(",", "")
-    try:
-        max_payout = int(payout_str)
-    except ValueError:
-        max_payout = 0
+    max_payout = parse_payout(state.get("payout", "0"))
 
     deadline = state.get("deadline")
     end_date = None
@@ -298,17 +325,18 @@ def find_report(finding_id: str, state_entry: dict | None) -> tuple[str | None, 
     2. Autodetección por nombre en REPO_DIR/reports/
     """
     # 1. Ruta registrada en el estado
+    repo_dir = get_repo_dir()
     report_path = None
     if state_entry and state_entry.get("report_file"):
         p = Path(state_entry["report_file"])
         if not p.is_absolute():
-            p = REPO_DIR / state_entry["report_file"]
+            p = repo_dir / state_entry["report_file"]
         if p.exists():
             report_path = p
 
     # 2. Autodetección por finding_id en reports/
     if not report_path:
-        reports_dir = REPO_DIR / "reports"
+        reports_dir = repo_dir / "reports"
         if reports_dir.exists():
             clean = finding_id.replace("-", "").replace("_", "").lower()
             for md in reports_dir.glob("*.md"):
@@ -338,23 +366,24 @@ def find_report(finding_id: str, state_entry: dict | None) -> tuple[str | None, 
 
 
 def find_poc(finding_id: str, explicit_path: str | None) -> str | None:
+    repo_dir = get_repo_dir()
     if explicit_path:
         p = Path(explicit_path)
         if not p.is_absolute():
-            p = REPO_DIR / explicit_path
+            p = repo_dir / explicit_path
         return p.read_text() if p.exists() else None
 
     clean = finding_id.replace("-", "").replace("_", "")
     candidates = [
-        REPO_DIR / f"test/chimera/PoC_{clean}.t.sol",
-        REPO_DIR / f"test/chimera/PoC_{finding_id}.t.sol",
-        REPO_DIR / f"test/PoC_{clean}.t.sol",
+        repo_dir / f"test/chimera/PoC_{clean}.t.sol",
+        repo_dir / f"test/chimera/PoC_{finding_id}.t.sol",
+        repo_dir / f"test/PoC_{clean}.t.sol",
     ]
     for c in candidates:
         if c.exists():
             return c.read_text()
 
-    test_dir = REPO_DIR / "test"
+    test_dir = repo_dir / "test"
     if test_dir.exists():
         for sol in test_dir.rglob("*.sol"):
             if clean.lower() in sol.stem.lower() or finding_id.lower() in sol.stem.lower():
@@ -474,17 +503,18 @@ def main():
 
     # ── 6. Construir payload ──────────────────────────────────────────────────
     component    = (state_entry or {}).get("component", "")
-    # severity: usar severity_final (post-RedTeam) si existe, si no severity
-    sev_raw_key  = "severity_final" if (state_entry or {}).get("severity_final") else "severity"
-    severity_raw = (state_entry or {}).get(sev_raw_key, "unknown").lower()
-    severity     = SEVERITY_MAP.get(severity_raw, "MEDIUM")
+    # severity: cascada — state_entry.severity_final > state_entry.severity > hyp.escalation_to > hyp.severity > MEDIUM
+    severity_raw = (
+        (state_entry or {}).get("severity_final")
+        or (state_entry or {}).get("severity")
+        or hyp.get("escalation_to")
+        or hyp.get("severity")
+        or "unknown"
+    ).lower()
+    severity = SEVERITY_MAP.get(severity_raw, "MEDIUM")
 
     # Payout estimates: derivados de maxPayout del programa + severidad
-    payout_str = state.get("payout", "0").replace("$", "").replace("K", "000").replace(",", "")
-    try:
-        max_payout = int(payout_str)
-    except ValueError:
-        max_payout = 0
+    max_payout = parse_payout(state.get("payout", "0"))
     program_type = state.get("program_type", "bug_bounty")
     est_min, est_max = estimate_payout(severity, max_payout, program_type)
     if args.estimate_min is not None:
@@ -493,11 +523,18 @@ def main():
         est_max = args.estimate_max
 
     # Descripción: usar el markdown de ReportWriter si existe, fallback al YAML
+    # Cantina limita títulos a 120 chars — truncar en palabra completa
+    def _truncate_title(prefix: str, body: str, max_len: int = 120) -> str:
+        if len(prefix) + len(body) <= max_len:
+            return f"{prefix}{body}"
+        avail = max_len - len(prefix)
+        truncated = body[:avail].rsplit(' ', 1)[0]  # cortar en palabra completa
+        return f"{prefix}{truncated}"
+
     if report_content:
         full_desc = report_content
-        _prefix_len = len(f"[{finding_id}] ")
-        _body = (report_title if report_title else hyp.get('description', ''))[:120 - _prefix_len].rstrip('.')
-        title = f"[{finding_id}] {_body}"
+        _body = report_title if report_title else hyp.get('description', '')
+        title = _truncate_title(f"[{finding_id}] ", _body)
     else:
         description     = hyp.get("description", "")
         attack_scenario = hyp.get("attack_scenario", "")
@@ -507,8 +544,7 @@ def main():
             full_desc += f"\n\n**Attack Scenario:**\n{attack_scenario}"
         if notes:
             full_desc += f"\n\n**Notes:**\n{notes}"
-        _prefix_len = len(f"[{finding_id}] ")
-        title = f"[{finding_id}] {description[:120 - _prefix_len].rstrip('.')}"
+        title = _truncate_title(f"[{finding_id}] ", description)
 
     # Impact y likelihood: leer del state_entry (guardados por RedTeam o manualmente).
     # Si no están, derivar defaults razonables desde severity para no enviar null.
@@ -525,6 +561,25 @@ def main():
     impact_val     = impact_val.capitalize() if impact_val.capitalize() in _VALID_IMPACT else _IMPACT_DEFAULTS.get(severity, "Medium")
     likelihood_val = likelihood_val.capitalize() if likelihood_val.capitalize() in _VALID_LIKELIHOOD else _LIKELIHOOD_DEFAULTS.get(severity, "Medium")
 
+    # Duplicate risk: parse from immunefi_assessment.risk_of_duplicate in YAML
+    dup_risk_label = None
+    dup_risk_pct = None
+    raw_dup_risk = (hyp.get("immunefi_assessment") or {}).get("risk_of_duplicate", "")
+    if not raw_dup_risk:
+        raw_dup_risk = hyp.get("risk_of_duplicate", "")
+    if raw_dup_risk:
+        raw_upper = raw_dup_risk.upper()
+        if "HIGH" in raw_upper:
+            dup_risk_label = "HIGH"
+        elif "MEDIUM" in raw_upper or "MED" in raw_upper:
+            dup_risk_label = "MEDIUM"
+        elif "LOW" in raw_upper:
+            dup_risk_label = "LOW"
+        # Extract percentage if present: "HIGH (80%)" -> 80
+        pct_match = re.search(r'(\d+)\s*%', raw_dup_risk)
+        if pct_match:
+            dup_risk_pct = int(pct_match.group(1))
+
     payload = {
         "programId":    program_id,
         "title":        title,
@@ -539,14 +594,18 @@ def main():
         "status":       "DRAFT",  # API requires DRAFT on creation; use PATCH to transition
         "estimateMin":  est_min,
         "estimateMax":  est_max,
+        "duplicateRisk":    dup_risk_label,
+        "duplicateRiskPct": dup_risk_pct,
         "payoutAmount": None,  # se actualiza en submit_finding.py --update --payout
     }
 
     if args.dry_run:
         est_range = f"${est_min:,}–${est_max:,}" if est_min is not None else "N/A"
         print(f"\n{'='*60}\n  DRY RUN\n{'='*60}")
+        dup_info = f"{dup_risk_label} ({dup_risk_pct}%)" if dup_risk_label else "N/A"
         print(f"  Title:    {title}")
         print(f"  Severity: {severity} | Impact: {impact_val} | Likelihood: {likelihood_val}")
+        print(f"  Dup Risk: {dup_info}")
         print(f"  PoC: {poc_status} | Status: {payload['status']}")
         print(f"  Estimate: {est_range} (maxPayout=${max_payout:,})")
         print(f"  Desc ({len(full_desc)} chars): {full_desc[:150]}...")
@@ -590,10 +649,12 @@ def main():
     # ── Telegram ─────────────────────────────────────────────────────────────
     protocol  = state.get("protocol", "unknown")
     est_range = f"${est_min:,}–${est_max:,}" if est_min is not None else "sin estimación"
+    dup_info = f"{dup_risk_label} ({dup_risk_pct}%)" if dup_risk_label else "N/A"
     msg = (
         f"🎯 *Nuevo Finding Registrado*\n\n"
         f"*{finding_id}* — {severity}\n"
         f"Protocolo: {protocol}\n"
+        f"Dup Risk: {dup_info}\n"
         f"PoC: {poc_status}\n"
         f"Status: {result['status']}\n"
         f"Estimación: {est_range}\n\n"

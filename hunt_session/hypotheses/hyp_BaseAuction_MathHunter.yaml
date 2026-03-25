@@ -1,0 +1,452 @@
+protocol: chainlink-pa-v2
+component: BaseAuction
+file: src/BaseAuction.sol
+domain: dex
+hunter: MathHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-01 — GPV2: decaimiento de precio entre isValidSignature y settlement
+# Tier 1: si se confirma, el protocolo recibe menos assetOut del que debería
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-01
+  tier: 1
+  type: property
+  description: >
+    En GPV2CompatibleAuction, `isValidSignature` valida que `order.buyAmount >= minBuyAmount`
+    usando el `elapsedTime` del momento de la consulta (view). Sin embargo, CowProtocol puede
+    ejecutar el settlement varios bloques/segundos después, cuando `elapsedTime` es mayor y el
+    precio ha decaído más. La orden que fue "justa" en T1 puede ejecutarse en T2 > T1 pagando
+    un `buyAmount` que en T2 está por debajo del precio vigente — el protocolo recibe menos
+    assetOut del que debería recibir según el precio de ejecución real.
+  attack_scenario: >
+    Un bidder malicioso construye una orden CowProtocol con `buyAmount` = minBuyAmount calculado
+    en bloque T1. El bidder retrasa intencionalmente el settlement a T2 = T1 + N segundos.
+    En T2, el precio ha decaído: `minBuyAmount(T2) < minBuyAmount(T1)`. La orden se ejecuta con
+    `buyAmount(T1)` que supera `minBuyAmount(T2)`, por lo que `isValidSignature` devuelve magic
+    value. El protocolo recibe exactamente `order.buyAmount` (el valor antiguo), pero a la tasa de
+    T2 ese amount ya es un exceso... Espera — el protocolo RECIBE `buyAmount` como pago, y el
+    precio BAJÓ, entonces el protocolo en realidad recibe el mismo buyAmount pero con el activo
+    costando menos. Corrección: el protocolo recibe `order.buyAmount` en assetOut, pero el valor
+    real del assetIn se cotizaría más bajo en T2. El protocolo entrega assetIn y recibe assetOut.
+    Si el precio decae (más tiempo = más descuento = menos assetOut requerido), el protocolo
+    entrega el mismo assetIn pero requiere MENOS assetOut. Si `order.buyAmount` se fijó en T1
+    (mayor precio, más assetOut requerido), el settlement en T2 no falla porque `order.buyAmount
+    >= minBuyAmount(T2)`. El protocolo recibe el mismo `buyAmount` — no hay pérdida directa aquí.
+    El efecto real: el bidder, al crear la orden en T1 con el precio vigente, sabe que si el
+    settlement se demora, el `minBuyAmount` baja, pero el bidder igual paga el `buyAmount` que
+    fijó. Sin embargo, si la orden es parcialmente llenada (partiallyFillable = true),
+    CoW Protocol puede llenar solo parte del `sellAmount`, y el `buyAmount` se prorratea.
+    En ese caso el ratio podría romperse si la implementación de CoW interpola mal.
+    CONCLUSIÓN: el riesgo principal es que el price check es point-in-time (T1) pero
+    execution es en T2. Para sell orders parcialmente llenables, el ratio assetIn/assetOut
+    puede favorecer al bidder si el protocolo de CoW no re-valida el ratio.
+  solidity: |
+    // Invariante: el assetOut recibido por el contrato en cualquier bid debe ser >= el
+    // calculado con _getAssetOutAmount en el momento del bid.
+    // Para CowSwap: verificar post-settlement que assetOut balance creció al menos lo esperado.
+    uint256 assetOutBalanceBefore = IERC20(assetOut).balanceOf(address(auction));
+    // [simular settlement de CowSwap]
+    uint256 assetOutBalanceAfter = IERC20(assetOut).balanceOf(address(auction));
+    uint256 received = assetOutBalanceAfter - assetOutBalanceBefore;
+    // Calcular lo mínimo que debería haber recibido al momento del settlement
+    uint256 elapsedAtSettlement = block.timestamp - auction.getAuctionStart(assetIn);
+    uint256 expectedMin = auction.getAssetOutAmount(assetIn, amountSold, block.timestamp - elapsedAtSettlement + 1);
+    gte(received, expectedMin, "BA-01: protocolo recibio menos assetOut del esperado al tiempo de settlement");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    Revisado con cuidado: el protocolo RECIBE assetOut (buyToken de CowProtocol = assetOut del
+    contrato). La orden tiene buyAmount fijo. Si el precio decae entre isValidSignature y settlement,
+    el minBuyAmount baja, pero la orden tiene buyAmount >= minBuyAmount(T1) >= minBuyAmount(T2).
+    El protocolo recibe el buyAmount fijado. No hay pérdida directa. El riesgo real sería si
+    CoW Protocol hiciera partial fills prorrateados de forma que el ratio precio se rompa.
+    Confianza: 45% — necesita análisis del protocolo CoW para confirmar. Investigar si
+    partial fills en CoW respetan el precio mínimo del contrato o solo verifican la firma una vez.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-02 — Triple mulDivUp acumulado: sobreestimación sistemática del assetOutAmount
+# Tier 2: rounding a favor del protocolo, no del atacante — pero puede causar DoS de bids
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-02
+  tier: 2
+  type: property
+  description: >
+    `_getAssetOutAmount` aplica `mulDivUp` tres veces en cascada:
+    (1) amountIn.mulDivUp(assetInUsdPrice, 10**decimals) — redondea hacia arriba el USD value
+    (2) .mulWadUp(priceMultiplier) — redondea hacia arriba aplicando el multiplier
+    (3) auctionUsdValue.mulDivUp(10**assetOutDecimals, assetOutUsdPrice) — redondea hacia arriba la conversión
+    El resultado es un `assetOutAmount` que sistemáticamente sobreestima el precio real del assetIn.
+    En tokens con pocos decimales (USDC=6, WBTC=8), el rounding acumulado puede ser de varios
+    unidades del token assetOut por bid. Si assetOut es LINK (18 decimals), el efecto es mínimo.
+    Si assetOut es WBTC (8 decimals), cada bid puede pagar 1-2 sats de más.
+  attack_scenario: >
+    No hay vector de extracción directo (el rounding favorece al protocolo, no al atacante).
+    Sin embargo, si el `minBidUsdValue` es muy ajustado y el rounding hace que `assetOutAmount`
+    sea mayor de lo esperado, un bidder podría no tener suficiente allowance aprobado y el bid
+    revertiría cuando debería haber pasado. Esto puede causar fricción de UX pero no pérdida.
+    El riesgo mayor: si el bidder calculó off-chain cuánto assetOut aprobar usando un cálculo
+    round-neutral, la transacción puede revertir en `safeTransferFrom` por insuficiente allowance.
+  solidity: |
+    // Verificar que el assetOutAmount calculado on-chain no excede el valor teórico
+    // por más de 3 unidades (1 wei por cada mulDivUp).
+    uint256 onChain = auction.getAssetOutAmount(asset, amount, block.timestamp);
+    // Valor teórico sin rounding (calcular manualmente con mulDiv)
+    uint256 elapsedTime = block.timestamp - auction.getAuctionStart(asset);
+    AssetParams memory params = auction.getAssetParams(asset);
+    uint256 priceMultiplier = params.startingPriceMultiplier
+      - FixedPointMathLib.mulDiv(
+          params.startingPriceMultiplier - params.endingPriceMultiplier,
+          elapsedTime,
+          params.auctionDuration
+        );
+    (uint256 assetInPrice,,) = auction.getAssetPrice(asset);
+    (uint256 assetOutPrice,,) = auction.getAssetPrice(auction.getAssetOut());
+    uint256 assetOutDecimals = 10 ** auction.getAssetParams(auction.getAssetOut()).decimals;
+    uint256 usdValue = FixedPointMathLib.mulDiv(amount, assetInPrice, 10 ** params.decimals);
+    uint256 usdWithMult = FixedPointMathLib.mulDiv(usdValue, priceMultiplier, 1e18);
+    uint256 theoretical = FixedPointMathLib.mulDiv(usdWithMult, assetOutDecimals, assetOutPrice);
+    // onChain puede ser hasta 3 wei más que theoretical (un rounding por cada mulDivUp)
+    lte(onChain, theoretical + 3, "BA-02: rounding acumulado excede 3 unidades");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    El triple mulDivUp es intencional para proteger al protocolo contra que el bidder pague de
+    menos. Pero crea sobreestimación sistemática. Para tokens con pocos decimales (WBTC=8),
+    el rounding puede ser de 1-2 sat por bid. No es pérdida para el protocolo sino para el bidder.
+    El caso de DoS por allowance insuficiente es el riesgo más concreto.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-03 — bidUsdValue check con división truncada vs assetOutAmount con mulDivUp
+# Tier 2: la verificación de minBidUsdValue puede pasar bids cuyo valor real es marginal
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-03
+  tier: 2
+  type: property
+  description: >
+    En `bid()`, el check de tamaño mínimo usa: `bidUsdValue = (amount * assetPrice) / (10 ** decimals)`
+    — división entera, trunca hacia abajo. Esto subestima el valor real del bid. Un atacante puede
+    enviar un `amount` tal que `bidUsdValue` sea exactamente `minBidUsdValue` después del truncado,
+    pero el valor real (sin truncar) es ligeramente menor que `minBidUsdValue`. En la práctica,
+    esto significa bids con valor efectivo de hasta `(10**decimals - 1) / assetPrice` por debajo
+    del mínimo pueden pasar el check.
+  attack_scenario: >
+    Para evadir el mínimo de bid: un atacante que quiere hacer micro-bids (bajo el mínimo) puede
+    encontrar un `amount` que con la división truncada dé exactamente `minBidUsdValue`, aunque
+    el valor real sea `minBidUsdValue - epsilon`. El impacto es minor: el protocolo acepta bids
+    ligeramente por debajo del mínimo configurado. Si `minBidUsdValue` existe para prevenir
+    ataques de dust/spam, esta evasión permite spam marginal.
+    Ejemplo concreto: assetPrice = 1.5e18 (1.5 USD), decimals = 18, minBidUsdValue = 100e18 (100 USD)
+    amount = floor(100e18 * 1e18 / 1.5e18) = floor(66.666...) * 1e18 = 66e18
+    bidUsdValue = (66e18 * 1.5e18) / 1e18 = 99e18 < minBidUsdValue → REVERT correcto
+    amount = 67e18: bidUsdValue = (67e18 * 1.5e18) / 1e18 = 100.5e18 → pasa. OK.
+    El truncado solo da una ventana de 1 token unit debajo del mínimo. Impacto: muy bajo.
+  solidity: |
+    // El bidUsdValue calculado con truncado nunca debería ser mayor que el valor real
+    // (el truncado siempre subestima, no sobreestima — no puede crear bids "gratis")
+    // Verificar que bidUsdValue + (10**decimals - 1) >= minBidUsdValue cuando bidUsdValue >= minBidUsdValue
+    uint256 amount = /* valor de test */;
+    (uint256 assetPrice,,) = auction.getAssetPrice(asset);
+    AssetParams memory params = auction.getAssetParams(asset);
+    uint256 bidUsdValue = (amount * assetPrice) / (10 ** params.decimals);
+    uint88 minBidUsdValue = auction.getMinBidUsdValue();
+    // Si pasa el check, el valor real debe estar a menos de (assetPrice / 10**decimals) del mínimo
+    if (bidUsdValue >= minBidUsdValue) {
+      uint256 maxError = assetPrice / (10 ** params.decimals) + 1;
+      // El bid puede tener valor real entre minBidUsdValue y minBidUsdValue + maxError
+      t(true, "BA-03: check documentado, no es bug por si solo");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    Investigado: la división truncada es un antipatrón menor (usar mulDivUp para el check sería
+    más correcto), pero el impacto es de máximo 1 token unit debajo del mínimo. No es explotable
+    para pérdida significativa de fondos. Marcar como low/informational.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-04 — priceMultiplier: mulDiv round-down crea descuento ligeramente menor al prometido
+# Tier 3: by design según el comentario del código — documentar como false positive
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-04
+  tier: 3
+  type: property
+  description: >
+    El comentario del código dice explícitamente que `decayRatePerSecond` se redondea hacia abajo
+    para que el descuento máximo nunca supere el `endingPriceMultiplier`. La fórmula:
+    `priceMultiplier = startingPriceMultiplier - (range * elapsedTime / auctionDuration)`
+    usa `mulDiv` (round-down) para la sustracción. Esto significa que al final de la subasta
+    (elapsedTime = auctionDuration), el priceMultiplier puede ser ligeramente mayor que
+    `endingPriceMultiplier` — el bidder paga marginalmente más que el descuento máximo prometido.
+  attack_scenario: >
+    No hay vector de ataque explotable. El rounding favorece al protocolo (bidder paga más de
+    lo que el `endingPriceMultiplier` implicaría). Sin embargo, desde la perspectiva del bidder,
+    el "máximo descuento prometido" nunca se alcanza exactamente — siempre hay 1 unidad de
+    priceMultiplier de más. Esto es por diseño según los comentarios del código.
+  solidity: |
+    // Al final de la subasta (elapsedTime = auctionDuration):
+    // priceMultiplier debería ser exactamente endingPriceMultiplier
+    // Con mulDiv round-down: priceMultiplier >= endingPriceMultiplier siempre
+    uint256 elapsedTime = assetParams.auctionDuration; // fin de subasta
+    uint256 range = uint256(assetParams.startingPriceMultiplier - assetParams.endingPriceMultiplier);
+    uint256 subtracted = FixedPointMathLib.mulDiv(range, elapsedTime, assetParams.auctionDuration);
+    // subtracted <= range siempre (round-down), entonces priceMultiplier >= endingPriceMultiplier
+    uint256 priceMultiplier = assetParams.startingPriceMultiplier - subtracted;
+    gte(priceMultiplier, assetParams.endingPriceMultiplier, "BA-04: priceMultiplier nunca baja del minimo");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Esto es BY DESIGN según el comentario en el código. El rounding hacia abajo en la sustracción
+    es intencional para garantizar que el protocolo nunca dé más descuento del configurado.
+    Documentar como false positive.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-05 — DataStreams vs AggregatorV3 fallback: asimetría de rounding en escalado de precio
+# Tier 2: puede crear discrepancias de precio según qué fuente esté activa
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-05
+  tier: 2
+  type: property
+  description: >
+    En `PriceManager._getAssetPrice()`, el escalado a 18 decimales es diferente según la fuente:
+    - DataStreams: `usdPrice = (usdPrice * 10**(18-feedDecimals))` para feedDecimals < 18
+    - DataStreams: `usdPrice = (usdPrice / 10**(feedDecimals-18))` para feedDecimals > 18 (trunca)
+    - AggregatorV3 fallback: misma lógica pero con `feedInfo.usdDataFeed.decimals()`
+    Si DataStreams tiene feedDecimals=8 y el fallback AggregatorV3 también tiene decimals=8,
+    ambos escalan multiplicando — consistente. Pero si DataStreams está stale y se cae al
+    fallback, el precio puede ser distinto no solo por diferencia de fuente sino por diferencia
+    en el momento de la cotización. La asimetría de rounding (truncado) puede crear spreads
+    de 1-2 unidades en la escala de 18 decimales entre fuentes.
+  attack_scenario: >
+    Si un atacante puede predecir cuándo DataStreams se vuelve stale (observando la frecuencia
+    de `transmit()`), puede timing una bid exactamente cuando el sistema cae al fallback AggregatorV3.
+    Si el fallback da un precio ligeramente diferente (y el atacante conoce este precio off-chain),
+    puede explotar la discrepancia para pagar menos assetOut. El impacto depende de la magnitud
+    de la diferencia entre DataStreams y AggregatorV3 — típicamente < 0.1% pero puede ser mayor
+    en momentos de alta volatilidad.
+  solidity: |
+    // Invariante: el precio devuelto por _getAssetPrice no debe diferir más de N bps
+    // entre el modo DataStreams y el fallback AggregatorV3 para el mismo activo.
+    // Simulación: forzar staleness de DataStreams y comparar precios.
+    // (Requiere fork para tener ambos configurados)
+    (uint256 priceDS,,) = auction.getAssetPrice(asset); // cuando DataStreams está fresco
+    // Avanzar tiempo para hacer stale el DataStreams
+    vm.warp(block.timestamp + feedInfo.stalenessThreshold + 1);
+    (uint256 priceFallback,,) = auction.getAssetPrice(asset); // cae al AggregatorV3
+    // La diferencia no debería ser mayor al 1% (100 bps) en condiciones normales
+    uint256 diff = priceDS > priceFallback ? priceDS - priceFallback : priceFallback - priceDS;
+    uint256 maxDiff = priceDS / 100; // 1%
+    lte(diff, maxDiff, "BA-05: diferencia entre DataStreams y fallback supera 1%");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    El riesgo es real pero el impacto depende de la diferencia de precio entre las fuentes.
+    En condiciones normales de mercado, DataStreams y AggregatorV3 deberían estar alineados.
+    El vector de ataque requiere que el atacante pueda predecir/forzar el staleness de DataStreams,
+    lo cual es difícil si el PRICE_ADMIN_ROLE está transmitiendo regularmente.
+    Requiere fork test para verificar magnitud real de discrepancias.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-06 — checkUpkeep usa balance del feeAggregator en T1, performUpkeep usa ese amount en T2
+# Tier 2: cantidad auctionada puede ser inconsistente con el balance real en performUpkeep
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-06
+  tier: 2
+  type: property
+  description: >
+    `checkUpkeep` captura `availableBalance = IERC20(asset).balanceOf(feeAggregator)` y lo
+    incluye en `eligibleAssets`. En `performUpkeep`, este amount se pasa a
+    `s_feeAggregator.transferForSwap(address(this), eligibleAssets)`. Entre los dos bloques,
+    el balance del feeAggregator puede haber cambiado: (a) más tokens ingresaron → el exceso
+    se queda en feeAggregator sin ser subastado; (b) los tokens se retiraron → `transferForSwap`
+    puede fallar o transferir menos de lo esperado.
+    En `performUpkeep`, el check de `availableAssetUsdValue < assetParams.minAuctionSizeUsd`
+    usa el `amount` de `eligibleAssets` (el capturado en T1), no el balance real en T2.
+  attack_scenario: >
+    Escenario (a): El protocolo captura 1000 LINK en checkUpkeep. Antes de performUpkeep,
+    llegan 500 LINK más al feeAggregator. El performUpkeep solo mueve los 1000 LINK originales
+    (según el amount capturado), dejando 500 LINK sin subastar hasta el próximo ciclo.
+    No es pérdida directa, pero es ineficiencia que puede acumularse.
+    Escenario (b): Si el feeAggregator pierde tokens entre los dos pasos, `transferForSwap`
+    puede transferir menos → la subasta comienza con menos fondos → el check de minAuctionSize
+    usa el amount original (mayor) y no detecta que el monto real es insuficiente.
+    El impacto real: posible inicio de subasta con menos fondos que el mínimo configurado.
+  solidity: |
+    // Invariante: al inicio de la subasta (post-performUpkeep), el balance del contrato
+    // debe ser >= el amount registrado como auctioned.
+    // Esta invariante captura el caso donde transferForSwap transfiere menos del amount esperado.
+    uint256 balanceBeforePerformUpkeep = IERC20(asset).balanceOf(address(auction));
+    // [simular checkUpkeep y luego performUpkeep]
+    uint256 capturedAmount = /* amount en eligibleAssets */;
+    uint256 balanceAfterPerformUpkeep = IERC20(asset).balanceOf(address(auction));
+    uint256 actualTransferred = balanceAfterPerformUpkeep - balanceBeforePerformUpkeep;
+    // El amount real transferido puede diferir del capturado en checkUpkeep
+    // Si es menor, la subasta comenzó con menos fondos del mínimo verificado
+    AssetParams memory params = auction.getAssetParams(asset);
+    (uint256 assetPrice,,) = auction.getAssetPrice(asset);
+    uint256 realUsdValue = (actualTransferred * assetPrice) / (10 ** params.decimals);
+    gte(realUsdValue, params.minAuctionSizeUsd, "BA-06: subasta iniciada con menos del minimo USD");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    El `transferForSwap` en el feeAggregator probablemente revierte si no tiene suficiente balance,
+    lo que protegería contra el escenario (b). El escenario (a) es simplemente ineficiencia,
+    no pérdida. Necesita revisar la implementación de `transferForSwap` en FeeAggregator para
+    determinar si revierte o transfiere lo disponible.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-07 — GPV2: isValidSignature con sellAmount > balance podría validar orden irrelizable
+# Tier 1: la orden se firma como válida pero en settlement CoW no puede ejecutarla
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-07
+  tier: 1
+  type: property
+  description: >
+    En `GPV2CompatibleAuction.isValidSignature()`, se verifica que `order.sellAmount > 0`
+    y que `order.sellAmount <= assetInBalance` (balance actual del contrato). Sin embargo,
+    la llamada es `view` — no hay lock de fondos. Entre la verificación (T1) y el settlement
+    de CoW Protocol (T2), otro bidder puede haber llamado a `bid()` en `BaseAuction`,
+    reduciendo el balance del assetIn. La orden firmada se vuelve irealizable, pero CoW Protocol
+    podría intentar ejecutarla de todas formas, causando un revert en el settlement.
+    Para órdenes parcialmente llenables, CoW Protocol puede llenar solo la parte disponible,
+    lo que significa que el ratio de precios se mantiene pero el fill es menor. Pero si el
+    balance cae a 0, el partial fill es imposible y la orden queda pendiente/inválida.
+  attack_scenario: >
+    1. Atacante observa que hay una orden CowProtocol grande pendiente (sellAmount = X).
+    2. Atacante llama a `bid(asset, X, "")` — vaciando el balance del assetIn.
+    3. CoW Protocol intenta hacer settlement de la orden grande → falla porque el balance es 0.
+    4. La orden queda inválida. Los solvers de CoW pierden tiempo/gas en el intento fallido.
+    No hay pérdida directa de fondos del protocolo, pero los settlements de CoW se vuelven
+    poco confiables — los solvers pueden dejar de incluir estas órdenes.
+    Impacto alternativo: si hay un solver malicioso que quiere bloquear el settlement de otros,
+    puede hacer front-run del bid para invalidar la orden.
+  solidity: |
+    // Invariante: si isValidSignature devolvió magic value para (asset, sellAmount),
+    // el balance de asset en el contrato debe ser >= sellAmount al momento del settlement.
+    // No se puede testear directamente (es view), pero se puede testear el escenario de race:
+    uint256 sellAmount = IERC20(asset).balanceOf(address(auction)); // todo el balance
+    // [simular bid() que consume parte del balance]
+    uint256 balanceAfterBid = IERC20(asset).balanceOf(address(auction));
+    // Si el bid consumió fondos, el sellAmount original ya no es satisfacible
+    t(
+      balanceAfterBid >= sellAmount || balanceAfterBid == 0,
+      "BA-07: balance caida entre isValidSignature y settlement"
+    );
+    // La invariante real: bid() no debería dejar saldos intermedios que invaliden órdenes pendientes
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    Este es un riesgo de race condition inherente a cualquier sistema que combina órdenes
+    off-chain (CoW Protocol) con liquidez on-chain. Las órdenes partialmente llenables
+    mitigan el problema (CoW puede llenar lo que haya disponible). Sin embargo, si el balance
+    cae a cero entre isValidSignature y el settlement, el partial fill tampoco funciona.
+    El impacto principal es en la fiabilidad del protocolo CoW, no en pérdida directa de fondos.
+    Verificar: ¿puede CoW Protocol ejecutar un partial fill de 0 tokens? Si sí, no hay DoS real.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BA-08 — Optimize: maximizar ganancia del bidder explotando la curva de precio
+# Tier 3: función de optimización para Echidna
+# ─────────────────────────────────────────────────────────────────────────────
+- id: BA-08
+  tier: 3
+  type: optimize
+  description: >
+    Maximizar la ganancia del bidder en términos de USD: recibir assetIn por precio más bajo
+    que su valor de mercado. El punto óptimo teórico es al final de la subasta (elapsedTime =
+    auctionDuration) cuando priceMultiplier = endingPriceMultiplier. Si se puede bid exactamente
+    en ese momento, se maximiza el descuento. Si hay rounding que hace que el precio real baje
+    del endingPriceMultiplier, esto sería un bug.
+  attack_scenario: >
+    Si el profit (valor de assetIn recibido en USD - valor de assetOut pagado en USD) es positivo,
+    hay un vector de arbitraje. Esto es esperado y by design hasta cierto punto (el descuento
+    incentiva a los bidders). Si el profit supera el `startingPriceMultiplier - 1e18` en porcentaje,
+    hay algo mal.
+  solidity: |
+    // Maximizar: valor_USD(assetIn recibido) - valor_USD(assetOut pagado)
+    // Si positivo → el bidder gana más de lo esperado
+    (uint256 assetInPrice,,) = auction.getAssetPrice(assetIn);
+    (uint256 assetOutPrice,,) = auction.getAssetPrice(auction.getAssetOut());
+    AssetParams memory params = auction.getAssetParams(assetIn);
+    uint256 amountIn = IERC20(assetIn).balanceOf(address(auction));
+    uint256 valueIn = (amountIn * assetInPrice) / (10 ** params.decimals);
+    uint256 assetOutAmount = auction.getAssetOutAmount(assetIn, amountIn, block.timestamp);
+    AssetParams memory assetOutParams = auction.getAssetParams(auction.getAssetOut());
+    uint256 valuePaid = (assetOutAmount * assetOutPrice) / (10 ** assetOutParams.decimals);
+    // Profit del bidder en USD (18 decimals)
+    return int256(valueIn) - int256(valuePaid);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    Esta función de optimización detectaría si hay algún edge case donde el bidder obtiene
+    más USD del que paga — lo cual indicaría un bug en la curva de precio. En condiciones
+    normales, con priceMultiplier <= 1e18, el bidder siempre paga >= valor de mercado del assetIn.
+    Con priceMultiplier > 1e18 (premium inicial), el bidder paga más que el valor de mercado.
+
+false_positives:
+- hunter: MathHunter
+  id: BA-FP-01
+  reason: >
+    El rounding hacia abajo en `mulDiv(elapsedTime, auctionDuration)` para calcular el
+    `priceMultiplier` es intencional. El comentario del código lo documenta explícitamente:
+    "rounded down to avoid higher discount than 2%". El protocolo garantiza que nunca dará
+    más descuento del configurado como `endingPriceMultiplier`. No es un bug.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      En subastas con curva de precio lineal, el round-down en el cálculo del priceMultiplier
+      es by design para garantizar que el descuento máximo nunca supere el endingPriceMultiplier.
+      No confundir con un bug de precision loss.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BA-FP-02
+  reason: >
+    La división por cero en `mulDiv(elapsedTime, assetInParams.auctionDuration)` no es posible
+    porque `_applyAssetParamsUpdates` valida `auctionDuration != 0` para todos los assets
+    que no son assetOut, y solo los assets que no son assetOut pueden tener subastas activas.
+    El assetOut no puede ser puesto en subasta (línea 350: si el asset es assetOut, se transfiere
+    al receiver en lugar de iniciar una subasta).
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      En BaseAuction, el assetOut nunca entra en subasta — se transfiere directamente al receiver.
+      Por lo tanto, la validación de auctionDuration != 0 aplica a todos los assets que pueden
+      ser subastados. No hay riesgo de división por cero en _getAssetOutAmount.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BA-FP-03
+  reason: >
+    El triple mulDivUp en _getAssetOutAmount (BA-02) favorece al protocolo, no al atacante.
+    El bidder siempre paga como mínimo el precio justo más un pequeño rounding. No hay vector
+    donde el bidder se beneficie del rounding. El riesgo de DoS por allowance insuficiente
+    es real pero marginal — off-chain UIs deben añadir un margen de seguridad al allowance.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      En subastas con múltiples rondas de mulDivUp, el bidder debe aprobar un allowance
+      ligeramente mayor al valor calculado off-chain para cubrir el rounding acumulado.
+      Off-chain UIs deben añadir ~3 unidades de margen al allowance de assetOut.
+    briefing_update_applied: false

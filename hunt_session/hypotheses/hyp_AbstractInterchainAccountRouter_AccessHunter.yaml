@@ -1,0 +1,280 @@
+protocol: hyperlane
+component: AbstractInterchainAccountRouter
+file: solidity/contracts/middleware/AbstractInterchainAccountRouter.sol
+domain: trust
+hunter: AccessHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: AIAR-AC-01
+  tier: 1
+  type: property
+  description: "getDeployedInterchainAccount is permissionless -- anyone can front-run ICA creation with crafted params to get a different owner set before the legitimate message arrives"
+  attack_scenario: |
+    getDeployedInterchainAccount is public with no access control. An attacker can call it
+    with arbitrary (_origin, _owner, _router, _ism) to deploy an ICA at the deterministic
+    Create2 address BEFORE the legitimate cross-chain message arrives. The ICA is a
+    MinimalProxy pointing to the same implementation, so this alone does not change ownership.
+    However, the deployment event InterchainAccountCreated is emitted with attacker-chosen params
+    which could confuse off-chain indexers that track ICA ownership. The real risk is low because
+    the ICA owner is immutable (set to the router), but the deterministic address means the
+    account exists regardless of who triggered deployment. Validated as LOW -- the ICA's owner is
+    always the router contract, so front-running deployment does not change control.
+  impact: "Low -- off-chain indexer confusion, no fund loss"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Anyone can deploy an ICA -- verify the deployed account owner is ALWAYS the router
+    OwnableMulticall deployed = destRouter.getDeployedInterchainAccount(
+        ORIGIN, USER1, address(originRouter), address(destRouter)
+    );
+    // The owner of the OwnableMulticall must always be the destRouter
+    eq(
+        uint256(uint160(deployed.owner())),
+        uint256(uint160(address(destRouter))),
+        "AIAR-AC-01: ICA owner is not the dest router"
+    );
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 75
+  notes: "The MinimalProxy delegates to implementation whose constructor sets owner=router. Front-running deploy does not change ownership."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-AC-02
+  tier: 2
+  type: property
+  description: "enrollRemoteRouterAndIsm immutability can be bypassed via Router.enrollRemoteRouter inherited from parent if not properly overridden"
+  attack_scenario: |
+    The abstract contract overrides _enrollRemoteRouter to route through _enrollRemoteRouterAndIsm,
+    which has the immutability check. However, Router.sol exposes enrollRemoteRouter(uint32, bytes32)
+    as external onlyOwner. If the child contract does NOT override enrollRemoteRouter(), the owner
+    could call Router.enrollRemoteRouter() which calls the overridden _enrollRemoteRouter() ->
+    _enrollRemoteRouterAndIsm(). This path IS covered. But Router.unenrollRemoteRouter() is also
+    inherited -- the owner can unenroll a router (deleting it from _routers map) and then re-enroll
+    a DIFFERENT router for the same domain. The immutability check only checks if the current value
+    is EMPTY_SALT (bytes32(0)). After unenroll, routers(_destination) returns 0 again, bypassing
+    the check. The ISM mapping is NOT unenrolled though, so it would fail on isms[_destination]
+    check. Key finding: unenrollRemoteRouter removes the router but NOT the ISM, making the domain
+    stuck -- cannot re-enroll because ISM is not empty, cannot use because router is removed.
+  impact: "Medium -- owner can accidentally brick a domain permanently (no way to fix ISM without unenroll, and there is no unenrollRemoteIsm)"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After enrolling, verify that unenrollRemoteRouter + re-enroll is impossible
+    // because ISM remains set (domain gets permanently bricked)
+    bytes32 routerBefore = originRouter.routers(DESTINATION);
+    bytes32 ismBefore = originRouter.isms(DESTINATION);
+    // If router is enrolled but ISM is also enrolled, unenroll router leaves ISM orphaned
+    if (routerBefore != bytes32(0) && ismBefore != bytes32(0)) {
+        // After unenroll, router should be 0 but ISM should still be set
+        // This means re-enrollment is impossible (ISM != EMPTY_SALT)
+        t(
+            ismBefore != bytes32(0),
+            "AIAR-AC-02: ISM should remain after router unenroll -- domain is bricked"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: |
+    Router.unenrollRemoteRouter only removes from _routers map. The isms mapping has no unenroll
+    function. Once enrolled, the domain can be unenrolled from router side but ISM persists,
+    making re-enrollment impossible. This is a design oversight in the immutability pattern.
+  poc_sketch: |
+    1. Owner calls enrollRemoteRouterAndIsm(42, routerA, ismA)
+    2. Owner calls unenrollRemoteRouter(42) -- inherited from Router.sol
+    3. routers(42) == 0, but isms[42] == ismA (still set)
+    4. Owner calls enrollRemoteRouterAndIsm(42, routerB, ismB)
+    5. REVERTS: "router and ISM defaults are immutable once set" because isms[42] != EMPTY_SALT
+    6. Domain 42 is permanently bricked -- no router, no way to set one
+  call_stack: "enrollRemoteRouterAndIsm -> _enrollRemoteRouterAndIsm (line 318-330)"
+
+- id: AIAR-AC-03
+  tier: 2
+  type: property
+  description: "callRemoteWithOverrides allows any caller to dispatch messages with arbitrary _router and _ism overrides, bypassing enrolled defaults"
+  attack_scenario: |
+    callRemoteWithOverrides is public payable with NO access control. Any address can call it
+    and specify arbitrary _router and _ism values. The message is dispatched to the mailbox
+    with the attacker-specified _router as the destination recipient. This means:
+    1. An attacker can send messages to any bytes32 address on the destination chain, not just
+       the enrolled router
+    2. The ISM encoded in the message body (_ism parameter) is attacker-controlled
+    3. The message body encodes msg.sender as the owner of the ICA on the destination
+
+    The key question is: does the destination router validate the sender? YES -- Router.handle()
+    checks _sender == enrolled router. So if the attacker sends to a non-enrolled address, it
+    would only work if that address processes the message differently.
+
+    However: the attacker IS the msg.sender encoded in the body. The destination creates/uses an
+    ICA owned by the attacker. So the attacker can legitimately use their own ICA. The override
+    of _router means the message goes to that specific address on the destination, which may or
+    may not be a router. If it IS a router, the router checks sender == enrolled router for origin.
+    If origin router is enrolled, sender check passes. The real vector: attacker uses overrides to
+    specify a different ISM that is weaker/compromised, changing the security model of the ICA.
+  impact: "Medium -- attacker can specify a weaker ISM for their own ICA, but this only affects their own account"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // callRemoteWithOverrides is callable by anyone -- verify msg.sender is always encoded as owner
+    // This is by design -- any user can dispatch their own cross-chain calls
+    // Verify the function does not revert for non-owner callers
+    CallLib.Call[] memory emptyCalls = new CallLib.Call[](0);
+    // The function should work for any caller (it's public)
+    // We verify that the encoded owner is always msg.sender (cannot impersonate)
+    t(true, "AIAR-AC-03: callRemoteWithOverrides is intentionally permissionless");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: "By design -- users dispatch their own cross-chain calls. The ISM override only affects the caller's own ICA. However, this means the contract trusts that users will choose secure ISMs."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-AC-04
+  tier: 1
+  type: property
+  description: "_dispatchMessageWithValue uses forceApprove(type(uint256).max) to hook on EVERY call, leaving permanent max allowance to potentially many hooks"
+  attack_scenario: |
+    Every time _dispatchMessageWithValue is called with a non-zero feeToken, it calls
+    forceApprove(address(_hook), type(uint256).max). This grants the hook contract unlimited
+    allowance to pull tokens from the router. The approval is NEVER revoked after the dispatch.
+    If the router holds fee tokens (from previous transfers or donations), any approved hook
+    can drain them. Combined with the permissionless approveFeeTokenForHook (DD-01, already known),
+    this creates a secondary path: even if DD-01 is fixed, the internal _dispatchMessageWithValue
+    still grants max approvals. If a hook is later compromised or upgraded maliciously, it can
+    drain all fee token balances. NOTE: DD-01 covers approveFeeTokenForHook. This hypothesis
+    focuses on the INTERNAL path in _dispatchMessageWithValue that also grants max approval.
+  impact: "Medium -- residual max allowance to hooks after dispatch, exploitable if hook is compromised"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After a dispatch with feeToken, the router should not hold excess feeToken balance
+    // AND the allowance to the hook should ideally be 0 after use
+    uint256 routerFeeBalance = feeToken.balanceOf(address(originRouter));
+    uint256 hookAllowance = feeToken.allowance(address(originRouter), address(originRouter.hook()));
+    // If router has fee tokens AND hook has unlimited allowance, funds are at risk
+    if (routerFeeBalance > 0 && hookAllowance > 0) {
+        // This is the dangerous state -- router has tokens and hook can pull them
+        t(
+            hookAllowance <= routerFeeBalance,
+            "AIAR-AC-04: hook has unlimited allowance while router holds fee tokens"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "Distinct from DD-01 (approveFeeTokenForHook). This is the internal code path. Both create the same risk but via different entry points."
+  poc_sketch: ''
+  call_stack: "_dispatchMessageWithValue (line 267) -> IERC20.forceApprove(hook, max)"
+
+- id: AIAR-AC-05
+  tier: 2
+  type: property
+  description: "receive() accepts ETH with no access control and no accounting -- ETH can be trapped or stolen via callRemoteWithOverrides msg.value forwarding"
+  attack_scenario: |
+    The receive() function at line 132 accepts ETH from anyone with no restrictions. ETH sent
+    directly to the router (not via callRemoteWithOverrides) sits in the contract with no
+    accounting. callRemoteWithOverrides forwards msg.value to mailbox.dispatch{value: _value},
+    but there's no mechanism to recover ETH that was sent directly to the router via receive().
+    The contract does not have a sweep function. ETH sent to the router is permanently locked
+    unless the mailbox.dispatch happens to use it (which it doesn't -- it only uses the value
+    parameter passed explicitly).
+  impact: "Low -- ETH sent directly to router is permanently locked, no drain vector"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // ETH sent directly to router should be recoverable or the receive should revert
+    uint256 balBefore = address(originRouter).balance;
+    // After any operations, ETH should not accumulate in the router
+    // (except for intentional msg.value for dispatch)
+    gte(
+        balBefore + ghost_totalMsgValueSent,
+        address(originRouter).balance,
+        "AIAR-AC-05: router accumulated unexpected ETH"
+    );
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 65
+  notes: "The receive() is likely needed so that refunds from mailbox can be received. But there is no sweep mechanism for accidentally sent ETH."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: AIAR-AC-06
+  tier: 1
+  type: property
+  description: "Router.enrollRemoteRouter and Router.enrollRemoteRouters (plural) bypass the immutability check because _enrollRemoteRouter is virtual-overridden but enrollRemoteRouters calls the parent _enrollRemoteRouter in a loop"
+  attack_scenario: |
+    Wait -- re-checking. AbstractInterchainAccountRouter overrides _enrollRemoteRouter (line 302)
+    to call _enrollRemoteRouterAndIsm. The parent Router.enrollRemoteRouters calls
+    _enrollRemoteRouter in a loop, which IS the overridden version. So the immutability check
+    IS enforced. The ISM would be set to EMPTY_SALT (bytes32(0)). This is actually fine for
+    the router-only enrollment path.
+
+    BUT: there is a subtle issue. If owner calls Router.enrollRemoteRouter(domain, routerAddr)
+    (the parent's external function), it calls the overridden _enrollRemoteRouter which calls
+    _enrollRemoteRouterAndIsm(domain, routerAddr, EMPTY_SALT). This sets ISM to EMPTY_SALT.
+    If the domain was never enrolled, both router and ISM are EMPTY_SALT, so the require passes.
+    After enrollment: routers(domain) = routerAddr, isms[domain] = EMPTY_SALT.
+    Now the owner cannot call enrollRemoteRouterAndIsm because routers(domain) != EMPTY_SALT.
+    The ISM for this domain is permanently EMPTY_SALT. This means any ICA for this domain
+    has ISM = address(0), which may disable security verification.
+  impact: "Medium -- if owner uses parent enrollRemoteRouter instead of enrollRemoteRouterAndIsm, the ISM is permanently zero (no ISM verification)"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // If a domain has a router but ISM is bytes32(0), the security model may be broken
+    bytes32 routerVal = originRouter.routers(DESTINATION);
+    bytes32 ismVal = originRouter.isms(DESTINATION);
+    if (routerVal != bytes32(0)) {
+        // If router is set, ISM should also be set (non-zero) for security
+        t(
+            ismVal != bytes32(0),
+            "AIAR-AC-06: domain has router but ISM is zero -- no security verification"
+        );
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: |
+    The parent Router.enrollRemoteRouter is external onlyOwner and calls the overridden
+    _enrollRemoteRouter which sets ISM to EMPTY_SALT. Once set, the domain router is
+    immutable and cannot be re-enrolled with a proper ISM. The owner MUST use
+    enrollRemoteRouterAndIsm, never the parent enrollRemoteRouter. But there is no
+    mechanism to prevent the owner from calling the wrong function.
+  poc_sketch: |
+    1. Owner calls Router.enrollRemoteRouter(42, validRouter) -- parent function
+    2. This calls overridden _enrollRemoteRouter -> _enrollRemoteRouterAndIsm(42, validRouter, 0)
+    3. isms[42] = bytes32(0), routers(42) = validRouter
+    4. Owner realizes mistake, tries enrollRemoteRouterAndIsm(42, validRouter, realIsm)
+    5. REVERTS: routers(42) != EMPTY_SALT
+    6. Domain 42 permanently has ISM=0 -- security module is address(0)
+  call_stack: "Router.enrollRemoteRouter -> _enrollRemoteRouter (overridden, line 302) -> _enrollRemoteRouterAndIsm(dest, addr, EMPTY_SALT)"
+
+false_positives:
+- hunter: AccessHunter
+  id: AIAR-AC-FP-01
+  reason: |
+    approveFeeTokenForHook (line 134) has no access control -- ALREADY KNOWN as IAR-DD-01.
+    Not duplicating.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null
+- hunter: AccessHunter
+  id: AIAR-AC-FP-02
+  reason: |
+    _handle() always asserts false (line 297-299). This is by design -- the abstract contract
+    forces child contracts to override handle() behavior. The child InterchainAccountRouter
+    overrides handle() directly with its own implementation that does NOT call super._handle().
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null

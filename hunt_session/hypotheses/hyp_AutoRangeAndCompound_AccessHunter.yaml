@@ -1,0 +1,140 @@
+component: AutoRangeAndCompound
+hunter: AccessHunter
+date: "2026-03-21"
+
+invariants:
+  - id: ARC-A-01
+    title: "execute: missing nonReentrant while autoCompound has it — asymmetric protection"
+    tier: 1
+    type: access_control
+    confidence: 75
+    description: >
+      autoCompound() has `nonReentrant` modifier (line 416).
+      execute() does NOT have `nonReentrant` modifier (line 162).
+      Both functions:
+      - Call external contracts (npm.decreaseLiquidity, npm.collect, npm.mint, npm.addLiquidity)
+      - Transfer NFTs (npm.safeTransferFrom)
+      - Interact with V3Vault via transform mode
+      The NFT transfer in execute() (line ~340: npm.safeTransferFrom to vault) triggers
+      V3Vault.onERC721Received. That function updates loan state and calls _cleanupLoan.
+      If onERC721Received re-enters execute() before the first call completes,
+      the positionConfigs for the new tokenId may not yet be set (config set at line ~350,
+      AFTER the transfer at ~340).
+      Attack: malicious vault or manipulated onERC721Received re-enters execute() between
+      NFT transfer and config setup.
+    affected_line: "AutoRangeAndCompound.sol:162 execute() - no nonReentrant"
+    attack_scenario: >
+      1. execute() called by keeper on position with VAULT strategy
+      2. Line ~340: npm.safeTransferFrom(address(this), address(vault), newTokenId)
+      3. vault.onERC721Received triggers: migrates loan, calls back into execute()?
+         (Not directly, but if V3Vault has any callback to the transformer here)
+      4. positionConfigs[newTokenId] not yet set
+      5. New position has no config → execute() on new position would fail or use stale config
+      NOTE: actual re-entry attack requires malicious vault, which is controlled by owner.
+      Low practical risk with honest vault. But execute() not having nonReentrant IS asymmetric.
+    status: hypothesis
+    solidity: |
+      // INV-ARC-A-01: execute() should have nonReentrant by symmetry with autoCompound()
+
+  - id: ARC-A-02
+    title: "configToken: no validation that lowerTickDelta < upperTickDelta"
+    tier: 1
+    type: validation
+    confidence: 85
+    description: >
+      configToken() stores positionConfigs without validating tick relationship.
+      If lowerTickDelta >= upperTickDelta (same tick or inverted), execute() would create
+      a position with invalid tick range (lower >= upper).
+      npm.mint() with tickLower >= tickUpper reverts in Uniswap V3.
+      This means misconfigured positions permanently revert on execute() — DoS.
+      A legitimate user can misconfigure their own position, leading to stuck range adjustment.
+    affected_line: "AutoRangeAndCompound.sol:542-570 configToken()"
+    attack_scenario: >
+      User calls configToken with lowerTickDelta = 100, upperTickDelta = 100 (equal deltas).
+      Execute() computes tickLower = baseTick + 100, tickUpper = baseTick + 100.
+      npm.mint(tickLower, tickUpper, ...) reverts: tickLower == tickUpper.
+      Position is stuck — cannot rerange. configToken can be re-called to fix, but
+      the user might not realize the config is invalid.
+    status: hypothesis
+    solidity: |
+      // INV-ARC-A-02: lowerTickDelta < upperTickDelta always
+      function invariant_config_tickOrderValid(int24 lowerDelta, int24 upperDelta) internal {
+          t(lowerDelta < upperDelta, "ARC-A-02: invalid tick config (lower >= upper)");
+      }
+
+  - id: ARC-A-03
+    title: "execute: positionConfig set AFTER NFT transfer — window with unconfigured newTokenId"
+    tier: 1
+    type: ordering
+    confidence: 80
+    description: >
+      execute() flow for vault strategy:
+      1. mint newTokenId (line ~265)
+      2. Transfer newTokenId to vault (line ~340): npm.safeTransferFrom(this, vault, newTokenId)
+      3. Set positionConfigs[newTokenId] (line ~350)
+      Between steps 2 and 3, newTokenId exists in vault but has NO config in AutoRangeAndCompound.
+      If anyone calls autoCompound(newTokenId) in this window (impossible in single tx, but
+      MEV bots could call in next block before the config tx lands), it would proceed with
+      empty config (zeros for all fields).
+      With empty config, autoCompoundMin0=0, autoCompoundMin1=0 → always passes threshold.
+      compoundFeesX64=0 → no keeper fee. rewardX64=0 → no reward. Not exploitable, just incorrect.
+    affected_line: "AutoRangeAndCompound.sol:265 (mint) vs ~350 (configToken)"
+    attack_scenario: >
+      execute() creates newTokenId and transfers to vault.
+      MEV bot in next block calls autoCompound(newTokenId) before config is set.
+      autoCompound runs with zero config: no fees charged, no reward. Benign.
+      More concerning: what if rewardX64 could be set maliciously between steps 2 and 3?
+      Only the position owner can call configToken, so this is self-DoS only.
+    status: low_priority
+    solidity: |
+      // INV-ARC-A-03: positionConfigs[tokenId].isActive implies config was set
+
+  - id: ARC-A-04
+    title: "executeWithVault: vault ownership not verified — any vault can call"
+    tier: 2
+    type: access_control
+    confidence: 60
+    description: >
+      executeWithVault() and autoCompoundWithVault() accept vault address as parameter.
+      If vault.transform() is callable by anyone with appropriate tokenId, a malicious
+      vault could pass arbitrary parameters. However, the vault address is typically
+      controlled by the vault contract, and _validateOwner verifies the NFT ownership
+      path (vault holds the NFT, or msg.sender is owner).
+      Risk: if isVault[vault] is not checked in these functions, a malicious contract
+      impersonating a vault could trigger executeWithVault.
+    affected_line: "AutoRangeAndCompound.sol:~380 executeWithVault()"
+    status: low_priority
+    solidity: |
+      // INV-ARC-A-04: vault parameter must be in approved vault set
+
+  - id: ARC-A-05
+    title: "configToken: can be called on tokenId in active transform — state inconsistency"
+    tier: 2
+    type: access_control
+    confidence: 55
+    description: >
+      During an active transform (transformedTokenId set), if the owner calls configToken
+      on the tokenId being transformed, the config is updated mid-transform.
+      execute() reads the config at the start and again when setting newTokenId's config.
+      If config changes between reads, the new position might be created with different params
+      than the original intent.
+    affected_line: "AutoRangeAndCompound.sol:542 configToken()"
+    status: low_priority
+    solidity: |
+      // INV-ARC-A-05: configToken should be blocked during active transform
+
+  - id: ARC-A-06
+    title: "autoCompound: COMPOUND_FEE_X64 can be set to max — 100% fee extraction"
+    tier: 2
+    type: economic
+    confidence: 70
+    description: >
+      COMPOUND_FEE_X64 is a fee that goes to the protocol/keeper.
+      If set to Q64 (100%), all collected fees go to the compound fee recipient.
+      Position owner receives nothing from the autoCompound.
+      This is operator abuse (requires owner/deployer to set), but worth validating
+      the maximum fee bounds.
+    affected_line: "AutoRangeAndCompound.sol:constructor or setFees()"
+    status: low_priority
+    solidity: |
+      // INV-ARC-A-06: COMPOUND_FEE_X64 <= MAX_COMPOUND_FEE (should be capped)

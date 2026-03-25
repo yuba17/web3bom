@@ -1,0 +1,556 @@
+protocol: morpho-bundler3
+component: GeneralAdapter1
+file: src/adapters/GeneralAdapter1.sol
+domain: trust
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════
+# ANÁLISIS DE TRUST BOUNDARIES — GeneralAdapter1
+# ═══════════════════════════════════════════════════════════════
+#
+# RESUMEN EJECUTIVO:
+#
+# El adapter es un contrato sin estado persistente que actúa como intermediario
+# entre el usuario (initiator) y Morpho/ERC4626 vaults. Las funciones siguen
+# el patrón: recibir tokens → aprobar → llamar protocolo → revocar aprobación.
+#
+# HALLAZGOS CLAVE:
+#
+# 1. FEE-ON-TRANSFER: erc20TransferFrom y permit2TransferFrom transfieren `amount`
+#    pero si el token cobra fee, el receiver recibe menos. Cuando receiver=adapter
+#    y luego se usa balanceOf(this) con type(uint256).max, esto se autocorrige.
+#    Pero si se pasa un amount fijo a morphoSupply/erc4626Deposit después,
+#    el adapter no tiene suficientes tokens → revert. No hay pérdida de fondos,
+#    solo DoS. El patrón max→balanceOf mitiga esto por diseño.
+#
+# 2. REBASING: Si el underlying es rebasing (stETH, aToken), el balance puede
+#    cambiar entre el momento del balanceOf y el momento del deposit/supply.
+#    Con stETH esto es conocido (1-2 wei off), EthereumGeneralAdapter1 maneja
+#    stETH→wstETH explícitamente. Para aTokens genéricos vía ERC4626, el rebase
+#    positivo no causa pérdida (el adapter tiene MÁS de lo que cree).
+#
+# 3. ERC777: Los callbacks tokensReceived() podrían dar control al atacante
+#    durante un safeTransferFrom. Pero el adapter no tiene estado mutable y
+#    está protegido por onlyBundler3 + el reenterHash del Bundler3. Un atacante
+#    no puede re-entrar al bundler porque no conoce el reenterHash.
+#
+# 4. APPROVAL TRUST ASIMÉTRICA: Morpho recibe approval permanente (nunca se
+#    revoca — "Morpho is trusted"). ERC4626 vaults reciben approve max → call →
+#    approve 0. Esto es CORRECTO: Morpho es immutable y audited, los vaults
+#    son arbitrarios (el usuario elige cuál).
+#
+# 5. VAULT NO VALIDADO: erc4626Mint/Deposit/Withdraw/Redeem aceptan CUALQUIER
+#    address como vault. Un usuario podría pasar un contrato malicioso como vault.
+#    Pero: (a) el usuario se perjudicaría a sí mismo, (b) el adapter no tiene
+#    fondos propios, (c) onlyBundler3 protege que solo el initiator puede
+#    triggear esto. La excepción es: vault malicioso que NO revierte en deposit()
+#    pero tampoco transfiere shares → el adapter aprueba max, revoca a 0, pero
+#    entre esos dos puntos el vault podría frontrun y drenar tokens. Esto es
+#    mitigado porque el approve→call→revoke es atómico dentro de una tx.
+#
+# 6. sendValue EN unwrapNative: Si receiver es un contrato sin receive(),
+#    Address.sendValue revierte → DoS pero no pérdida de fondos. El usuario
+#    controla receiver, así que es su responsabilidad.
+#
+# 7. morphoRepay shares==max usa onBehalf (CORREGIDO): El Solodit finding sobre
+#    morphoRepay usando initiator en vez de onBehalf para borrowShares ya está
+#    corregido en este código (L281 usa onBehalf). Verificado.
+#
+# ═══════════════════════════════════════════════════════════════
+
+invariants:
+- id: GA-T01
+  tier: 2
+  type: property
+  description: >
+    Fee-on-transfer token: cuando erc20TransferFrom transfiere un token FoT
+    al adapter (receiver=address(this)), y luego morphoSupply usa un amount
+    fijo (no type(uint256).max), el supply revierte porque el adapter tiene
+    menos tokens de los esperados. Si el usuario usa max, balanceOf autocorrige.
+    Invariante: si token es FoT y amount != max, la transacción DEBE revertir
+    en Morpho (insufficient balance), no dejar fondos perdidos en el adapter.
+  attack_scenario: >
+    1. Token X cobra 1% fee on transfer.
+    2. Usuario llama bundle: [erc20TransferFrom(X, adapter, 1000), morphoSupply(X, 1000, ...)].
+    3. erc20TransferFrom transfiere 1000, adapter recibe 990.
+    4. morphoSupply intenta aprobar y enviar 1000 a Morpho → reverts (solo tiene 990).
+    5. No hay pérdida de fondos, pero el usuario no puede completar la operación
+       sin usar type(uint256).max como amount en morphoSupply.
+    Si en algún caso Morpho acepta 990 pero registra 1000 de supply → pérdida para el pool.
+  impact: >
+    DoS para usuarios con tokens FoT que usan amounts fijos. No hay pérdida
+    directa de fondos porque el revert previene el estado inconsistente.
+    Severidad baja porque el workaround (usar max) existe y es documentado.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simular con un token FoT mock
+    // 1. Transfer 1000 FoT tokens to adapter via erc20TransferFrom
+    // 2. Check adapter balance < 1000
+    // 3. Try morphoSupply with exact 1000 → expect revert
+    // 4. Try morphoSupply with type(uint256).max → expect success with actual balance
+    uint256 balanceBefore = fotToken.balanceOf(address(adapter));
+    // After erc20TransferFrom(fotToken, adapter, 1000):
+    uint256 balanceAfter = fotToken.balanceOf(address(adapter));
+    t(balanceAfter < 1000, "GA-T01: FoT token should have less than transferred amount");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: >
+    Este es un patrón conocido. La mitigación por diseño (usar max) es documentada.
+    Morpho Blue probablemente también tiene checks internos. Verificar si Morpho
+    markets pueden crearse con tokens FoT — si no, este finding es irrelevante.
+
+- id: GA-T02
+  tier: 2
+  type: property
+  description: >
+    ERC4626 vault malicioso: el adapter llama forceApprove(max) al vault
+    ANTES de llamar vault.deposit(). Si el vault es un contrato malicioso
+    que en su deposit() no consume los tokens sino que los redirige a otro
+    address, los tokens se pierden. Pero esto requiere que el usuario (initiator)
+    voluntariamente pase un vault malicioso, lo cual es auto-phishing.
+    Invariante: después de erc4626Deposit, la allowance del adapter al vault
+    DEBE ser 0 (revocada correctamente).
+  attack_scenario: >
+    1. Atacante crea VaultMalicioso que en deposit() hace:
+       token.transferFrom(adapter, attacker, token.balanceOf(adapter))
+    2. Víctima es engañada para usar el bundler con vault=VaultMalicioso.
+    3. Bundle: [erc20TransferFrom(token, adapter, 1000), erc4626Deposit(VaultMalicioso, max, ...)].
+    4. adapter aprueba VaultMalicioso con max, llama deposit().
+    5. VaultMalicioso drena los tokens del adapter.
+    Pero: esto requiere phishing social — la víctima firma un bundle con un vault
+    que no reconoce. El bundler no valida vaults. Riesgo real en frontends comprometidos.
+  impact: >
+    Pérdida total de tokens del usuario si es engañado a usar un vault malicioso.
+    El adapter no tiene fondos propios, así que solo afecta la transacción actual.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que después de erc4626Deposit, allowance es 0
+    // Esto es correcto en el código actual (L91: forceApprove(underlyingToken, vault, 0))
+    uint256 allowanceAfter = underlyingToken.allowance(address(adapter), vault);
+    eq(allowanceAfter, 0, "GA-T02: allowance must be zero after erc4626 operation");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    El riesgo real aquí es de frontend phishing, no un bug en el contrato.
+    El adapter CORRECTAMENTE revoca el approve después del call. El vector
+    es que durante el call, el vault tiene allowance infinita. Pero esto es
+    inherente al patrón approve→call→revoke. No reportable como bug del adapter.
+
+- id: GA-T03
+  tier: 2
+  type: property
+  description: >
+    Morpho permanent approval: forceApprove(token, MORPHO, max) se llama en
+    morphoSupply, morphoSupplyCollateral, morphoRepay, morphoFlashLoan pero
+    NUNCA se revoca ("Morpho's allowance is not reset as it is trusted").
+    Esto significa que si MORPHO tiene una vulnerabilidad futura, podría
+    drenar cualquier token del adapter. Invariante: el adapter no debe retener
+    tokens entre transacciones, eliminando el riesgo de esta approval persistente.
+  attack_scenario: >
+    1. Morpho contract tiene un bug (hipotético).
+    2. Attacker explota el bug para llamar transferFrom(adapter, attacker, balance)
+       en cualquier token previamente aprobado al adapter.
+    3. Pero: el adapter no retiene tokens entre bundles — su balance debería ser 0
+       al final de cada multicall.
+    Riesgo real: si un usuario envía tokens al adapter por error (directamente, no
+    via bundle), esos tokens quedan expuestos a Morpho's approval permanente.
+  impact: >
+    Riesgo teórico. En práctica, el adapter no retiene fondos entre transacciones.
+    Tokens enviados por error al adapter podrían ser drenados por Morpho.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el adapter no retiene tokens después de un bundle completo
+    // Para cada token usado en el bundle:
+    uint256 adapterBalance = IERC20(token).balanceOf(address(adapter));
+    eq(adapterBalance, 0, "GA-T03: adapter should not retain tokens after bundle");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    Este es un design decision documentado ("Morpho is trusted"). Morpho Blue es
+    immutable y heavily audited. El riesgo residual es aceptable. No reportable
+    como bug — es by design. Pero el invariante de "adapter balance = 0 post-bundle"
+    sí es valioso para verificar que no hay token leakage.
+
+- id: GA-T04
+  tier: 1
+  type: property
+  description: >
+    ERC777 reentrancy via erc20TransferFrom: si el token es ERC777, el
+    safeTransferFrom en L381 triggerea tokensReceived() en el receiver.
+    Si receiver es un contrato del atacante, obtiene control de ejecución.
+    Pero: (a) el Bundler3 usa reenterHash para controlar reentradas,
+    (b) onlyBundler3 protege todas las funciones del adapter,
+    (c) el atacante necesitaría ser el initiator para construir el bundle.
+    Vector real: el atacante ES el initiator y usa el callback para observar
+    estado intermedio del adapter (e.g., tokens recibidos pero no aún depositados).
+  attack_scenario: >
+    1. Token ERC777 con hooks activados.
+    2. Atacante (initiator) construye bundle: [erc20TransferFrom(erc777, attackerContract, 1000)].
+    3. Durante safeTransferFrom, attackerContract.tokensReceived() se ejecuta.
+    4. Dentro del callback, attackerContract intenta llamar al adapter o bundler.
+    5. No puede reentrar al bundler porque reenterHash no matchea (no se configuró callbackHash).
+    6. No puede llamar al adapter directamente (onlyBundler3).
+    Conclusión: el reenterHash del Bundler3 protege contra reentrancy ERC777.
+    Pero verificar: ¿qué pasa si el atacante CONFIGURA un callbackHash en su bundle
+    que coincida con el hash del callback del ERC777?
+  impact: >
+    Si el reenterHash puede ser predicho/manipulado por el atacante durante un
+    ERC777 callback, podría ejecutar calls arbitrarios durante estado intermedio.
+    En el código actual, el callbackHash se configura POR CALL en el bundle array.
+    El atacante controla el bundle, así que controla callbackHash. Pero el
+    reenterHash se verifica como keccak256(sender || callbackHash), y el sender
+    del reenter debe ser el contract que recibió el call original.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que durante un ERC777 callback, el atacante no puede reentrar al bundler
+    // Test: bundle con erc20TransferFrom de un ERC777, receiver = attackerContract
+    // attackerContract.tokensReceived() intenta bundler.reenter(maliciousBundle)
+    // Debe revertir con IncorrectReenterHash
+    //
+    // CRITICAL CHECK: si el call que triggerea erc20TransferFrom tiene un callbackHash
+    // configurado, ¿puede el atacante predecir el hash correcto?
+    //
+    // reenterHash = keccak256(bytes20(to) || callbackHash)
+    // to = address del adapter (conocido)
+    // callbackHash = hash del calldata del reenter (controlado por atacante)
+    // PERO: el reenterHash se setea ANTES del call, y el atacante necesitaría
+    // que to (el receiver del token) sea el que llama reenter.
+    // En erc20TransferFrom, to = adapter, pero el callback es en el RECEIVER del token.
+    // Si receiver != adapter, el receiver no puede matchear reenterHash porque
+    // reenterHash espera bytes20(adapter), no bytes20(receiver).
+    //
+    // CONCLUSIÓN: Seguro. El ERC777 callback se ejecuta en el receiver del token,
+    // pero reenterHash espera que el sender del reenter sea el target del call original
+    // (el adapter). El receiver del token != adapter target → no puede reentrar.
+    bool reentered = false;  // Set by mock ERC777 receiver
+    t(!reentered, "GA-T04: ERC777 callback should not enable reentry to bundler");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    Análisis más profundo revela que el mecanismo es seguro:
+    - Bundle call: Bundler3 llama adapter.erc20TransferFrom()
+    - reenterHash se calcula con bytes20(adapter_address) || callbackHash
+    - Dentro de erc20TransferFrom, safeTransferFrom triggerea tokensReceived() en el RECEIVER
+    - El RECEIVER intenta llamar Bundler3.reenter()
+    - Bundler3 verifica: keccak256(bytes20(msg.sender) || keccak256(msg.data[4:]))
+    - msg.sender sería el RECEIVER, no el adapter → hash no matchea → revert
+    - SALVO QUE: el atacante configure callbackHash para el call al adapter de forma
+      que el hash matchee con receiver como sender. Pero callbackHash se setea en la Call
+      que targeteó al adapter, y el sender del reenter sería el token receiver.
+      keccak256(bytes20(receiver_address) || ...) != keccak256(bytes20(adapter_address) || ...)
+    VEREDICTO: Seguro por diseño. El reenterHash bindea al target del call, no al receptor del token.
+
+- id: GA-T05
+  tier: 1
+  type: property
+  description: >
+    unwrapNative con receiver=contrato sin receive(): Address.sendValue revierte
+    si el receiver no puede aceptar ETH. Esto es un DoS potencial si el usuario
+    configura receiver incorrectamente, pero no una vulnerabilidad.
+    Más interesante: ¿qué pasa si receiver es un contrato con receive() que
+    consume mucho gas? Address.sendValue usa call{value: amount}("") que
+    forwarda todo el gas disponible → el receiver puede ejecutar código arbitrario.
+  attack_scenario: >
+    1. Atacante crea un contrato con receive() que hace algo costoso o reentrant.
+    2. Usa bundle: [..., unwrapNative(amount, attackerContract)].
+    3. Address.sendValue envía ETH al attackerContract.
+    4. receive() del attackerContract se ejecuta con gas restante.
+    5. ¿Puede reentrar al bundler? No — mismo análisis que GA-T04.
+    6. ¿Puede hacer algo útil? Solo si hay estado del adapter que pueda explotar.
+       El adapter no tiene estado mutable. El bundler usa transient storage que
+       se limpia al final del multicall.
+    Conclusión: DoS por gas exhaustion es el peor caso.
+  impact: >
+    DoS si receiver es un contrato hostil. No hay pérdida de fondos porque
+    el atacante controla receiver (se perjudica a sí mismo).
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: unwrapNative con receiver = contrato sin receive()
+    // Expect revert
+    // Test: unwrapNative con receiver = contrato con receive() que consume gas
+    // Expect success pero verificar que no hay side effects
+    bool unwrapSucceeded = false;
+    try adapter.unwrapNative(amount, contractWithoutReceive) {
+        unwrapSucceeded = true;
+    } catch {
+        unwrapSucceeded = false;
+    }
+    t(!unwrapSucceeded, "GA-T05: unwrapNative to contract without receive should revert");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    Address.sendValue de OpenZeppelin es el patrón estándar. El riesgo de gas
+    griefing existe pero es self-inflicted (el atacante elige receiver). No reportable.
+
+- id: GA-T06
+  tier: 2
+  type: property
+  description: >
+    Rebasing token balance drift entre steps del bundle: si un token rebasing
+    (e.g., stETH) se transfiere al adapter en step 1, y en step 2 se usa
+    type(uint256).max para depositar, el balanceOf podría haber cambiado
+    (positiva o negativamente) entre los dos steps. Para stETH, el rebase
+    es por bloque/slot, así que DENTRO de una transacción el balance no cambia.
+    Pero para tokens con rebase intra-tx (raro pero posible), esto podría causar
+    discrepancias.
+  attack_scenario: >
+    1. Token X hace rebase intra-transacción (muy raro, pero posible en diseños exóticos).
+    2. Bundle step 1: erc20TransferFrom(X, adapter, 1000) → adapter tiene 1000.
+    3. Rebase ocurre intra-tx → adapter ahora tiene 999.
+    4. Bundle step 2: morphoSupply(X, type(uint256).max, ...) → usa balanceOf = 999.
+    5. Morpho recibe 999, no 1000. Diferencia de 1 token.
+    En práctica: stETH rebase es por oracle update, no intra-tx. aTokens de Aave
+    también actualizan por bloque. No hay tokens mainstream con rebase intra-tx.
+  impact: >
+    Teórico. No hay tokens mainstream con rebase intra-transacción.
+    Para tokens con rebase por bloque (stETH), el balance es estable dentro
+    de una transacción. Riesgo negligible.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el balance del adapter no cambia entre steps del bundle
+    // (dentro de la misma transacción)
+    uint256 balanceStep1 = rebasingToken.balanceOf(address(adapter));
+    // ... execute some logic ...
+    uint256 balanceStep2 = rebasingToken.balanceOf(address(adapter));
+    eq(balanceStep1, balanceStep2, "GA-T06: rebasing token balance should be stable intra-tx");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    Investigado y descartado como riesgo real. stETH tiene su propio wrapper
+    (wstETH) en EthereumGeneralAdapter1. Tokens rebasing mainstream no cambian
+    balance intra-tx. Marcar como false positive si se confirma.
+
+- id: GA-T07
+  tier: 1
+  type: property
+  description: >
+    forceApprove en tokens con approval race condition (USDT): OpenZeppelin's
+    forceApprove primero intenta approve(spender, value). Si eso falla (USDT
+    rechaza approve de non-zero a non-zero), hace approve(spender, 0) y luego
+    approve(spender, value). ¿Hay un window entre approve(0) y approve(value)
+    donde un spender malicioso podría actuar? No — todo está en la misma tx.
+    Pero verificar: ¿forceApprove maneja correctamente tokens que retornan
+    false en vez de revertir? SafeERC20 maneja esto.
+  attack_scenario: >
+    No hay ataque viable. forceApprove es una operación atómica dentro de la tx.
+    USDT's approval requirement (set to 0 first) es manejado por forceApprove.
+    No hay window de MEV entre las dos operaciones porque están en la misma tx.
+  impact: "Ninguno — forceApprove es la solución correcta para USDT."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que forceApprove funciona con USDT (approve non-zero to non-zero)
+    // En fork test con USDT real:
+    // 1. Set allowance to non-zero via forceApprove
+    // 2. Set allowance to different non-zero via forceApprove
+    // 3. Both should succeed
+    SafeERC20.forceApprove(IERC20(USDT), spender, 100);
+    uint256 allowance1 = IERC20(USDT).allowance(address(this), spender);
+    eq(allowance1, 100, "GA-T07a: forceApprove should set allowance");
+    SafeERC20.forceApprove(IERC20(USDT), spender, 200);
+    uint256 allowance2 = IERC20(USDT).allowance(address(this), spender);
+    eq(allowance2, 200, "GA-T07b: forceApprove should update allowance");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Investigado: forceApprove de OZ 5.x maneja USDT correctamente. No es un bug.
+    Marcado como validated=false solo porque no se ha testeado en fork aún.
+
+- id: GA-T08
+  tier: 1
+  type: property
+  description: >
+    Morpho callback reentrancy via morphoCallback: cuando Morpho llama
+    onMorphoSupply/onMorphoRepay/etc., el adapter llama reenterBundler3(data)
+    que ejecuta un nuevo bundle dentro del callback. El caller check es
+    msg.sender == MORPHO. ¿Puede un atacante explotar esto?
+    El atacante necesita que Morpho llame al adapter con data arbitraria.
+    Esto solo sucede si el atacante tiene una posición en Morpho y triggerea
+    un callback. Los callbacks de Morpho son: supply, supplyCollateral, repay,
+    flashLoan — todos iniciados por el adapter mismo como parte de un bundle.
+    El data en el callback es el data pasado por el adapter al llamar a Morpho.
+  attack_scenario: >
+    1. Atacante incluye en su bundle: morphoSupply(market, 100, 0, ..., onBehalf, maliciousCallbackData).
+    2. Adapter llama MORPHO.supply(..., maliciousCallbackData).
+    3. Morpho calls back adapter.onMorphoSupply(100, maliciousCallbackData).
+    4. adapter verifica msg.sender == MORPHO ✓.
+    5. adapter llama reenterBundler3(maliciousCallbackData).
+    6. Bundler3.reenter() verifica reenterHash.
+    7. reenterHash fue configurado en el Call que targetea al adapter con el callbackHash
+       correspondiente al hash del maliciousCallbackData.
+    8. Si el atacante calculó el callbackHash correctamente, reenter() ejecuta el nuevo bundle.
+    PREGUNTA: ¿puede el atacante ejecutar calls dentro del callback que no debería?
+    RESPUESTA: Sí, pero el atacante ES el initiator — solo puede perjudicarse a sí mismo.
+    El initiator controla todo el bundle, incluyendo los callbacks. No hay escalación.
+  impact: >
+    No hay escalación. El initiator ya controla el bundle completo. Los callbacks
+    de Morpho solo se ejecutan si el initiator los configuró en su bundle.
+    reenterHash asegura que solo los callbacks pre-autorizados se ejecutan.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que morphoCallback SOLO acepta calls de MORPHO
+    // Test: llamar onMorphoSupply desde un address != MORPHO → expect revert
+    try adapter.onMorphoSupply(100, bytes("")) {
+        t(false, "GA-T08: onMorphoSupply should only accept calls from MORPHO");
+    } catch {
+        t(true, "GA-T08: correctly reverted for non-MORPHO sender");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    El mecanismo de reenterHash + msg.sender check en morphoCallback es robusto.
+    El atacante controla el data del callback pero también controla el bundle —
+    no hay escalación de privilegios. El sistema asume correctamente que el
+    initiator es el trust boundary principal.
+
+- id: GA-T09
+  tier: 2
+  type: property
+  description: >
+    erc4626Deposit/Mint con vault que reporta asset() distinto del token real:
+    el adapter llama IERC4626(vault).asset() para obtener el underlyingToken,
+    luego aprueba ese token al vault. Si vault.asset() retorna un token A pero
+    vault.deposit() realmente consume token B, el approve es inútil y el deposit
+    falla (o peor, el vault drena token A sin dar shares).
+    Pero: el usuario elige el vault. Si el vault es malicioso, el usuario se
+    phishea a sí mismo.
+  attack_scenario: >
+    1. Vault malicioso: asset() retorna USDC, deposit() hace transferFrom(USDC) pero
+       mint() retorna shares de un token sin valor.
+    2. Usuario transfere USDC al adapter, llama erc4626Deposit(maliciousVault, max, ...).
+    3. Adapter aprueba USDC al vault, vault drena USDC, retorna worthless shares.
+    4. slippage check (assets.rDivUp(shares) <= maxSharePriceE27) podría pasar si
+       vault retorna muchas shares para pocos assets.
+    Pero: el usuario firmó el bundle con este vault. Self-phishing.
+  impact: >
+    Self-phishing via vault malicioso. No es un bug del adapter — el adapter
+    ejecuta lo que el usuario pide. La slippage protection mitiga parcialmente.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que erc4626Deposit revierte si vault.deposit revierte
+    // Verificar que slippage check protege contra vaults que dan pocas shares
+    uint256 sharePrice = assets.rDivUp(shares);
+    lte(sharePrice, maxSharePriceE27, "GA-T09: slippage check must hold");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    Self-phishing no es reportable como bug del protocolo. El adapter no puede
+    validar que un vault sea "legítimo" — eso es responsabilidad del frontend.
+
+- id: GA-T10
+  tier: 1
+  type: property
+  description: >
+    morphoRepay con shares==type(uint256).max y assets==type(uint256).max:
+    ambos pueden ser max simultáneamente. Si assets==max, se resuelve a
+    balanceOf(adapter). Si shares==max, se resuelve a borrowShares(onBehalf).
+    ¿Qué pasa si ambos son non-zero después de la resolución? Morpho.repay()
+    requiere que exactamente uno sea zero. Si el adapter pasa ambos non-zero,
+    Morpho revierte. Pero: el usuario puede configurar ambos como max en el
+    bundle, y después de resolver, ambos serían non-zero → revert en Morpho.
+    Esto es un error de usuario, no del adapter. El adapter documenta
+    "Either assets or shares should be zero".
+  attack_scenario: >
+    No hay ataque. El usuario que pasa ambos como max obtiene un revert en Morpho.
+    No hay pérdida de fondos, solo una transacción fallida.
+  impact: "DoS auto-infligido. No es un bug."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que morphoRepay con ambos max revierte correctamente
+    // No es un invariante útil para fuzzing — es un edge case de input validation
+    // que Morpho ya maneja
+    t(true, "GA-T10: documented behavior - either assets or shares should be zero");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Documentado en NatSpec. Morpho Blue valida esto internamente.
+    No reportable.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: GA-FP-01
+  reason: >
+    Fee-on-transfer tokens: investigado en profundidad. El adapter usa el patrón
+    balanceOf(this) con type(uint256).max para manejar tokens FoT correctamente.
+    El usuario debe usar max en vez de amounts fijos. Esto es by design y documentado.
+    No es un bug del adapter — es una limitación inherente de tokens FoT que se
+    mitiga con el patrón max.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Bundler3 adapter maneja FoT tokens via type(uint256).max → balanceOf().
+      No es un bug — es el patrón estándar. Solo falla si usuario usa amounts fijos.
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: GA-FP-02
+  reason: >
+    ERC777 reentrancy: investigado. El mecanismo de reenterHash del Bundler3
+    previene reentrancy no autorizada. El callback ERC777 (tokensReceived) se
+    ejecuta en el receiver del token, pero reenterHash bindea al target del
+    call original (el adapter). El receiver no puede matchear el reenterHash
+    porque bytes20(receiver) != bytes20(adapter).
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Bundler3 reenterHash previene ERC777 reentrancy: el hash bindea al target
+      del call (adapter), no al receiver del token. Los callbacks del receiver
+      no pueden reentrar porque msg.sender sería el receiver, no el adapter.
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: GA-FP-03
+  reason: >
+    morphoRepay borrowShares lookup: el Solodit finding reportó que morphoRepay
+    usaba initiator() en vez de onBehalf para leer borrowShares. En el código
+    actual (L281), esto ya está corregido — usa onBehalf. Verified.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

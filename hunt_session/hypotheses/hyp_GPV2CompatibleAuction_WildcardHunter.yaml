@@ -1,0 +1,467 @@
+protocol: chainlink-pa-v2
+component: GPV2CompatibleAuction
+file: src/GPV2CompatibleAuction.sol
+domain: dex
+hunter: WildcardHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: GPVCA-WC-01
+  tier: 1
+  type: property
+  description: >
+    Approval desync via donation: _onAuctionStart approves VaultRelayer for
+    balanceOf(this), which includes tokens donated directly to the contract
+    before performUpkeep. These donated tokens are NOT from the feeAggregator
+    and were not accounted in the eligibleAssets amount, yet they get approved
+    for CowSwap settlement and can be sold at the Dutch auction discount.
+    An attacker could donate low-value tokens before performUpkeep to inflate
+    the approved amount, then as a solver fill the order taking the donated
+    tokens at the discounted price. Net effect: donated tokens sold below
+    fair value. Impact is limited if the attacker is also the donor (they
+    donated the tokens so they get them back at a discount to themselves),
+    but if a third party innocently sends tokens to the contract, the solver
+    captures them at discount.
+  attack_scenario: >
+    1. Attacker transfers 1000 WETH directly to the auction contract.
+    2. performUpkeep starts auction for WETH, pulling e.g. 5000 WETH from feeAggregator.
+    3. _onAuctionStart approves VaultRelayer for balanceOf(this) = 6000 WETH.
+    4. CowSwap solver creates order selling 6000 WETH (not just the 5000 from feeAggregator).
+    5. isValidSignature validates because balanceOf(this) >= 6000.
+    6. The extra 1000 WETH is sold at the current Dutch auction price (potentially at a discount).
+    Result: 1000 WETH sold below market price. If attacker is also the solver, they profit
+    from the discount on their own donated tokens (self-arbitrage). More importantly,
+    ANY tokens stuck in the contract from previous auctions or accidental transfers
+    are silently included in the next auction at a discount.
+  impact: >
+    Tokens sent directly to the contract (accidentally or from stuck previous auctions)
+    are included in the auction at potentially below-market prices.
+    Financial loss depends on auction curve position and token value.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before performUpkeep: record expected auction amount from feeAggregator
+    uint256 feeAggBalance = IERC20(asset).balanceOf(feeAggregator);
+    // After _onAuctionStart: check approval matches feeAggregator amount, not total balance
+    uint256 approval = IERC20(asset).allowance(address(auction), vaultRelayer);
+    uint256 contractBalance = IERC20(asset).balanceOf(address(auction));
+    // If donation happened, contractBalance > feeAggBalance (pulled amount)
+    // and approval == contractBalance (includes donation)
+    // This invariant checks that the approved amount doesn't exceed the intended auction amount
+    lte(approval, feeAggBalance + 1, "GPVCA-WC-01: approval includes non-feeAggregator tokens");
+  ghost_vars:
+  - uint256 internal ghost_preAuctionBalance;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The approval is set to balanceOf(this) in _onAuctionStart (line 92 of GPV2CompatibleAuction.sol).
+    The transferred amount from feeAggregator is eligibleAssets[i].amount which is the feeAggregator
+    balance at checkUpkeep time. Any difference between current balanceOf(this) and the transferred
+    amount represents tokens not intended for this auction.
+
+- id: GPVCA-WC-02
+  tier: 1
+  type: property
+  description: >
+    bid() callback flash-loan exploit: bid() transfers auctioned tokens to
+    msg.sender (line 444) BEFORE pulling assetOut payment (line 453). If
+    data.length != 0, the callback executes between these two operations.
+    During the callback, the bidder has received tokens without paying yet.
+    This is effectively a flash loan. The bidder can use the received tokens
+    as collateral or liquidity in other protocols during the callback, then
+    pay with profits earned from that capital usage.
+  attack_scenario: >
+    1. Attacker calls bid(WETH, 1000e18, callbackData).
+    2. Contract transfers 1000 WETH to attacker (line 444).
+    3. Callback executes: attacker uses 1000 WETH as flash capital in Aave/Uniswap,
+       earns profit, and acquires the required LINK (assetOut) amount.
+    4. Control returns to bid(), which pulls LINK from attacker (line 453).
+    Result: Attacker got free flash loan without paying flash loan fees.
+    This is by design (callback pattern is intentional), but the key question is
+    whether the s_entered reentrancy guard is sufficient. Since s_entered blocks
+    re-entering bid() and isValidSignature() during the callback, and the
+    safeTransferFrom at line 453 ensures payment, this is likely safe.
+    However: if the callback calls the CowSwap settlement contract to trigger
+    a batch that includes THIS contract's orders, the settlement would call
+    isValidSignature which reverts due to s_entered. This means the callback
+    can grief pending CowSwap settlements.
+  impact: >
+    Low direct impact (flash loan is by design). Grief vector for CowSwap settlements
+    during bid() callback window. Could cause solver tx to revert, wasting gas.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track that during callback, no CowSwap settlement should be possible
+    // because s_entered == true blocks isValidSignature
+    // This is a sanity check that the reentrancy guard works for CowSwap path
+    bool entered = auction.s_entered(); // need getter
+    if (entered) {
+        // isValidSignature should revert
+        try auction.isValidSignature(someHash, someSignature) {
+            t(false, "GPVCA-WC-02: isValidSignature should revert when s_entered is true");
+        } catch {}
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The reentrancy guard appears to work correctly. The flash-loan pattern in bid()
+    callback is intentional. The grief on CowSwap settlement is theoretical and low impact.
+    Marking as tier 1 only because it's worth verifying the guard holds in all paths.
+
+- id: GPVCA-WC-03
+  tier: 1
+  type: property
+  description: >
+    isValidSignature TOCTOU with CowSwap pre-interactions: CowSwap settlement
+    allows pre-interactions (arbitrary calls) that execute BEFORE trades are settled.
+    GPv2Settlement.settle() processes interactions[0] (pre-interactions) before
+    processing trades. A malicious solver could: (1) set a pre-interaction that
+    calls bid() on the auction contract to drain some tokens, (2) include a CowSwap
+    order for the auction contract where isValidSignature is called AFTER the
+    pre-interaction has reduced the balance. But since isValidSignature checks
+    balanceOf at the time of validation (which runs in the same tx after pre-interactions),
+    the reduced balance would cause isValidSignature to correctly reject orders exceeding
+    the new balance. However, the APPROVAL was set for the original higher balance,
+    so there's no approval-level protection. The question is whether CowSwap's internal
+    execution order can cause a state where isValidSignature passes but the actual
+    transfer fails or vice versa.
+  attack_scenario: >
+    1. Auction has 5000 WETH, approval = 5000 WETH to VaultRelayer.
+    2. Solver creates batch: pre-interaction calls bid(WETH, 3000, "") removing 3000 WETH.
+    3. Solver includes CowSwap order selling 5000 WETH from auction.
+    4. isValidSignature checks balanceOf = 2000 WETH (after bid), rejects 5000 order.
+    5. Settlement reverts or the order is partial-filled for 2000 only.
+    Actually: bid() requires msg.sender == solver (or anyone), and sets s_entered = true.
+    If bid() is called as pre-interaction, s_entered stays true (bid resets it at the end).
+    Then isValidSignature would revert with ReentrantCall. Wait no — bid() does reset
+    s_entered = false at line 457. So after the pre-interaction bid() completes,
+    s_entered is false again. Then isValidSignature can run.
+    Revised attack: Solver calls bid() as pre-interaction (s_entered true then false),
+    draining some tokens. Then CowSwap order goes through isValidSignature with reduced
+    balance. The order is for the full original amount, but balanceOf is now lower, so
+    isValidSignature reverts with InsufficientAssetInBalance. Settlement reverts.
+    This is a grief vector where a solver can cause batches to fail.
+  impact: >
+    Solver grief — can cause CowSwap batch settlements to fail by draining tokens
+    via bid() in pre-interactions, making pending CowSwap orders invalid.
+    No fund loss but auction efficiency degraded.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a bid reduces balance, isValidSignature should correctly reject
+    // orders that exceed the new balance
+    uint256 postBidBalance = IERC20(asset).balanceOf(address(auction));
+    // Any valid CowSwap order sellAmount must be <= postBidBalance
+    // Invariant: isValidSignature(order with sellAmount > postBidBalance) must revert
+    if (order.sellAmount > postBidBalance) {
+        try auction.isValidSignature(hash, abi.encode(order)) {
+            t(false, "GPVCA-WC-03: validated order exceeding available balance");
+        } catch {}
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    The code handles this correctly — isValidSignature checks balanceOf at validation
+    time (line 160-162). The real question is whether the CowSwap settlement execution
+    model can create a window where validation passes but execution uses stale state.
+    In CowSwap GPv2Settlement, isValidSignature is called as part of trade processing,
+    and the VaultRelayer pull happens atomically. So TOCTOU within a single CowSwap
+    trade is not exploitable. Cross-trade within same batch is the edge case.
+
+- id: GPVCA-WC-04
+  tier: 1
+  type: property
+  description: >
+    No minBidUsdValue check in isValidSignature: the bid() function enforces
+    a minimum bid USD value (s_minBidUsdValue, line 431-434) to prevent dust
+    attacks. However, isValidSignature has NO equivalent minimum check for
+    CowSwap orders. A solver could create many tiny CowSwap orders that each
+    pass isValidSignature validation. If partial fills are executed for very
+    small amounts, rounding in _getAssetOutAmount (which uses mulDivUp/mulWadUp)
+    could systematically favor the solver. Over many tiny fills, the rounding
+    error accumulates, extracting value from the protocol.
+  attack_scenario: >
+    1. Auction for WETH with balance = 100e18.
+    2. Solver creates a partially fillable CowSwap order selling 100e18 WETH.
+    3. CowSwap executes partial fills of 1 wei each.
+    4. _getAssetOutAmount uses mulDivUp and mulWadUp (line 799-802), meaning the
+       protocol pays MORE assetOut than proportional for tiny amounts.
+    5. For each 1 wei of WETH, the assetOut amount rounds UP, potentially
+       paying 1 wei extra assetOut per fill.
+    6. Over 100e18 fills (impractical but illustrative), the extra assetOut
+       paid = 100e18 wei = 100 LINK.
+    Practical limit: CowSwap settlement gas costs make fills below ~$1 uneconomical
+    for solvers. But the invariant is still broken — there's no floor on order size
+    via CowSwap path unlike the bid() path.
+  impact: >
+    Rounding extraction via many tiny partial fills through CowSwap path.
+    Practically limited by gas costs but asymmetry with bid() path is a design gap.
+    At scale (L2s with cheap gas), could extract meaningful rounding surplus.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // CowSwap orders should have the same minimum size protection as bid()
+    // Check: for any validated CowSwap order, the sell amount USD value >= minBidUsdValue
+    uint256 sellAmountUsdValue = (order.sellAmount * assetPrice) / (10 ** decimals);
+    uint88 minBid = auction.getMinBidUsdValue();
+    // This invariant would fail for tiny CowSwap orders
+    gte(sellAmountUsdValue, minBid, "GPVCA-WC-04: CowSwap order below minBidUsdValue");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The rounding direction (mulDivUp, mulWadUp) in _getAssetOutAmount is intentionally
+    conservative (protocol pays more to the solver). This is correct to ensure the
+    solver always gets at least fair value. But without a floor on order size, the
+    rounding error per fill becomes a proportionally larger fraction of the fill value.
+    On L2s where gas is cheap, this could be economically viable to exploit.
+    Key difference: bid() has minBidUsdValue guard, CowSwap path does not.
+
+- id: GPVCA-WC-05
+  tier: 2
+  type: property
+  description: >
+    Approval persists after auction ends if _onAuctionEnd reverts: if
+    IERC20(asset).forceApprove(i_gpV2VaultRelayer, 0) in _onAuctionEnd
+    reverts (e.g., token with non-standard approve that reverts on zero),
+    the entire performUpkeep transaction reverts, preventing the auction
+    from being properly closed. This leaves the approval active and the
+    auction in a zombie state — not technically live (duration expired) but
+    also not properly ended. However, isValidSignature checks elapsedTime
+    against auctionDuration, so orders after expiry would be rejected.
+    The dangling approval is the risk — VaultRelayer could still pull tokens
+    if a valid order existed from before the auction ended.
+  attack_scenario: >
+    1. Auction for token X with non-standard approve (reverts on 0).
+    2. Auction duration expires.
+    3. performUpkeep tries to end auction, _onAuctionEnd reverts on forceApprove(0).
+    4. Entire performUpkeep reverts, s_auctionStarts[X] remains set.
+    5. isValidSignature still works because elapsedTime check at line 166
+       would revert (elapsedTime > auctionDuration).
+    6. But s_auctionStarts[X] != 0 prevents new auction for X (line 327).
+    7. Token X is stuck — can't end auction, can't start new one.
+    Actually: SafeERC20.forceApprove first sets to 0 then to amount, and
+    handles tokens that return false. OZ forceApprove should handle most
+    non-standard tokens. And the allowlisting process should vet tokens.
+    Risk is very low but worth flagging for exotic tokens.
+  impact: >
+    Token stuck in contract if forceApprove(0) reverts. No fund loss but permanent
+    DOS for that token's auctions. Very unlikely with OZ SafeERC20.forceApprove.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After _onAuctionEnd, VaultRelayer approval must be zero
+    uint256 postEndApproval = IERC20(asset).allowance(address(auction), vaultRelayer);
+    eq(postEndApproval, 0, "GPVCA-WC-05: approval not revoked after auction end");
+    // And s_auctionStarts must be zero (deleted)
+    uint256 auctionStart = auction.getAuctionStart(asset);
+    eq(auctionStart, 0, "GPVCA-WC-05: auction not properly ended");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    OZ forceApprove handles USDT-style non-standard approve by first setting to 0
+    then setting to the desired amount. This mitigates most exotic token issues.
+    Flagged as tier 2 because the risk is theoretical for properly vetted tokens.
+
+- id: GPVCA-WC-06
+  tier: 1
+  type: property
+  description: >
+    CowSwap order validated at time T1 with price P1 can be settled at time
+    T2 > T1 when the Dutch auction price has dropped further. isValidSignature
+    is view and validates at the current block. But a partially fillable order
+    validated at T1 remains valid in CowSwap's order book. If a solver holds
+    the order and waits for the price to drop further (closer to endingPriceMultiplier),
+    they can fill it at T2 when the protocol would demand LESS assetOut.
+    BUT: isValidSignature is called again at settlement time (T2), and it
+    recomputes minBuyAmount based on T2's elapsed time. Since the order's
+    buyAmount was set based on T1's price, and T2's price is lower, the
+    order's buyAmount (set high for T1) would still exceed minBuyAmount at T2.
+    So the protocol gets buyAmount (set at T1 pricing) while giving sellAmount
+    at T2 pricing. This means the SOLVER overpays, not the protocol. No exploit.
+    Wait — in CowSwap, the solver chooses clearing prices. For a sell order, the
+    solver decides how much buyToken to send. The order's buyAmount is the MINIMUM.
+    So the solver sends exactly buyAmount (the minimum). At T1, buyAmount >= minBuyAmount(T1).
+    At T2, minBuyAmount(T2) < minBuyAmount(T1), so buyAmount >= minBuyAmount(T2) too.
+    The solver sends buyAmount which was the T1 minimum, but at T2 the fair price
+    would require less. So the protocol gets MORE than the T2 fair price. No exploit.
+    Actually, the solver can just create a NEW order at T2 with a lower buyAmount
+    matching T2's price. So the old order is just stale, not exploitable.
+    FALSE POSITIVE.
+  attack_scenario: >
+    N/A — analysis shows this is not exploitable. The protocol is protected
+    because isValidSignature is re-evaluated at settlement time with current
+    prices, and the order's buyAmount acts as a floor that only benefits the protocol.
+  impact: 'None'
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // At any time during the auction, the minBuyAmount should be non-increasing
+    // as elapsed time increases (Dutch auction decays)
+    uint256 minBuyAmount_t1 = auction.getAssetOutAmount(asset, amount, t1);
+    uint256 minBuyAmount_t2 = auction.getAssetOutAmount(asset, amount, t2);
+    if (t2 > t1) {
+        gte(minBuyAmount_t1, minBuyAmount_t2, "GPVCA-WC-06: Dutch auction price not monotonically decreasing");
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Confirmed false positive. The Dutch auction price monotonically decreases,
+    and isValidSignature re-validates at settlement time. Old orders with high
+    buyAmount are overpaying from the solver's perspective, not exploitable.
+
+- id: GPVCA-WC-07
+  tier: 1
+  type: property
+  description: >
+    Multiple concurrent auctions share a single s_assetOut balance.
+    When _onAuctionEnd is called for auction A, it sweeps ALL s_assetOut
+    (LINK) balance to s_assetOutReceiver (BaseAuction.sol line 393-396).
+    This is the known BA-SWEEP-01 pattern. HOWEVER, this creates an additional
+    wildcard: if auction A ends and sweeps LINK that was received as payment
+    for auction B (still live), then when auction B's CowSwap orders try to
+    settle, the LINK (buyToken) is sent to the contract but immediately
+    becomes available for the NEXT _onAuctionEnd sweep. The accounting
+    between auctions is purely temporal — there are no per-auction LINK
+    balances tracked. This means bid() for auction B sends LINK to the
+    contract, and if auction C ends in the same tx or a later tx, that
+    LINK is swept to receiver. This is actually CORRECT behavior (all
+    LINK should go to receiver), but it means CowSwap orders where
+    receiver=address(this) accumulate LINK in the contract that depends
+    on _onAuctionEnd to forward. If no auction ends, LINK sits in the
+    contract indefinitely.
+    SKIP — this is BA-SWEEP-01 territory.
+  attack_scenario: 'Known finding BA-SWEEP-01 territory. Skipping.'
+  impact: 'See BA-SWEEP-01'
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Skip — BA-SWEEP-01
+    t(true, "GPVCA-WC-07: skipped, BA-SWEEP-01 territory");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    Deliberately skipping as this overlaps with known finding BA-SWEEP-01.
+    Left in the file for completeness and to document the reasoning.
+
+- id: GPVCA-WC-08
+  tier: 1
+  type: property
+  description: >
+    Front-running performUpkeep to manipulate auction set: checkUpkeep
+    determines which auctions should start/end based on current balances
+    and prices. Between checkUpkeep (off-chain read) and performUpkeep
+    (on-chain execution), an attacker could: (1) donate tokens to the
+    feeAggregator to push an asset above minAuctionSizeUsd, causing
+    an unintended auction to start, or (2) drain tokens from feeAggregator
+    (if they have access) to prevent an auction from starting. More
+    interestingly: (3) the attacker front-runs performUpkeep by calling
+    bid() on a live auction to reduce its balance below minAuctionSizeUsd,
+    causing checkUpkeep to flag it as ended. If the AUCTION_WORKER calls
+    performUpkeep with the stale checkUpkeep data (which included this
+    auction as ended), the auction gets ended prematurely.
+    Wait — performUpkeep doesn't re-check balances for ended auctions.
+    It just checks s_auctionStarts[asset] != 0 (line 362). It doesn't
+    verify the end condition again. So an attacker can force-end any
+    auction by front-running performUpkeep with a bid that drains the
+    balance, IF the AUCTION_WORKER includes the asset in endedAuctions.
+    But the AUCTION_WORKER would only include it if checkUpkeep flagged
+    it. And checkUpkeep is called off-chain before performUpkeep.
+    Actually, performUpkeep accepts arbitrary performData. The AUCTION_WORKER
+    could include ANY asset in endedAuctions as long as s_auctionStarts != 0.
+    The AUCTION_WORKER is trusted (has AUCTION_WORKER_ROLE). If the worker
+    is honest, they only include assets flagged by checkUpkeep.
+  attack_scenario: >
+    1. Auction for WETH is live, 30 minutes remaining.
+    2. Attacker front-runs performUpkeep with bid() to drain WETH balance below minAuctionSize.
+    3. checkUpkeep flags WETH as ended (balance < minAuctionSize).
+    4. AUCTION_WORKER calls performUpkeep with WETH in endedAuctions.
+    5. Auction ends prematurely — remaining WETH sent back to feeAggregator.
+    6. Attacker got their WETH at the current discount, AND prevented other
+       bidders from getting a better price later in the auction.
+    This requires the attacker to have enough LINK to bid, and the benefit
+    is griefing other bidders. The attacker doesn't directly profit beyond
+    the normal bid execution.
+  impact: >
+    Auction can be force-ended early by draining balance below minAuctionSize
+    via bid(). Other bidders lose the opportunity for better prices later.
+    Attacker doesn't directly profit beyond their bid execution.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a bid, if remaining balance < minAuctionSize, checkUpkeep
+    // will flag auction as ended. Verify this is intended behavior.
+    uint256 postBidBalance = IERC20(asset).balanceOf(address(auction));
+    uint256 postBidUsdValue = (postBidBalance * assetPrice) / (10 ** decimals);
+    uint96 minAuctionSize = assetParams.minAuctionSizeUsd;
+    // If this is true, the auction becomes eligible for ending
+    // even if auctionDuration hasn't elapsed
+    if (postBidUsdValue < minAuctionSize && elapsedTime < assetParams.auctionDuration) {
+        // Log that auction can be force-ended via dust balance
+        t(false, "GPVCA-WC-08: auction can be force-ended early by draining balance");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    The early-end mechanism for auctions below minAuctionSize is a design feature
+    to prevent dust attacks. But it can be weaponized by an attacker who bids the
+    majority of the auction early to force closure, denying other bidders the
+    chance at better prices. The minBidUsdValue prevents truly tiny bids from
+    triggering this. This is a design trade-off, not necessarily a bug.
+
+false_positives:
+- hunter: WildcardHunter
+  id: GPVCA-WC-FP-01
+  reason: >
+    Dutch auction price staleness across blocks: isValidSignature re-evaluates
+    price at settlement time, and the order buyAmount acts as a minimum floor.
+    Old orders with high buyAmount are not exploitable — the solver overpays,
+    not the protocol. See GPVCA-WC-06 analysis.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Dutch auction EIP-1271 orders with partially fillable flag: stale orders
+      in CowSwap order book are not exploitable because isValidSignature re-validates
+      at settlement time with current elapsed time. The buyAmount minimum only
+      benefits the protocol (seller). Not a bug.
+    briefing_update_applied: false
+- hunter: WildcardHunter
+  id: GPVCA-WC-FP-02
+  reason: >
+    Self-referential auction (s_assetOut == sellToken): Code at BaseAuction.sol
+    line 350-351 explicitly handles this case by sending assetOut directly to
+    s_assetOutReceiver instead of starting an auction. isValidSignature cannot
+    validate an order where sellToken == s_assetOut because s_auctionStarts
+    would be 0 (auction never started). This is by design.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Self-referential auction in Chainlink PA V2: s_assetOut cannot be auctioned.
+      performUpkeep sends it directly to receiver (line 350-351). isValidSignature
+      rejects because s_auctionStarts[assetOut] == 0. Not a bug — by design.
+    briefing_update_applied: false

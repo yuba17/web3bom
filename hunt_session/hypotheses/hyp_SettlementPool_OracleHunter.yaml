@@ -1,0 +1,333 @@
+# OracleHunter — SettlementPool Analysis
+# Generated: 2026-03-23
+# Contract: variational-audit/src/SettlementPool.sol
+# Note: "Oracle" in this protocol is a clearing/settlement engine, NOT a price oracle.
+# This analysis focuses on: external price dependencies, balance manipulation vectors,
+# accounting integrity relative to actual USDC balances, and replay/donation attack surfaces.
+
+component: SettlementPool
+hunter: OracleHunter
+date: "2026-03-23"
+
+hypotheses:
+
+  - id: SP-O-01
+    tier: 1
+    type: property
+    title: "transferFromOLPToPool bypasses transfers_processed tracking — unaccounted balance inflation"
+    severity: medium
+    confidence: 75
+    description: |
+      Oracle.transferFromOLPToPool() (Oracle.sol L267-285) transfers USDC directly to the pool
+      address via usdc.transfer(poolAddress, amount) WITHOUT calling any SettlementPool deposit
+      function. This means the USDC arrives at the pool but is never recorded in transfers_processed.
+      The pool's _totalBalance() (balanceOf) increases, but there is no on-chain accounting entry.
+      If any off-chain or on-chain logic relies on transfers_processed to reconcile deposits vs
+      balance, this path creates a discrepancy. More critically, if these funds are later withdrawn
+      via withdrawUSDC (which DOES mark transfers_processed), the pool could become insolvent for
+      other depositors since the OLP deposit was never tracked.
+    attack_scenario: |
+      1. Provider calls Oracle.transferFromOLPToPool(olpWallet, poolAddr, 1000e6, poolUuid, rfqUuid, quoteUuid)
+      2. Pool receives 1000 USDC but transfers_processed[quoteUuid] is NOT set
+      3. Provider calls Oracle.atomicDeposit with the SAME parentQuoteUuid — since transfers_processed
+         was never set in the pool for this UUID, the deposit goes through again
+      4. Net effect: double-counting of the same economic deposit, or ability to withdraw more than
+         was legitimately deposited through the tracked path
+    affected_functions:
+      - "Oracle.transferFromOLPToPool"
+      - "SettlementPool._totalBalance"
+      - "SettlementPool._withdrawUSDCOnBehalf"
+    invariant_code: |
+      // Track cumulative deposits through tracked functions vs actual balance
+      // After any transferFromOLPToPool, the pool balance should still be reconcilable
+      uint256 poolBalance = usdc.balanceOf(address(pool));
+      // This invariant checks that no withdrawal can exceed what was deposited through tracked paths
+      // (requires ghost variable tracking total tracked deposits and withdrawals)
+      uint256 trackedNet = ghost_totalTrackedDeposits[address(pool)] - ghost_totalTrackedWithdrawals[address(pool)];
+      uint256 untrackedBalance = poolBalance > trackedNet ? poolBalance - trackedNet : 0;
+      // untrackedBalance should be zero in a perfectly tracked system
+      // If untrackedBalance > 0 after transferFromOLPToPool, accounting is broken
+      t(untrackedBalance == 0, "SP-O-01: untracked USDC in pool after OLP transfer");
+    validated: false
+    priority: high
+
+  - id: SP-O-02
+    tier: 1
+    type: property
+    title: "Second party deposit in atomic operations has no replay protection (transferUuid=0)"
+    severity: high
+    confidence: 80
+    description: |
+      In both depositUSDCAtomic() and batchDepositUSDCAtomic(), when both parties deposit,
+      the transferUuid is reset to 0 after the first party's deposit (L140, L197). When
+      _depositUSDCOnBehalf is called with transferUuid=0, the duplicate check on L97
+      passes (transfers_processed[0] starts as false), but critically, the transfers_processed
+      mapping is NEVER updated (L106: if(transferUuid != 0)). This means transfers_processed[0]
+      remains false forever. However, the actual exploit is limited because: (a) these functions
+      are onlyOracle, meaning only the provider can call them, and (b) the provider controls
+      which UUIDs to use. The real risk is if a malicious/compromised provider replays the
+      second party's deposit portion — the second party's transferFrom would succeed if they
+      still have allowance, draining their funds repeatedly.
+    attack_scenario: |
+      1. Provider calls depositUSDCAtomic(partyOne, partyTwo, 100e6, 50e6, rfqUuid, quoteUuid)
+      2. First deposit: partyOne deposits 100e6, transfers_processed[quoteUuid] = true, transferUuid reset to 0
+      3. Second deposit: partyTwo deposits 50e6 with transferUuid=0, transfers_processed[0] is NOT set
+      4. Compromised provider calls depositUSDCAtomic again with a different quoteUuid2
+      5. First deposit for partyOne: transfers_processed[quoteUuid2] = true (new UUID, passes)
+      6. Second deposit for partyTwo: again transferUuid=0, no replay check, partyTwo loses another 50e6
+      7. PartyTwo's funds are drained as long as they have USDC allowance to the pool
+    affected_functions:
+      - "SettlementPool.depositUSDCAtomic"
+      - "SettlementPool.batchDepositUSDCAtomic"
+      - "SettlementPool._depositUSDCOnBehalf"
+    invariant_code: |
+      // After any atomic deposit, EVERY individual transferFrom should be replay-protected
+      // The second party's deposit with transferUuid=0 bypasses this
+      // Test: call depositUSDCAtomic twice with different parentQuoteUuids but same parties/amounts
+      // The second call should fail for the second party if it was already processed
+      bool secondPartyReplayProtected = pool.transfers_processed(0);
+      // transfers_processed[0] should be true after ANY deposit with transferUuid=0
+      // But it never gets set — this is the bug
+      t(secondPartyReplayProtected == true, "SP-O-02: transferUuid=0 never marked as processed");
+    validated: false
+    priority: critical
+
+  - id: SP-O-03
+    tier: 2
+    type: property
+    title: "Direct USDC donation inflates _totalBalance without corresponding deposit accounting"
+    severity: low
+    confidence: 60
+    description: |
+      _totalBalance() uses balanceOf(address(this)) which includes any USDC sent directly
+      to the contract (donations). Since SettlementPool has no share/token math and no
+      internal balance tracking (only transfers_processed for dedup), a donation attack
+      doesn't directly cause fund loss. However, if any off-chain system uses _totalBalance()
+      or the USDC balance of the pool to determine available funds for withdrawal or
+      settlement amounts, a donation could trick the off-chain oracle into authorizing
+      withdrawals that drain legitimate depositors' funds. The _totalBalance function is
+      currently private and unused in any on-chain logic, making this primarily an off-chain
+      risk.
+    attack_scenario: |
+      1. Pool has 1000 USDC from legitimate deposits
+      2. Attacker sends 500 USDC directly to pool via usdc.transfer(poolAddress, 500e6)
+      3. _totalBalance() now returns 1500 USDC
+      4. If off-chain system reads balanceOf and authorizes withdrawal of 1500 USDC
+         to a party, that party extracts 500 USDC of the attacker's donation + their own funds
+      5. This is not a loss for the pool per se (attacker donated), but it breaks
+         the accounting invariant that pool balance == sum of tracked deposits - sum of tracked withdrawals
+    affected_functions:
+      - "SettlementPool._totalBalance"
+    invariant_code: |
+      // Pool USDC balance should equal sum of all deposits minus sum of all withdrawals
+      // through the tracked functions. Any discrepancy indicates donation or untracked transfer.
+      uint256 actualBalance = usdc.balanceOf(address(pool));
+      uint256 expectedBalance = ghost_cumulativeDeposits[address(pool)] - ghost_cumulativeWithdrawals[address(pool)];
+      eq(actualBalance, expectedBalance, "SP-O-03: pool balance diverges from tracked deposits/withdrawals");
+    validated: false
+    priority: medium
+
+  - id: SP-O-04
+    tier: 2
+    type: property
+    title: "withdrawFees has no solvency check — can drain pool below depositors' entitlements"
+    severity: medium
+    confidence: 70
+    description: |
+      withdrawFees() (L273-286) allows the Oracle to withdraw any amountRequested from the pool
+      to any requestor address, with no check that the remaining balance covers depositors'
+      entitlements. The only checks are: amount > 0, fees_batch_id != 0, and fees_batch_id
+      not already processed. A compromised or buggy provider could call collectFees() via the
+      Oracle with inflated fee amounts, draining the pool. There is no on-chain cap on fee
+      amounts relative to pool balance, and no on-chain record of how much fees are actually owed.
+      The TODO comment on L104 ("We first should make sure that there is not negative equity")
+      confirms this gap was known but not implemented.
+    attack_scenario: |
+      1. Pool has 10,000 USDC from party deposits
+      2. Compromised provider calls Oracle.collectFees with a request for 10,000 USDC fee
+      3. withdrawFees transfers 10,000 USDC to the provider (msg.sender in Oracle context)
+      4. Pool is now empty — legitimate depositors cannot withdraw their funds
+      5. The TODO at L104 explicitly acknowledges this: "make sure there is not negative equity"
+    affected_functions:
+      - "SettlementPool.withdrawFees"
+      - "Oracle.collectFees"
+    invariant_code: |
+      // After fee withdrawal, pool balance should remain >= 0 (always true for uint)
+      // but more importantly, fees withdrawn should not exceed a reasonable % of pool balance
+      // This is a design-level check — the contract has NO solvency guard
+      uint256 balanceAfterFees = usdc.balanceOf(address(pool));
+      uint256 balanceBefore = ghost_balanceBeforeFeeWithdrawal[address(pool)];
+      uint256 feesWithdrawn = balanceBefore - balanceAfterFees;
+      // Invariant: fees should never exceed total balance (causing revert) — but more useful:
+      // fees should never exceed some tracked fee accumulation (not implemented on-chain)
+      t(balanceAfterFees >= ghost_minRequiredBalance[address(pool)],
+        "SP-O-04: fee withdrawal drained pool below depositor entitlements");
+    validated: false
+    priority: high
+
+  - id: SP-O-05
+    tier: 2
+    type: property
+    title: "Factory oracle() is mutable — pool trusts whatever oracle the factory returns at call time"
+    severity: medium
+    confidence: 65
+    description: |
+      The onlyOracle modifier calls _oracle() which calls ISettlementPoolFactory(factory).oracle()
+      on every invocation. The oracle address is NOT cached at initialization — it's read from
+      the factory dynamically. If the factory owner changes the oracle address (via
+      Oracle.setSettlementPoolFactory or a factory setOracle function), ALL existing pools
+      immediately trust the new oracle. A malicious new oracle could drain all pools.
+      This is a trust-boundary issue: pool security depends on the factory owner never
+      setting a malicious oracle, and there's no timelock or governance delay.
+    attack_scenario: |
+      1. Factory owner (or compromised admin) calls factory.setOracle(maliciousOracle)
+      2. maliciousOracle calls pool.withdrawUSDC for all USDC in every pool
+      3. Since onlyOracle checks factory.oracle() dynamically, the malicious oracle passes
+      4. All pool funds are drained in a single transaction
+      Note: This requires admin compromise — may be "trusted role" exclusion in bounty scope.
+    affected_functions:
+      - "SettlementPool._oracle"
+      - "SettlementPool.onlyOracle"
+    invariant_code: |
+      // The oracle address should not change after pool initialization
+      // (or if it does, there should be a timelock)
+      address currentOracle = address(ISettlementPoolFactory(pool.factory()).oracle());
+      eq(currentOracle, ghost_oracleAtInit[address(pool)],
+        "SP-O-05: oracle address changed after pool initialization");
+    validated: false
+    priority: medium
+
+  - id: SP-O-06
+    tier: 2
+    type: property
+    title: "batchDepositUSDCAtomic charges creatorPartyAmountRequested N times for N items"
+    severity: medium
+    confidence: 70
+    description: |
+      In batchDepositUSDCAtomic(), creatorPartyAmountRequested is deposited for EVERY item
+      in the batch (L130: inside the for loop). If items has 10 entries and
+      creatorPartyAmountRequested is 100 USDC, the creator pays 1000 USDC total. The comment
+      and function name suggest this is "atomic" per-item, but it's ambiguous whether the
+      creator intended to deposit 100 USDC total or 100 USDC per item. The Oracle's
+      batchAtomicDeposit (Oracle.sol L324-342) passes the same creatorPartyAmountRequested
+      for the entire batch without multiplying, suggesting it expects the pool to charge
+      once. But the pool charges N times. If the off-chain system calculates the creator
+      needs to approve 100 USDC but the contract pulls 1000 USDC, the tx reverts (safe)
+      or if they approved max, they lose 10x. The transfers_processed[parentQuoteUuid] is
+      set on the first iteration, so iterations 2+ would revert because that UUID is already
+      processed — UNLESS different parentQuoteUuids are used per item.
+    attack_scenario: |
+      1. Provider calls batchAtomicDeposit with 5 items, creatorPartyAmountRequested = 100e6
+      2. Each item has a unique parentQuoteUuid
+      3. Creator's _depositUSDCOnBehalf is called 5 times, each pulling 100e6 USDC
+      4. Creator loses 500e6 USDC when they expected to deposit only 100e6
+      5. This requires the creator to have approved >= 500e6 to the pool
+    affected_functions:
+      - "SettlementPool.batchDepositUSDCAtomic"
+      - "Oracle.batchAtomicDeposit"
+    invariant_code: |
+      // After batchDepositUSDCAtomic, creator's total deposit should match expectation
+      // ghost_creatorExpectedDeposit tracks what the off-chain system intended
+      uint256 actualCreatorDeposit = ghost_cumulativeCreatorDeposits[address(pool)];
+      uint256 expectedCreatorDeposit = ghost_creatorExpectedDeposit[address(pool)];
+      eq(actualCreatorDeposit, expectedCreatorDeposit,
+        "SP-O-06: creator charged N times instead of once in batch deposit");
+    validated: false
+    priority: high
+
+  - id: SP-O-07
+    tier: 3
+    type: property
+    title: "No withdrawal solvency check — withdrawals can exceed pool balance (caught by try/catch)"
+    severity: low
+    confidence: 55
+    description: |
+      _withdrawUSDCOnBehalf and withdrawFees use try/catch on USDC.transfer. If the pool
+      doesn't have enough USDC, the transfer fails and the catch block reverts. This is
+      functionally safe (no loss), but it means there's no explicit solvency check — the
+      contract relies on USDC.transfer reverting. With a non-standard ERC20 that returns
+      false instead of reverting on insufficient balance, the try block would succeed
+      (transfer returns false), transfers_processed would be marked true, but no USDC
+      would actually move. The withdrawal would be "processed" with zero funds transferred.
+      USDC is standard and reverts, so this is theoretical for USDC but relevant if the
+      factory's usdcAddress is ever changed to a non-standard token.
+    attack_scenario: |
+      1. Factory admin changes usdcAddress to a token that returns false on failed transfer
+      2. Oracle calls withdrawUSDC for 1000 tokens when pool only has 100
+      3. Token.transfer returns false (no revert) — try block succeeds
+      4. transfers_processed[transferUuid] = true — marked as processed
+      5. Requestor receives 0 tokens but the withdrawal is permanently marked as done
+      6. Requestor can never retry — their funds are lost
+    affected_functions:
+      - "SettlementPool._withdrawUSDCOnBehalf"
+      - "SettlementPool.withdrawFees"
+    invariant_code: |
+      // After a successful withdrawal (transfers_processed[uuid] == true),
+      // the requestor's balance should have increased by amountRequested
+      uint256 balanceAfter = usdc.balanceOf(requestor);
+      uint256 balanceBefore = ghost_requestorBalanceBefore[requestor];
+      uint256 expectedIncrease = ghost_lastWithdrawalAmount[requestor];
+      gte(balanceAfter - balanceBefore, expectedIncrease,
+        "SP-O-07: withdrawal marked processed but funds not received");
+    validated: false
+    priority: low
+
+flash_loan_analysis:
+  _depositUSDCOnBehalf:
+    reads_manipulable_state: false  # reads allowance (not manipulable by third party)
+    affects_fund_movement: true
+    same_tx_consume: true  # deposit + withdraw possible in same tx via oracle
+    post_action_verification: false  # no FREI-PI pattern
+    reentrancy_guard: true  # nonReentrant on callers
+    spot_vs_twap: "N/A — no price oracle"
+    reward_by_instant_balance: false
+    flash_loan_candidate: false  # no value extraction from balance manipulation
+  _withdrawUSDCOnBehalf:
+    reads_manipulable_state: false
+    affects_fund_movement: true
+    same_tx_consume: true
+    post_action_verification: false
+    reentrancy_guard: true
+    spot_vs_twap: "N/A"
+    reward_by_instant_balance: false
+    flash_loan_candidate: false
+  withdrawFees:
+    reads_manipulable_state: false
+    affects_fund_movement: true
+    same_tx_consume: true
+    post_action_verification: false
+    reentrancy_guard: true
+    spot_vs_twap: "N/A"
+    reward_by_instant_balance: false
+    flash_loan_candidate: false
+
+oracle_deep_check:
+  summary: |
+    This contract has NO Chainlink/price oracle dependency. The "Oracle" is a clearing engine
+    (Oracle.sol) with PROVIDER_ROLE access control. No latestRoundData, no TWAP, no price feeds.
+    The only external data dependency is balanceOf(address(this)) via _totalBalance(), which is
+    private and unused in any on-chain calculation. Price manipulation vectors are N/A.
+  latestRoundData_calls: 0
+  twap_usage: false
+  sequencer_check: "N/A"
+  minmax_answer: "N/A"
+
+false_positives:
+  - id: FP-SP-O-01
+    description: "Reentrancy via USDC transfer callback"
+    reason: |
+      USDC is not ERC777 and has no transfer callbacks. All external-facing functions use
+      nonReentrant. Even if a malicious token were substituted, the ReentrancyGuard would
+      prevent re-entry. Not exploitable.
+  - id: FP-SP-O-02
+    description: "First depositor / share inflation attack"
+    reason: |
+      SettlementPool has no share/token math. There are no shares, no exchange rates, no
+      virtual balances. Deposits and withdrawals are tracked by UUID in a boolean mapping.
+      The classic first-depositor attack vector does not apply here.
+  - id: FP-SP-O-03
+    description: "_totalBalance donation causing incorrect pricing"
+    reason: |
+      _totalBalance() is private and never used in any on-chain calculation that affects
+      fund distribution. There's no share price, no collateral ratio, no liquidation threshold.
+      Donations to the pool don't affect any on-chain logic — only off-chain reconciliation.

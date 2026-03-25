@@ -1,0 +1,737 @@
+protocol: morpho-metamorpho
+component: MetaMorpho
+file: src/MetaMorpho.sol
+domain: vault
+hunter: DoSHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-01: totalAssets() revert in any market blocks ALL vault operations
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-01
+  tier: 1
+  type: property
+  description: >
+    totalAssets() (L585-588) iterates the entire withdrawQueue and calls
+    MORPHO.expectedSupplyAssets() for each market. This is called by
+    _accruedFeeShares() (L894) → _accrueFee() (L883) which is invoked at
+    the top of deposit(), mint(), withdraw(), and redeem(). If ANY single
+    market in the withdrawQueue causes expectedSupplyAssets() to revert
+    (e.g., market's IRM reverts, oracle issue in accrueInterest, or
+    corrupted market state), then ALL vault operations are permanently
+    blocked. There is NO try/catch around totalAssets() — unlike
+    _supplyMorpho/_withdrawMorpho which have try/catch for individual
+    market calls. The only way to unblock would be to remove the offending
+    market via updateWithdrawQueue, but that requires allocator role AND
+    the market removal process (cap=0, submitMarketRemoval, wait timelock).
+    During the timelock period (1-14 days), the vault is completely frozen.
+  attack_scenario: >
+    1. Vault has market M in withdrawQueue whose IRM or oracle has an
+       exploitable revert condition.
+    2. Attacker triggers that condition (e.g., manipulating oracle state
+       or IRM parameters if externally controllable).
+    3. MORPHO.expectedSupplyAssets(M) now reverts.
+    4. Every call to deposit/mint/withdraw/redeem calls _accrueFee() →
+       _accruedFeeShares() → totalAssets() which iterates all markets
+       including M → reverts.
+    5. Vault is frozen. Depositors cannot withdraw funds.
+    6. Curator must: setCap(M, 0), submitMarketRemoval(M), wait timelock,
+       then updateWithdrawQueue to remove M. Minimum 1 day delay.
+  impact: >
+    Complete vault freeze — no deposits or withdrawals possible. All
+    depositor funds locked for at least timelock duration (1-14 days).
+    For large vaults this could mean millions locked.
+  impact_rating: High
+  likelihood: Low
+  severity_final: Medium
+  solidity: |
+    // Track if totalAssets() reverts after any state change
+    bool private _totalAssetsReverted;
+
+    function property_mm_dos_01() public {
+      // After any operation, totalAssets() must remain callable
+      // If it reverts, the entire vault is frozen
+      try MetaMorpho(address(this)).totalAssets() returns (uint256) {
+        _totalAssetsReverted = false;
+      } catch {
+        _totalAssetsReverted = true;
+      }
+      t(!_totalAssetsReverted, "MM-DOS-01: totalAssets() reverted — vault frozen");
+    }
+  ghost_vars:
+    - _totalAssetsReverted
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The key question is whether MORPHO.expectedSupplyAssets() can revert
+    for a well-formed market. It calls accrueInterest internally which
+    calls the IRM. If the IRM is a custom contract that reverts under
+    certain conditions, this is exploitable. Morpho Blue whitelists IRMs
+    at market creation, but the IRM itself could have latent revert paths.
+    Need to verify: does expectedSupplyAssets use staticcall internally?
+    If so, IRM state changes cannot cause permanent reverts.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-02: Fee recipient revert-on-transfer blocks all operations
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-02
+  tier: 1
+  type: property
+  description: >
+    _accrueFee() (L883-889) mints fee shares to feeRecipient via
+    _mint(feeRecipient, feeShares) at L887. The OZ ERC20._mint calls
+    _update() which calls _afterTokenTransfer (ERC20 hook). If
+    feeRecipient is a contract that reverts on ERC20 receive (e.g.,
+    via ERC20 hooks or a malicious receive callback), AND fee > 0 AND
+    there is accrued interest (totalInterest > 0), then _accrueFee()
+    reverts. Since _accrueFee() is called at the start of deposit(),
+    mint(), withdraw(), and redeem(), ALL vault operations are blocked.
+    However: OZ 5.x ERC20._mint does NOT call any receiver hook — it
+    just updates balances and emits Transfer. So this is NOT exploitable
+    with standard OZ ERC20. The mint cannot revert due to receiver
+    behavior. The only revert path is if feeRecipient == address(0)
+    which OZ ERC20 checks, but fee cannot be set with zero recipient
+    (L234 check). DEBUNKED for OZ 5.x.
+  attack_scenario: >
+    NOT exploitable. OZ ERC20._mint does not call receiver hooks.
+    feeRecipient cannot cause _mint to revert by being a malicious
+    contract. The only risk would be if a custom ERC20 override added
+    hooks, but MetaMorpho uses standard OZ.
+  impact: >
+    No impact — OZ ERC20._mint is safe against receiver-induced reverts.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dos_02() public {
+      // Fee accrual must never revert when fee > 0 and interest exists
+      // OZ ERC20._mint has no receiver hooks, so this is informational.
+      // Verify that deposit still works after interest accrues with fee set.
+      uint256 fee_ = MetaMorpho(address(this)).fee();
+      if (fee_ > 0) {
+        try MetaMorpho(address(this)).totalAssets() returns (uint256) {
+          // If totalAssets succeeds, _accrueFee should also succeed
+          // (barring overflow in feeShares calc, which is bounded by MAX_FEE=50%)
+        } catch {}
+      }
+      t(true, "MM-DOS-02: informational — fee mint cannot revert from receiver");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    Debunked. OZ 5.x ERC20._mint has no hooks. Standard ERC-20 token
+    behavior. feeRecipient address(0) prevented by setFee/setFeeRecipient
+    checks.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-03: Withdraw queue gas griefing — 30 markets × external calls
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-03
+  tier: 2
+  type: property
+  description: >
+    _withdrawMorpho() (L803-823) iterates the entire withdrawQueue. For
+    each market, it calls _accruedSupplyBalance() which calls
+    MORPHO.accrueInterest() + MORPHO.market() + MORPHO.supplyShares(),
+    then _withdrawable() which calls ERC20.balanceOf(MORPHO). That is
+    4+ external calls per market. With MAX_QUEUE_LENGTH=30, a single
+    withdraw can require 120+ external calls plus the actual
+    MORPHO.withdraw() calls. Each accrueInterest involves IRM call.
+    Gas cost: ~30k per market × 30 = ~900k gas just for iteration,
+    plus actual withdraw calls. Total could approach block gas limit
+    for large queues with heavy IRM computation.
+    Similarly, totalAssets() (called in every operation) iterates
+    withdrawQueue with expectedSupplyAssets() per market.
+    The MAX_QUEUE_LENGTH=30 cap mitigates this — gas is bounded at
+    ~3-5M for worst case, well within block limits.
+  attack_scenario: >
+    1. Allocator adds 30 markets to withdrawQueue (max allowed).
+    2. A user tries to withdraw — _withdrawMorpho iterates all 30.
+    3. Gas cost for the withdraw is ~3-5M, but still under block limit.
+    4. For some L2s with lower gas limits, this could be problematic.
+    5. However, the 30-market cap is a design choice and well-known.
+  impact: >
+    High gas cost for withdrawals on vaults with many markets. On
+    Ethereum mainnet (30M gas limit) this is not a DoS. On some L2s
+    with 10-15M gas limits it could be borderline.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Info
+  solidity: |
+    function property_mm_dos_03() public view {
+      // withdrawQueue length must never exceed MAX_QUEUE_LENGTH
+      uint256 wqLen = MetaMorpho(address(this)).withdrawQueueLength();
+      t(wqLen <= 30, "MM-DOS-03: withdrawQueue exceeds MAX_QUEUE_LENGTH");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    The 30-market cap is an explicit design choice. Gas griefing is
+    mitigated by this bound. Not a real vulnerability — documenting
+    for completeness. The real risk is if a single market's
+    accrueInterest is extremely gas-heavy (complex IRM).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-04: try/catch in _withdrawMorpho silently reduces liquidity
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-04
+  tier: 1
+  type: property
+  description: >
+    _withdrawMorpho() (L803-823) uses try/catch around MORPHO.withdraw()
+    at L815. If a market's withdraw reverts (e.g., due to Morpho Blue
+    internal issue, reentrancy guard, or market-specific revert), the
+    catch block silently skips that market. The assets that SHOULD have
+    been withdrawable from that market are NOT withdrawn, reducing the
+    actual amount available. If remaining markets don't have enough
+    liquidity, the function reverts with NotEnoughLiquidity.
+    KEY ISSUE: _simulateWithdrawMorpho() (used in maxWithdraw) does NOT
+    use try/catch — it calls expectedMarketBalances which is a view
+    function that may NOT revert even when the actual withdraw would.
+    This creates a discrepancy: maxWithdraw() reports X assets available,
+    but actual withdraw() reverts because try/catch skips reverting
+    markets that simulation counted.
+    However: the Morpho team comments at L837-839 explain why the vault
+    withdrawing cannot fail: (1) no oracle call, (2) amount capped to
+    liquidity, (3) accrueInterest worked. This is correct for normal
+    operation. The try/catch is defensive programming for edge cases.
+  attack_scenario: >
+    1. Vault has 100 ETH across 3 markets: M1(40), M2(30), M3(30).
+    2. Attacker causes M1's MORPHO.withdraw to revert (hypothetical).
+    3. maxWithdraw() reports 100 ETH available (simulation doesn't revert).
+    4. User calls withdraw(100 ETH).
+    5. _withdrawMorpho: M1 reverts (skipped), M2 withdraws 30, M3 withdraws 30.
+    6. Remaining 40 ETH → NotEnoughLiquidity revert.
+    7. User expected 100 but can only get 60. Partial DoS.
+  impact: >
+    Users may be unable to withdraw their full balance if a market's
+    withdraw reverts. The discrepancy between maxWithdraw and actual
+    withdrawal creates broken ERC4626 compliance.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    uint256 private _lastMaxWithdraw;
+    bool private _withdrawReverted;
+
+    function property_mm_dos_04() public {
+      address owner = msg.sender;
+      uint256 maxW = MetaMorpho(address(this)).maxWithdraw(owner);
+      _lastMaxWithdraw = maxW;
+      if (maxW > 0) {
+        // Attempting to withdraw maxWithdraw should never revert
+        // If it does, there's a simulation/reality discrepancy
+        try MetaMorpho(address(this)).withdraw(maxW, owner, owner) {
+          _withdrawReverted = false;
+        } catch {
+          _withdrawReverted = true;
+        }
+        t(!_withdrawReverted, "MM-DOS-04: withdraw(maxWithdraw) reverted — simulation mismatch");
+      }
+    }
+  ghost_vars:
+    - _lastMaxWithdraw
+    - _withdrawReverted
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The Morpho team specifically designed the simulation to match
+    reality (see comments L837-839). In practice, the try/catch
+    almost never triggers. The question is whether there exists ANY
+    path where MORPHO.withdraw reverts but expectedMarketBalances
+    does not account for it. Needs fork testing against real markets.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-05: try/catch in _supplyMorpho — deposit silently loses allocation
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-05
+  tier: 2
+  type: property
+  description: >
+    _supplyMorpho() (L771-799) uses try/catch around MORPHO.supply()
+    at L791. If a market's supply call reverts, the market is silently
+    skipped. If ALL markets revert (or have cap=0), and assets remain
+    unallocated, the function reverts with AllCapsReached at L799.
+    An attacker who can cause supply to revert on key markets can
+    either: (a) force deposits into less-preferred markets, or (b)
+    block deposits entirely. However, causing MORPHO.supply to revert
+    for a valid market with available cap is non-trivial — the supply
+    function in Morpho Blue is straightforward. The main revert path
+    would be if the token transfer from vault to Morpho fails, but
+    the vault already approved max uint256 to Morpho in constructor.
+  attack_scenario: >
+    1. supplyQueue = [M1, M2, M3] with caps [100, 50, 50].
+    2. Attacker causes M1's MORPHO.supply to revert.
+    3. User deposits 100 tokens.
+    4. _supplyMorpho skips M1, supplies 50 to M2, 50 to M3.
+    5. Deposit succeeds but allocation differs from intended queue order.
+    6. If M2 and M3 also revert → AllCapsReached, deposit blocked.
+  impact: >
+    Deposits may be allocated to non-preferred markets, or blocked
+    entirely if enough markets revert. Allocator's strategy is
+    undermined.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Info
+  solidity: |
+    function property_mm_dos_05() public {
+      // After a deposit, totalAssets should increase by deposit amount
+      // If try/catch swallowed a revert, assets still end up in some market
+      uint256 totalBefore = MetaMorpho(address(this)).totalAssets();
+      uint256 depositAmt = 1e18;
+      // Attempt deposit — should either succeed fully or revert
+      try MetaMorpho(address(this)).deposit(depositAmt, address(this)) {
+        uint256 totalAfter = MetaMorpho(address(this)).totalAssets();
+        // totalAfter should be >= totalBefore + depositAmt (minus rounding)
+        t(totalAfter >= totalBefore + depositAmt - 1,
+          "MM-DOS-05: deposit succeeded but totalAssets didn't increase");
+      } catch {
+        // Deposit reverted entirely — that's fine, no partial loss
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    The try/catch prevents individual market failures from blocking the
+    entire deposit flow. This is a FEATURE, not a bug. The concern is
+    whether an attacker can weaponize it to force suboptimal allocation.
+    Practically hard to exploit since MORPHO.supply is simple.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-06: Market removal deadlock — donation keeps supplyShares > 0
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-06
+  tier: 1
+  type: property
+  description: >
+    To remove a market from withdrawQueue via updateWithdrawQueue(),
+    several conditions must hold for a market being removed (L343-356):
+    - config[id].cap == 0
+    - pendingCap[id].validAt == 0
+    - Either supplyShares == 0 OR (removableAt != 0 AND timelock elapsed)
+    The removableAt path exists precisely to handle the case where
+    supplyShares cannot be zeroed (e.g., dust or donation). However,
+    if removableAt is not set (submitMarketRemoval not called), and
+    an attacker keeps donating small amounts to the Morpho market to
+    inflate the vault's supply position, the market cannot be removed
+    via the "zero shares" path. The curator must use submitMarketRemoval
+    which requires cap==0 and waiting the timelock.
+    The key question: can an attacker FRONTRUN the reallocate(assets=0)
+    call that tries to withdraw all shares? If reallocate withdraws all
+    by passing shares (allocation.assets == 0 path at L383-384), this
+    withdraws ALL supplyShares regardless of donation. So the allocator
+    can always fully exit a market. The donation attack is ineffective
+    because reallocate(assets=0) uses the shares path.
+  attack_scenario: >
+    1. Curator sets cap=0 on market M.
+    2. Allocator calls reallocate to move all funds out of M.
+    3. Attacker frontrun-donates to M, increasing supplyAssets.
+    4. Allocator's reallocate(assets=0) passes shares=supplyShares,
+       withdrawn=0 (L383-385), withdrawing ALL shares regardless.
+    5. After reallocate, supplyShares==0, market can be removed.
+    DEBUNKED: The shares-based withdrawal path defeats the donation
+    attack. The allocator can always fully exit by setting assets=0.
+  impact: >
+    No impact — reallocate(assets=0) always withdraws all shares.
+    Market removal cannot be permanently blocked by donations.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dos_06() public view {
+      // For any market with cap=0, reallocate(assets=0) should be able
+      // to withdraw all shares, enabling market removal.
+      // This is ensured by the shares path in reallocate (L383-384).
+      // Informational — the design handles this correctly.
+      t(true, "MM-DOS-06: informational — donation attack on market removal defeated by shares path");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 90
+  notes: >
+    The reallocate function's special case when allocation.assets==0
+    (L383: shares = supplyShares, withdrawn = 0) is specifically
+    designed to handle this scenario. Well-designed defense.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-07: AlreadyPending blocks cap changes for timelock duration
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-07
+  tier: 2
+  type: property
+  description: >
+    submitCap() (L275) reverts with AlreadyPending if pendingCap[id].validAt != 0.
+    Similarly, submitTimelock (L217) and submitGuardian (L261) have the same
+    pattern. Once a pending value is submitted, no NEW pending value can be
+    submitted for the same slot until the first one is accepted or revoked.
+    A malicious curator could submit a cap increase on a critical market,
+    then refuse to accept it, blocking any other cap change on that market
+    for up to MAX_TIMELOCK (14 days). The guardian/curator can revoke via
+    revokePendingCap(), and the OWNER can always act as curator. So this
+    requires a malicious curator WITHOUT guardian or owner override.
+    Since owner always has curator+guardian powers, the owner can revoke
+    any pending cap. MITIGATED by role hierarchy.
+  attack_scenario: >
+    1. Malicious curator calls submitCap(M, huge_cap).
+    2. pendingCap[M].validAt is now set.
+    3. No other cap can be submitted for M until accepted/revoked.
+    4. Owner notices and calls revokePendingCap(M) — resolves immediately.
+    MITIGATED: Owner can always revoke. Guardian can also revoke.
+  impact: >
+    Temporary disruption only — owner can immediately revoke any
+    malicious pending cap. No real DoS if governance is responsive.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Info
+  solidity: |
+    function property_mm_dos_07() public view {
+      // A pending cap should always be revocable by owner/guardian
+      // The AlreadyPending check prevents parallel pending values but
+      // revocation is always available to owner (who has guardian role).
+      // No invariant violation — design choice.
+      t(true, "MM-DOS-07: informational — pending value blocking mitigated by revocation");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    The role hierarchy (owner > curator > allocator, owner > guardian)
+    ensures that pending value blocking is always recoverable. The
+    owner has ultimate authority over all pending values.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-08: Revert-on-transfer token as vault asset blocks skim/withdraw
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-08
+  tier: 2
+  type: property
+  description: >
+    If the vault's underlying asset is a token that can be paused or
+    blocked (e.g., USDC with blacklisting, USDT with pause), then:
+    (a) skim() at L488 calls safeTransfer which will revert if token
+        transfer is blocked.
+    (b) _withdraw at L691 calls super._withdraw which does safeTransfer
+        to receiver — reverts if receiver is blacklisted.
+    (c) _deposit at L671 calls super._deposit which does safeTransferFrom
+        — reverts if caller is blacklisted.
+    These are external token risks, not MetaMorpho bugs. The vault
+    inherits the risk profile of its underlying asset. However, there's
+    a specific scenario: if the VAULT ADDRESS itself gets blacklisted
+    on the token (e.g., USDC Circle blacklists the vault), then ALL
+    operations involving token transfer to/from the vault are blocked.
+    But the vault's assets are in Morpho, not in the vault directly
+    (except during skim). So blacklisting the vault address would only
+    block deposits (transferFrom to vault before supply to Morpho) and
+    the final transfer in withdrawals (vault receives from Morpho then
+    sends to user). Actually, withdrawals call MORPHO.withdraw which
+    sends tokens from Morpho to vault, then vault sends to user. If
+    vault is blacklisted, Morpho→vault transfer fails.
+  attack_scenario: >
+    1. Vault holds USDC as underlying asset.
+    2. Circle blacklists the vault address (regulatory action).
+    3. MORPHO.withdraw → transfers USDC from Morpho to vault → reverts
+       because vault is blacklisted.
+    4. All withdrawals blocked. Deposits also blocked (safeTransferFrom
+       from user to vault reverts).
+    5. Funds locked in Morpho markets indefinitely.
+  impact: >
+    Complete vault freeze if the vault address is blacklisted by the
+    token issuer. This is an inherent risk of using blacklistable tokens
+    and not a MetaMorpho-specific vulnerability.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dos_08() public {
+      // The vault should be able to receive and send its underlying token
+      // If the token blocks transfers to/from the vault, all ops are frozen
+      address asset_ = MetaMorpho(address(this)).asset();
+      uint256 balance = IERC20(asset_).balanceOf(address(this));
+      // Test: can we transfer 0 tokens? (checks for blacklist/pause)
+      try IERC20(asset_).transfer(address(this), 0) returns (bool success) {
+        t(success, "MM-DOS-08: token transfer to self failed");
+      } catch {
+        t(false, "MM-DOS-08: vault is blocked from token transfers — full DoS");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    This is a known class of risk for any vault holding blacklistable
+    tokens (USDC, USDT). Not specific to MetaMorpho. Would be
+    informational/QA in a bug bounty. Documenting for completeness.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-09: Withdrawal blocked if all markets have zero liquidity
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-09
+  tier: 1
+  type: property
+  description: >
+    _withdrawMorpho() reverts with NotEnoughLiquidity if it cannot
+    withdraw the requested assets across all markets. The _withdrawable()
+    function (L858-870) caps withdrawal at min(supplyAssets,
+    availableLiquidity) where availableLiquidity =
+    min(totalSupplyAssets - totalBorrowAssets, token.balanceOf(MORPHO)).
+    If ALL markets in the withdrawQueue are fully utilized (100%
+    utilization: totalBorrowAssets == totalSupplyAssets), then
+    availableLiquidity == 0 for all markets, and NO withdrawal is
+    possible. This is by design — lending markets have utilization risk.
+    However, the vault aggregates this risk across multiple markets.
+    An attacker could borrow all available liquidity across all markets
+    simultaneously (requiring collateral), making withdrawals impossible.
+    The economic cost to the attacker is the interest paid on borrows.
+    KEY: The vault has no mechanism to force-withdraw or prioritize
+    user redemptions over borrowers. Users must wait for borrowers
+    to repay or for interest rates to incentivize repayment.
+  attack_scenario: >
+    1. Vault has 1M USDC across 3 markets.
+    2. Attacker provides collateral and borrows all available USDC
+       from all 3 markets (or USDC is already fully utilized).
+    3. _withdrawable returns 0 for every market.
+    4. Any withdraw/redeem call reverts with NotEnoughLiquidity.
+    5. Users' funds are locked until borrowers repay.
+    6. IRM should push rates up to incentivize repayment, but there's
+       no guarantee of timing.
+  impact: >
+    Temporary liquidity crisis — depositors cannot withdraw. This is
+    inherent lending market risk, not a MetaMorpho bug. The IRM is
+    designed to handle this via high utilization rates.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: Low
+  solidity: |
+    function property_mm_dos_09() public view {
+      // At least some liquidity should be available across all markets
+      // (This is an economic property, not a strict invariant)
+      uint256 totalWithdrawable = 0;
+      uint256 wqLen = MetaMorpho(address(this)).withdrawQueueLength();
+      for (uint256 i = 0; i < wqLen; i++) {
+        Id id = MetaMorpho(address(this)).withdrawQueue(i);
+        MarketParams memory mp = MORPHO.idToMarketParams(id);
+        uint256 supplyShares = MORPHO.supplyShares(id, address(this));
+        (uint256 totalSupplyAssets, uint256 totalSupplyShares, uint256 totalBorrowAssets,) =
+          MORPHO.expectedMarketBalances(mp);
+        uint256 supplyAssets = supplyShares * totalSupplyAssets / totalSupplyShares;
+        uint256 available = totalSupplyAssets > totalBorrowAssets
+          ? totalSupplyAssets - totalBorrowAssets : 0;
+        uint256 morphoBalance = IERC20(mp.loanToken).balanceOf(address(MORPHO));
+        available = available < morphoBalance ? available : morphoBalance;
+        totalWithdrawable += supplyAssets < available ? supplyAssets : available;
+      }
+      // Soft invariant: if vault has assets, some should be withdrawable
+      // This is economic, not absolute — documenting the risk
+      // t(totalWithdrawable > 0 || totalAssets() == 0, "MM-DOS-09: zero liquidity");
+      t(true, "MM-DOS-09: liquidity risk is inherent to lending — informational");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    This is well-known lending market risk. MetaMorpho diversifies across
+    markets to mitigate, but cannot eliminate utilization risk. The IRM
+    mechanisms in Morpho Blue handle this. Not a reportable finding.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-10: Guardian revoke race — pending changes always revocable
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-10
+  tier: 2
+  type: property
+  description: >
+    The guardian can revoke any pending timelock, guardian, cap, or market
+    removal. The owner also has guardian role. If guardian is compromised,
+    they could grief the vault by repeatedly revoking legitimate pending
+    changes. The owner submits a timelock change → guardian immediately
+    revokes it. Owner submits again → guardian revokes again. This creates
+    an infinite loop where governance changes are impossible.
+    MITIGATION: Owner can change the guardian via submitGuardian. If
+    current guardian is malicious, owner submits guardian change. But
+    the CURRENT guardian can revoke the pending guardian change too!
+    However: if guardian == address(0), there's no guardian to revoke.
+    And: owner is always in onlyGuardianRole, so owner can revoke
+    pendingGuardian too. The edge case: if guardian != address(0) and
+    guardian is malicious, can they prevent their own replacement?
+    submitGuardian sets pendingGuardian. Guardian calls
+    revokePendingGuardian. Owner calls submitGuardian again...
+    BUT: onlyGuardianRole is (owner || guardian). Owner can call
+    revokePendingGuardian? No — revokePendingGuardian revokes the
+    pending guardian, which is what owner WANTS to accept, not revoke.
+    The OWNER wants to ACCEPT the new guardian, but must wait timelock.
+    During that time, current guardian revokes.
+    This IS a real governance deadlock if guardian is malicious.
+  attack_scenario: >
+    1. Guardian key is compromised.
+    2. Owner calls submitGuardian(newGuardian).
+    3. Malicious guardian calls revokePendingGuardian() immediately.
+    4. Owner submits again → guardian revokes again.
+    5. Owner cannot replace the guardian.
+    6. Meanwhile, guardian also revokes any pending timelock or cap changes.
+    7. Vault governance is paralyzed.
+    IMPORTANT: Owner can transfer ownership to a new owner who can then
+    act with full authority. But the core guardian replacement is blocked.
+  impact: >
+    Governance paralysis if guardian is compromised. The malicious guardian
+    can prevent their own replacement and block all pending governance
+    changes. Owner must transfer ownership or use another mechanism to
+    break the deadlock.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    bool private _guardianCanBlockReplacement;
+
+    function property_mm_dos_10() public {
+      address guardian_ = MetaMorpho(address(this)).guardian();
+      // If guardian is set and there's a pending guardian change,
+      // the current guardian should not be able to permanently block it.
+      // In practice, the guardian CAN revoke pending guardian changes,
+      // creating a governance deadlock.
+      (address pendingValue, uint64 validAt) = MetaMorpho(address(this)).pendingGuardian();
+      if (guardian_ != address(0) && validAt != 0) {
+        // Guardian could revoke this — that's the design.
+        // Owner's recourse: transferOwnership.
+        _guardianCanBlockReplacement = true;
+      }
+      // This is a design trade-off, not a bug.
+      t(true, "MM-DOS-10: guardian replacement race is a known design trade-off");
+    }
+  ghost_vars:
+    - _guardianCanBlockReplacement
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    This is acknowledged in the Morpho documentation. The guardian role
+    is trusted, and a compromised guardian is a known risk. The owner's
+    escape hatch is transferOwnership. This is likely already reported
+    in the Cantina contest (444+ submissions). Documenting for
+    completeness.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-11: reallocate InconsistentReallocation — must balance exactly
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-11
+  tier: 2
+  type: property
+  description: >
+    reallocate() (L368-416) requires totalWithdrawn == totalSupplied at
+    L416, reverting with InconsistentReallocation otherwise. This
+    conservation check means the allocator must provide a perfectly
+    balanced set of allocations. Due to interest accrual between the
+    individual withdraw/supply calls within the same transaction, there
+    can be a tiny rounding discrepancy. However, since all accrueInterest
+    calls happen within the same block, the interest delta is zero for
+    already-accrued markets. The real risk: if a market's accrueInterest
+    changes totalSupplyAssets between the allocator's offchain calculation
+    and the onchain execution (frontrunning), the exact amounts may
+    not balance. The allocator would need to recalculate and retry.
+    This is a UX issue, not a security DoS — the allocator can always
+    retry with updated values.
+  attack_scenario: >
+    1. Allocator calculates reallocation offchain.
+    2. MEV bot frontruns with a supply/borrow to a market, changing
+       interest accrual state.
+    3. Allocator's reallocate tx fails with InconsistentReallocation.
+    4. Allocator must recalculate and retry.
+    5. Repeated frontrunning could delay reallocation but cannot cause
+       permanent DoS — the allocator can use Flashbots/private mempool.
+  impact: >
+    Temporary reallocation failure. Allocator retries with updated
+    values or uses private mempool to avoid frontrunning.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: Info
+  solidity: |
+    function property_mm_dos_11() public view {
+      // reallocate must ensure totalWithdrawn == totalSupplied
+      // This is enforced by the contract at L416.
+      // No additional invariant needed — the check IS the invariant.
+      t(true, "MM-DOS-11: InconsistentReallocation check is built-in");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    The type(uint256).max special case in supply (L395) helps allocators
+    handle rounding by making the last supply consume all remaining
+    withdrawn assets. This mitigates the rounding issue.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOS-12: Supply queue with all cap=0 markets blocks deposits
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOS-12
+  tier: 1
+  type: property
+  description: >
+    _supplyMorpho() (L771-799) iterates supplyQueue. For each market, if
+    cap==0 it continues (skips). If ALL markets in supplyQueue have cap==0,
+    the loop completes without supplying anything, and L799 reverts with
+    AllCapsReached (assets != 0). This means deposits are blocked.
+    The supplyQueue can contain markets with cap=0 because setSupplyQueue()
+    at L310-322 checks that cap != 0 for each entry. Wait — L316:
+    `if (config[newSupplyQueue[i]].cap == 0) revert UnauthorizedMarket`.
+    So setSupplyQueue REQUIRES cap > 0 for all entries. But the cap can
+    be set to 0 AFTER the supply queue is set. If curator sets cap=0 on
+    a market that's in the supply queue, the supply queue entry remains
+    but with cap=0, causing it to be skipped. If ALL markets in supply
+    queue get their cap set to 0, deposits are blocked until the allocator
+    updates the supply queue.
+  attack_scenario: >
+    1. supplyQueue = [M1, M2]. Both have cap > 0.
+    2. Curator (or owner) calls submitCap(M1, 0) — instant since lowering.
+    3. Curator calls submitCap(M2, 0) — instant.
+    4. Now supplyQueue = [M1, M2] but both have cap = 0.
+    5. Any deposit call → _supplyMorpho skips both → AllCapsReached.
+    6. Deposits blocked until allocator calls setSupplyQueue with valid markets.
+    SEVERITY: This requires a malicious/compromised curator. Normal
+    operation: curator would update supply queue after changing caps.
+  impact: >
+    Deposits blocked. Existing depositors can still withdraw (withdraw
+    queue is separate from supply queue). New deposits impossible until
+    allocator fixes the supply queue. Requires trusted role compromise.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dos_12() public view {
+      // At least one market in supplyQueue should have cap > 0
+      // Otherwise deposits are blocked
+      uint256 sqLen = MetaMorpho(address(this)).supplyQueueLength();
+      bool hasPositiveCap = false;
+      for (uint256 i = 0; i < sqLen; i++) {
+        Id id = MetaMorpho(address(this)).supplyQueue(i);
+        (uint184 cap,,) = MetaMorpho(address(this)).config(id);
+        if (cap > 0) {
+          hasPositiveCap = true;
+          break;
+        }
+      }
+      // If supply queue is non-empty, at least one market should have cap > 0
+      t(sqLen == 0 || hasPositiveCap,
+        "MM-DOS-12: all markets in supplyQueue have cap=0 — deposits blocked");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    This requires curator/owner action and is quickly fixable by the
+    allocator. Not a permanent DoS. The design separates cap management
+    (curator) from queue management (allocator) which creates this
+    temporary inconsistency window.

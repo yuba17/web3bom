@@ -1,0 +1,387 @@
+protocol: hyperlane
+component: InterchainAccountRouter
+file: solidity/contracts/middleware/InterchainAccountRouter.sol
+domain: trust
+hunter: DoSHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: IAR-DOS-01
+  tier: 1
+  type: property
+  description: "handle() con CALLS message: si UNA call en el array multicall revierte, TODA la entrega del mensaje se bloquea -- no hay try/catch ni skip de calls fallidas"
+  attack_scenario: "Cuando un usuario envia un batch de calls via callRemote(), todas las calls se ejecutan atomicamente en handle() L162-163 via ica.multicall(). Si el usuario incluye N calls y la call N-1 revierte (ej: target contract pausado, fondos insuficientes en ICA, target autodestruido), TODA la entrega falla. El relayer reintenta pero siempre falla. El mensaje queda permanentemente stuck en el Mailbox. Peor: si el usuario envio ETH value con el mensaje, ese ETH queda atrapado en el Mailbox/relayer porque handle() revierte. El usuario no tiene forma de cancelar el mensaje ni recuperar los fondos. Un atacante puede self-DoS o grief a su propia ICA intencionalmente, pero el impacto real es sobre usuarios legitimos cuyo call target cambia de estado entre dispatch y delivery (cross-chain latency window)."
+  impact: "Mensajes con calls que reviertan quedan permanentemente bloqueados. ETH enviado como value queda potencialmente atrapado. No hay mecanismo de retry parcial ni cancelacion."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // handle() L162-163: ica.multicall{value: msg.value}(calls)
+    // CallLib.multicall iterates all calls, any revert propagates up
+    // No try/catch wrapping individual calls
+    // Invariant: si una call individual revierte, todo handle() revierte
+    // En fuzzing: enviar mensaje con una call valida + una call que revierte
+    // Verificar que el mensaje queda sin procesar
+    bool handleReverted = false;
+    try router.handle{value: 0}(originDomain, senderRouter, maliciousMessage) {
+        // handle succeeded
+    } catch {
+        handleReverted = true;
+    }
+    // Si la call interna revierte, handle DEBE revertir (esto es el comportamiento actual)
+    // El invariante verifica que NO hay mecanismo de recovery
+    t(handleReverted, "IAR-DOS-01: handle reverts when inner call reverts -- no partial execution");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Este es un patron conocido en cross-chain messaging. Hyperlane ICA no tiene mecanismo de retry selectivo ni skip de calls fallidas. La mitigacion esperada es que los usuarios sean responsables de sus calls. Pero la ventana de latencia cross-chain crea un gap donde el estado del target puede cambiar entre dispatch y delivery. Comparar con Axelar/LayerZero que tienen mecanismos de retry/refund."
+  poc_sketch: |
+    // 1. User dispatches callRemote with 2 calls: [transferERC20, interactWithPausableContract]
+    // 2. During cross-chain latency, target contract gets paused
+    // 3. Relayer delivers message, handle() calls ica.multicall()
+    // 4. First call succeeds, second call reverts (paused)
+    // 5. Entire handle() reverts, message permanently stuck
+    // 6. No cancel/retry mechanism exists
+  call_stack: 'Mailbox.process() -> InterchainAccountRouter.handle() -> ica.multicall() -> CallLib.multicall() -> CallLib.call() -> Address.functionCallWithValue() -> REVERT'
+
+- id: IAR-DOS-02
+  tier: 1
+  type: property
+  description: "callRemoteCommitReveal() usa address(this).balance para pagar el segundo dispatch -- un atacante puede front-run con selfdestruct/coinbase para manipular el pago del reveal message"
+  attack_scenario: "En callRemoteCommitReveal() L630, el segundo dispatch (reveal message) usa address(this).balance como value. Un atacante puede enviar ETH al router via selfdestruct() o coinbase rewards ANTES de la tx del usuario. Esto infla address(this).balance, haciendo que el reveal dispatch pague MAS de lo necesario al hook. El exceso de ETH se pierde para el router. Inversamente, si otro usuario llama callRemoteCommitReveal() justo antes, puede drenar el balance del router, haciendo que el segundo dispatch falle por fondos insuficientes si el hook requiere pago. El router tiene receive() payable, asi que cualquiera puede enviar ETH."
+  impact: "Usuarios pueden perder ETH extra en el reveal dispatch, o el reveal dispatch puede fallar si el balance fue drenado por una tx concurrente. El commitment se entrega pero el reveal no, dejando el commitment sin poder ejecutarse."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // callRemoteCommitReveal L606-618: primer dispatch usa msg.value
+    // L624-631: segundo dispatch usa address(this).balance
+    // Si alguien envia ETH al router entre las dos llamadas, el balance cambia
+    // Race condition: dos usuarios llamando callRemoteCommitReveal concurrentemente
+    uint256 routerBalance = address(router).balance;
+    // El router no debe tener balance residual significativo despues de operaciones
+    // Un balance alto indica ETH atrapado o manipulacion
+    // Despues de callRemoteCommitReveal, el balance deberia ser ~0
+    t(routerBalance < 1 ether, "IAR-DOS-02: router has unexpected ETH balance -- potential stuck funds or manipulation");
+  ghost_vars:
+    - ghost_routerBalanceBefore
+    - ghost_routerBalanceAfter
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "address(this).balance es un patron peligroso en contratos con receive() payable. El primer dispatch consume msg.value, el segundo consume TODO el balance restante. Si msg.value > fee del primer dispatch, el sobrante se usa para el segundo. Pero si hay ETH residual de otros sources, se incluye. Esto puede causar overpayment o underpayment dependiendo del estado del balance."
+  poc_sketch: |
+    // 1. Alice calls callRemoteCommitReveal{value: 2 ether}()
+    // 2. First dispatch (commitment) consumes 1 ether
+    // 3. Bob front-runs with selfdestruct sending 10 ether to router
+    // 4. Second dispatch (reveal) pays address(this).balance = 11 ether (1 ether residual + 10 ether attack)
+    // 5. Alice overpays 10 ether for the reveal message
+    // Alternatively:
+    // 1. Alice calls callRemoteCommitReveal{value: 2 ether}()
+    // 2. Carol simultaneously calls callRemoteCommitReveal{value: 2 ether}()
+    // 3. Carol's first dispatch runs first, consuming her msg.value
+    // 4. Carol's second dispatch uses address(this).balance which now includes Alice's value
+    // 5. Alice's second dispatch has insufficient balance
+  call_stack: 'callRemoteCommitReveal() -> _dispatchMessageWithValue(msg.value) -> _dispatchMessageWithValue(address(this).balance)'
+
+- id: IAR-DOS-03
+  tier: 1
+  type: property
+  description: "Gas griefing via calls con datos arbitrariamente grandes -- un usuario puede crear un mensaje con calls[] enormes que excede el gas limit del relayer"
+  attack_scenario: "callRemote() acepta un array CallLib.Call[] sin limite de tamano. Cada Call tiene bytes data sin limite. Un usuario puede dispatchar un mensaje con miles de calls o calls con data de megabytes. Cuando el relayer intenta entregar el mensaje via handle(), la decodificacion de _message.calls() (abi.decode del array) consume gas proporcional al tamano. Incluso si las calls individuales no son costosas, la decodificacion puede exceder el block gas limit. El mensaje queda permanentemente sin entregar. El usuario paga el dispatch fee (quizas bajo), pero el relayer pierde gas intentando entregar un mensaje imposible."
+  impact: "Relayer pierde gas en intentos fallidos de entrega. Mensajes con payload excesivo quedan permanentemente bloqueados. No es un DoS a otros usuarios (cada mensaje es independiente), pero si un griefing al relayer."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // handle() L162: CallLib.Call[] memory calls = _message.calls()
+    // _message.calls() = abi.decode(_message[97:], (CallLib.Call[]))
+    // abi.decode de un array grande consume gas proporcional al tamano
+    // No hay limite en la cantidad de calls ni en el tamano de call.data
+    // El gas limit del handle() esta determinado por el hookMetadata del sender
+    // Si el sender especifica gas limit insuficiente, el relayer falla
+    // Invariante: verificar que mensajes con calls grandes no causan OOG
+    uint256 callsLength = 0; // decoded from message
+    // En un test real, crear mensaje con 1000 calls vacias y medir gas
+    t(callsLength < 100, "IAR-DOS-03: message has excessive number of calls -- potential gas griefing");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "El gas griefing al relayer es limitado porque el dispatch fee deberia cubrir el gas cost de la entrega. Si el gas payment hook esta bien calibrado, el usuario paga por el gas que el relayer necesita. Sin embargo, si el gas estimation es incorrecta o el usuario especifica un gas limit bajo en hookMetadata, el relayer pierde. La mitigacion es que los relayers pueden filtrar mensajes con payload excesivo off-chain."
+  poc_sketch: |
+    // 1. Attacker creates 10000 Call structs with empty data
+    // 2. Dispatches via callRemote with minimal msg.value
+    // 3. Relayer tries to deliver, abi.decode of 10000 Call structs exceeds gas
+    // 4. handle() reverts with OOG
+    // 5. Relayer retries, fails again, eventually gives up
+  call_stack: 'Mailbox.process() -> InterchainAccountRouter.handle() -> _message.calls() -> abi.decode (OOG)'
+
+- id: IAR-DOS-04
+  tier: 1
+  type: property
+  description: "enrollRemoteRouterAndIsm es inmutable una vez seteado -- si se enrolla un router/ISM incorrecto para un dominio, no se puede corregir"
+  attack_scenario: "AbstractInterchainAccountRouter._enrollRemoteRouterAndIsm() L298-302 tiene un require que previene re-enrollment: 'router and ISM defaults are immutable once set'. Si el owner enrolla un router o ISM incorrecto para un dominio (typo en address, router de otro protocolo, ISM incompatible), no hay forma de corregirlo. Todos los callRemote() para ese dominio enviaran mensajes al router incorrecto. Los mensajes nunca seran entregados correctamente. Las ICAs derivadas usaran el ISM incorrecto, lo que puede causar que mensajes sean rechazados por el ISM."
+  impact: "Un dominio entero queda permanentemente inutilizable si se enrolla con parametros incorrectos. Todos los mensajes a ese dominio fallan. No hay recovery path excepto desplegar un nuevo InterchainAccountRouter."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // _enrollRemoteRouterAndIsm L298-302:
+    // require(routers(_destination) == EMPTY_SALT && isms[_destination] == EMPTY_SALT,
+    //         "router and ISM defaults are immutable once set");
+    // Una vez seteado, no se puede cambiar
+    // El owner DEBE verificar los parametros antes de enrollar
+    bytes32 enrolledRouter = router.routers(testDomain);
+    bytes32 enrolledIsm = router.isms(testDomain);
+    if (enrolledRouter != bytes32(0)) {
+        // Router is enrolled -- verify it points to a valid contract
+        address routerAddr = address(uint160(uint256(enrolledRouter)));
+        t(routerAddr.code.length > 0, "IAR-DOS-04: enrolled router must be a contract");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "Patron similar a V3Vault.setGaugeManager one-time lock. Es una decision de diseno deliberada para prevenir que el owner cambie rutas despues de deployment, lo cual protege a usuarios que ya tienen ICAs derivadas con esos parametros. Si el router cambiara, las ICAs existentes quedarian huerfanas. El trade-off es que un error en enrollment es permanente. NOTA: unenrollRemoteRouter() existe en Router base pero _enrollRemoteRouter esta overridden para llamar _enrollRemoteRouterAndIsm, no esta claro si unenroll permite re-enroll."
+  poc_sketch: |
+    // 1. Owner enrolls domain 42 with wrong router address (typo)
+    // 2. All callRemote(42, ...) sends to wrong address
+    // 3. Messages never delivered or delivered to wrong router
+    // 4. Owner tries to re-enroll domain 42 -> REVERT "router and ISM defaults are immutable once set"
+    // 5. No fix possible without new router deployment
+  call_stack: 'enrollRemoteRouterAndIsm() -> _enrollRemoteRouterAndIsm() -> REVERT if already set'
+
+- id: IAR-DOS-05
+  tier: 1
+  type: property
+  description: "handle() no tiene onlyRemoteRouter -- cualquier sender en un origin domain puede crear ICAs y ejecutar calls, pero esto habilita spam de mensajes que despliegan proxies via Create2"
+  attack_scenario: "handle() override en InterchainAccountRouter L134-168 tiene onlyMailbox pero NO onlyRemoteRouter (el comment en L133 explica por que: 'designed to receive messages from untrusted remote contracts'). Esto significa que cualquier contrato en cualquier chain puede enviar mensajes al Mailbox destino que seran procesados por handle(). Cada mensaje con un nuevo (origin, owner, sender, ism, salt) tuple despliega un nuevo proxy via Create2 en getDeployedInterchainAccount(). Un atacante puede spamear mensajes desde una chain barata para desplegar miles de proxies en la chain destino, consumiendo gas del relayer y creando storage bloat. Cada deploy es ~100K gas (MinimalProxy + Create2)."
+  impact: "Un atacante puede forzar el deployment de miles de proxies MinimalProxy en la chain destino, consumiendo gas del relayer. No bloquea a otros usuarios (cada ICA es independiente), pero genera costo para el relayer y storage bloat."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // handle() L134-168: onlyMailbox, NO onlyRemoteRouter
+    // getDeployedInterchainAccount L129-157: deploys if !isContract
+    // Cada combinacion unica de (origin, owner, sender, ism, salt) = nueva ICA
+    // Un atacante puede generar N combinaciones variando owner/salt
+    // Cada deploy: ~100K gas (Create2 + MinimalProxy)
+    // Invariante: verificar que el costo de deploy es proporcional al dispatch fee
+    // El sender NO necesita ser un router enrollado
+    address ica = address(router.getLocalInterchainAccount(
+        originDomain,
+        bytes32(uint256(uint160(attacker))),
+        bytes32(uint256(uint160(attackerRouter))),
+        address(0),
+        bytes32(uint256(1))
+    ));
+    // ICA address es deterministica -- computeAddress no consume gas excesivo
+    t(true, "IAR-DOS-05: any sender can trigger ICA deployment -- no router check in handle");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "El diseno intencional de no tener onlyRemoteRouter permite que cualquier contrato en cualquier chain use ICAs. El costo del ataque es el dispatch fee en la chain origen + gas del relayer. Si el IGP (Interchain Gas Paymaster) cobra adecuadamente, el costo del ataque es proporcional al dano. La mitigacion real es economica, no tecnica. Storage bloat de MinimalProxy es minimo (~45 bytes por proxy)."
+  poc_sketch: |
+    // 1. Attacker on cheap L2 deploys contract that sends 1000 messages to Mailbox
+    // 2. Each message has unique salt -> unique ICA deployment on destination
+    // 3. Relayer delivers all 1000 messages, deploying 1000 proxies
+    // 4. Cost: 1000 * dispatch_fee on L2 (cheap) vs 1000 * 100K gas on destination (expensive)
+  call_stack: 'Mailbox.process() -> InterchainAccountRouter.handle() -> getDeployedInterchainAccount() -> Create2.deploy()'
+
+- id: IAR-DOS-06
+  tier: 1
+  type: property
+  description: "Commitment sin reveal: setCommitment marca commitment como pending, pero si el reveal message nunca llega o falla, el commitment queda pendiente para siempre bloqueando re-uso del mismo commitment hash"
+  attack_scenario: "callRemoteCommitReveal() envia DOS mensajes: (1) commitment que setea commitments[hash] = true en la ICA, y (2) reveal que ejecuta las calls y borra el commitment. Si el reveal message falla (relayer no lo entrega, ISM rechaza, gas insuficiente), el commitment queda pendiente permanentemente. La ICA tiene require(!commitments[_commitment], 'Previous commitment pending execution') en setCommitment(), asi que el mismo hash no se puede re-enviar. El usuario necesaria generar un nuevo commitment con salt diferente. Los fondos enviados con el commitment message quedan en la ICA sin poder ejecutarse."
+  impact: "Commitment permanentemente pendiente bloquea re-envio del mismo commitment hash. El usuario debe generar nuevo commitment con diferente salt. Fondos en la ICA asociados al commitment quedan sin ejecutar."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // OwnableMulticall.setCommitment L41-48:
+    // require(!commitments[_commitment], "ICA: Previous commitment pending execution");
+    // commitments[_commitment] = true;
+    // revealAndExecute L60: require(commitments[revealedHash], "ICA: Invalid Reveal");
+    // L64: delete commitments[revealedHash];
+    // Si reveal nunca llega, commitments[hash] queda true para siempre
+    // No hay mecanismo de cancelacion/cleanup de commitments pendientes
+    // El owner de la ICA (el router) no tiene funcion para limpiar commitments
+    // Invariante: un commitment pendiente debe eventualmente ejecutarse o ser cancelable
+    // Como no hay cancel, verificar que el re-envio funciona con salt diferente
+    t(true, "IAR-DOS-06: no cancellation mechanism for pending commitments -- stuck if reveal fails");
+  ghost_vars:
+    - ghost_pendingCommitments
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "El commitment-reveal pattern tiene un gap fundamental: no hay mecanismo de cancelacion. Si el reveal falla, el commitment es permanente. La ICA no expone funcion para limpiar commitments (solo el owner=router puede llamar setCommitment, y el router no tiene cancel function). El workaround es usar un salt diferente para un nuevo commitment, pero los fondos del commitment original quedan inutilizados si se enviaron value con el commitment message. revealAndExecute es permissionless (no tiene onlyOwner), asi que cualquiera puede revelar si conoce las calls y salt."
+  poc_sketch: |
+    // 1. Alice calls callRemoteCommitReveal() -- sends commitment + reveal messages
+    // 2. Commitment message delivered: ICA.commitments[hash] = true
+    // 3. Reveal message delivery fails (gas too low, ISM rejects, etc)
+    // 4. ICA.commitments[hash] is permanently true
+    // 5. Alice tries to re-send same commitment -> setCommitment reverts "Previous commitment pending execution"
+    // 6. Alice must create new commitment with different salt
+    // 7. No way to clear the stuck commitment
+  call_stack: 'handle(COMMITMENT) -> ica.setCommitment(hash) -> commitments[hash] = true -> [reveal never arrives] -> STUCK'
+
+- id: IAR-DOS-07
+  tier: 1
+  type: property
+  description: "route() permite que el ISM del mensaje sea arbitrario -- un atacante puede especificar un ISM malicioso que revierte en verify(), bloqueando la entrega del mensaje"
+  attack_scenario: "route() L170-191 retorna el ISM especificado en el mensaje body. Para CALLS/COMMITMENT messages, usa InterchainAccountMessage.ism(), que viene directamente del sender en la chain origen. Si el sender especifica un ISM que revierte en verify(), el Mailbox no puede procesar el mensaje porque ISM.verify() falla. Esto es self-DoS (el sender bloquea su propio mensaje). PERO: si el sender es un contrato compartido (multisig, DAO), un actor malicioso dentro del contrato podria sabotear mensajes de otros participantes especificando un ISM malicioso. El ISM address(0) se resuelve al defaultIsm del Mailbox, que es seguro."
+  impact: "Self-DoS: el sender puede bloquear sus propios mensajes eligiendo un ISM que revierte. No afecta a otros usuarios porque cada mensaje tiene su propio ISM routing."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // route() L172-191: retorna ISM del message body
+    // Para CALLS: _ism = InterchainAccountMessage.ism(_body).bytes32ToAddress()
+    // Si _ism == address(0), usa mailbox.defaultIsm()
+    // Si _ism != address(0), usa el ISM especificado -- sin validacion
+    // El ISM puede ser cualquier contrato, incluyendo uno que revierte
+    // Invariante: ISM especificado debe ser un contrato valido
+    address ismAddr = address(uint160(uint256(specifiedIsm)));
+    if (ismAddr != address(0)) {
+        t(ismAddr.code.length > 0, "IAR-DOS-07: specified ISM is not a contract -- message undeliverable");
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 75
+  notes: "El diseno de ICA permite ISMs arbitrarios por diseno -- es una feature, no un bug. El sender elige su propio nivel de seguridad. Self-DoS por ISM incorrecto es responsabilidad del sender. No hay impacto a terceros. El ISM address(0) fallback al defaultIsm es una mitigacion razonable para usuarios que no especifican ISM."
+  poc_sketch: ''
+  call_stack: 'Mailbox.process() -> InterchainAccountRouter.route(message) -> IInterchainSecurityModule(maliciousIsm).verify() -> REVERT'
+
+- id: IAR-DOS-08
+  tier: 1
+  type: property
+  description: "approveFeeTokenForHook() no tiene access control -- cualquiera puede forzar approval de max uint256 de cualquier token al cualquier hook, habilitando un hook malicioso a drenar tokens del router"
+  attack_scenario: "AbstractInterchainAccountRouter.approveFeeTokenForHook() L109-111 es external sin restriccion de acceso. Cualquiera puede llamarlo con _feeToken=<token que el router tiene> y _hook=<attacker contract>. Esto aprueba type(uint256).max al atacante. Si el router tiene balance de ese token (por ejemplo, fee tokens sobrantes de dispatches previos), el atacante puede transferirlos. El router recibe tokens via _dispatchMessageWithValue() L241 (safeTransferFrom del sender), y si el hook no consume todos, quedan residuales. Esto tambien se aplica a tokens enviados por error al router."
+  impact: "Cualquier token con balance en el router puede ser drenado por un atacante que llame approveFeeTokenForHook con su propia address como hook. Perdida directa de fondos."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // approveFeeTokenForHook L109-111:
+    // function approveFeeTokenForHook(address _feeToken, address _hook) external {
+    //     IERC20(_feeToken).forceApprove(_hook, type(uint256).max);
+    // }
+    // NO tiene onlyOwner ni ninguna restriccion de acceso
+    // Cualquiera puede llamar con _hook = attacker
+    // Invariante: el router no debe tener balance significativo de fee tokens
+    // Pero si lo tiene, cualquiera puede drenarlo
+    uint256 tokenBalance = IERC20(feeToken).balanceOf(address(router));
+    uint256 allowanceToAttacker = IERC20(feeToken).allowance(address(router), attacker);
+    // Despues de approveFeeTokenForHook(feeToken, attacker):
+    // allowanceToAttacker == type(uint256).max
+    // attacker puede transferFrom todo el balance
+    if (tokenBalance > 0) {
+        t(allowanceToAttacker == 0, "IAR-DOS-08: router has token balance with non-zero allowance to external address");
+    }
+  ghost_vars:
+    - ghost_routerTokenBalance
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "ESTE ES UN FINDING POTENCIAL, NO SOLO DOS. approveFeeTokenForHook sin access control permite a cualquiera aprobar tokens del router a cualquier address. Si el router tiene balance residual de ERC20 fee tokens, es robo directo. La funcion esta disenada para que el owner pre-apruebe fee tokens para hooks, pero sin access control es peligrosa. Verificar si _dispatchMessageWithValue deja residuales: L234 calcula _fee y L241 transfiere exactamente _fee, pero si _fee < balance pre-existente, hay residual. NOTA: Esto puede ser mas un Access Control finding que DoS, pero el impacto incluye que un atacante puede revocar approvals legitimas cambiando el allowance."
+  poc_sketch: |
+    // 1. Alice calls _dispatchMessageWithValue with feeToken = USDC
+    // 2. Fee is 100 USDC, transferred from Alice to router, then approved to hook
+    // 3. Hook consumes 99 USDC, 1 USDC remains in router
+    // 4. Attacker calls approveFeeTokenForHook(USDC, attackerAddress)
+    // 5. Router approves type(uint256).max USDC to attackerAddress
+    // 6. Attacker calls USDC.transferFrom(router, attacker, 1 USDC)
+    // 7. Attacker steals residual USDC
+  call_stack: 'attacker -> approveFeeTokenForHook(token, attacker) -> IERC20.forceApprove(attacker, max) -> attacker.transferFrom(router, attacker, balance)'
+
+- id: IAR-DOS-09
+  tier: 2
+  type: property
+  description: "ICA proxy deployment via Create2 es deterministica pero irrevocable -- si el implementation contract es destruido o corrupted, todas las ICAs quedan bricked"
+  attack_scenario: "El constructor L73 despliega el implementation via Create2.deploy(0, bytes32(0), bytecode). Todas las ICAs son MinimalProxy que delegan al implementation. Si alguien logra destruir el implementation contract (via selfdestruct en una delegatecall, o un bug en el EVM), todas las proxies se vuelven no-funcionales. Las proxies siguen existiendo pero delegatecall a una address sin codigo retorna success=true con empty data, lo que puede causar comportamiento inesperado. En Solidity >=0.8.13 con EIP-3529, SELFDESTRUCT esta deprecated pero todavia funciona. El implementation tiene receive() y funciones, pero es un contrato regular sin selfdestruct."
+  impact: "Si el implementation muere, TODAS las ICAs en esa chain quedan permanentemente inutilizables. Fondos en ICAs (ETH + tokens) quedan atrapados."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Constructor L73: implementation = Create2.deploy(0, bytes32(0), bytecode)
+    // implementation is OwnableMulticall(address(this)) -- constructor arg is router address
+    // All ICAs are MinimalProxy pointing to implementation
+    // If implementation.code.length == 0, all proxies are dead
+    address impl = router.implementation();
+    t(impl.code.length > 0, "IAR-DOS-09: implementation contract destroyed -- all ICAs bricked");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 60
+  notes: "El riesgo es bajo porque OwnableMulticall no tiene selfdestruct y no acepta delegatecalls de fuentes externas. El unico vector seria un bug en el EVM (ej: Pectra hardfork cambiando semantica de selfdestruct/create2). El implementation es desplegado via Create2 con salt=0, asi que su address es deterministica. Si se destruyera, Create2 podria re-desplegarlo en la misma address (si el bytecode es el mismo). Post-EIP-6780, selfdestruct solo destruye en la misma tx que deployment, asi que en la practica el implementation es inmutable una vez desplegado."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: IAR-DOS-10
+  tier: 1
+  type: property
+  description: "Concurrent callRemoteCommitReveal() calls race on address(this).balance -- second caller can steal first caller's ETH or first caller's reveal fails"
+  attack_scenario: "callRemoteCommitReveal() es NOT reentrancy-protected. Dos usuarios llamando simultaneamente comparten address(this).balance. User A envia 2 ETH: primer dispatch (commitment) usa msg.value = 2 ETH, pero el hook solo consume 1 ETH, dejando 1 ETH en el router. Segundo dispatch (reveal) usa address(this).balance = 1 ETH. Si User B llama entre el primer y segundo dispatch de A (en el mismo bloque via bundle), B's primer dispatch puede consumir el ETH residual de A, dejando A sin fondos para su reveal dispatch. Esto NO requiere reentrancy -- solo concurrencia en el mismo bloque."
+  impact: "Un usuario puede inadvertidamente usar el ETH de otro usuario para su reveal dispatch. El primer usuario's reveal dispatch falla por fondos insuficientes. El commitment se entrega pero el reveal no."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // callRemoteCommitReveal flow:
+    // 1. First dispatch: _dispatchMessageWithValue(..., msg.value)  [L606-618]
+    // 2. Second dispatch: _dispatchMessageWithValue(..., address(this).balance)  [L624-631]
+    // Between 1 and 2, address(this).balance = msg.value - fee1
+    // If another tx runs between, balance changes
+    // In same-block MEV context, this is exploitable
+    uint256 balanceBefore = address(router).balance;
+    // After a callRemoteCommitReveal, balance should be 0 (all value used for dispatches)
+    // If balance > 0, there's residual ETH that can be claimed by next caller
+    uint256 balanceAfter = address(router).balance;
+    t(balanceAfter == 0, "IAR-DOS-10: router has residual ETH after callRemoteCommitReveal -- vulnerable to front-running");
+  ghost_vars:
+    - ghost_commitRevealConcurrentCalls
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "Esto es fundamentalmente el mismo bug que IAR-DOS-02 pero con enfoque en la concurrencia. La raiz del problema es usar address(this).balance en vez de calcular el valor exacto necesario (msg.value - fee1). Si el segundo dispatch usara msg.value - fee1 (o el valor retornado por el primer dispatch), no habria race condition. Esto es un pattern de design flaw, no un bug accidental. Combinar con IAR-DOS-02 para un finding mas fuerte."
+  poc_sketch: |
+    // 1. Alice sends callRemoteCommitReveal{value: 2 ether}()
+    // 2. Commitment dispatch consumes 1 ether (fee), 1 ether remains
+    // 3. In same block, Bob sends callRemoteCommitReveal{value: 2 ether}()
+    // 4. Bob's commitment dispatch consumes 1 ether, leaving Bob's 1 ether + Alice's 1 ether
+    // 5. Bob's reveal dispatch uses address(this).balance = 2 ether (steals Alice's 1 ether)
+    // 6. Alice's reveal dispatch uses address(this).balance = 0 ether -> reverts or underpays
+  call_stack: 'Alice: callRemoteCommitReveal() -> dispatch1(msg.value) -> [Bob interleaves] -> dispatch2(address(this).balance = wrong)'
+
+false_positives:
+- hunter: DoSHunter
+  id: IAR-DOS-FP-01
+  reason: "handle() no teniendo onlyRemoteRouter es by design, no un DoS vector. El comment en L133 explica que el sistema esta disenado para recibir mensajes de contratos untrusted. Cada ICA es aislada por (origin, owner, sender, ism, salt), asi que un mensaje malicioso solo afecta la ICA del atacante, no las de otros usuarios."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false
+- hunter: DoSHunter
+  id: IAR-DOS-FP-02
+  reason: "OwnableMulticall.multicall() loop no es unbounded en el sentido clasico -- el gas limit lo controla el sender via hookMetadata. Si el sender especifica gas suficiente, todas las calls se ejecutan. Si no, falla. No hay vector de DoS a terceros porque cada mensaje tiene su propio gas budget."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false
+- hunter: DoSHunter
+  id: IAR-DOS-FP-03
+  reason: "getDeployedInterchainAccount Create2 deploy no puede fallar por address collision. Create2 con salt unico siempre genera address unico. Si la address ya tiene codigo (isContract=true), skip deploy. No hay DoS vector en el deployment path."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

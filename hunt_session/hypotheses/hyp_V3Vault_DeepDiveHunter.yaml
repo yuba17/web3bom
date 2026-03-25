@@ -1,0 +1,381 @@
+component: V3Vault
+hunter: DeepDiveHunter
+methodology: |
+  Section 1 — Design Assumption Analysis:
+    - liquidate() assumes _calculateLiquidation never reverts (div/0 possible at boundary)
+    - _sendPositionValue assumes fullValue > feeValue when position has liquidity (false for out-of-range)
+    - _handleReserveLiquidation assumes totalLent > missing (false in extreme insolvency)
+    - setLimits() assumes minLoanSize only affects new borrows (but repay() also enforces it)
+    - Socialized loss assumes all lenders share proportionally (front-runners can avoid)
+  Section 2 — Cross-Function State Analysis:
+    - liquidate() → _calculateLiquidation → _sendPositionValue: feeValue=0 for staked positions propagates
+    - _handleReserveLiquidation reduces lendExchangeRate BEFORE any withdrawal can execute (but mempool front-running possible)
+    - borrow() in transform mode skips health check; _transform() checks at end (safe if atomic)
+  Section 3 — Value Exit Trace:
+    - borrow() line 636: SafeERC20.safeTransfer — protected by health check (except transform mode)
+    - _withdraw() line 997: SafeERC20.safeTransfer — protected by balance check
+    - _sendPositionValue: decreaseLiquidity + collect — protected by liquidation logic BUT div/0 can block it
+    - withdrawReserves: admin only, protected by reserve calculation
+  Section 4 — Convergence Deep-Dive:
+    - borrow() + transform() flagged by 13 hunters combined — transform mode bypass is THE convergence
+    - liquidate() + _calculateLiquidation flagged by 9 hunters — penalty math edge cases are real
+    - stakePosition fee exclusion flagged by 6 hunters — already found as VV-O-02/VV-O-05
+
+false_positives_consumed:
+  - VV-FP-01 through VV-FP-04 (AccessHunter)
+  - VV-FP-D-01 through VV-FP-D-03 (DomainHunter)
+  - VV-FP-01 through VV-FP-03 (FlowHunter)
+  - VV-FP-01 through VV-FP-04 (MathHunter)
+  - VV-O-FP-01 through VV-O-FP-03 (OracleHunter)
+  - VV-FP-W-01, VV-FP-W-02 (WildcardHunter)
+  - VV-TB-FP-01 through VV-TB-FP-03 (TrustBoundaryHunter)
+  - VV-SIG-FP-01, VV-SIG-FP-02 (SignatureHunter)
+  - VV-DOS-FP-01 through VV-DOS-FP-03 (DoSHunter)
+
+hypotheses:
+  - id: VV-DD-01
+    tier: 1
+    type: math
+    description: "_calculateLiquidation division by zero when startLiquidationValue equals maxPenaltyValue — liquidation reverts, position becomes unliquidatable, bad debt accumulates"
+    attack_scenario: |
+      1. Position has collateralFactor ≈ 90.9% (Q32^2 / (Q32 + MAX_LIQUIDATION_PENALTY_X32))
+      2. Position becomes slightly unhealthy (fullValue just above maxPenaltyValue)
+      3. liquidate() calls _calculateLiquidation
+      4. startLiquidationValue = debt * fullValue / collateralValue
+      5. If startLiquidationValue == maxPenaltyValue (happens at specific collateralFactor/LTV ratio):
+         denominator = startLiquidationValue - maxPenaltyValue = 0
+      6. penaltyFractionX96 = Q96 - ((fullValue - maxPenaltyValue) * Q96 / 0) → REVERT
+      7. Position is permanently unliquidatable at this exact health level
+      8. Debt accrues interest, eventually entering a different branch, but during the window: bad debt risk
+    solidity: |
+      function property_vv_dd_01() public {
+          // INV: _calculateLiquidation must never revert for any liquidatable position
+          // This checks the boundary condition where penalty fraction denominator = 0
+          for (uint256 i; i < _tokenIds.length; i++) {
+              (uint256 shares) = vault.loans(_tokenIds[i]);
+              if (shares > 0) {
+                  (,,,,uint256 debtX96,) = vault.vaultInfo();
+                  uint256 debt = shares * debtX96 / (2**96);
+                  (bool isHealthy, uint256 fullValue, uint256 collateralValue,) =
+                      vault.loanInfo(_tokenIds[i]);
+                  if (!isHealthy && collateralValue > 0) {
+                      uint256 maxPenaltyValue = debt * (2**32 + vault.MAX_LIQUIDATION_PENALTY_X32()) / (2**32);
+                      if (fullValue >= maxPenaltyValue) {
+                          uint256 startLiquidationValue = debt * fullValue / collateralValue;
+                          // This denominator must never be zero
+                          t(startLiquidationValue != maxPenaltyValue,
+                            "VV-DD-01: liquidation penalty denominator = 0 — position unliquidatable");
+                      }
+                  }
+              }
+          }
+      }
+    ghost_vars: []
+    validated: true
+    priority: high
+    confidence: 65
+    call_stack: |
+      liquidate() → _calculateLiquidation(debt, fullValue, collateralValue)
+        → line 1173: startLiquidationValue = debt * fullValue / collateralValue
+        → line 1175: penaltyFractionX96 = Q96 - ((fullValue - maxPenaltyValue) * Q96 / (startLiquidationValue - maxPenaltyValue))
+        → REVERT if startLiquidationValue == maxPenaltyValue
+    poc_sketch: |
+      function test_VV_DD_01_liquidation_div_zero() public {
+          // Setup: create position with collateralFactor that triggers boundary
+          // collateralFactor = Q32^2 / (Q32 + MAX_LIQUIDATION_PENALTY_X32)
+          uint32 targetFactor = uint32(uint256(Q32) * Q32 / (Q32 + MAX_LIQUIDATION_PENALTY_X32));
+          vault.setTokenConfig(token0, uint192(targetFactor), type(uint32).max);
+
+          // Create and fund position, borrow to exact boundary
+          uint256 tokenId = _createPosition(1000e6);
+          vault.borrow(tokenId, _calculateBoundaryDebt(tokenId));
+
+          // Manipulate oracle so fullValue == maxPenaltyValue exactly
+          _setOraclePrice(targetPrice);
+
+          // This should revert with division by zero
+          vm.expectRevert();
+          vault.liquidate(LiquidateParams(tokenId, 0, 0, address(this), block.timestamp));
+      }
+
+  - id: VV-DD-02
+    tier: 1
+    type: math
+    description: "_sendPositionValue division by zero when fullValue equals feeValue — out-of-range position with all value in uncollected fees causes liquidation revert"
+    attack_scenario: |
+      1. Uniswap V3 position goes completely out of range (0 liquidity value)
+      2. Position accumulates significant uncollected fees over time
+      3. Oracle reports: fullValue = feeValue (all value is fees, no liquidity value)
+      4. Position becomes unhealthy due to debt accrual
+      5. liquidate() calls _sendPositionValue with:
+         liquidationValue > feeValue (wants some liquidity too)
+         BUT fullValue == feeValue
+      6. Line 1135: liquidity = (liquidationValue - feeValue) * liquidity / (fullValue - feeValue)
+         = (liquidationValue - feeValue) * liquidity / 0 → REVERT
+      7. Position is unliquidatable despite having value in fees
+      8. Note: for staked positions, feeValue=0 (ignoreFees=true), so this only affects unstaked positions
+    solidity: |
+      function property_vv_dd_02() public {
+          // INV: _sendPositionValue must handle positions where all value is in fees
+          for (uint256 i; i < _tokenIds.length; i++) {
+              (uint256 shares) = vault.loans(_tokenIds[i]);
+              if (shares > 0) {
+                  (bool isHealthy, uint256 fullValue,, uint256 feeValue) =
+                      vault.loanInfo(_tokenIds[i]);
+                  if (!isHealthy && fullValue > 0 && feeValue > 0) {
+                      // If all value is in fees, liquidation would revert
+                      t(fullValue != feeValue,
+                        "VV-DD-02: fullValue == feeValue — liquidation would div/0 in _sendPositionValue");
+                  }
+              }
+          }
+      }
+    ghost_vars: []
+    validated: true
+    priority: high
+    confidence: 70
+    call_stack: |
+      liquidate() → _sendPositionValue(tokenId, liquidationValue, fullValue, feeValue, recipient, deadline)
+        → line 1122: oracle.getLiquidityAndFees(tokenId)
+        → line 1131: liquidationValue > feeValue branch
+        → line 1135: liquidity = (liquidationValue - feeValue) * liquidity / (fullValue - feeValue)
+        → REVERT if fullValue == feeValue
+    poc_sketch: |
+      function test_VV_DD_02_fee_only_position_liquidation() public {
+          // Create position, borrow against it
+          uint256 tokenId = _createPosition(1000e6);
+          vault.borrow(tokenId, 500e6);
+
+          // Move price completely out of range so liquidity value = 0
+          _manipulatePoolPrice(extremePrice);
+
+          // Advance time to accumulate fees
+          vm.warp(block.timestamp + 90 days);
+
+          // Now fullValue ≈ feeValue (only uncollected fees have value)
+          // Increase debt rate so position is unhealthy
+          _accrueInterest();
+
+          // Liquidation should work but reverts with div/0
+          vm.expectRevert();
+          vault.liquidate(LiquidateParams(tokenId, 0, 0, address(this), block.timestamp));
+      }
+
+  - id: VV-DD-03
+    tier: 1
+    type: math
+    description: "_handleReserveLiquidation underflow when socialized loss exceeds total lent — cascading revert blocks all liquidations"
+    attack_scenario: |
+      1. Protocol has low total lent (e.g., 100 USDC from few lenders)
+      2. One large position with debt = 500 USDC goes deeply underwater
+      3. Reserve is insufficient: reserves = 50 USDC
+      4. liquidate() → _handleReserveLiquidation(reserveCost=450, ...)
+      5. missing = reserveCost - reserves = 400
+      6. totalLent = 100
+      7. Line 1216: newLendExchangeRateX96 = (totalLent - missing) * rate / totalLent
+         = (100 - 400) * rate / 100 → UNDERFLOW → REVERT
+      8. All liquidations for underwater positions with reserveCost > totalLent are blocked
+      9. Bad debt accumulates without any liquidation path
+      10. Protocol enters death spiral: no liquidation → more bad debt → more insolvency
+    solidity: |
+      function property_vv_dd_03() public {
+          // INV: Socialized loss must never exceed total lent assets
+          // If it does, _handleReserveLiquidation reverts and liquidation is blocked
+          (uint256 debt, uint256 lent, uint256 balance, uint256 reserves,,) = vault.vaultInfo();
+          // Sum all debt from active loans
+          uint256 totalDebt;
+          for (uint256 i; i < _tokenIds.length; i++) {
+              (uint256 shares) = vault.loans(_tokenIds[i]);
+              totalDebt += shares;
+          }
+          if (totalDebt > 0 && lent > 0) {
+              // Worst case: largest single loan socialization
+              // If any single debt > reserves + lent, liquidation would revert
+              for (uint256 i; i < _tokenIds.length; i++) {
+                  (uint256 shares) = vault.loans(_tokenIds[i]);
+                  if (shares > 0) {
+                      (,,,,uint256 debtX96,) = vault.vaultInfo();
+                      uint256 loanDebt = shares * debtX96 / (2**96);
+                      if (loanDebt > reserves) {
+                          uint256 missing = loanDebt - reserves;
+                          t(missing < lent,
+                            "VV-DD-03: socialized loss >= totalLent — liquidation would revert");
+                      }
+                  }
+              }
+          }
+      }
+    ghost_vars: []
+    validated: true
+    priority: high
+    confidence: 65
+    call_stack: |
+      liquidate() → _calculateLiquidation → reserveCost = debt - liquidatorCost
+        → _handleReserveLiquidation(reserveCost, debtRate, lendRate)
+          → line 1208: reserves = _getBalanceAndReserves(...)
+          → line 1211: missing = reserveCost - reserves
+          → line 1213: totalLent = _convertToAssets(totalSupply(), lendRate, Up)
+          → line 1216: (totalLent - missing) * lendRate / totalLent → UNDERFLOW if missing > totalLent
+    poc_sketch: |
+      function test_VV_DD_03_socialization_exceeds_lent() public {
+          // Small vault: only 100 USDC deposited
+          vault.deposit(100e6, address(this));
+
+          // Create position and borrow maximum
+          uint256 tokenId = _createPosition(10 ether);
+          vault.borrow(tokenId, 90e6);
+
+          // Crash collateral value to near zero
+          _crashOraclePrice();
+
+          // Advance time for massive interest accrual
+          vm.warp(block.timestamp + 365 days);
+
+          // Now debt >> lent. Liquidation should socialize but reverts
+          vm.expectRevert(); // underflow in _handleReserveLiquidation
+          vault.liquidate(LiquidateParams(tokenId, 0, 0, address(this), block.timestamp));
+      }
+
+  - id: VV-DD-04
+    tier: 2
+    type: domain
+    description: "minLoanSize increase traps existing small borrowers — partial repay reverts, only full repay works, forcing unnecessary liquidations"
+    attack_scenario: |
+      1. minLoanSize = 100 USDC. Alice borrows 150 USDC.
+      2. Admin increases minLoanSize to 200 USDC via setLimits()
+      3. Alice tries to repay 60 USDC (remaining debt = 90 < 200): REVERTS (MinLoanSize)
+      4. Alice cannot partial repay to improve health ratio
+      5. Alice must either:
+         a) Full repay 150 USDC (may not have liquidity)
+         b) Borrow MORE to reach 200 USDC minimum (increases risk)
+         c) Get liquidated (loses collateral)
+      6. If oracle price drops during this trap, forced liquidation causes user loss
+      7. Multiple users can be trapped simultaneously by admin parameter change
+    solidity: |
+      function property_vv_dd_04() public {
+          // INV: Every position with debt must be able to partial repay
+          // If minLoanSize prevents partial repay, borrower is trapped
+          uint256 minLoan = vault.minLoanSize();
+          for (uint256 i; i < _tokenIds.length; i++) {
+              (uint256 shares) = vault.loans(_tokenIds[i]);
+              if (shares > 0) {
+                  (,,,,uint256 debtX96,) = vault.vaultInfo();
+                  uint256 debt = shares * debtX96 / (2**96);
+                  if (debt > 0 && debt < minLoan) {
+                      // Position exists with debt below minLoanSize
+                      // Partial repay is impossible — only full repay works
+                      // This is a deadlock if borrower can't afford full repay
+                      t(false,
+                        "VV-DD-04: position has debt < minLoanSize — partial repay blocked");
+                  }
+              }
+          }
+      }
+    ghost_vars: []
+    validated: true
+    priority: medium
+    confidence: 60
+    call_stack: |
+      setLimits() → minLoanSize = newValue (line 863+)
+      _repay(tokenId, partialAmount, false)
+        → line 1038: loanDebtShares = currentShares - shares
+        → line 1046: if (currentShares != shares) {
+        → line 1048: if (_convertToAssets(loanDebtShares, rate, Up) < minLoanSize) revert MinLoanSize()
+        → REVERT if remaining debt < new minLoanSize
+    poc_sketch: |
+      function test_VV_DD_04_minloan_trap() public {
+          // Setup: minLoanSize = 100 USDC
+          vault.setLimits(100e6, ...);
+
+          // Alice borrows 150 USDC
+          uint256 tokenId = _createPosition(1 ether);
+          vault.borrow(tokenId, 150e6);
+
+          // Admin increases minLoanSize to 200 USDC
+          vault.setLimits(200e6, ...);
+
+          // Alice tries partial repay of 60 USDC (remaining = 90 < 200)
+          vm.expectRevert("MinLoanSize");
+          vault.repay(tokenId, 60e6, false);
+
+          // Alice CAN fully repay
+          vault.repay(tokenId, 150e6, false); // this works
+      }
+
+  - id: VV-DD-05
+    tier: 1
+    type: flow
+    description: "Socialized loss front-running — first-to-exit lenders avoid haircut at expense of remaining lenders, creating bank run incentive"
+    attack_scenario: |
+      1. Large underwater position pending liquidation with reserveCost >> reserves
+      2. _handleReserveLiquidation will reduce lendExchangeRateX96 proportionally
+      3. MEV bot monitors mempool, sees liquidation tx that will socialize 100 USDC loss
+      4. Bot front-runs with withdraw() at current (pre-haircut) lendExchangeRateX96
+      5. Bot withdraws 500 USDC of 1000 USDC total lent
+      6. Now totalLent = 500 USDC when liquidation executes
+      7. Haircut: (500 - 100) / 500 = 80% rate (20% loss for remaining)
+      8. Without front-run: (1000 - 100) / 1000 = 90% rate (10% loss for all)
+      9. Remaining lenders lose 2x more. Bot re-deposits after haircut, profiting from rate difference.
+      10. Extends to multiple bots: race to exit creates cascading withdrawals (bank run)
+    solidity: |
+      function property_vv_dd_05() public {
+          // INV: Socialized loss must be bounded relative to totalLent
+          // If a single liquidation can cause > 10% haircut, bank run incentive exists
+          (uint256 debt,, uint256 balance, uint256 reserves,,) = vault.vaultInfo();
+          uint256 totalSupply_ = vault.totalSupply();
+          if (totalSupply_ > 0) {
+              (,,,,, uint256 lendX96) = vault.vaultInfo();
+              uint256 totalLent = totalSupply_ * lendX96 / (2**96);
+              // Check: can any single liquidation cause > 10% haircut?
+              for (uint256 i; i < _tokenIds.length; i++) {
+                  (uint256 shares) = vault.loans(_tokenIds[i]);
+                  if (shares > 0) {
+                      (,,,,uint256 debtX96,) = vault.vaultInfo();
+                      uint256 loanDebt = shares * debtX96 / (2**96);
+                      if (loanDebt > reserves) {
+                          uint256 potentialMissing = loanDebt - reserves;
+                          // If potential socialized loss > 10% of total lent, bank run risk
+                          lte(potentialMissing * 10, totalLent,
+                            "VV-DD-05: single liquidation can cause >10% haircut — bank run risk");
+                      }
+                  }
+              }
+          }
+      }
+    ghost_vars: []
+    validated: true
+    priority: high
+    confidence: 75
+    call_stack: |
+      FRONT-RUN TX: _withdraw(receiver, owner, maxAmount, false)
+        → line 997: SafeERC20.safeTransfer at pre-haircut rate
+        → totalSupply decreases, balance decreases
+      LIQUIDATION TX: liquidate(params)
+        → _calculateLiquidation → reserveCost = debt (free liquidation, position deeply underwater)
+        → _handleReserveLiquidation(reserveCost, ...)
+          → line 1208: reserves < reserveCost → missing = reserveCost - reserves
+          → line 1213: totalLent = _convertToAssets(totalSupply(), lendRate, Up) ← SMALLER after front-run
+          → line 1216: newRate = (totalLent - missing) * rate / totalLent ← BIGGER haircut
+      POST-HAIRCUT: front-runner re-deposits at discounted rate, capturing spread
+    poc_sketch: |
+      function test_VV_DD_05_socialization_frontrun() public {
+          // Setup: 1000 USDC deposited by Alice (500) and Bob (500)
+          vm.prank(alice); vault.deposit(500e6, alice);
+          vm.prank(bob); vault.deposit(500e6, bob);
+
+          // Create underwater position: debt = 800, collateral crashed to 0
+          uint256 tokenId = _createPosition(0); // worthless collateral
+          // Somehow has 800 USDC debt (setup via initial borrow + price crash)
+
+          // Reserves = 50 USDC. Missing = 750 USDC.
+          // Normal: haircut = (1000 - 750) / 1000 = 25% loss each
+
+          // Alice front-runs liquidation
+          vm.prank(alice);
+          vault.withdraw(500e6, alice, alice); // exits at full rate
+
+          // Now totalLent = 500. Missing = 750 > 500 → REVERT!
+          // Or if missing < 500: haircut = (500 - missing) / 500 → much worse for Bob
+
+          // Bob eats all the loss. Alice escaped.
+      }

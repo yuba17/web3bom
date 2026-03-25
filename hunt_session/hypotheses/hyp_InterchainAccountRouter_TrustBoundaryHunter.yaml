@@ -1,0 +1,523 @@
+protocol: hyperlane
+component: InterchainAccountRouter
+file: solidity/contracts/middleware/InterchainAccountRouter.sol
+domain: trust
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: IAR-TB-01
+  tier: 1
+  type: property
+  description: "route() returns attacker-specified ISM from message body — sender can bypass all security verification"
+  attack_scenario: |
+    The route() function extracts the ISM address directly from the message body (InterchainAccountMessage.ism()).
+    An attacker on chain A dispatches a message to chain B with a malicious ISM address embedded in the body.
+    The malicious ISM's verify() always returns true. On chain B, Mailbox.process() calls
+    recipientIsm(router) -> router.interchainSecurityModule() -> router (itself, AbstractRoutingIsm).
+    Then Mailbox calls router.verify(metadata, message) which calls route(message).verify(metadata, message).
+    route() reads ISM from the message body -> returns the attacker's ISM -> verify() returns true.
+    Now handle() executes: deploys/gets ICA and runs multicall with attacker's calls.
+    The ICA is unique per (origin, owner, sender, ism, salt) so the attacker gets their own ICA,
+    but that ICA could hold tokens or ETH from prior operations. The key issue is that
+    ANY message from ANY origin with ANY sender is processed without verification if the ISM is malicious.
+    This is a CRITICAL trust boundary: the message body controls its own verification.
+  impact: "Complete ISM bypass. Any relayer or attacker who can call Mailbox.process() with crafted metadata+message can execute arbitrary calls through an ICA without real cryptographic verification."
+  impact_rating: Critical
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Test that the ISM returned by route() for a CALLS message
+    // is the one embedded in the message body, not a trusted/enrolled one
+    bytes memory fakeBody = abi.encodePacked(
+        uint8(0), // MessageType.CALLS
+        bytes32(uint256(uint160(address(this)))), // owner
+        bytes32(uint256(uint160(address(maliciousIsm)))), // ISM = attacker controlled
+        bytes32(0), // salt
+        abi.encode(new CallLib.Call[](0)) // empty calls
+    );
+    // Build full Hyperlane message wrapping the body
+    // route() should NOT return the attacker ISM if security is sound
+    // If it does, this invariant fails
+    IInterchainSecurityModule returnedIsm = router.route(fullMessage);
+    t(
+        address(returnedIsm) != address(maliciousIsm),
+        "IAR-TB-01: route() returned attacker-controlled ISM from message body"
+    );
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 95
+  notes: |
+    This is by design per the comment "Does not need to be onlyRemoteRouter, as this application
+    is designed to receive messages from untrusted remote contracts." The security model relies on
+    the ISM specified by the SENDER on chain A being the ISM that verifies on chain B. The sender
+    chooses their own ISM, and each (origin, owner, sender, ism) tuple maps to a unique ICA.
+    So an attacker with a weak ISM only controls THEIR OWN ICA (derived with that weak ISM).
+    The risk is if a legitimate user's ICA was deployed with ISM=0 (falling back to defaultIsm),
+    and then the defaultIsm changes or is weak. Downgrading to tier 2 after analysis but keeping
+    high confidence that the pattern is worth testing.
+  poc_sketch: ''
+  call_stack: 'Mailbox.process -> recipientIsm(router) -> router.interchainSecurityModule() -> address(this) -> AbstractRoutingIsm.verify -> route(message) -> ISM from body -> ISM.verify -> handle()'
+
+- id: IAR-TB-02
+  tier: 1
+  type: property
+  description: "approveFeeTokenForHook() has no access control — anyone can force max approval to arbitrary hook address"
+  attack_scenario: |
+    AbstractInterchainAccountRouter.approveFeeTokenForHook(address _feeToken, address _hook) is external
+    with NO access modifier (no onlyOwner). Any user can call it with any feeToken and any hook address.
+    Attack: attacker deploys a malicious "hook" contract, then calls
+    router.approveFeeTokenForHook(USDC, attackerHook). Now the router has approved max USDC to
+    attackerHook. If the router holds any USDC (from fees, stuck tokens, etc.), the attacker's
+    hook contract calls USDC.transferFrom(router, attacker, balance) to drain all USDC.
+    This applies to any ERC20 token the router might hold.
+  impact: "Theft of all ERC20 tokens held by the router contract. Anyone can approve unlimited tokens to arbitrary addresses."
+  impact_rating: Critical
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Before: router has some token balance
+    uint256 routerBalBefore = IERC20(token).balanceOf(address(router));
+    // Attacker calls approveFeeTokenForHook with their own address as hook
+    // This should revert or be restricted to owner
+    try router.approveFeeTokenForHook(address(token), address(attacker)) {
+        // If it succeeds, check that the router did NOT approve to attacker
+        uint256 allowance = IERC20(token).allowance(address(router), address(attacker));
+        t(allowance == 0, "IAR-TB-02: approveFeeTokenForHook allowed non-owner to set max approval");
+    } catch {
+        // Expected: should revert for non-owner
+    }
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 90
+  notes: |
+    Looking at the code: `function approveFeeTokenForHook(address _feeToken, address _hook) external {`
+    There is no onlyOwner or any access control modifier. This is a permissionless function that
+    grants type(uint256).max approval of any ERC20 to any address. The router may hold tokens
+    from fee payments (see _dispatchMessageWithValue which does safeTransferFrom to address(this)
+    then forceApprove to hook). If the router accumulates any token dust, it's drainable.
+    The intended use seems to be pre-approving fee tokens for hooks, but the lack of access control
+    is a clear vulnerability. Needs to verify the router actually holds tokens in practice.
+  poc_sketch: |
+    1. Deploy token, send 100 tokens to router
+    2. Call router.approveFeeTokenForHook(token, attacker) from attacker EOA
+    3. Call token.transferFrom(router, attacker, 100) from attacker
+    4. Assert attacker received 100 tokens
+  call_stack: 'attacker -> router.approveFeeTokenForHook(token, attackerAddr) -> IERC20(token).forceApprove(attackerAddr, MAX) -> attacker -> token.transferFrom(router, attacker, balance)'
+
+- id: IAR-TB-03
+  tier: 1
+  type: property
+  description: "callRemoteCommitReveal uses address(this).balance for reveal msg value — donation attack can steal ETH or cause underpayment"
+  attack_scenario: |
+    In callRemoteCommitReveal (L630), the reveal message dispatch uses `address(this).balance`
+    as the value sent. After the commitment dispatch uses msg.value, any remaining ETH plus
+    pre-existing ETH in the router is sent with the reveal. Attack vector:
+    1. Attacker sends ETH to the router via receive() or selfdestruct
+    2. Legitimate user calls callRemoteCommitReveal with msg.value = X
+    3. Commitment dispatch uses msg.value = X
+    4. Reveal dispatch uses address(this).balance which includes donated ETH
+    This means: (a) the user pays for gas with ETH they didn't intend, or
+    (b) the donated ETH is sent to the hook unintentionally, or
+    (c) front-running: attacker drains router balance before reveal dispatch,
+    causing reveal to dispatch with 0 value and potentially failing on destination.
+  impact: "ETH accounting mismatch in commit-reveal flow. User's reveal message may carry unexpected amounts or fail. Potential loss of donated/accumulated ETH."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a callRemoteCommitReveal, the router should have 0 ETH
+    // If it has more, it means external ETH was consumed
+    uint256 routerBalBefore = address(router).balance;
+    uint256 userMsgValue = 1 ether;
+    // Donate ETH to router
+    (bool ok,) = address(router).call{value: 0.5 ether}("");
+    // User calls callRemoteCommitReveal
+    // The reveal dispatch will use address(router).balance which includes the donation
+    uint256 routerBalAfter = address(router).balance;
+    // Invariant: router should not consume ETH it didn't receive from the current caller
+    t(
+        routerBalAfter >= routerBalBefore,
+        "IAR-TB-03: router consumed donated ETH in commit-reveal flow"
+    );
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: |
+    The code at L630: `_dispatchMessageWithValue(..., address(this).balance)`.
+    This is after the commitment dispatch at L606-618 which uses msg.value.
+    If the commitment dispatch does not consume all msg.value (e.g., hook returns change),
+    the remaining value PLUS any pre-existing balance goes into the reveal.
+    The `receive() external payable {}` function accepts any incoming ETH.
+    Could also be an issue if multiple users call concurrently (unlikely but possible).
+  poc_sketch: ''
+  call_stack: 'user -> callRemoteCommitReveal -> _dispatchMessageWithValue(commitMsg, msg.value) -> _dispatchMessageWithValue(revealMsg, address(this).balance)'
+
+- id: IAR-TB-04
+  tier: 1
+  type: property
+  description: "handle() accepts messages from ANY sender on ANY origin domain — no onlyRemoteRouter check"
+  attack_scenario: |
+    InterchainAccountRouter.handle() overrides Router.handle() and only has `onlyMailbox`.
+    The base Router.handle() has both `onlyMailbox` AND checks `_mustHaveRemoteRouter(_origin)`
+    and `require(_router == _sender)`. The override removes these checks.
+    An attacker deploys a contract on chain A that dispatches a Hyperlane message to chain B's
+    InterchainAccountRouter with _sender = attackerContract. The message specifies ISM = 0
+    (falling back to defaultIsm) and calls to drain the ICA.
+    Since the ICA address is derived from (origin, owner, sender, ism, salt), the attacker
+    controls an ICA derived from their own parameters. This is by design, BUT:
+    If someone sent tokens to a predictable ICA address (e.g., via getLocalInterchainAccount
+    with a specific origin/owner/router/ism), an attacker from the SAME origin domain with
+    a DIFFERENT sender (not the enrolled router) can control a DIFFERENT ICA.
+    The real risk: if the defaultIsm is a weak/permissive ISM, the attacker's message
+    gets verified trivially, and they can execute calls via their derived ICA.
+  impact: "Messages from unregistered/unknown origin domains and senders are processed. Security depends entirely on the ISM specified in the message body."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Simulate: Mailbox delivers a message from an unregistered origin domain
+    // handle() should reject messages from unknown origins
+    // Currently it does NOT — it only checks onlyMailbox
+    uint32 unknownOrigin = 99999;
+    bytes32 unknownSender = bytes32(uint256(1));
+    bytes memory body = InterchainAccountMessage.encode(
+        address(attacker), bytes32(0), new CallLib.Call[](0), bytes32(0)
+    );
+    // This should revert but won't under current implementation
+    bool success;
+    try router.handle(unknownOrigin, unknownSender, body) {
+        success = true;
+    } catch {
+        success = false;
+    }
+    t(!success, "IAR-TB-04: handle accepted message from unregistered origin domain");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: |
+    The design comment says "Does not need to be onlyRemoteRouter, as this application is designed
+    to receive messages from untrusted remote contracts." This is intentional — the ICA is
+    namespaced by (origin, owner, sender, ism, salt), so each sender gets their own isolated ICA.
+    However, this design means the ENTIRE security model relies on the ISM being correct.
+    If ISM=0 and defaultIsm is weak, any origin can create ICAs and execute calls.
+    The isolation is good but the trust assumption on ISM correctness is a single point of failure.
+  poc_sketch: ''
+  call_stack: 'Mailbox.process -> handle(unknownOrigin, unknownSender, body) -> getDeployedInterchainAccount -> ica.multicall'
+
+- id: IAR-TB-05
+  tier: 1
+  type: property
+  description: "route() with ISM=0 in message body falls back to mailbox.defaultIsm — if defaultIsm changes, verification weakens retroactively"
+  attack_scenario: |
+    When the ISM field in the message body is bytes32(0), route() falls back:
+    - For CALLS/COMMITMENT: `_ism = address(mailbox.defaultIsm())`
+    - For REVEAL: `_ism = address(CCIP_READ_ISM)`
+    The defaultIsm is a mutable setting on the Mailbox (setDefaultIsm by mailbox owner).
+    Attack scenario:
+    1. User on chain A dispatches message with ISM=0 (expecting current strong defaultIsm)
+    2. Before message is relayed, Mailbox owner on chain B changes defaultIsm to a weaker one
+    3. Message is now verified by the weaker ISM
+    4. Alternatively: attacker dispatches message with ISM=0, waits for a governance transition
+       that weakens defaultIsm, then relays the old message
+    The ICA created uses ISM=address(0) in the salt, so the ICA address is deterministic.
+    If a user previously sent funds to an ICA derived with ISM=0, and defaultIsm weakens,
+    an attacker can drain that ICA.
+  impact: "Retroactive weakening of security for all messages with ISM=0. Funds in ICAs derived with zero-ISM become vulnerable to defaultIsm changes."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check that route() for a message with ISM=0 returns defaultIsm
+    bytes32 zeroIsm = bytes32(0);
+    // If defaultIsm changes, the verification changes for pending messages
+    address currentDefault = address(mailbox.defaultIsm());
+    // Build message with ISM=0
+    IInterchainSecurityModule routedIsm = router.route(fullMessageWithZeroIsm);
+    eq(
+        address(routedIsm),
+        currentDefault,
+        "IAR-TB-05: ISM=0 should route to defaultIsm"
+    );
+    // After defaultIsm change, same message routes to new ISM
+    // This is the vulnerability — same message, different verification
+  ghost_vars:
+  - address internal ghost_previousDefaultIsm;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: |
+    This is somewhat architectural — the Mailbox owner is trusted. But in a cross-chain
+    context with governance delays and relaying latency, there's a window where ISM weakening
+    can be exploited. The ISM=0 fallback is a convenience feature that trades security
+    configurability for ease of use. Worth flagging for protocols that rely on ICA with ISM=0.
+  poc_sketch: ''
+  call_stack: 'route(message) -> ism from body = 0 -> mailbox.defaultIsm() -> returns current (possibly changed) ISM'
+
+- id: IAR-TB-06
+  tier: 2
+  type: property
+  description: "OwnableMulticall.revealAndExecute has no onlyOwner — anyone who knows the commitment preimage can execute"
+  attack_scenario: |
+    OwnableMulticall.revealAndExecute() has NO access control. It checks that the commitment
+    hash matches a stored pending commitment, then executes the calls. The commit-reveal
+    scheme is designed for MEV protection (keeping calldata secret). BUT:
+    1. The commitment is set via setCommitment() (onlyOwner = router only)
+    2. The reveal is triggered by CommitmentReadIsm.verify() which is called during Mailbox.process()
+    3. However, revealAndExecute is public — anyone who discovers the salt+calls preimage
+       (e.g., from mempool observation, off-chain CCIP-read server leak, or brute force for
+       simple calls) can front-run the reveal and execute the calls themselves.
+    Since the ICA executes calls as itself, the result is the same, but the front-runner
+    can sandwich the execution or DoS by executing before the legitimate reveal message.
+  impact: "Front-running of commit-reveal execution. Attacker can execute committed calls before the legitimate reveal, potentially sandwiching the ICA's trades."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After commitment is set, anyone should NOT be able to call revealAndExecute
+    // But currently they can if they know the preimage
+    ica.setCommitment(commitment); // Only router can do this
+    // Attacker knows salt and calls (from CCIP-read URL or mempool)
+    try ica.revealAndExecute(calls, salt) {
+        // Should this succeed for non-owner? Currently yes.
+        t(false, "IAR-TB-06: non-owner executed revealAndExecute");
+    } catch {
+        // Expected: should be restricted
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: |
+    The commit-reveal scheme's security relies on the preimage being secret. The CCIP-read
+    server is supposed to release the preimage only to the CommitmentReadIsm during verify().
+    However, if the CCIP-read server is public or the preimage leaks, anyone can execute.
+    This is somewhat by design (the calls would execute anyway), but the timing control is lost.
+    The real risk is MEV: if the commit-reveal was meant to prevent sandwich attacks on swaps,
+    a front-runner who discovers the preimage defeats the purpose entirely.
+  poc_sketch: ''
+  call_stack: 'attacker -> ica.revealAndExecute(calls, salt) -> checks commitment -> deletes commitment -> multicall(calls)'
+
+- id: IAR-TB-07
+  tier: 2
+  type: property
+  description: "callRemoteWithOverrides allows specifying arbitrary _router — message sent to non-enrolled/malicious recipient"
+  attack_scenario: |
+    callRemoteWithOverrides() accepts a _router parameter (bytes32) that specifies the
+    destination recipient of the Hyperlane message. There is NO validation that this _router
+    is an enrolled remote router. An attacker (or confused user) can specify any address as
+    the router on the destination chain.
+    The _dispatchMessageWithValue only checks `require(_router != bytes32(0))`.
+    Potential issues:
+    1. User specifies wrong router -> message goes to wrong contract -> funds/calls lost
+    2. Attacker deploys a contract on chain B that mimics the router interface but steals
+       the msg.value sent with the message
+    3. The ISM in the message body can be set to bytes32(0) (defaultIsm), so even the
+       verification is not per-router
+    This is less of a protocol vulnerability and more of a user footgun, but the API
+    surface is dangerously permissive.
+  impact: "User funds (msg.value for gas) sent to arbitrary destination. Calls may be executed on wrong ICA or lost entirely."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // callRemoteWithOverrides should validate _router is enrolled
+    bytes32 arbitraryRouter = bytes32(uint256(uint160(address(maliciousContract))));
+    // This should revert but doesn't
+    try router.callRemoteWithOverrides{value: 1 ether}(
+        destinationDomain,
+        arbitraryRouter,
+        bytes32(0),
+        calls
+    ) {
+        t(false, "IAR-TB-07: callRemoteWithOverrides accepted non-enrolled router");
+    } catch {
+        // Expected
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: |
+    This is by design — the "WithOverrides" suffix implies the user is opting out of
+    default router/ISM settings. The simpler callRemote() uses enrolled routers.
+    However, the override variants are public (not restricted to owner), meaning
+    any caller can dispatch to arbitrary destinations. Worth flagging but likely
+    accepted risk per the design intent.
+  poc_sketch: ''
+  call_stack: 'user -> callRemoteWithOverrides(dest, arbitraryRouter, ism, calls) -> _dispatchMessageWithValue -> mailbox.dispatch to arbitrary recipient'
+
+- id: IAR-TB-08
+  tier: 1
+  type: property
+  description: "CommitmentReadIsm.verify executes calls inside ISM.verify — reentrancy into Mailbox during process()"
+  attack_scenario: |
+    During Mailbox.process(), the flow is:
+    1. Mark message as delivered (effects)
+    2. Call ism.verify(metadata, message) (interaction)
+    3. Call recipient.handle(origin, sender, body) (interaction)
+    For REVEAL messages, the ISM is CommitmentReadIsm, whose verify() calls
+    ica.revealAndExecute(calls, salt) which executes arbitrary external calls.
+    This means arbitrary code execution happens INSIDE the ISM verification step,
+    before handle() is called. If any of those calls reenter the Mailbox (e.g., to
+    dispatch new messages or process other messages), the reentrancy could cause issues.
+    Additionally, handle() for REVEAL messages just returns early (L169-171), so the
+    actual execution happens in verify(), not handle(). This inverts the expected
+    control flow: calls execute during verification, not during handling.
+  impact: "Reentrancy during ISM verification. Arbitrary external calls execute before handle() completes. Could be used to manipulate state relied upon by subsequent Mailbox operations."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // During CommitmentReadIsm.verify, calls are executed
+    // This happens BEFORE handle() in the Mailbox.process flow
+    // Invariant: no state-changing external calls should happen during verify()
+    // But CommitmentReadIsm.verify -> ica.revealAndExecute -> multicall -> arbitrary calls
+    // Test: can we reenter Mailbox.process during verify?
+    // Build a call that reenters mailbox
+    CallLib.Call[] memory maliciousCalls = new CallLib.Call[](1);
+    maliciousCalls[0] = CallLib.Call({
+        to: bytes32(uint256(uint160(address(mailbox)))),
+        value: 0,
+        data: abi.encodeCall(Mailbox.process, (metadata2, message2))
+    });
+    // If this doesn't revert, reentrancy is possible
+    t(false, "IAR-TB-08: reentrancy into Mailbox during ISM verify");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: |
+    The Mailbox marks delivery BEFORE calling verify (L225-228 effects, then L236 verify).
+    So reentering with the SAME message would fail (already delivered check).
+    But reentering with a DIFFERENT message is possible. The Mailbox has no reentrancy guard.
+    In practice, the delivered mapping prevents replay of the same message, but cross-message
+    reentrancy during verify() is theoretically possible and worth investigating.
+  poc_sketch: |
+    1. Prepare message1 (REVEAL type) whose committed calls include processing message2
+    2. message2 reads state that message1's execution would change
+    3. Process message1: verify -> revealAndExecute -> process(message2) -> handle(message2) reads stale state
+  call_stack: 'Mailbox.process(msg1) -> deliveries[id1]=true -> CommitmentReadIsm.verify -> ica.revealAndExecute -> CallLib.multicall -> Mailbox.process(msg2)'
+
+- id: IAR-TB-09
+  tier: 2
+  type: property
+  description: "enrollRemoteRouterAndIsm is immutable once set but base Router.enrollRemoteRouter can still be called by owner"
+  attack_scenario: |
+    AbstractInterchainAccountRouter._enrollRemoteRouterAndIsm enforces immutability:
+    `require(routers(_destination) == EMPTY_SALT && isms[_destination] == EMPTY_SALT)`.
+    However, _enrollRemoteRouter is overridden to call _enrollRemoteRouterAndIsm with
+    ISM=EMPTY_SALT. The base Router.enrollRemoteRouter calls _enrollRemoteRouter (virtual).
+    So once a router+ISM is enrolled for a domain, calling enrollRemoteRouter will revert
+    because the require check fails.
+    BUT: Router.unenrollRemoteRouter exists and is onlyOwner. If the owner unenrolls a
+    remote router, the _routers map entry is removed but isms[domain] is NOT cleared.
+    Then re-enrolling via enrollRemoteRouterAndIsm would fail because isms[domain] != EMPTY_SALT.
+    This creates a state where a domain's router is unenrolled but the ISM mapping persists,
+    potentially causing inconsistency.
+  impact: "Domain routing inconsistency after unenroll. ISM mapping persists after router removal, blocking re-enrollment and creating stale ISM references."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After unenrollRemoteRouter, isms[domain] should be cleared
+    router.enrollRemoteRouterAndIsm(domain, remoteRouter, remoteIsm);
+    // Owner unenrolls
+    router.unenrollRemoteRouter(domain);
+    // Router is removed but ISM persists
+    bytes32 routerAfter = router.routers(domain);
+    bytes32 ismAfter = router.isms(domain);
+    eq(routerAfter, bytes32(0), "IAR-TB-09a: router should be cleared");
+    eq(ismAfter, bytes32(0), "IAR-TB-09b: ism should also be cleared after unenroll");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: |
+    unenrollRemoteRouter removes from _routers but does NOT clear isms[domain].
+    This means after unenrolling, the ISM for that domain is still set, and
+    re-enrolling is impossible because the require check in _enrollRemoteRouterAndIsm
+    needs both to be EMPTY_SALT. This could be a griefing vector if the owner
+    needs to rotate ISMs, or a configuration bug that locks domains.
+  poc_sketch: ''
+  call_stack: 'owner -> unenrollRemoteRouter(domain) -> _routers.remove(domain) [isms[domain] NOT cleared] -> enrollRemoteRouterAndIsm reverts'
+
+- id: IAR-TB-10
+  tier: 2
+  type: property
+  description: "callRemoteWithOverrides allows user to specify custom IPostDispatchHook — arbitrary hook can steal msg.value"
+  attack_scenario: |
+    The 7-parameter callRemoteWithOverrides (L554-584) accepts an IPostDispatchHook parameter.
+    This is public and callable by anyone. The msg.value is forwarded to mailbox.dispatch
+    which then calls hook.postDispatch{value: ...}. If the attacker specifies a malicious
+    hook that simply receives and keeps the ETH, the msg.value is lost.
+    However, the msg.value belongs to the caller, so they're only stealing from themselves.
+    The real issue: if a protocol integrates with ICA and calls callRemoteWithOverrides
+    programmatically with a user-supplied hook parameter, the user can steal the protocol's
+    ETH. This is a composability risk.
+  impact: "msg.value can be sent to arbitrary hook contracts. Direct risk to caller's own funds, but composability risk to protocols integrating with ICA."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // User specifies their own hook that steals msg.value
+    // This is their own msg.value, so direct risk is low
+    // But if a protocol wraps this call with protocol funds...
+    uint256 hookBalBefore = address(maliciousHook).balance;
+    router.callRemoteWithOverrides{value: 1 ether}(
+        dest, remoteRouter, ism, calls, hookMetadata, salt, IPostDispatchHook(maliciousHook)
+    );
+    uint256 hookBalAfter = address(maliciousHook).balance;
+    // The hook received the ETH
+    t(
+        hookBalAfter <= hookBalBefore,
+        "IAR-TB-10: custom hook received caller's msg.value"
+    );
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 55
+  notes: |
+    Since the caller is the one providing msg.value AND the hook, this is essentially
+    self-inflicted. However, the function is public and could be called by another
+    contract that doesn't validate the hook parameter. This is more of a design
+    review item than a direct vulnerability. Marking tier 2.
+  poc_sketch: ''
+  call_stack: 'caller -> callRemoteWithOverrides(..., maliciousHook) -> mailbox.dispatch{value: msg.value}(..., maliciousHook) -> maliciousHook.postDispatch{value: ...}'
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: IAR-FP-01
+  reason: |
+    handle() not checking onlyRemoteRouter is by design. The comment at L157 explicitly states
+    "Does not need to be onlyRemoteRouter, as this application is designed to receive messages
+    from untrusted remote contracts." The ICA namespacing by (origin, owner, sender, ism, salt)
+    provides isolation. Each unique combination gets its own ICA, so an untrusted sender cannot
+    control another sender's ICA. This is NOT a vulnerability per se, but the security model
+    critically depends on ISM correctness and ICA address isolation.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: |
+      Hyperlane ICA Router intentionally accepts messages from any sender/origin.
+      Security is per-ICA via ISM specified in message body. Do NOT flag lack of
+      onlyRemoteRouter as a vulnerability — it's the core design pattern.
+    briefing_update_applied: false
+- hunter: TrustBoundaryHunter
+  id: IAR-FP-02
+  reason: |
+    ERC20 weird token checks (FoT, rebasing, ERC777) are not directly relevant here.
+    The router only handles ERC20s in the fee token flow (_dispatchMessageWithValue
+    does safeTransferFrom for fee tokens). The router is not a vault or custody contract
+    for user tokens. Token weirdness in ICA calls is the user's own responsibility
+    since they craft the calls themselves.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

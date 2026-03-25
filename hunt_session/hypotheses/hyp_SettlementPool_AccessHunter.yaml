@@ -1,0 +1,411 @@
+hunter: AccessHunter
+component: SettlementPool
+file: variational-audit/src/SettlementPool.sol
+date: 2026-03-23
+status: complete
+
+# ═══════════════════════════════════════════════════════
+# TRUST BOUNDARY MAP
+# ═══════════════════════════════════════════════════════
+#
+# Roles:
+#   - factory: set once in initialize(), immutable after that. Used to resolve oracle + usdc.
+#   - creatorAddress: set once in initialize(), immutable. Can call depositUSDC (onlyParties).
+#   - otherAddresses[]: set in initialize() + addOtherParty(). Can call depositUSDC (onlyParties). NEVER removable.
+#   - oracle: resolved dynamically via factory.oracle(). Can call ALL deposit/withdraw/addOtherParty functions.
+#   - factoryOwner: resolved dynamically via factory.getOwner(). Has onlyFactoryOwner modifier but NO function uses it.
+#
+# Critical observation: The oracle has TOTAL control over pool funds.
+#   - Can withdraw ANY amount to ANY party address (withdrawUSDC, withdrawUSDCNoEvent, withdrawFees)
+#   - Can deposit from ANY address with sufficient allowance
+#   - Can add new parties unilaterally
+#   - The oracle address is MUTABLE (factory.setOracleAddress by factory owner)
+#   - If oracle is compromised or factory owner changes oracle → total fund drain
+#
+# Attack surface: The pool delegates ALL authorization for withdrawals to the oracle.
+#   Parties themselves CANNOT withdraw — only deposit (onlyParties only gates depositUSDC).
+#   This is a centralization risk but likely by design for a settlement system.
+#
+
+hypotheses:
+
+  - id: SP-A-01
+    tier: 1
+    type: property
+    title: "withdrawFees sends funds to arbitrary address without party membership check"
+    severity: high
+    confidence: 75
+    validated: true
+    priority: high
+    description: |
+      withdrawFees() (L273-286) transfers USDC to `requestor` without verifying that
+      `requestor` is creatorAddress or in otherAddresses[]. Unlike _withdrawUSDCOnBehalf()
+      (L270-271) which explicitly checks party membership, withdrawFees() has NO such check.
+
+      The oracle (PROVIDER_ROLE holder) calls collectFees() in Oracle.sol L106, which passes
+      `msg.sender` (the provider) as the requestor. This means ANY provider can extract fees
+      to their own address from ANY pool, regardless of whether they are a party.
+
+      While fees are conceptually owed to the provider, the SettlementPool has no internal
+      accounting of how much is owed as fees vs party collateral. The pool's entire USDC
+      balance is accessible via withdrawFees() — the only guard is the oracle's onlyRole check.
+
+      Compare: _withdrawUSDCOnBehalf (L270-271) checks requestor is party. withdrawFees does NOT.
+    attack_scenario: |
+      1. A PROVIDER_ROLE holder calls Oracle.collectFees() with amountRequested = pool's entire balance
+      2. Oracle calls pool.withdrawFees(provider_address, entire_balance, fresh_fees_batch_id)
+      3. withdrawFees checks: amount > 0 ✓, fees_batch_id != 0 ✓, not processed ✓
+      4. USDC transferred to provider — pool drained
+      5. Party collateral is gone — no party membership check was performed
+
+      This is a trusted-role risk: if a provider key is compromised, ALL pool funds are at risk,
+      not just earned fees. The function lacks a bound on withdrawable amount relative to fees owed.
+    affected_functions:
+      - "withdrawFees (L273-286)"
+      - "Oracle.collectFees (Oracle.sol L28-43)"
+      - "Oracle._processFeeRequests (Oracle.sol L89-134)"
+    invariant_code: |
+      // withdrawFees should not be able to drain more than a reasonable fee cap
+      // Since there's no on-chain fee accounting, we check the party check is missing
+      // This is a design-level invariant — withdrawFees has no requestor validation
+      uint256 balBefore = usdc.balanceOf(address(pool));
+      // oracle calls withdrawFees with non-party address
+      vm.prank(address(oracle));
+      pool.withdrawFees(nonPartyAddress, balBefore, freshBatchId);
+      uint256 balAfter = usdc.balanceOf(address(pool));
+      // If this succeeds, non-party received all funds — no party check
+      eq(balAfter, 0, "SP-A-01: withdrawFees drained pool to non-party");
+
+  - id: SP-A-02
+    tier: 1
+    type: property
+    title: "Oracle address is mutable — factory owner can change oracle and drain all pools"
+    severity: critical
+    confidence: 85
+    validated: true
+    priority: high
+    description: |
+      The onlyOracle modifier (L68-74) resolves the oracle dynamically on every call via
+      factory.oracle(). The factory owner can call setOracleAddress() (SettlementPoolFactory.sol L103)
+      to change the oracle at any time. The new oracle instantly gains full control over ALL
+      existing pools: withdraw any amount, deposit from any approved address, add parties.
+
+      This is a single-point-of-failure centralization vector. If the factory owner key is
+      compromised, or the owner is malicious, ALL pool funds across ALL pools are drainable
+      in a single transaction sequence:
+      1. setOracleAddress(attacker_contract)
+      2. attacker_contract calls withdrawUSDC/withdrawFees on every pool
+
+      There is NO timelock, NO multisig requirement, NO delay on oracle changes.
+      The factory uses Ownable (single owner) not AccessControl.
+    attack_scenario: |
+      1. Factory owner (single EOA via Ownable) calls factory.setOracleAddress(maliciousOracle)
+      2. maliciousOracle is a contract controlled by the attacker
+      3. Attacker calls maliciousOracle which calls pool.withdrawUSDC(attacker, pool.balance, uuid)
+         for every pool (iterating over known poolUuids)
+      4. onlyOracle check passes because factory.oracle() now returns maliciousOracle
+      5. All pools drained in one block
+
+      Even without compromise: the factory owner IS a trusted single point of failure.
+    affected_functions:
+      - "onlyOracle modifier (L68-74)"
+      - "_oracle() (L108-109)"
+      - "SettlementPoolFactory.setOracleAddress (SettlementPoolFactory.sol L103-106)"
+      - "All onlyOracle-gated functions: withdrawUSDC, withdrawFees, addOtherParty, deposit*"
+    invariant_code: |
+      // The oracle address should not change after pool initialization
+      // (or at minimum, existing pools should be protected from new oracles)
+      address oracleBefore = address(ISettlementPoolFactory(pool.factory()).oracle());
+      // ... factory owner changes oracle ...
+      address oracleAfter = address(ISettlementPoolFactory(pool.factory()).oracle());
+      // If oracle changed, all pools are now controlled by new oracle
+      eq(oracleBefore, oracleAfter, "SP-A-02: oracle changed — all pools at risk");
+
+  - id: SP-A-03
+    tier: 1
+    type: property
+    title: "depositUSDCOnBehalfOfParty does not verify sender is a pool party — oracle can deposit from arbitrary addresses"
+    severity: medium
+    confidence: 70
+    validated: true
+    priority: medium
+    description: |
+      depositUSDCOnBehalfOfParty() (L259-271) accepts any `sender` address from the oracle
+      without checking that sender is creatorAddress or in otherAddresses[]. Compare with
+      depositUSDC() (L246-257) which uses onlyParties and msg.sender.
+
+      The oracle can trigger a deposit from ANY address that has approved the pool.
+      In Oracle.depositUSDC() (Oracle.sol L344-357), the provider passes `sender` directly
+      with no validation that sender is a party of the pool.
+
+      Impact: If Alice has approved the pool's USDC spending (for a legitimate reason in
+      another pool), a compromised provider could force deposits from Alice's wallet into
+      an unrelated pool. The funds enter the pool but Alice has no party membership to
+      withdraw them — only the oracle can withdraw on her behalf.
+    attack_scenario: |
+      1. Alice approves USDC to Pool_A (she's a party there)
+      2. Pool_B exists with same USDC token (all pools share factory.usdcAddress)
+      3. Since Pool_A and Pool_B are different contracts, Alice's approval is per-contract —
+         BUT if Alice approved the Oracle contract or a pool she's not in, the issue applies
+      4. More concretely: Oracle.depositUSDC(alice, 1000e6, poolUuid_B, transferUuid)
+         → Pool_B.depositUSDCOnBehalfOfParty(alice, 1000e6, transferUuid)
+         → _depositUSDCOnBehalf checks allowance of alice to Pool_B — if Alice approved Pool_B
+           (e.g., because she was added as other party but later removed, or by mistake), funds move
+      5. Alice's funds are now in Pool_B where she may not be a party — cannot withdraw
+    affected_functions:
+      - "depositUSDCOnBehalfOfParty (L259-271)"
+      - "Oracle.depositUSDC (Oracle.sol L344-357)"
+      - "_depositUSDCOnBehalf (L116-141)"
+    invariant_code: |
+      // Only parties should have deposits made on their behalf
+      address nonParty = address(0xdead);
+      bool isParty = (nonParty == pool.creatorAddress()) || pool.checkOtherAddress(nonParty);
+      // Oracle deposits on behalf of non-party — should revert but doesn't
+      vm.prank(address(oracle));
+      // This will succeed if nonParty has approved the pool
+      // pool.depositUSDCOnBehalfOfParty(nonParty, amount, transferUuid);
+      t(isParty, "SP-A-03: deposit made on behalf of non-party");
+
+  - id: SP-A-04
+    tier: 1
+    type: property
+    title: "otherAddresses can never be removed — permanent access even after dispute/compromise"
+    severity: medium
+    confidence: 90
+    validated: true
+    priority: medium
+    description: |
+      addOtherParty() (L350-357) adds addresses to otherAddresses mapping, but there is NO
+      removeOtherParty() function anywhere in the contract. Once an address is added as a
+      party (either in initialize() or via addOtherParty()), it can NEVER be removed.
+
+      This means:
+      - A compromised party address retains depositUSDC() access forever
+      - A dispute between parties cannot result in access revocation
+      - The _withdrawUSDCOnBehalf check (L270-271) will always pass for old parties
+
+      In a settlement context, parties may need to be removed after settlement completion
+      or in case of key compromise. The current design makes this impossible.
+
+      The onlyParties modifier (L26-32) will always return true for any historically added party.
+    attack_scenario: |
+      1. Pool is created with creatorAddress=Alice, otherAddresses=[Bob]
+      2. Bob's key is compromised
+      3. Attacker (with Bob's key) can call depositUSDC() at any time (onlyParties passes)
+      4. More critically, oracle can still withdraw to Bob's address via withdrawUSDC
+         because _withdrawUSDCOnBehalf L270-271 checks otherAddresses[Bob] == true
+      5. There is NO way to revoke Bob's party status — no removeOtherParty exists
+      6. If the off-chain system tries to settle, Bob's compromised address is permanent
+    affected_functions:
+      - "addOtherParty (L350-357)"
+      - "onlyParties modifier (L26-32)"
+      - "_withdrawUSDCOnBehalf (L270-271)"
+      - "initialize (L78-98)"
+    invariant_code: |
+      // Once added, an address should be removable — but no function exists
+      // This invariant documents the gap: otherAddresses is append-only
+      bool bobIsParty = pool.checkOtherAddress(bob);
+      // After any sequence of calls, if bob was ever added, he remains a party
+      t(bobIsParty == true, "SP-A-04: party cannot be removed once added");
+
+  - id: SP-A-05
+    tier: 2
+    type: property
+    title: "onlyFactoryOwner modifier exists but is UNUSED — dead code or missing authorization"
+    severity: low
+    confidence: 95
+    validated: true
+    priority: low
+    description: |
+      The onlyFactoryOwner modifier (L60-66) is defined but NEVER used by any function in
+      SettlementPool.sol. It resolves factory.getOwner() dynamically, suggesting it was
+      intended for some administrative function that was either removed or never implemented.
+
+      This is either dead code (informational) or indicates a missing function that the
+      factory owner was supposed to have (e.g., emergency withdrawal, party removal, pause).
+      If the latter, the missing function could be a security gap.
+    attack_scenario: |
+      If onlyFactoryOwner was intended to gate an emergency function (e.g., emergencyWithdraw
+      or removeParty), its absence means:
+      - No emergency recovery mechanism exists at the pool level
+      - Factory owner cannot intervene in a pool even in case of stuck funds
+      - Combined with no removeOtherParty, pools are fully immutable once created
+
+      This is informational but notable as a design concern.
+    affected_functions:
+      - "onlyFactoryOwner modifier (L60-66)"
+    invariant_code: |
+      // onlyFactoryOwner is defined but no function uses it
+      // This is a code coverage / dead code observation
+      // No invariant needed — this is a static analysis finding
+
+  - id: SP-A-06
+    tier: 1
+    type: property
+    title: "batchDepositUSDCAtomic reuses creatorPartyAmountRequested across all items — creator charged N times"
+    severity: high
+    confidence: 80
+    validated: true
+    priority: high
+    description: |
+      In batchDepositUSDCAtomic() (L148-183), the `creatorPartyAmountRequested` is deposited
+      for EACH item in the batch loop (L156-167). If there are N items and
+      creatorPartyAmountRequested > 0, the creator is charged N times that amount.
+
+      The duplicate-prevention mechanism (transfers_processed[transferUuid]) uses
+      items[i].parentQuoteUuid as the transferUuid for the FIRST deposit (L155), then
+      resets transferUuid to 0 for the second deposit in the same iteration (L166).
+
+      BUT across iterations: items[0].parentQuoteUuid is used for iteration 0,
+      items[1].parentQuoteUuid for iteration 1, etc. Each is a DIFFERENT UUID, so the
+      duplicate check does NOT prevent charging the creator N times.
+
+      The oracle (batchAtomicDeposit in Oracle.sol L324-342) passes creatorPartyAmountRequested
+      as a single value applied to ALL items. If the off-chain system intends "total creator
+      deposit = creatorPartyAmountRequested", the on-chain result is actually
+      "total creator deposit = creatorPartyAmountRequested * items.length".
+
+      This is a logic bug that could drain the creator's USDC if they approved enough.
+    attack_scenario: |
+      1. Provider calls Oracle.batchAtomicDeposit with:
+         - creatorPartyAmountRequested = 1000 USDC
+         - items = [item1, item2, item3] (3 items, each with different parentQuoteUuid)
+      2. Pool.batchDepositUSDCAtomic loops 3 times
+      3. Each iteration: if creatorPartyAmountRequested > 0, calls _depositUSDCOnBehalf(creator, 1000, uuid_i)
+      4. Creator is charged 1000 * 3 = 3000 USDC total
+      5. If creator only expected 1000 USDC deposit, they lost 2000 USDC extra
+
+      The check on L154 validates amounts but doesn't prevent repeated charges.
+      The transferUuid differs per item (L155: items[i].parentQuoteUuid), so
+      transfers_processed doesn't block subsequent iterations.
+    affected_functions:
+      - "batchDepositUSDCAtomic (L148-183)"
+      - "_depositUSDCOnBehalf (L116-141)"
+      - "Oracle.batchAtomicDeposit (Oracle.sol L324-342)"
+    invariant_code: |
+      // Creator should only be charged creatorPartyAmountRequested ONCE total,
+      // not once per batch item
+      uint256 creatorBalBefore = usdc.balanceOf(creatorAddress);
+      vm.prank(address(oracle));
+      pool.batchDepositUSDCAtomic(creatorAddress, creatorAmount, items);
+      uint256 creatorBalAfter = usdc.balanceOf(creatorAddress);
+      uint256 totalCharged = creatorBalBefore - creatorBalAfter;
+      // If items.length > 1, creator was charged N times
+      lte(totalCharged, creatorAmount, "SP-A-06: creator overcharged in batch deposit");
+
+  - id: SP-A-07
+    tier: 2
+    type: property
+    title: "transferUuid=0 bypasses duplicate protection in _depositUSDCOnBehalf"
+    severity: medium
+    confidence: 85
+    validated: true
+    priority: high
+    description: |
+      In _depositUSDCOnBehalf() (L116-141), the duplicate check on L123 runs BEFORE
+      the transferUuid==0 check on L132. When transferUuid == 0:
+      - L123: transfers_processed[0] is checked — initially false, passes
+      - L132: if (transferUuid != 0) → false, so transfers_processed[0] is NEVER set to true
+
+      This means transferUuid=0 can be used unlimited times without triggering the
+      "already processed" guard. This is intentionally used in the atomic deposit functions
+      (L166, L223) for the second party's deposit within the same atomic operation.
+
+      However, this creates a bypass: any function that passes transferUuid=0 to
+      _depositUSDCOnBehalf can deposit unlimited times without duplicate protection.
+
+      depositUSDCNoEvent() (L311-322) is called by the oracle and does NOT require
+      transferUuid != 0. The oracle could call it repeatedly with transferUuid=0.
+
+      Wait — checking L311-322: depositUSDCNoEvent just calls _depositUSDCOnBehalf directly
+      with no transferUuid != 0 require. So oracle CAN pass transferUuid=0 there.
+    attack_scenario: |
+      1. Oracle calls depositUSDCNoEvent(victim, amount, 0) — transferUuid = 0
+      2. _depositUSDCOnBehalf: transfers_processed[0] == false → passes
+      3. Transfer succeeds, but transfers_processed[0] is NOT set to true (L132 skips)
+      4. Oracle calls depositUSDCNoEvent(victim, amount, 0) again — same result
+      5. This can repeat indefinitely — each time pulling `amount` from victim
+      6. If victim approved the pool for type(uint256).max, their entire balance is drainable
+
+      Note: depositUSDC (L246) and depositUSDCOnBehalfOfParty (L263) DO require
+      transferUuid != 0. But depositUSDCNoEvent (L311) does NOT have this require.
+    affected_functions:
+      - "_depositUSDCOnBehalf (L116-141, specifically L123 and L132)"
+      - "depositUSDCNoEvent (L311-322)"
+      - "batchDepositUSDCAtomic (L166 — intentional reset to 0)"
+      - "depositUSDCAtomic (L223 — intentional reset to 0)"
+    invariant_code: |
+      // transferUuid=0 should not be usable to bypass duplicate protection
+      // Call depositUSDCNoEvent twice with transferUuid=0 — both should not succeed
+      uint256 balBefore = usdc.balanceOf(sender);
+      vm.startPrank(address(oracle));
+      pool.depositUSDCNoEvent(sender, amount, 0);
+      pool.depositUSDCNoEvent(sender, amount, 0);
+      vm.stopPrank();
+      uint256 balAfter = usdc.balanceOf(sender);
+      // If both succeeded, sender lost 2*amount — duplicate protection bypassed
+      gte(balAfter, balBefore - amount, "SP-A-07: duplicate deposit via transferUuid=0");
+
+  - id: SP-A-08
+    tier: 2
+    type: property
+    title: "No balance check before withdrawal — oracle can withdraw more than pool balance"
+    severity: medium
+    confidence: 70
+    validated: true
+    priority: medium
+    description: |
+      Neither withdrawFees() (L273-286) nor _withdrawUSDCOnBehalf() (L288-309) check that
+      amountRequested <= _totalBalance() before calling usdc.transfer(). They rely on the
+      ERC20 transfer reverting if insufficient balance.
+
+      While USDC's transfer will revert on insufficient balance, the try/catch pattern
+      (L281, L301) catches the revert and re-throws with a generic error message, losing
+      the original revert reason. This masks whether the failure was due to insufficient
+      balance, a paused USDC contract, or a blacklisted address.
+
+      More importantly: in batchDepositUSDCAtomic, if the creator is charged N times
+      (SP-A-06) and their balance runs out mid-batch, the entire batch reverts —
+      there's no partial execution handling at the pool level.
+    attack_scenario: |
+      1. Pool has 100 USDC balance
+      2. Oracle calls withdrawUSDC(party, 200, transferUuid)
+      3. _withdrawUSDCOnBehalf: amountRequested > 0 ✓, transferUuid != 0 ✓, party check ✓
+      4. usdc.transfer(party, 200) reverts (insufficient balance)
+      5. catch block: reverts with generic "Could not withdraw USDC."
+      6. No specific error about insufficient balance — debugging is harder
+      7. The oracle's try/catch in _processFeeRequests catches this, but the error is opaque
+    affected_functions:
+      - "withdrawFees (L273-286)"
+      - "_withdrawUSDCOnBehalf (L288-309)"
+      - "_totalBalance (L104-106)"
+    invariant_code: |
+      // Pool should never attempt to transfer more than its balance
+      uint256 poolBal = usdc.balanceOf(address(pool));
+      // If oracle tries to withdraw more, the try/catch hides the real error
+      // Invariant: successful withdrawals should not exceed pool balance
+      uint256 withdrawn = amountRequested; // if the call didn't revert
+      lte(withdrawn, poolBal, "SP-A-08: withdrawal exceeds pool balance");
+
+false_positives:
+  - id: SP-FP-01
+    description: |
+      "initialize can be front-run" — investigated and dismissed. The factory creates the
+      clone and immediately calls initialize() in the same transaction (SettlementPoolFactory.sol
+      L85-93: Clones.clone → initialize). The factory checks msg.sender == factory (L85),
+      so even if someone front-runs with a different factory address, the legitimate factory's
+      initialize will pass because factory == address(0) check (L86) ensures one-time init.
+      A front-runner would need to deploy their own factory at the exact clone address, which
+      is infeasible with CREATE (nonce-based) or CREATE2 (salt-based by legitimate factory).
+
+  - id: SP-FP-02
+    description: |
+      "nonReentrant on initialize is unnecessary" — it's true that initialize is called once
+      and factory==address(0) prevents re-entry, but the guard doesn't hurt and follows
+      defense-in-depth. Not a vulnerability.
+
+  - id: SP-FP-03
+    description: |
+      "USDC fee-on-transfer could cause accounting mismatch" — USDC (Circle) does NOT have
+      fee-on-transfer. The contract uses the standard IERC20 interface and USDC is the only
+      token (hardcoded via factory.usdcAddress). Not exploitable with real USDC.

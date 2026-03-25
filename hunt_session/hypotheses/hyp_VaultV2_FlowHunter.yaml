@@ -1,0 +1,765 @@
+protocol: morpho-vault-v2
+component: VaultV2
+file: src/VaultV2.sol
+domain: vault
+hunter: FlowHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-01: CEI violation in exit() — deallocate before state update
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-01
+  tier: 1
+  type: property
+  title: CEI violation in exit() — deallocateInternal external call before deleteShares and _totalAssets update
+  description: >
+    exit() at L793-811 calls deallocateInternal() (external call to adapter at L602)
+    BEFORE deleteShares() at L807 and _totalAssets -= at L808. If the adapter
+    reenters vault during deallocate callback, shares are minted/burned at inflated
+    rate because totalSupply and _totalAssets haven't been reduced yet. No reentrancy
+    guard exists — only the adapter trust assumption.
+  attack_scenario: >
+    1. Malicious adapter on deallocate() calls back into vault.deposit().
+    2. deposit() → accrueInterest() returns early (firstTotalAssets set).
+    3. previewDeposit() uses current totalSupply (NOT yet reduced) and _totalAssets (NOT yet reduced).
+    4. Attacker gets shares at PRE-withdrawal rate, then exit completes burning original shares.
+    5. Net: extra shares minted at favorable rate, diluting other depositors.
+  impact: >
+    Fund theft via share dilution. Depends on whether curator-approved adapters can reenter.
+    Docs say they MUST NOT but it's not enforced on-chain.
+  impact_rating: High
+  likelihood: Low
+  severity: Medium
+  confidence: 40
+  solidity: |
+    uint256 internal ghost_exitReentrancyDepth;
+
+    function property_fl_01() public {
+      // After any exit operation, totalAssets decreased implies totalSupply decreased
+      uint256 supplyAfter = vault.totalSupply();
+      uint256 totalAssetsAfter = uint256(vault._totalAssets());
+      if (totalAssetsAfter < ghost_totalAssetsBeforeExit) {
+        t(supplyAfter < ghost_totalSupplyBeforeExit, "FL-01: totalAssets decreased but totalSupply did not");
+      }
+    }
+  affected_functions:
+    - exit
+    - withdraw
+    - redeem
+    - deallocateInternal
+  ghost_vars:
+    - 'uint256 internal ghost_totalSupplyBeforeExit'
+    - 'uint256 internal ghost_totalAssetsBeforeExit'
+    - 'uint256 internal ghost_exitReentrancyDepth'
+  validated: false
+  priority: high
+  notes: >
+    Adapter trust model says adapters must not reenter. No mutex/nonReentrant modifier.
+    firstTotalAssets only prevents double interest accrual, not reentrant deposit/withdraw.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-02: forceDeallocate double external call chain — stale state between calls
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-02
+  tier: 1
+  type: property
+  title: forceDeallocate executes deallocateInternal then withdraw with stale interest state
+  description: >
+    forceDeallocate() at L822-831 calls deallocateInternal() (external call #1 to adapter)
+    then withdraw() which calls exit() potentially triggering deallocateInternal() again
+    (external call #2 to liquidityAdapter). The first deallocateInternal does NOT call
+    accrueInterest() — interest is only accrued when withdraw() runs. Caps allocation
+    tracking is updated with pre-interest-accrual values.
+  attack_scenario: >
+    1. Significant interest has accrued since last interaction (realAssets >> _totalAssets).
+    2. Anyone calls forceDeallocate(adapter, data, amount, victim).
+    3. deallocateInternal runs with stale _totalAssets, updates caps[id].allocation.
+    4. withdraw() then calls accrueInterest(), updating _totalAssets to real value.
+    5. Caps allocation is now inconsistent — set against stale state.
+    6. Subsequent allocate() calls may bypass intended cap ratios.
+  impact: >
+    Cap enforcement inaccuracy after forceDeallocate during high interest periods.
+    Allocators could over-allocate to risky markets.
+  impact_rating: Medium
+  likelihood: Low
+  severity: Medium
+  confidence: 35
+  solidity: |
+    uint256 internal ghost_totalAssetsPreForceDeallocate;
+
+    function property_fl_02() public {
+      uint256 totalAssetsAfter = uint256(vault._totalAssets());
+      uint256 supplyAfter = vault.totalSupply();
+      if (ghost_totalAssetsPreForceDeallocate > 0) {
+        // After forceDeallocate, totalAssets should have decreased by penaltyAssets
+        lte(totalAssetsAfter, ghost_totalAssetsPreForceDeallocate, "FL-02: totalAssets increased after forceDeallocate");
+        // totalSupply must also have decreased (penalty shares burned)
+        t(supplyAfter <= ghost_totalSupplyBeforeExit, "FL-02: no shares burned in forceDeallocate");
+      }
+    }
+  affected_functions:
+    - forceDeallocate
+    - deallocateInternal
+    - withdraw
+    - exit
+  ghost_vars:
+    - 'uint256 internal ghost_totalAssetsPreForceDeallocate'
+  validated: false
+  priority: high
+  notes: >
+    Stale _totalAssets during first deallocateInternal is concerning but impact
+    limited because deallocateInternal uses adapter-returned change values, not
+    _totalAssets directly.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-03: allocateInternal accrues interest but deallocateInternal does not
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-03
+  tier: 1
+  type: property
+  title: Asymmetric accrueInterest between allocate and deallocate paths
+  description: >
+    allocateInternal() at L572 calls accrueInterest() before transferring assets.
+    deallocateInternal() does NOT call accrueInterest(). In forceDeallocate flow,
+    the first deallocateInternal at L826 executes with stale interest. The caps
+    allocation update uses pre-interest values. This asymmetry means cap enforcement
+    is based on different time snapshots depending on the operation direction.
+  attack_scenario: >
+    1. Time passes, adapters earn interest. _totalAssets is stale.
+    2. Attacker calls forceDeallocate(adapter, data, amount, self).
+    3. deallocateInternal: allocation -= change (against stale _totalAssets).
+    4. withdraw → accrueInterest → _totalAssets jumps up to real value.
+    5. Attacker then calls allocate with stale allocation values — relative cap
+       check uses firstTotalAssets (now updated) vs allocation (stale).
+    6. More allocation allowed than intended because allocation was reduced
+       against stale values but cap check uses fresh totalAssets.
+  impact: >
+    Cap bypass via allocation tracking inconsistency. Risk concentrated in
+    scenarios with large interest accrual between interactions.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 50
+  solidity: |
+    uint256 internal ghost_lastAccrueTimestamp;
+
+    function property_fl_03() public {
+      uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 totalAssets = uint256(vault._totalAssets());
+      uint256 sumAllocations = 0;
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        sumAllocations += IAdapter(vault.adapters(i)).realAssets();
+      }
+      uint256 realTotal = idle + sumAllocations;
+      uint256 deviation = realTotal > totalAssets
+        ? realTotal - totalAssets
+        : totalAssets - realTotal;
+      lte(deviation, totalAssets / 1000 + 1, "FL-03: allocation tracking deviates >0.1% from real assets");
+    }
+  affected_functions:
+    - allocateInternal
+    - deallocateInternal
+    - forceDeallocate
+  ghost_vars:
+    - 'uint256 internal ghost_lastAccrueTimestamp'
+  validated: false
+  priority: medium
+  notes: >
+    The caps system uses adapter-returned change values, not realAssets(). The
+    asymmetry creates drift potential. Needs fork testing with real adapters.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-04: Donation attack — direct transfer inflates balanceOf in accrueInterestView
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-04
+  tier: 1
+  type: property
+  title: Direct token donation inflates realAssets in accrueInterestView via balanceOf read
+  description: >
+    accrueInterestView() at L655 reads IERC20(asset).balanceOf(address(this)) to
+    compute realAssets. A direct transfer to the vault inflates this value. While
+    maxRate caps growth via min(realAssets, maxTotalAssets) at L660, the cap allows
+    _totalAssets * elapsed * maxRate / WAD of growth. With MAX_MAX_RATE = 200% APR
+    and long elapsed periods, substantial donations can be absorbed. An attacker
+    front-runs with deposit, then donation takes effect on next accrueInterest.
+  attack_scenario: >
+    1. Vault idle for 30 days, _totalAssets = 100e18, maxRate = MAX_MAX_RATE.
+    2. maxTotalAssets = 100e18 + 100e18 * 30days * MAX_MAX_RATE / WAD ≈ 116.4e18.
+    3. Attacker deposits 100e18, gets ~100e18 shares (50% of supply).
+    4. Attacker donates 50e18 directly via asset.transfer(vault, 50e18).
+    5. Next accrueInterest: realAssets = 250e18, newTotalAssets = min(250, 216.4) = 216.4e18.
+    6. Interest = 16.4e18 distributed to all shareholders including attacker.
+    7. Attacker extracts value from existing depositors proportional to their share.
+  impact: >
+    Share price manipulation via donation. maxRate mitigates but does not prevent
+    if vault is stale or maxRate is high. Known Solodit HIGH finding for VaultV2.
+  impact_rating: High
+  likelihood: Medium
+  severity: High
+  confidence: 65
+  solidity: |
+    uint256 internal ghost_totalAssetsBeforeDonation;
+
+    function property_fl_04() public {
+      uint256 currentTotal = uint256(vault._totalAssets());
+      uint256 elapsed = block.timestamp - vault.lastUpdate();
+      if (ghost_totalAssetsBeforeDonation > 0 && elapsed > 0) {
+        uint256 maxGrowth = (ghost_totalAssetsBeforeDonation * elapsed * vault.maxRate()) / 1e18;
+        uint256 maxAllowed = ghost_totalAssetsBeforeDonation + maxGrowth;
+        lte(currentTotal, maxAllowed + 1, "FL-04: totalAssets jumped beyond maxRate allows");
+      }
+    }
+  affected_functions:
+    - accrueInterest
+    - accrueInterestView
+    - deposit
+    - redeem
+  ghost_vars:
+    - 'uint256 internal ghost_totalAssetsBeforeDonation'
+  validated: false
+  priority: high
+  notes: >
+    Known Solodit HIGH: "Side effects of underlying directly donated to VaultV2
+    or adapters positions." maxRate is the mitigation but edge cases with stale
+    vaults remain exploitable.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-05: Share conservation — totalSupply must equal sum of all balanceOf
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-05
+  tier: 1
+  type: property
+  title: Share conservation — totalSupply must always equal sum of individual balanceOf entries
+  description: >
+    createShares() and deleteShares() update both balanceOf[account] and totalSupply.
+    transfer/transferFrom move between balances without changing totalSupply.
+    accrueInterest() mints fee shares via createShares(). If any path creates or
+    destroys shares without atomically updating both, totalSupply diverges from
+    the real sum of balances, breaking the exchange rate for everyone.
+  attack_scenario: >
+    1. Any code path where balanceOf is updated but totalSupply is not (or vice versa).
+    2. This breaks share-to-asset conversion for all users.
+    3. Specific concern: fee share minting in accrueInterest — if recipient address
+       changes between computation and execution (impossible in single tx but defensive check).
+  impact: >
+    Broken share accounting. If totalSupply != sum(balanceOf), share price wrong
+    for all users. Fundamental ERC20 invariant.
+  impact_rating: Critical
+  likelihood: Low
+  severity: Critical
+  confidence: 85
+  solidity: |
+    uint256 internal ghost_sumBalances;
+
+    function property_fl_05() public {
+      eq(vault.totalSupply(), ghost_sumBalances, "FL-05: totalSupply != sum of balanceOf");
+    }
+  affected_functions:
+    - createShares
+    - deleteShares
+    - transfer
+    - transferFrom
+    - enter
+    - exit
+    - accrueInterest
+  ghost_vars:
+    - 'uint256 internal ghost_sumBalances'
+  validated: false
+  priority: critical
+  notes: >
+    Fundamental ERC20 invariant. ghost_sumBalances tracked in handlers on every
+    transfer/mint/burn.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-06: Asset conservation — _totalAssets must not exceed real backing
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-06
+  tier: 1
+  type: property
+  title: Asset conservation — _totalAssets must never exceed real asset backing (idle + adapter positions)
+  description: >
+    _totalAssets is updated in accrueInterest() as min(realAssets, maxTotalAssets),
+    and directly by enter() (+= assets) and exit() (-= assets). If _totalAssets
+    exceeds the real backing (idle balance + sum of adapter realAssets()), the vault
+    is insolvent — shares are worth less than advertised. This can happen if an
+    adapter's underlying market suffers bad debt between accrueInterest calls.
+  attack_scenario: >
+    1. _totalAssets = 100e18, adapter reports realAssets = 100e18.
+    2. Underlying market suffers bad debt, adapter real value drops to 80e18.
+    3. No one calls accrueInterest. _totalAssets still 100e18.
+    4. User deposits 50e18 → _totalAssets = 150e18. Shares priced at 100e18 rate.
+    5. Next accrueInterest: realAssets = 130e18, newTotalAssets = min(130, maxAllowed).
+    6. 20e18 loss realized. Depositor got shares at inflated rate, diluting existing holders.
+  impact: >
+    Late loss realization allows new depositors to enter at inflated rates,
+    socializing losses to existing depositors. Core solvency invariant.
+  impact_rating: High
+  likelihood: Medium
+  severity: High
+  confidence: 70
+  solidity: |
+    uint256 internal ghost_realTotalBacking;
+
+    function property_fl_06() public {
+      uint256 totalAssets = uint256(vault._totalAssets());
+      uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 adapterAssets = 0;
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        adapterAssets += IAdapter(vault.adapters(i)).realAssets();
+      }
+      uint256 realBacking = idle + adapterAssets;
+      lte(totalAssets, realBacking + 1, "FL-06: _totalAssets exceeds real backing — vault insolvent");
+    }
+  affected_functions:
+    - accrueInterest
+    - accrueInterestView
+    - enter
+    - exit
+  ghost_vars:
+    - 'uint256 internal ghost_realTotalBacking'
+  validated: false
+  priority: high
+  notes: >
+    maxRate bounds growth speed but between accrueInterest calls, _totalAssets is stale.
+    Core solvency invariant that must always hold.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-07: No reentrancy guard — adapter callback window in both enter and exit
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-07
+  tier: 1
+  type: property
+  title: No reentrancy guard on vault — adapter callbacks create reentrant windows in enter/exit
+  description: >
+    The vault has no mutex or nonReentrant modifier. enter() calls allocateInternal()
+    which makes external call to adapter.allocate(). exit() calls deallocateInternal()
+    which makes external call to adapter.deallocate(). Both paths have state already
+    partially updated when the external call happens. firstTotalAssets transient var
+    prevents double interest accrual but does NOT prevent reentrant deposit/withdraw.
+  attack_scenario: >
+    1. Attacker calls withdraw(). exit() → deallocateInternal → adapter.deallocate().
+    2. Adapter reenters vault.deposit(Y, attacker).
+    3. deposit() runs: accrueInterest no-op, previewDeposit uses stale totalSupply/totalAssets,
+       enter() mints shares and updates _totalAssets.
+    4. Returns to exit(): deleteShares, _totalAssets -= original assets.
+    5. Rate = totalAssets/totalSupply. Both inflated proportionally, rate similar.
+    6. Small discrepancy from rounding/fees could be exploited at scale.
+  impact: >
+    Proportional inflation limits impact, but non-proportional distributions (fees,
+    donations, losses) create exploitable windows. Dust-level unless specific
+    conditions met.
+  impact_rating: Medium
+  likelihood: Low
+  severity: Medium
+  confidence: 45
+  solidity: |
+    uint256 internal ghost_enterExitDepth;
+
+    function property_fl_07() public {
+      lte(ghost_enterExitDepth, 1, "FL-07: reentrant call detected in vault");
+    }
+  affected_functions:
+    - enter
+    - exit
+    - deposit
+    - withdraw
+    - redeem
+    - allocateInternal
+    - deallocateInternal
+  ghost_vars:
+    - 'uint256 internal ghost_enterExitDepth'
+  validated: false
+  priority: high
+  notes: >
+    Adapter trust model explicitly says adapters must not reenter. Worth testing
+    if proportional inflation still leaks value through rounding at scale.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-08: exit() reads balanceOf before deallocate — stale idle leads to over-deallocate
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-08
+  tier: 1
+  type: property
+  title: exit() reads idle balance before deallocate — can request more than needed if balance changes
+  description: >
+    exit() at L797 reads idleAssets = IERC20(asset).balanceOf(address(this)).
+    If assets > idleAssets, it deallocates (assets - idleAssets) from liquidity
+    adapter. But if the vault's balance changes between the read and the final
+    safeTransfer at L809 (e.g., via adapter callback or concurrent interaction),
+    the vault may over-deallocate or the transfer at L809 may fail. Also, if the
+    liquidity adapter's underlying market is fully utilized, the deallocate reverts
+    and the entire withdrawal fails — DoS vector.
+  attack_scenario: >
+    1. Vault has 10e18 idle, 90e18 in liquidity adapter. Market fully utilized.
+    2. User withdraws 50e18. exit() sees idle=10, deficit=40.
+    3. deallocateInternal for 40e18 reverts — market has no available liquidity.
+    4. Entire withdrawal reverts. User funds locked.
+    5. forceDeallocate exists as escape but requires penalty payment.
+  impact: >
+    DoS on withdrawals when underlying markets illiquid. Users locked out until
+    liquidity returns. Partially mitigated by forceDeallocate.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 60
+  solidity: |
+    uint256 internal ghost_lastWithdrawAttempt;
+
+    function property_fl_08() public {
+      uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 totalAssets = uint256(vault._totalAssets());
+      // If vault has totalAssets > 0, idle portion should always be withdrawable
+      if (totalAssets > 0 && idle > 0) {
+        gte(idle, 1, "FL-08: idle assets should allow at least partial withdrawal");
+      }
+    }
+  affected_functions:
+    - exit
+    - withdraw
+    - redeem
+    - deallocateInternal
+  ghost_vars:
+    - 'uint256 internal ghost_lastWithdrawAttempt'
+  validated: false
+  priority: medium
+  notes: >
+    Known ERC4626 limitation with external lending. forceDeallocate is the escape.
+    Worth confirming DoS scenario with fork test.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-09: forceDeallocate with zero penalty — free allocation manipulation
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-09
+  tier: 1
+  type: property
+  title: forceDeallocate costs nothing if forceDeallocatePenalty[adapter] == 0 (default)
+  description: >
+    forceDeallocate() at L827 computes penaltyAssets = assets.mulDivUp(forceDeallocatePenalty[adapter], WAD).
+    Default forceDeallocatePenalty is 0 for all adapters. If curator never sets it,
+    anyone can forceDeallocate at zero cost, arbitrarily moving funds from adapters
+    back to idle. This griefs the vault's allocation strategy.
+  attack_scenario: >
+    1. Adapter X has forceDeallocatePenalty = 0 (never configured).
+    2. Attacker calls forceDeallocate(X, data, 1000e18, attacker).
+    3. penaltyAssets = 0, penaltyShares = 0. Zero cost.
+    4. 1000e18 pulled from adapter X to vault idle. Zero yield on idle.
+    5. Repeated griefing disrupts vault allocation strategy, reducing yield for all depositors.
+  impact: >
+    Free allocation griefing. Attacker disrupts investment strategy at zero cost.
+    Vault earns less yield, harming all depositors.
+  impact_rating: Medium
+  likelihood: High
+  severity: Medium
+  confidence: 80
+  solidity: |
+    uint256 internal ghost_penaltyPaid;
+
+    function property_fl_09() public {
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        address adapter = vault.adapters(i);
+        uint256 penalty = vault.forceDeallocatePenalty(adapter);
+        t(penalty > 0, "FL-09: adapter has zero forceDeallocatePenalty — free griefing possible");
+      }
+    }
+  affected_functions:
+    - forceDeallocate
+    - deallocateInternal
+  ghost_vars:
+    - 'uint256 internal ghost_penaltyPaid'
+  validated: false
+  priority: high
+  notes: >
+    Operational issue — curator should set penalty. But default of 0 is dangerous.
+    Could lead to MEV-driven allocation griefing.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-10: Fee share rounding to zero on small interest — fee theft via frequent accruals
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-10
+  tier: 2
+  type: property
+  title: Fee shares round to zero on small interest amounts — griefable by frequent accruals
+  description: >
+    accrueInterestView() at L675-678 computes fee shares using mulDivDown with
+    denominator (newTotalAssetsWithoutFees + 1). For small interest amounts, the
+    result rounds to 0 — fee recipient gets nothing. An attacker can trigger
+    accrueInterest() very frequently (every block) to ensure interest per call
+    is always tiny, stealing fees from the fee recipient via rounding.
+  attack_scenario: >
+    1. Vault has small total assets (1e6 USDC). performanceFee = 50%.
+    2. Interest per block is ~100 wei. performanceFeeAssets = 50 wei.
+    3. feeShares = 50 * (totalSupply + virtualShares) / (999950 + 1).
+    4. With small totalSupply, result rounds to 0.
+    5. Attacker calls accrueInterest every block — fees always round to 0.
+    6. Fee recipient gets nothing despite interest accruing.
+  impact: >
+    Fee recipient griefed out of expected fees. Low-decimal tokens (USDC) more
+    vulnerable. Economically viable only if gas < expected fee value.
+  impact_rating: Low
+  likelihood: Medium
+  severity: Low
+  confidence: 60
+  solidity: |
+    uint256 internal ghost_totalFeeSharesMinted;
+    uint256 internal ghost_totalInterestAccrued;
+
+    function property_fl_10() public {
+      // Over time, fee shares should be proportional to interest
+      if (ghost_totalInterestAccrued > 1e6) {
+        // At least some fee shares should have been minted
+        t(ghost_totalFeeSharesMinted > 0, "FL-10: interest accrued but zero fee shares minted");
+      }
+    }
+  affected_functions:
+    - accrueInterest
+    - accrueInterestView
+  ghost_vars:
+    - 'uint256 internal ghost_totalFeeSharesMinted'
+    - 'uint256 internal ghost_totalInterestAccrued'
+  validated: false
+  priority: low
+  notes: >
+    Docs say "Both fees are rounded down, so fee recipients could receive less than
+    expected." Acknowledged. The griefing angle via frequent small accruals may not
+    be documented explicitly.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-11: Management fee can exceed total assets on stale vaults — permanent DoS
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-11
+  tier: 1
+  type: property
+  title: Management fee overflow on stale vault — accrueInterest reverts permanently bricking vault
+  description: >
+    managementFeeAssets at L670 = (newTotalAssets * elapsed).mulDivDown(managementFee, WAD).
+    Docs warn "Interest should be accrued at least every 10 years." If uninteracted for
+    >10 years with MAX_MANAGEMENT_FEE (5% APR), managementFeeAssets can approach
+    newTotalAssets. At L674: newTotalAssetsWithoutFees = newTotalAssets - fees. If fees >
+    newTotalAssets, arithmetic underflow reverts in 0.8.x. Vault permanently bricked —
+    every interaction calls accrueInterest which always reverts.
+  attack_scenario: >
+    1. Vault with managementFee = MAX_MANAGEMENT_FEE, small balance.
+    2. No interaction for 11 years. elapsed = 11 * 365 days.
+    3. managementFeeAssets = newTotalAssets * 11y * 0.05/y = 0.55 * newTotalAssets.
+    4. Combined with performanceFee: total fees > newTotalAssets.
+    5. L674 underflows. Every function calling accrueInterest reverts.
+    6. All depositor funds locked forever.
+  impact: >
+    Permanent DoS and fund lock if vault uninteracted for extended period with
+    high fees. Documented liveness requirement but could trap unaware users.
+  impact_rating: High
+  likelihood: Low
+  severity: Medium
+  confidence: 65
+  solidity: |
+    function property_fl_11() public {
+      // accrueInterestView should never revert — if it does, vault is bricked
+      (uint256 newTotalAssets, uint256 perfShares, uint256 mgmtShares) = vault.accrueInterestView();
+      gte(newTotalAssets, 0, "FL-11: accrueInterestView should succeed");
+      uint256 totalFeeShares = perfShares + mgmtShares;
+      lte(totalFeeShares, vault.totalSupply() * 10, "FL-11: fee shares exceed 10x totalSupply");
+    }
+  affected_functions:
+    - accrueInterest
+    - accrueInterestView
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: >
+    Documented liveness requirement. Vault must be pinged at least every 10 years.
+    Worth confirming exact threshold and whether any keeper mechanism exists.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-12: Adapter allocation tracking diverges from real positions over time
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-12
+  tier: 1
+  type: property
+  title: Caps allocation tracking relies on adapter-reported change values — diverges from real positions
+  description: >
+    allocateInternal L579 and deallocateInternal L607 update caps[id].allocation
+    using (int256(allocation) + change) where change comes from the adapter. If
+    the adapter has entry/exit fees, rounding, or bugs, the reported change diverges
+    from actual position value. Over many cycles, allocation tracking drifts, making
+    caps ineffective. An over-reporting adapter allows more allocation than intended.
+  attack_scenario: >
+    1. Adapter with 0.1% entry fee. Vault allocates 100e18.
+    2. Adapter reports change = +100e18 but real position is 99.9e18.
+    3. caps[id].allocation = 100e18, real exposure = 99.9e18.
+    4. Over 1000 cycles: allocation says 100000e18 in/out but real position drifted.
+    5. Caps checks against inflated allocation values — may be too restrictive or loose.
+  impact: >
+    Cap enforcement becomes inaccurate. Could allow over-concentration in risky
+    markets or prevent allocation to safe markets.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 55
+  solidity: |
+    uint256 internal ghost_cumulativeAllocated;
+    uint256 internal ghost_cumulativeDeallocated;
+
+    function property_fl_12() public {
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        address adapter = vault.adapters(i);
+        uint256 realAssets = IAdapter(adapter).realAssets();
+        // Adapter realAssets should be positive and bounded
+        gte(realAssets + 1, 1, "FL-12: adapter realAssets sanity check");
+      }
+    }
+  affected_functions:
+    - allocateInternal
+    - deallocateInternal
+    - allocate
+    - deallocate
+  ghost_vars:
+    - 'uint256 internal ghost_cumulativeAllocated'
+    - 'uint256 internal ghost_cumulativeDeallocated'
+  validated: false
+  priority: medium
+  notes: >
+    Adapter spec says "sum of changes must be exactly the current estimated position."
+    Trust assumption. Testing with real adapters would reveal drift magnitude.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-13: Roundtrip deposit-withdraw should never profit the user
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-13
+  tier: 1
+  type: property
+  title: Atomic deposit-then-withdraw roundtrip must never yield profit for the depositor
+  description: >
+    A user depositing X assets and immediately withdrawing should get back <= X assets
+    (minus rounding in vault's favor). previewDeposit rounds shares DOWN, previewWithdraw
+    rounds shares UP — both favor the vault. But if the exchange rate changes between
+    the two operations (e.g., via fee share minting in accrueInterest, or via
+    allocateInternal side effects in enter()), the user could extract value.
+  attack_scenario: >
+    1. Attacker calls deposit(X) in same tx as redeem(all_shares).
+    2. Between deposit and redeem, accrueInterest only runs once (transient).
+    3. enter() calls allocateInternal which updates caps — could this change rate?
+    4. allocateInternal doesn't change _totalAssets or totalSupply directly.
+    5. BUT: adapter.allocate() returns (ids, change) — change is for cap tracking only.
+    6. If the adapter somehow returns assets to vault (unlikely), rate changes.
+  impact: >
+    If roundtrip is profitable, infinite extraction loop. Fundamental ERC4626 invariant.
+  impact_rating: Critical
+  likelihood: Low
+  severity: High
+  confidence: 75
+  solidity: |
+    uint256 internal ghost_userBalanceBefore;
+    uint256 internal ghost_userSharesBefore;
+
+    function property_fl_13() public {
+      // After deposit+redeem in same block, user should not have more assets than started
+      // Track via ghost: if deposit happened, then redeem happened, compare
+      uint256 userAssets = IERC20(vault.asset()).balanceOf(msg.sender);
+      if (ghost_userBalanceBefore > 0) {
+        lte(userAssets, ghost_userBalanceBefore, "FL-13: user profited from deposit-withdraw roundtrip");
+      }
+    }
+  affected_functions:
+    - deposit
+    - withdraw
+    - redeem
+    - enter
+    - exit
+  ghost_vars:
+    - 'uint256 internal ghost_userBalanceBefore'
+    - 'uint256 internal ghost_userSharesBefore'
+  validated: false
+  priority: critical
+  notes: >
+    Fundamental ERC4626 property. Rounding directions should protect vault.
+    Fuzz extensively with edge case amounts (0, 1, type(uint256).max).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL-14: forceDeallocate penalty burns shares from onBehalf via withdraw allowance
+# ═══════════════════════════════════════════════════════════════════════════
+- id: FL-14
+  tier: 1
+  type: property
+  title: forceDeallocate burns onBehalf shares via withdraw — approved spenders can grief
+  description: >
+    forceDeallocate(adapter, data, assets, onBehalf) at L828 calls
+    withdraw(penaltyAssets, address(this), onBehalf). exit() checks if msg.sender != onBehalf
+    and requires allowance. So a third party calling forceDeallocate with onBehalf=victim
+    needs victim's share allowance. Routers/bundlers commonly have max approval.
+    A malicious or compromised router can call forceDeallocate repeatedly to drain
+    victim's shares as penalty, with the assets going to the vault (address(this))
+    benefiting remaining depositors.
+  attack_scenario: >
+    1. User approves bundler contract for max shares (common pattern).
+    2. Malicious bundler calls forceDeallocate(adapter, data, maxAmount, user).
+    3. penaltyAssets = maxAmount * penalty / WAD. penalty = 2% max.
+    4. withdraw(penaltyAssets, vault, user) — burns user's shares, assets stay in vault.
+    5. User loses shares. Value socialized to remaining depositors.
+    6. Bundler repeats until user has no shares left.
+  impact: >
+    Approved spenders can drain victim's shares via penalty burns. Requires existing
+    max approval which is common with bundlers/routers. Value not stolen but
+    redistributed.
+  impact_rating: Medium
+  likelihood: Medium
+  severity: Medium
+  confidence: 70
+  solidity: |
+    uint256 internal ghost_sharesBurnedAsPenalty;
+    address internal ghost_lastPenaltyVictim;
+
+    function property_fl_14() public {
+      // forceDeallocate should only burn proportional penalty shares
+      // The penalty must be bounded by MAX_FORCE_DEALLOCATE_PENALTY (2%)
+      if (ghost_sharesBurnedAsPenalty > 0) {
+        gte(ghost_sharesBurnedAsPenalty, 0, "FL-14: penalty shares burned sanity");
+      }
+    }
+  affected_functions:
+    - forceDeallocate
+    - withdraw
+    - exit
+  ghost_vars:
+    - 'uint256 internal ghost_sharesBurnedAsPenalty'
+    - 'address internal ghost_lastPenaltyVictim'
+  validated: false
+  priority: high
+  notes: >
+    By design — forceDeallocate penalizes onBehalf. But third-party invocation
+    with existing allowance is a griefing vector. Check bundler/router patterns.
+
+false_positives:
+- hunter: FlowHunter
+  id: FL-FP-01
+  reason: >
+    Fee-on-transfer token support: VaultV2 uses SafeERC20Lib.safeTransfer and
+    safeTransferFrom. Docs at L115-116 EXPLICITLY state tokens with fees on
+    transfer are not supported. Documented design decision, not a bug.
+  investigated_at: '2026-03-25T00:00:00Z'
+
+- hunter: FlowHunter
+  id: FL-FP-02
+  reason: >
+    multicall reentrancy via delegatecall: delegatecall executes in vault's own
+    context — equivalent to calling functions in sequence. Transient firstTotalAssets
+    correctly prevents double interest accrual. Interest-once-per-tx is by design (L37).
+  investigated_at: '2026-03-25T00:00:00Z'
+
+- hunter: FlowHunter
+  id: FL-FP-03
+  reason: >
+    enter() ordering — createShares before allocateInternal: This is the SAFE ordering.
+    Shares and assets are recorded BEFORE external call to adapter. If adapter reenters,
+    exchange rate is already correct. allocateInternal is a "use of funds" step. If it
+    reverts, entire deposit reverts atomically.
+  investigated_at: '2026-03-25T00:00:00Z'
+
+- hunter: FlowHunter
+  id: FL-FP-04
+  reason: >
+    forceDeallocate double-deallocate from same adapter: MAX_FORCE_DEALLOCATE_PENALTY
+    = 0.02e18 (2%). penaltyAssets = assets * 2% = at most 2% of deallocated amount.
+    Since full deallocated amount enters idle, idle always covers penalty withdrawal.
+    Double-deallocate from same adapter impossible.
+  investigated_at: '2026-03-25T00:00:00Z'

@@ -1,0 +1,327 @@
+protocol: chainlink-pa-v2
+component: GPV2CompatibleAuction
+file: src/GPV2CompatibleAuction.sol
+domain: dex
+hunter: FlowHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: GPVCA-FL-01
+  tier: 1
+  type: property
+  description: "bid() callback durante s_entered=true NO puede re-entrar performUpkeep para terminar la subasta prematuramente y robar tokens mid-bid"
+  attack_scenario: >
+    Escenario: El asset auctioned es un token ERC777 o con hooks de transferencia.
+    1. Atacante llama bid(asset, amount, data) — asset se transfiere al atacante (línea 444)
+    2. El token ERC777 dispara tokensReceived en el contrato del atacante
+    3. En el callback, el atacante (si tiene AUCTION_WORKER_ROLE) llama performUpkeep
+       con endedAuctions=[asset] — performUpkeep NO chequea s_entered
+    4. performUpkeep llama _onAuctionEnd → intenta transferir el balance restante del asset
+       al feeAggregator + sweep todo el assetOut (LINK) al receiver
+    5. _onAuctionEnd borra s_auctionStarts[asset], la subasta ya no existe
+    6. Cuando vuelve al bid(), el safeTransferFrom del assetOut todavía ejecuta —
+       pero el assetOut ya fue sweepado por _onAuctionEnd
+    Impacto: DoS del bid (revert por falta de assetOut) o doble-gasto si el timing permite
+    que el atacante reciba el asset Y el assetOut se pierda en el sweep.
+    Requiere: atacante con AUCTION_WORKER_ROLE + token ERC777. Probabilidad baja pero
+    impacto alto. performUpkeep debería chequear s_entered.
+  impact: "DoS de bid() o pérdida de assetOut (LINK) acumulado si se re-entra performUpkeep"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: durante bid() (s_entered=true), performUpkeep no puede ejecutarse
+    // Test: llamar performUpkeep desde un callback de bid() — debe revertir
+    // Esto se testea mejor como unit test que como fuzzing invariant
+    bool entered_before_callback = s_entered;
+    // Simular callback: si s_entered es true y performUpkeep se puede llamar, invariante roto
+    t(entered_before_callback == false || !canCallPerformUpkeep, "GPVCA-FL-01: performUpkeep callable during bid reentrancy");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    Requiere que el atacante tenga AUCTION_WORKER_ROLE, lo cual es un rol privilegiado.
+    También requiere token ERC777 que probablemente no esté whitelisted.
+    La combinación hace que sea Low likelihood pero el code path existe.
+    performUpkeep no tiene reentrancy guard, lo cual es un gap de defensa.
+
+- id: GPVCA-FL-02
+  tier: 1
+  type: property
+  description: "La aprobación al vault relayer se calcula con balanceOf al START, pero bid() reduce el balance sin actualizar la aprobación — CowSwap settlement y bid() pueden operar en paralelo sobre los mismos tokens"
+  attack_scenario: >
+    1. Subasta empieza con 1000 USDC. _onAuctionStart aprueba vault relayer por 1000.
+    2. CowSwap solver envía un order por 1000 USDC → isValidSignature valida (balance=1000).
+    3. Antes de que CowSwap settle, un bidder llama bid(USDC, 500) → recibe 500 USDC.
+    4. Balance ahora = 500, pero approval sigue en 1000.
+    5. CowSwap settlement intenta transferFrom(auction, solver, 1000) → falla por balance insuficiente.
+    6. El CowSwap solver pierde gas y la oportunidad. El bidder pagó precio justo.
+    Esto es un griefing/liveness issue, no pérdida directa de fondos.
+    Pero revela que los dos paths (bid + CowSwap) NO están coordinados.
+  impact: "Griefing de CowSwap solvers — orders validadas pero no ejecutables"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Después de bid(), la aprobación al vault relayer debe ser >= balance actual del asset
+    uint256 balance = IERC20(asset).balanceOf(address(auction));
+    uint256 allowance = IERC20(asset).allowance(address(auction), gpV2VaultRelayer);
+    // Si hay subasta activa, la allowance debe reflejar el balance real
+    if (auctionActive) {
+        gte(allowance, balance, "GPVCA-FL-02: stale approval after bid — allowance < balance");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    La aprobación es >= balance por diseño (se aprueba al inicio con el balance total,
+    y bid() solo reduce balance sin tocar la aprobación). Así que allowance >= balance
+    siempre se cumple. El riesgo real es al revés: si llegan tokens DESPUÉS del start
+    (direct transfer), allowance < balance. Pero esto NO es un bug de seguridad — solo
+    un cap en lo que CowSwap puede tomar. Ajustado a Low.
+
+- id: GPVCA-FL-03
+  tier: 1
+  type: property
+  description: "isValidSignature es view — TOCTOU entre validación y settlement permite que orders validadas se vuelvan inválidas antes de ejecutar, causando DoS del solver"
+  attack_scenario: >
+    1. Solver S prepara order: vender 1000 USDC por 100 LINK a precio de subasta.
+    2. CowSwap settlement llama isValidSignature → pasa todas las checks.
+    3. Entre la validación y el settlement (misma tx en CowSwap batch), otro bidder
+       llama bid() y drena 800 USDC del contrato.
+    4. Settlement intenta transferFrom(auction, S, 1000 USDC) → falla por balance=200.
+    5. Toda la batch del solver puede fallar, causando gas waste.
+    NOTA: En CowSwap, isValidSignature y transferFrom ocurren en la MISMA tx
+    (settlement batch). Pero bid() de un tercer bidder podría front-run el batch.
+    La subasta es compatible con dos mecanismos de venta simultáneos sin coordinación.
+  impact: "Griefing — CowSwap solver batches fail, gas perdido, subasta no se completa"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: si isValidSignature retorna magic value para un sellAmount,
+    // entonces balanceOf(asset) >= sellAmount debe sostenerse hasta el settlement
+    // Esto no es testeable como invariant estático — es un TOCTOU por diseño
+    uint256 balanceAtValidation = IERC20(asset).balanceOf(address(auction));
+    // Después de cualquier bid(), verificar que orders pendientes siguen siendo válidas
+    uint256 balanceAfterBid = IERC20(asset).balanceOf(address(auction));
+    t(balanceAfterBid >= pendingOrderSellAmount, "GPVCA-FL-03: bid invalidated pending CowSwap order");
+  ghost_vars:
+  - uint256 internal ghost_pendingOrderSellAmount;
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    El protocolo tiene dos paths de venta concurrentes (bid + CowSwap) sin coordinación.
+    Esto es un design choice deliberado — CowSwap orders son idempotentes y el solver
+    asume riesgo de execution failure. Pero documenta un gap arquitectónico real.
+
+- id: GPVCA-FL-04
+  tier: 1
+  type: property
+  description: "Window entre super._onAuctionEnd y forceApprove(0) donde vault relayer puede pull tokens si feeAggregator=self (hasFeeAggregator=false)"
+  attack_scenario: >
+    Configuración: feeAggregator = address(auction) (self-aggregating mode).
+    1. Subasta de USDC activa, vault relayer aprobado para 1000 USDC.
+    2. Subasta termina, performUpkeep llama _onAuctionEnd(USDC, hasFeeAggregator=false).
+    3. GPV2CompatibleAuction._onAuctionEnd llama super._onAuctionEnd primero.
+    4. super._onAuctionEnd: hasFeeAggregator=false → NO transfiere USDC al feeAggregator.
+       Pero SÍ transfiere assetOut (LINK) al receiver (línea 393-396).
+    5. Durante el safeTransfer de LINK, si LINK tiene callback (no lo tiene pero hipotéticamente),
+       el vault relayer todavía tiene approval activa sobre los 1000 USDC.
+    6. CowSwap settlement en este punto podría pull los USDC antes de que la approval sea revocada.
+    7. Después de super, forceApprove(0) revoca la approval.
+    Impacto: Si el vault relayer puede actuar en esta window, extrae tokens que deberían quedarse.
+    LINK (ERC20 estándar) no tiene callbacks, así que esta window no es explotable en la práctica.
+  impact: "Teórico — tokens podrían ser extraídos por vault relayer entre end y revoke"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Después de _onAuctionEnd, la approval al vault relayer DEBE ser 0
+    uint256 allowanceAfter = IERC20(asset).allowance(address(auction), gpV2VaultRelayer);
+    eq(allowanceAfter, 0, "GPVCA-FL-04: approval not revoked after auction end");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    Ventana de explotación extremadamente estrecha. LINK es ERC20 estándar sin callbacks.
+    Solo sería relevante si se whitelist un token con transfer hooks como assetOut.
+    Probability de explotar esto en la práctica es cercana a cero.
+
+- id: GPVCA-FL-05
+  tier: 1
+  type: property
+  description: "bid() transfiere el asset al bidder ANTES de recibir el pago (assetOut) — flash-swap pattern. Si el assetOut safeTransferFrom falla, el bidder ya tiene los tokens"
+  attack_scenario: >
+    1. bid() línea 444: safeTransfer(msg.sender, amount) — bidder recibe asset.
+    2. bid() línea 448-449: si data.length > 0, callback al bidder.
+    3. bid() línea 453: safeTransferFrom(msg.sender, this, assetOutAmount) — pull assetOut.
+    Si paso 3 revierte, TODO revierte (incluido paso 1). Esto es correcto — la atomicidad
+    de la transacción protege. NO es un bug.
+    PERO: durante el callback (paso 2), el bidder tiene los assets y aún no ha pagado.
+    El bidder puede hacer arbitraje con esos tokens (flash swap). Esto es BY DESIGN.
+    El riesgo es si el bidder puede manipular el precio del oráculo durante el callback
+    para reducir el assetOutAmount que debe pagar.
+  impact: "Potencial manipulación de precio durante callback — bidder paga menos"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // El precio calculado en bid() debe ser el mismo antes y después del callback
+    // (assetOutAmount se calcula ANTES del callback, así que esto es safe)
+    // Verificar que assetOutAmount no se recalcula post-callback
+    uint256 assetOutAmountPre = _getAssetOutAmount(params, price, amount, elapsed, true);
+    // [callback ocurre aquí]
+    // assetOutAmount ya está fijado — inmutable post-cálculo
+    eq(assetOutAmount, assetOutAmountPre, "GPVCA-FL-05: assetOutAmount changed after callback");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    Analizando el código: assetOutAmount se calcula en línea 442 ANTES del transfer y callback.
+    El valor es local y no puede ser modificado por el callback. Esto es SAFE BY DESIGN.
+    El flash-swap pattern es intencional (IAuctionCallback). No es un bug.
+    DESCARTADO como finding pero documentado como false positive.
+
+- id: GPVCA-FL-06
+  tier: 1
+  type: property
+  description: "Dual sell path (bid + CowSwap) permite que el total vendido exceda el balance original de la subasta si ambos paths ejecutan concurrentemente"
+  attack_scenario: >
+    1. Subasta empieza con 1000 USDC. Approval a vault relayer = 1000.
+    2. Solver A prepara CowSwap order por 600 USDC (isValidSignature pasa, balance=1000).
+    3. Bidder B llama bid(USDC, 500) → recibe 500 USDC, paga LINK. Balance=500.
+    4. Solver A's settlement ejecuta → transferFrom(auction, solver, 600) → FALLA (balance=500).
+    Resultado: no hay doble-gasto porque el transferFrom falla. Pero:
+    5. ¿Qué pasa si Solver A ajusta a 500 USDC? Settlement pasa. Total vendido = 1000. OK.
+    6. ¿Qué pasa si hay partial fill? Order era por 600 pero se llena con 500. 500+500=1000. OK.
+    Conclusión: La protección es a nivel de ERC20 transferFrom (balance check).
+    NO hay accounting interno que trackee cuánto se ha vendido.
+  impact: "No hay doble-gasto real — ERC20 balance es el invariante. Pero falta accounting interno."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: total tokens vendidos (via bid + CowSwap) <= balance al inicio de subasta
+    // No hay ghost var nativo — necesitaríamos trackear deposits y withdrawals
+    uint256 currentBalance = IERC20(asset).balanceOf(address(auction));
+    gte(currentBalance, 0, "GPVCA-FL-06: balance cannot go negative — ERC20 enforces this");
+    // El verdadero invariante es: sum(bid_amounts) + sum(cowswap_amounts) <= initial_balance
+    lte(ghost_totalBidAmount + ghost_totalCowswapAmount, ghost_initialAuctionBalance, "GPVCA-FL-06: total sold exceeds initial balance");
+  ghost_vars:
+  - uint256 internal ghost_totalBidAmount;
+  - uint256 internal ghost_totalCowswapAmount;
+  - uint256 internal ghost_initialAuctionBalance;
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    ERC20 balance enforcement es la protección real. No hay bug aquí.
+    La falta de accounting interno es un design choice, no un vulnerability.
+    CowSwap partial fills manejan el caso naturalmente.
+
+- id: GPVCA-FL-07
+  tier: 2
+  type: property
+  description: "performUpkeep puede iniciar nuevas subastas Y terminar viejas en la misma tx — si un ended auction sweep assetOut y un nuevo auction esperaba ese assetOut, hay interferencia"
+  attack_scenario: >
+    1. performData contiene eligibleAssets=[tokenA] y endedAuctions=[tokenB].
+    2. performUpkeep primero procesa eligibleAssets: si tokenA == assetOut (LINK),
+       transfiere todo LINK balance al assetOutReceiver (línea 351).
+    3. Luego procesa endedAuctions: _onAuctionEnd(tokenB) intenta sweep assetOut (LINK)
+       al receiver (línea 393-396). Pero el LINK ya fue enviado en paso 2.
+    4. assetOutBalance = 0, nada se transfiere. LINK acumulado de bids de tokenB
+       ya fue "robado" por el sweep de tokenA como assetOut.
+    Impacto: LINK acumulado de una subasta se mezcla con LINK recibido directamente
+    como eligible asset. Interferencia entre los dos flows en la misma tx.
+  impact: "LINK de bids previos sweepado prematuramente si assetOut es también eligible"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Antes de endAuctions: si assetOut fue eligible, todo su balance ya fue enviado
+    // Los bids acumulados (assetOut) de ended auctions deben llegar al receiver
+    uint256 assetOutBalancePre = IERC20(assetOut).balanceOf(address(auction));
+    // [performUpkeep con eligible assetOut + ended auctions]
+    uint256 assetOutSentToReceiver = IERC20(assetOut).balanceOf(assetOutReceiver);
+    // Todo el assetOut acumulado debe llegar al receiver, no importa el path
+    gte(assetOutSentToReceiver, ghost_totalAssetOutFromBids, "GPVCA-FL-07: assetOut from bids not fully delivered");
+  ghost_vars:
+  - uint256 internal ghost_totalAssetOutFromBids;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    Si LINK es eligible (porque alguien depositó LINK en el feeAggregator) Y hay auctions
+    terminando, el order de operaciones en performUpkeep importa. Los eligible assets
+    se procesan PRIMERO (loop línea 324-357), luego ended auctions (loop línea 359-369).
+    Si LINK es eligible, se transfiere al receiver en línea 351. Luego _onAuctionEnd
+    intenta sweep LINK que ya no existe. El LINK de bids se pierde en la mezcla.
+    Esto es related a BA-SWEEP-01 pero es un vector diferente — no es sweep de concurrent
+    auctions sino interferencia eligible-vs-ended en la misma tx. INVESTIGAR MÁS.
+
+- id: GPVCA-FL-08
+  tier: 1
+  type: property
+  description: "isValidSignature valida order.receiver == address(this) pero el comment en línea 52-56 dice 'receiver must be the configured asset out receiver' — discrepancia code vs spec"
+  attack_scenario: >
+    Análisis de la discrepancia:
+    - Error message InvalidReceiver(receiver, assetOutReceiver) referencia assetOutReceiver.
+    - Pero el CHECK en línea 138 compara contra address(this), no s_assetOutReceiver.
+    - Esto es CORRECTO para el flujo: CowSwap envía LINK al auction contract, que luego
+      lo sweeps al receiver en _onAuctionEnd. Si receiver fuera s_assetOutReceiver directamente,
+      el contrato nunca tendría el LINK y no podría trackearlo.
+    - La discrepancia es SOLO en la documentación (error message), no en la lógica.
+    - Si alguien cambia la lógica basándose en la doc errónea, podría causar fund loss.
+  impact: "Discrepancia doc/code — no es exploitable pero puede causar bugs futuros"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // En isValidSignature, order.receiver DEBE ser address(this), no assetOutReceiver
+    // Verificar que la implementación matchea la intención
+    address expectedReceiver = address(auction);
+    eq(order.receiver, expectedReceiver, "GPVCA-FL-08: receiver must be auction contract");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    Error confirmado en la documentación del error message. El error InvalidReceiver
+    dice "assetOutReceiver" en su param name pero el check es contra address(this).
+    Esto es informational / QA — no es un bug de seguridad, es una inconsistencia doc.
+    Reportable como QA/Info en contest.
+
+false_positives:
+- hunter: FlowHunter
+  id: GPVCA-FP-01
+  reason: >
+    bid() flash-swap pattern (transfer asset before pulling payment) es by design.
+    assetOutAmount se calcula ANTES del callback y es un valor local inmutable.
+    El callback no puede manipular el precio porque el amount ya está fijado.
+    La atomicidad de la tx garantiza que si el pago falla, todo revierte.
+    Esto es el IAuctionCallback pattern documentado.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Flash-swap patterns donde el amount se calcula pre-callback son safe — no confundir con reentrancy real. El callback solo permite al bidder preparar los fondos, no manipular el precio."
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: GPVCA-FP-02
+  reason: >
+    Approval stale (vault relayer approval > balance after bid) no es un bug.
+    ERC20 transferFrom es limited by min(approval, balance). Si balance < approval,
+    el transfer just caps at balance. No hay double-spend posible.
+    La aprobación no se actualiza after bid() by design — sería gas-wasteful.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Stale ERC20 approvals (approval > balance) no son un bug — transferFrom caps at min(approval, balance). Solo sería bug si la approval se usara como accounting source, no como spending cap."
+    briefing_update_applied: false

@@ -1,0 +1,548 @@
+protocol: pancakeswap-infinity
+component: CLPoolManager
+file: src/pool-cl/CLPoolManager.sol
+domain: dex
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-23T00:00:00Z'
+compiler_version: "0.8.26"
+compiler_bugs_checked: true
+compiler_notes: >
+  Solidity 0.8.26 — no known compiler bugs affecting this contract.
+  abi.encode/decode safe, overflow checks built-in (unchecked blocks are explicit).
+  The unchecked block in swap() for protocolFeesAccrued is safe because it only adds a uint256.
+
+invariants:
+# ============================================================================
+# CLPM-TB-01: Hook Delta Accounting Conservation
+# ============================================================================
+# The core trust boundary: hooks return arbitrary BalanceDelta values that get
+# applied to the caller's and hook's accounting in the Vault. If hookDelta is
+# not properly constrained, a malicious hook can steal from callers.
+#
+# Key insight: callerDelta = delta - hookDelta, so a positive hookDelta REDUCES
+# what the caller receives (or increases what they pay). The hook's own debt in
+# the Vault is hookDelta. So the Vault enforces that hookDelta is settled by
+# the hook address. But the question is: can a hook return a hookDelta that
+# makes the CALLER pay more than the pool actually computed?
+#
+# In afterModifyLiquidity (line 172): delta + feeDelta is passed as the base,
+# then hookDelta is subtracted from it → callerDelta = (delta+feeDelta) - hookDelta.
+# The hook is charged hookDelta via vault.accountAppDeltaWithHookDelta.
+# This is zero-sum IF the vault settlement enforces it. The vault does enforce
+# that hook address must settle its own delta by end of lock(). So a hook that
+# returns a crazy hookDelta just creates a debt for itself.
+#
+# HOWEVER: if the hook IS the locker (hook calls vault.lock, then calls
+# poolManager operations from within lockCallback), the hook settles its own
+# deltas. A malicious hook could return a large negative hookDelta (meaning
+# "the pool owes me tokens"), which would credit the hook and debit the caller.
+# The caller then owes MORE to the vault. Since the caller is the hook itself
+# (msg.sender in the vault context), this is self-referential.
+#
+# After deep analysis: the vault tracks deltas per address. hookDelta is
+# accounted to address(key.hooks), callerDelta to msg.sender. If hook == locker
+# == msg.sender, both go to the same address and net out. NOT exploitable.
+#
+# BUT: if a ROUTER calls on behalf of a user, msg.sender is the router.
+# hookDelta goes to address(key.hooks). callerDelta goes to the router.
+# The router must settle callerDelta. The hook must settle hookDelta.
+# These are separate addresses → zero-sum is enforced by vault lock().
+#
+# VALIDATED: This is by-design. Zero-sum accounting in vault prevents theft.
+# Keeping as Tier 2 to verify in fuzz that the invariant actually holds.
+- id: CLPM-TB-01
+  tier: 2
+  type: property
+  description: "After swap/modifyLiquidity/donate, the sum of callerDelta + hookDelta must equal the pool's computed delta. No tokens can be created or destroyed by hook return values."
+  attack_scenario: "A malicious hook returns a large negative hookDelta (pool owes hook), inflating its credit. If vault accounting doesn't enforce settlement, hook drains vault."
+  impact: "Total vault drain — hook extracts tokens without depositing"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After each swap call, verify:
+    // vault.currencyDelta(settler, currency0) + vault.currencyDelta(hookAddr, currency0) == expected pool delta0
+    // This must be checked across the entire lock() lifecycle
+    int256 settlerDelta0 = vault.currencyDelta(settler, key.currency0);
+    int256 settlerDelta1 = vault.currencyDelta(settler, key.currency1);
+    int256 hookDelta0 = vault.currencyDelta(address(key.hooks), key.currency0);
+    int256 hookDelta1 = vault.currencyDelta(address(key.hooks), key.currency1);
+    // The vault must revert on lock() exit if any of these are nonzero
+    // So after lock() completes: all deltas must be zero
+    eq(settlerDelta0 + hookDelta0, 0, "CLPM-TB-01: currency0 delta not zero-sum after lock");
+    eq(settlerDelta1 + hookDelta1, 0, "CLPM-TB-01: currency1 delta not zero-sum after lock");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "By-design the vault lock() reverts if unsettled deltas remain. But worth fuzzing to confirm no edge case allows partial settlement."
+
+# ============================================================================
+# CLPM-TB-02: Hook beforeSwap Can Modify amountToSwap Without Bound
+# ============================================================================
+# In CLHooks.beforeSwap (line 150-159), if HOOKS_BEFORE_SWAP_RETURNS_DELTA_OFFSET
+# is set, the hook returns a BeforeSwapDelta with a specifiedDelta.
+# amountToSwap += hookDeltaSpecified
+#
+# The ONLY check is: if the sign flips (exact input becomes exact output or
+# vice versa), revert HookDeltaExceedsSwapAmount.
+#
+# But a hook can return hookDeltaSpecified that REDUCES amountToSwap to near
+# zero (e.g., user wants to swap -1000 tokens, hook returns +999, so only
+# -1 token actually swaps). The hook then "takes" 999 tokens via its hookDelta.
+#
+# This is actually the intended design for hooks that implement custom routing,
+# TWAMM, limit orders, etc. The key question: does the user lose funds?
+# The user's callerDelta accounts for delta (from the tiny swap) MINUS hookDelta.
+# The hook's delta is tracked separately. So the user pays based on callerDelta.
+#
+# POTENTIAL ISSUE: if hookDeltaSpecified reduces amountToSwap but the
+# hookDeltaUnspecified is not proportionally adjusted, the user could get
+# less output than expected for their input. The hook essentially takes the
+# user's specified tokens and gives nothing back on the unspecified side.
+#
+# This IS a trust boundary issue: users interacting with pools that have
+# beforeSwapReturnsDelta hooks are TRUSTING that hook to handle their tokens
+# fairly. A malicious hook can absorb the user's input without providing output.
+- id: CLPM-TB-02
+  tier: 1
+  type: property
+  description: "A hook with beforeSwapReturnsDelta can reduce amountToSwap to near-zero, absorbing user's specified tokens via hookDelta without providing proportional unspecified output."
+  attack_scenario: "1) Attacker deploys malicious hook with beforeSwapReturnsDelta. 2) Hook returns hookDeltaSpecified = amountSpecified - 1 (reduces swap to 1 wei). 3) Hook does NOT return any unspecified delta. 4) User's callerDelta: pays full input, gets 1 wei of output from pool + 0 from hook. 5) Hook profits: receives the specified tokens, pays nothing."
+  impact: "Users lose nearly all swap input when interacting with malicious hook pools"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For a swap with beforeSwapReturnsDelta, verify the user is not worse off
+    // than a no-hook swap would produce
+    // ghost_preSwapBalance0 and ghost_preSwapBalance1 captured before swap
+    int256 callerDelta0 = delta.amount0();
+    int256 callerDelta1 = delta.amount1();
+    // In an exact input swap (amountSpecified < 0, zeroForOne=true):
+    // callerDelta0 should be negative (user pays), callerDelta1 positive (user receives)
+    // If hookDeltaSpecified absorbed most of the input, callerDelta1 will be tiny
+    // This is "by design" for trusted hooks but a trap for users
+    // Invariant: if hook absorbs >50% of specified, it must provide >50% of unspecified
+    // (This invariant is exploratory — may be by-design)
+    if (hookDeltaSpecified > amountToSwap / 2) {
+        gt(hookDeltaUnspecified, 0, "CLPM-TB-02: hook absorbed input but gave no output");
+    }
+  ghost_vars:
+    - "int256 internal ghost_preSwapBalance0;"
+    - "int256 internal ghost_preSwapBalance1;"
+  validated: false
+  priority: high
+  confidence: 55
+  notes: "This may be by-design — hooks like TWAMM legitimately absorb swap amounts. The real risk is to users who don't realize a pool has this hook. Frontend/router responsibility to warn. But if hook is upgradeable, it could turn malicious after deployment."
+
+# ============================================================================
+# CLPM-TB-03: Extsload Exposes ALL Private Storage — Including pools Mapping
+# ============================================================================
+# CLPoolManager inherits Extsload, which allows ANYONE to read ANY storage slot.
+# The `pools` mapping is `private` but Extsload bypasses Solidity visibility.
+#
+# What can be read:
+# - Pool state: sqrtPriceX96, tick, liquidity, protocolFee, lpFee
+# - Position data: liquidity per user/tick range
+# - Tick data: all initialized ticks, bitmap
+# - Fee growth globals and per-position
+# - poolIdToPoolKey: full pool key including hook address
+#
+# Security implications:
+# 1) Privacy: All position data is public (but this is blockchain, so expected)
+# 2) MEV: Precise pool state allows optimal sandwich/frontrun calculations
+# 3) No real vulnerability — state is already readable via events/getters
+#
+# HOWEVER: Extsload has no access control. A malicious contract could use it
+# to read storage of CLPoolManager from within a hook callback, gaining info
+# about other pools during execution. This could enable cross-pool MEV within
+# a single transaction.
+- id: CLPM-TB-03
+  tier: 2
+  type: property
+  description: "Extsload exposes all private storage slots without access control, including the pools mapping, positions, and fee data. Any external contract can compute storage slots and read them."
+  attack_scenario: "1) Attacker's hook contract reads CLPoolManager storage via extsload during beforeSwap callback. 2) Reads exact state of another pool (sqrtPriceX96, liquidity). 3) Uses this to calculate optimal cross-pool arbitrage within the same lock() transaction. 4) Executes multi-pool sandwich attack with perfect information."
+  impact: "Enhanced MEV extraction via cross-pool information leakage during hook execution"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that extsload can read pool state
+    bytes32 slot = keccak256(abi.encode(poolId, uint256(0))); // pools mapping slot
+    bytes32 data = CLPoolManager(address(clPoolManager)).extsload(slot);
+    // If data != 0, storage is readable (expected behavior but risk for MEV)
+    // This is an informational invariant — extsload is intentional
+    t(true, "CLPM-TB-03: extsload is accessible (informational)");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 40
+  notes: "Extsload is intentional (EIP-2330 pattern). The MEV risk is real but considered acceptable by the protocol. Low confidence as a finding because it is by design. Including for completeness."
+
+# ============================================================================
+# CLPM-TB-04: Hook Validation Only at Initialize — Not Enforced at Runtime
+# ============================================================================
+# In initialize(), two validations happen:
+# 1) Hooks.validateHookConfig(key) — checks that the hook's getHooksRegistrationBitmap()
+#    matches the bitmap in key.parameters
+# 2) CLHooks.validatePermissionsConflict(key) — checks that returnsDelta flags
+#    require the corresponding hook call flag
+#
+# These checks happen ONLY at pool initialization. At runtime (swap, modifyLiquidity,
+# donate), the code trusts key.parameters from poolIdToPoolKey[id].
+#
+# CRITICAL QUESTION: Can a hook's getHooksRegistrationBitmap() change after init?
+# If the hook is an upgradeable proxy, the implementation could change, making
+# the bitmap return different values. But this doesn't matter because the
+# STORED key.parameters in poolIdToPoolKey is what's used at runtime.
+#
+# HOWEVER: The PoolKey is stored in poolIdToPoolKey at init, but callers of
+# swap/modifyLiquidity pass PoolKey as a MEMORY parameter. The code uses
+# key.toId() to look up the pool state, but uses the CALLER-PROVIDED key
+# for hook calls! If the caller provides a PoolKey with different parameters
+# (different hook flags), it could enable/disable hooks.
+#
+# Wait — PoolId is computed from the full PoolKey (hash of all fields including
+# parameters and hooks). So a different key.parameters would produce a different
+# PoolId, which would point to an uninitialized pool → revert at checkPoolInitialized.
+#
+# VALIDATED: The PoolId includes all PoolKey fields, so you can't substitute
+# a different key.parameters for the same pool. Safe by design.
+- id: CLPM-TB-04
+  tier: 2
+  type: property
+  description: "Hook permissions are validated only at initialize() via getHooksRegistrationBitmap(). If hook is a proxy that changes its bitmap post-init, the stored pool key still controls which hooks fire at runtime."
+  attack_scenario: "1) Hook is upgradeable proxy. 2) At init, bitmap matches. 3) Post-init, hook upgrades to add returnsDelta capability. 4) Attacker creates new pool with same tokens but new parameters matching upgraded bitmap. 5) Original pool is unaffected (parameters locked in PoolId). New pool works as expected. No exploit."
+  impact: "None — PoolId includes full key, preventing parameter substitution"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that a swap with a modified PoolKey reverts
+    PoolKey memory fakeKey = key;
+    fakeKey.parameters = bytes32(uint256(key.parameters) | (1 << HOOKS_BEFORE_SWAP_RETURNS_DELTA_OFFSET));
+    PoolId fakeId = fakeKey.toId();
+    // fakeId != original id, so pool lookup fails
+    t(PoolId.unwrap(fakeId) != PoolId.unwrap(key.toId()), "CLPM-TB-04: modified key produces different PoolId");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: "Confirmed safe. PoolId is deterministic hash of entire PoolKey. Cannot substitute parameters."
+
+# ============================================================================
+# CLPM-TB-05: Hook Self-Call Bypass via shouldCall Guard
+# ============================================================================
+# Hooks.shouldCall (line 71-73): returns true only if:
+# 1) The offset is enabled in parameters, AND
+# 2) address(hook) != msg.sender
+#
+# This means: if the HOOK ITSELF calls CLPoolManager.swap(), the hook
+# callbacks are SKIPPED. This prevents infinite recursion.
+#
+# TRUST BOUNDARY ISSUE: A hook can call CLPoolManager.swap() or modifyLiquidity()
+# from within its own callback (e.g., during beforeSwap, the hook calls
+# poolManager.swap() on the same pool). The second swap would skip all hook
+# callbacks because msg.sender == hook.
+#
+# This could be exploited if the hook is designed to enforce invariants via
+# its callbacks. A re-entrant call from the hook itself would bypass those
+# invariants.
+#
+# In practice: the hook is calling swap ON ITSELF (its own pool), skipping
+# its own hooks. This is intentional — it lets hooks do internal swaps without
+# recursion. But it means the hook's beforeSwap price manipulation checks
+# (if any) don't apply to its own internal swaps.
+- id: CLPM-TB-05
+  tier: 1
+  type: property
+  description: "When a hook calls CLPoolManager directly (msg.sender == hook), all hook callbacks are skipped via the shouldCall guard. A malicious or buggy hook can perform unchecked swaps/liquidity operations on its own pool."
+  attack_scenario: "1) Hook has beforeSwap that enforces a max price impact of 5%. 2) During afterSwap callback, hook calls poolManager.swap() on the same pool. 3) shouldCall returns false (msg.sender == hook), so beforeSwap is NOT called. 4) The internal swap can have unlimited price impact. 5) Hook manipulates price, then lets the original swap complete at a manipulated price. 6) Users in the pool suffer from the price manipulation."
+  impact: "Hook can bypass its own safety checks when re-entering the pool manager, enabling price manipulation within the hook's own pool"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track whether hook callbacks fire when hook is msg.sender
+    // In the test harness, have the hook call poolManager.swap() from within beforeSwap
+    // Verify that the nested swap does NOT trigger any hook callbacks
+    // ghost_hookCallCount tracks how many times beforeSwap was called
+    uint256 countBefore = ghost_hookCallCount;
+    // After hook's internal swap:
+    eq(ghost_hookCallCount, countBefore, "CLPM-TB-05: hook callbacks were skipped for hook-initiated swap");
+    // This confirms the bypass exists — then test if it can cause price manipulation
+  ghost_vars:
+    - "uint256 internal ghost_hookCallCount;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: "The shouldCall bypass is by-design to prevent recursion. The risk is that users trust a hook's safety checks but those checks don't apply to the hook's own operations. This is a pool-specific risk — only affects pools with that hook. Worth investigating if any deployed hooks rely on their own callbacks for safety."
+
+# ============================================================================
+# CLPM-TB-06: Cross-App Trust — CL and BIN Pool Managers Share Vault
+# ============================================================================
+# Both CLPoolManager and BinPoolManager are registered apps in the same Vault.
+# They share:
+# - The same Vault contract (settlement, token custody)
+# - The same lock() mechanism (only one locker at a time)
+# - The same reservesOfApp tracking (but separated by app address)
+#
+# Key trust assumption: CLPoolManager trusts that the Vault correctly isolates
+# its reserves from BinPoolManager's reserves. This is enforced by
+# reservesOfApp[msg.sender][currency] — each app has its own reserve bucket.
+#
+# POTENTIAL ISSUE: During lock(), a callback can interact with BOTH pool
+# managers in the same transaction. The deltas are tracked per settler address,
+# not per pool manager. So a single lock() callback could:
+# 1) Swap on CLPoolManager (creates delta for settler)
+# 2) Swap on BinPoolManager (creates delta for settler)
+# 3) Settle ONCE in the vault
+#
+# The settlement is currency-level, not pool-level. So positive delta from
+# CLPool can offset negative delta from BinPool. This is INTENTIONAL — it
+# enables cross-pool routing efficiency.
+#
+# But it means: if CLPoolManager has a bug that miscalculates delta, the
+# settler can make up the difference via BinPoolManager (or vice versa).
+# The vault won't catch the bug because total deltas still sum to zero.
+- id: CLPM-TB-06
+  tier: 2
+  type: property
+  description: "CLPoolManager and BinPoolManager share the same Vault. A bug in one app's delta calculation can be masked by the other app's correct calculation, as settlement is per-currency not per-app."
+  attack_scenario: "1) CLPoolManager has a rounding bug that gives the user 1 wei extra of token0 per swap. 2) User does 1M swaps via CLPool, accumulating 1M wei of free token0. 3) User offsets by providing 1M wei of token0 via BinPool deposit. 4) Vault settles both — total delta is zero. 5) CLPoolManager's reservesOfApp is drained by 1M wei. 6) Eventually CLPool becomes insolvent (reserves < obligations)."
+  impact: "Cross-app reserve drainage via delta calculation bugs masked by vault-level settlement"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track CLPoolManager reserves independently
+    uint256 clReserve0_before = vault.reservesOfApp(address(clPoolManager), currency0);
+    uint256 clReserve1_before = vault.reservesOfApp(address(clPoolManager), currency1);
+    // After a swap:
+    uint256 clReserve0_after = vault.reservesOfApp(address(clPoolManager), currency0);
+    uint256 clReserve1_after = vault.reservesOfApp(address(clPoolManager), currency1);
+    // CLPool reserves should NEVER go negative (underflow would revert)
+    // But they should also track consistently with pool state
+    // This invariant monitors for slow drainage
+    gte(clReserve0_after + clReserve1_after, ghost_minReserveSum, "CLPM-TB-06: CLPool reserves draining below minimum");
+  ghost_vars:
+    - "uint256 internal ghost_minReserveSum;"
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "This is more of a systemic risk than a specific bug. The vault architecture intentionally allows cross-app settlement for efficiency. The risk is that it also masks per-app accounting bugs. Would need to monitor reservesOfApp per pool manager over many operations."
+
+# ============================================================================
+# CLPM-TB-07: Fee-on-Transfer / Rebasing Tokens in Pools
+# ============================================================================
+# CLPoolManager does NOT handle actual token transfers — the Vault does.
+# CLPoolManager only computes deltas (BalanceDelta) and reports them to the Vault.
+# The Vault uses sync/settle pattern: sync() snapshots balance, settle() measures
+# the difference.
+#
+# For fee-on-transfer tokens:
+# - User transfers 100 FOT to vault (vault receives 98 after fee)
+# - settle() sees paid = balanceNow - reservesBefore = 98
+# - User gets credit for 98, not 100
+# - This is CORRECT — the sync/settle pattern handles FOT tokens properly
+#
+# For rebasing tokens (e.g., stETH):
+# - Between sync() and settle(), the vault balance could change due to rebase
+# - If positive rebase: paid = balanceNow - reservesBefore includes rebase profit
+# - Settler gets credited for the rebase amount they didn't deposit
+# - This is a FREE MONEY vector for rebasing tokens
+#
+# HOWEVER: rebase between sync and settle within the same tx is unlikely
+# (rebase happens at specific times, not per-block for most tokens).
+# The real risk: rebase between lock() start and settle(). If stETH rebases
+# mid-transaction... this is extremely unlikely in a single tx.
+#
+# Cross-block risk: if sync() is called in one tx and settle() in another...
+# but lock() requires both in the same callback, so this can't happen.
+- id: CLPM-TB-07
+  tier: 2
+  type: property
+  description: "Rebasing tokens (stETH, AMPL) can cause sync/settle accounting mismatch if a rebase occurs between sync() and settle() within the same lock() callback."
+  attack_scenario: "1) Pool uses stETH as token0. 2) Attacker calls vault.lock(). 3) In lockCallback: sync(stETH), then trigger a stETH rebase (if possible), then settle(). 4) settle() credits attacker with rebase amount on top of their deposit. 5) Attacker profits from free stETH rebase credit."
+  impact: "Free token credit from rebase occurring between sync and settle"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For rebasing tokens, verify that settle amount equals actual transfer
+    uint256 balanceBefore = currency.balanceOfSelf();
+    vault.sync(currency);
+    // Transfer happens here
+    vault.settle();
+    uint256 balanceAfter = currency.balanceOfSelf();
+    uint256 actualReceived = balanceAfter - balanceBefore;
+    // With rebasing tokens, actualReceived might differ from what was credited
+    // This invariant checks the vault's accounting matches reality
+    eq(vault.reservesOfApp(address(clPoolManager), currency), ghost_expectedReserve, "CLPM-TB-07: reserve mismatch with rebasing token");
+  ghost_vars:
+    - "uint256 internal ghost_expectedReserve;"
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: "Intra-transaction rebase is extremely unlikely for most tokens. stETH rebases once per day at a specific time. AMPL rebases once per day. Risk is theoretical but worth documenting. The bigger risk is simply that protocols shouldn't use rebasing tokens in these pools."
+
+# ============================================================================
+# CLPM-TB-08: donate() Does Not Settle Through Hook Delta Path
+# ============================================================================
+# Unlike swap() and modifyLiquidity(), donate() calls:
+#   vault.accountAppBalanceDelta(key.currency0, key.currency1, delta, msg.sender)
+# Instead of:
+#   vault.accountAppDeltaWithHookDelta(key, delta, hookDelta)
+#
+# This means donate() does NOT support hook return deltas. The afterDonate
+# hook is called but its return value is ignored (it returns bytes4 only,
+# not BalanceDelta).
+#
+# CONSISTENCY ISSUE: If a hook expects to receive a delta from donate()
+# (e.g., taking a cut of donations), it cannot. This is by-design but creates
+# an asymmetry: hooks can take a cut of swaps and liquidity operations but
+# NOT donations.
+#
+# This means: if a hook is designed to take fees on ALL pool operations,
+# donations bypass the hook fee mechanism. An attacker could use donate()
+# to add liquidity to a pool's fee growth without paying hook fees.
+- id: CLPM-TB-08
+  tier: 2
+  type: property
+  description: "donate() settles directly via vault.accountAppBalanceDelta without hook delta support, unlike swap() and modifyLiquidity() which use accountAppDeltaWithHookDelta. Hooks cannot take a cut of donations."
+  attack_scenario: "1) Hook charges a 1% fee on all pool operations via afterSwap/afterModifyLiquidity return delta. 2) User donates to pool instead of swapping — donation goes directly to LPs without hook fee. 3) Hook's fee model is bypassed for donation operations. 4) If the hook relies on fee revenue for security (e.g., insurance fund), donations reduce the hook's income while still benefiting LPs."
+  impact: "Hook fee bypass via donate() — hooks cannot capture donation revenue"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that donate does not produce any hookDelta
+    // In the test, call donate on a pool with returnsDelta hooks
+    // Verify hook's vault delta is unchanged after donate
+    int256 hookDelta0Before = vault.currencyDelta(address(key.hooks), key.currency0);
+    // ... donate() ...
+    int256 hookDelta0After = vault.currencyDelta(address(key.hooks), key.currency0);
+    eq(hookDelta0Before, hookDelta0After, "CLPM-TB-08: donate should not produce hook delta");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 85
+  notes: "This is by-design — donate interface returns (bytes4) only, no BalanceDelta. But creates an asymmetry in the hook fee model. Low severity because donate() is a specialized function and hooks should be aware of this limitation."
+
+# ============================================================================
+# CLPM-TB-09: updateDynamicLPFee Caller Check — Only hooks Address
+# ============================================================================
+# updateDynamicLPFee (line 270-277) checks:
+#   msg.sender != address(key.hooks) → revert UnauthorizedDynamicLPFeeUpdate
+#
+# The fee is validated: newDynamicLPFee.validate(ONE_HUNDRED_PERCENT_FEE)
+# So the hook can set fee up to 100% but not above.
+#
+# TRUST ISSUE: The hook can set LP fee to 100% at any time (even between
+# user's approval and execution). This is a known MEV vector:
+# 1) User submits swap tx to mempool
+# 2) Hook front-runs: sets LP fee to 100%
+# 3) User's swap executes: pays 100% fee, gets 0 output
+# 4) Hook back-runs: sets LP fee back to normal
+#
+# The ONLY protection is: key.fee must have isDynamicLPFee flag set at init.
+# So users can see from the pool key that this pool has dynamic fees.
+# But users interacting via routers may not check this.
+- id: CLPM-TB-09
+  tier: 1
+  type: property
+  description: "A hook can call updateDynamicLPFee to set LP fee to 100% at any time, causing all swap output to go to LPs and zero to the swapper. Only dynamic fee pools are affected."
+  attack_scenario: "1) Pool has dynamic LP fee enabled. 2) User submits swap via mempool. 3) Hook (or hook owner) sees pending swap, calls updateDynamicLPFee(100%). 4) User's swap executes with 100% fee — receives 0 output tokens. 5) Hook resets fee to normal. 6) LP (possibly the hook owner) collects the entire swap input as fees."
+  impact: "Complete loss of swap output for users — 100% of input goes to LP fees"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any swap, verify that the effective fee was not 100%
+    // delta.amount0() and delta.amount1() should both not be the same sign
+    // (user pays one token, receives the other)
+    int128 amount0 = delta.amount0();
+    int128 amount1 = delta.amount1();
+    // In a valid swap, one is positive and one is negative
+    // If fee is 100%, the output side would be 0 or near-0
+    if (amount0 < 0) {
+        // User paid token0, should receive token1
+        gt(amount1, int128(0), "CLPM-TB-09: swap output is zero — possible 100% fee attack");
+    } else {
+        gt(amount0, int128(0), "CLPM-TB-09: swap output is zero — possible 100% fee attack");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "This is a known pattern in Uniswap v4 as well. Dynamic fee pools are inherently trusted — users should verify the hook before swapping. But routers/aggregators may not check, leading to user losses. The mitigation is slippage protection (sqrtPriceLimitX96), but if the user doesn't set it tightly, they're vulnerable."
+
+# ============================================================================
+# CLPM-TB-10: protocolFeesAccrued Unchecked Overflow
+# ============================================================================
+# In swap() line 203-206:
+#   unchecked {
+#       if (state.feeAmountToProtocol > 0) {
+#           protocolFeesAccrued[...] += state.feeAmountToProtocol;
+#       }
+#   }
+#
+# This uses unchecked addition. If protocolFeesAccrued overflows uint256,
+# it wraps to zero. After overflow, collectProtocolFees could extract
+# more than actually accrued (if the mapping value wraps to a small number
+# and then new fees accumulate past it).
+#
+# HOWEVER: uint256 max is 2^256 ≈ 1.15e77. Even at $1T/day in fees for
+# 1 billion years, you wouldn't overflow. This is practically impossible.
+- id: CLPM-TB-10
+  tier: 3
+  type: property
+  description: "protocolFeesAccrued uses unchecked addition in swap(). Theoretical overflow would wrap the fee counter, but uint256 overflow is practically impossible."
+  attack_scenario: "Attacker performs 2^256 / feeAmount swaps to overflow protocolFeesAccrued. After overflow, protocol can collect fees that wrap around. Practically impossible — would cost more gas than exists."
+  impact: "None — uint256 overflow is impossible in practice"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify protocolFeesAccrued never decreases (monotonically increasing)
+    uint256 feesBefore = clPoolManager.protocolFeesAccrued(currency);
+    // ... swap ...
+    uint256 feesAfter = clPoolManager.protocolFeesAccrued(currency);
+    gte(feesAfter, feesBefore, "CLPM-TB-10: protocolFeesAccrued decreased");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: "Not a real vulnerability. The unchecked block is a gas optimization. Including for completeness as it's a trust boundary (unchecked arithmetic) but the risk is zero."
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-01
+  reason: "PoolKey substitution attack — initially suspected that a caller could pass a modified PoolKey to swap() with different hook parameters. Investigation showed PoolId is a hash of the FULL PoolKey, so any parameter change produces a different PoolId pointing to an uninitialized pool (reverts)."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "PancakeSwap v4 / Uniswap v4 PoolId includes full PoolKey hash — cannot substitute parameters for same pool"
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-02
+  reason: "Extsload private storage exposure — initially flagged as a trust boundary violation. Investigation showed this is an intentional EIP-2330 pattern adopted by Uniswap v4 and PancakeSwap. All on-chain data is already public; extsload just makes it more gas-efficient to read. Not a vulnerability."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Extsload (arbitrary storage read) is intentional in v4 pool managers — not a vulnerability, just a convenience for integrators"
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: CLPM-FP-03
+  reason: "Hook self-settlement when hook == locker — initially suspected hookDelta could be used to steal from callers when hook is the locker. Analysis showed that when hook == msg.sender, both callerDelta and hookDelta go to the same address in vault accounting, netting to zero. When hook != msg.sender (router pattern), they're separate addresses and vault.lock() enforces both settle independently."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "v4 hook delta accounting is zero-sum by construction — vault.lock() forces all addresses to settle their deltas before unlocking"
+    briefing_update_applied: false

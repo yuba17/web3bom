@@ -1,0 +1,319 @@
+component: MetaMorpho
+hunter: OracleHunter
+date: "2026-03-25"
+file: /home/kali/Documents/Web3/metamorpho/src/MetaMorpho.sol
+domain: trust
+
+analysis_summary: |
+  Deep analysis of MetaMorpho external data dependencies, Morpho Blue market state reads,
+  totalAssets calculation, oracle/IRM manipulation vectors, and stale interest accrual.
+
+  Key external dependencies:
+  1. MORPHO.expectedSupplyAssets() → calls IIrm.borrowRateView() per market (view path)
+  2. MORPHO.accrueInterest() → calls IIrm.borrowRate() per market (mutative path)
+  3. ERC20.balanceOf(MORPHO) in _withdrawable() → flash-loan manipulable
+  4. lastTotalAssets cached value vs live totalAssets() → drift between mutations
+
+  7 hypotheses generated covering: IRM revert DoS, lastTotalAssets drift for fee gaming,
+  flash loan liquidity deflation, view/mutative path divergence, bad debt socialization,
+  donation-based fee extraction, and maxDeposit ERC4626 spec violation.
+
+hypotheses:
+
+  - id: MM-O-01
+    title: "IRM revert in expectedMarketBalances bricks totalAssets and all ERC4626 operations"
+    description: |
+      totalAssets() (L585-589) iterates the withdrawQueue calling MORPHO.expectedSupplyAssets()
+      for each market. This internally calls IIrm(irm).borrowRateView() (MorphoBalancesLib L45).
+      If ANY market's IRM reverts (bug, self-destruct, malicious upgrade, gas bomb), totalAssets()
+      reverts, which bricks: deposit, mint, withdraw, redeem, _accrueFee, _convertToShares,
+      _convertToAssets, maxWithdraw, maxRedeem, maxDeposit, maxMint — every user-facing function.
+      The vault becomes a permanent brick until the market is removed from withdrawQueue, which
+      itself requires allocator action + timelock. During this time funds are locked.
+
+      Note: This is borderline "Faulty Oracle" excluded risk, but the impact is total DoS of the
+      vault rather than mispricing, and the attack surface is any IRM in any enabled market.
+    attack_path: |
+      1. Curator adds market with IRM that has a latent revert condition
+      2. IRM starts reverting on borrowRateView()
+      3. totalAssets() reverts on every call
+      4. ALL vault operations (deposit/withdraw/redeem/mint) revert
+      5. User funds locked until allocator removes market from queue (requires timelock >= 1 day)
+    impact: "DoS — all vault users unable to withdraw for at least MIN_TIMELOCK (1 day)"
+    confidence: 65
+    severity: medium
+    solidity: |
+      function check_totalAssets_never_reverts() public {
+          if (vault.totalSupply() == 0) return;
+          try vault.totalAssets() returns (uint256 ta) {
+              t(ta >= 0, "totalAssets returned");
+          } catch {
+              t(false, "MM-O-01: totalAssets() reverted while vault has shares — vault bricked");
+          }
+      }
+    references:
+      - "MetaMorpho.sol L585-589 totalAssets()"
+      - "MorphoBalancesLib.sol L44-45 borrowRateView external call"
+
+  - id: MM-O-02
+    title: "lastTotalAssets drift from totalAssets enables fee timing arbitrage"
+    description: |
+      _accruedFeeShares() (L894-906) computes fee on totalInterest = totalAssets() - lastTotalAssets.
+      lastTotalAssets is updated only during mutations (deposit/mint/withdraw/redeem/setFee/setFeeRecipient/_setCap).
+      Between mutations, interest accrues in Morpho Blue markets but lastTotalAssets stays stale.
+
+      The larger the gap between mutations, the larger the "burst" of interest captured in the
+      next _accrueFee() call. A depositor who deposits 1 wei right after a large interest burst
+      forces feeShares minting on the full accumulated delta. While feeRecipient is trusted, the
+      timing sensitivity means the first user after a quiet period pays disproportionate dilution.
+
+      Conversely, frequent small deposits/withdrawals keep lastTotalAssets close to totalAssets,
+      reducing fee accumulation spikes. This creates an asymmetry: busy vaults have smooth fee
+      accrual, idle vaults have lumpy fee accrual.
+    attack_path: |
+      1. Vault idle for days, fee=50%, lastTotalAssets=1000, totalAssets grows to 1100
+      2. First depositor calls deposit(1 wei)
+      3. _accrueFee() sees 100e18 interest, mints feeShares for 50e18 worth
+      4. Depositor's 1 wei enters AFTER fee dilution — gets slightly fewer shares
+      5. Had depositor waited 1 block, another user might have absorbed the fee burst
+    impact: "Fee timing asymmetry — first depositor after idle period absorbs full fee dilution"
+    confidence: 40
+    severity: low
+    solidity: |
+      function check_lastTotalAssets_drift_bounded() public {
+          uint256 live = vault.totalAssets();
+          uint256 cached = vault.lastTotalAssets();
+          if (live > cached) {
+              uint256 drift = live - cached;
+              t(drift <= cached / 20 + 1, "MM-O-02: lastTotalAssets drifted >5% below totalAssets — fee burst risk");
+          }
+      }
+    references:
+      - "MetaMorpho.sol L894-906 _accruedFeeShares()"
+      - "MetaMorpho.sol L108 lastTotalAssets storage"
+
+  - id: MM-O-03
+    title: "Flash loan deflates MORPHO balanceOf restricting _withdrawable liquidity"
+    description: |
+      _withdrawable() (L858-870) computes available liquidity as:
+        min(totalSupplyAssets - totalBorrowAssets, ERC20(loanToken).balanceOf(MORPHO))
+      The balanceOf(MORPHO) check is explicitly documented (L864) as a flash loan concern.
+      An attacker can flash-borrow from Morpho Blue, temporarily reducing MORPHO's token balance.
+      During the flash loan callback, they can trigger MetaMorpho withdrawals that see zero
+      liquidity. _simulateWithdrawMorpho (L828-854) used by maxWithdraw also reads this balance.
+
+      This is documented behavior but the invariant is still valuable to verify that the
+      implementation correctly handles the edge case and doesn't allow permanent state corruption.
+    attack_path: |
+      1. Attacker flash-borrows maximum from Morpho Blue (drains loanToken balance in singleton)
+      2. In callback, victim calls MetaMorpho.withdraw()
+      3. _withdrawable() sees balanceOf(MORPHO) ≈ 0, returns 0 for all markets
+      4. Withdrawal reverts with NotEnoughLiquidity
+      5. Attacker repays flash loan — liquidity restored
+    impact: "Griefing — temporary withdrawal DoS during flash loan window"
+    confidence: 55
+    severity: low
+    solidity: |
+      function check_withdrawable_not_permanently_zero() public {
+          uint256 ta = vault.totalAssets();
+          uint256 bal = vault.balanceOf(address(this));
+          if (ta > 0 && bal > 0) {
+              uint256 maxW = vault.maxWithdraw(address(this));
+              // maxWithdraw can be temporarily 0 during flash loans, but should not be
+              // permanently 0 when vault has real assets
+              // This invariant catches permanent DoS, not transient flash loan effects
+              t(maxW > 0 || ta < 2, "MM-O-03: maxWithdraw is 0 despite vault having real assets and user having shares");
+          }
+      }
+    references:
+      - "MetaMorpho.sol L858-870 _withdrawable()"
+      - "MetaMorpho.sol L864 flash loan comment"
+
+  - id: MM-O-04
+    title: "View vs mutative interest accrual path divergence in IRM"
+    description: |
+      Two distinct code paths compute interest:
+      - View path: totalAssets() → expectedSupplyAssets → expectedMarketBalances → IIrm.borrowRateView()
+      - Mutative path: _accruedSupplyBalance → MORPHO.accrueInterest() → IIrm.borrowRate()
+
+      The IIrm interface has both borrowRate() and borrowRateView(). If an IRM implementation
+      returns different values for these (e.g., borrowRate has side effects that change state,
+      or reads from a stateful oracle that differs between view/call), the vault's internal
+      accounting diverges from the actual on-chain state.
+
+      totalAssets() (used for share pricing, fee accrual) uses view path.
+      _supplyMorpho/_withdrawMorpho/reallocate use mutative path.
+
+      If borrowRateView > borrowRate: totalAssets overestimates → shares underpriced → depositors get more shares than deserved
+      If borrowRateView < borrowRate: totalAssets underestimates → shares overpriced → withdrawers get more assets than deserved
+    attack_path: |
+      1. Market has IRM where borrowRateView() > borrowRate() (stale view vs updated state)
+      2. totalAssets() overestimates vault assets via view path
+      3. _accrueFee() uses totalAssets() → overestimates interest → mints excess feeShares
+      4. But actual supply in Morpho is lower (mutative path used in _supplyMorpho)
+      5. feeRecipient got shares based on phantom interest
+    impact: "Share mispricing if IRM view/mutative paths diverge — affects all users"
+    confidence: 35
+    severity: low
+    solidity: |
+      function check_view_vs_mutative_interest_consistency(uint256 marketIdx) public {
+          uint256 qLen = vault.withdrawQueueLength();
+          if (qLen == 0) return;
+          marketIdx = marketIdx % qLen;
+          Id id = vault.withdrawQueue(marketIdx);
+          MarketParams memory mp = morpho.idToMarketParams(id);
+          uint256 expectedAssets = morpho.expectedSupplyAssets(mp, address(vault));
+          morpho.accrueInterest(mp);
+          Market memory market = morpho.market(id);
+          uint256 shares = morpho.supplyShares(id, address(vault));
+          uint256 actualAssets = shares * (uint256(market.totalSupplyAssets) + 1) / (uint256(market.totalSupplyShares) + 1e6);
+          uint256 diff = expectedAssets > actualAssets ? expectedAssets - actualAssets : actualAssets - expectedAssets;
+          t(diff <= 1, "MM-O-04: view/mutative interest paths diverged beyond rounding");
+      }
+    references:
+      - "MetaMorpho.sol L585-589 totalAssets() — view path"
+      - "MetaMorpho.sol L704-713 _accruedSupplyBalance() — mutative path"
+      - "MorphoBalancesLib.sol L44-46 borrowRateView vs borrowRate"
+
+  - id: MM-O-05
+    title: "Bad debt silently socialized via zeroFloorSub — front-run loss recognition"
+    description: |
+      In _accruedFeeShares() (L897): totalInterest = newTotalAssets.zeroFloorSub(lastTotalAssets).
+      If totalAssets() drops below lastTotalAssets (bad debt in a Morpho Blue market),
+      totalInterest = 0 and no fee is charged. Importantly, lastTotalAssets is NOT decreased
+      until the next mutation triggers _accrueFee() which sets lastTotalAssets = totalAssets().
+
+      Between the bad debt event and the first mutation:
+      - View functions (_convertToShares/_convertToAssets) correctly see the lower totalAssets
+      - But lastTotalAssets is stale-high, meaning the gap is invisible to the fee system
+      - The first user to transact (deposit/withdraw) triggers the loss recognition
+
+      Sophisticated users monitoring Morpho Blue markets can detect bad debt events and
+      front-run other users by redeeming shares at the (correctly computed) lower share price
+      BEFORE less-informed users realize the loss occurred. The loss is correctly socialized
+      but the timing advantage creates unfairness.
+    attack_path: |
+      1. Market experiences bad debt: totalAssets drops from 1000 to 900
+      2. lastTotalAssets still = 1000 (no mutation yet)
+      3. Sophisticated user sees the Morpho Blue bad debt event on-chain
+      4. They call redeem() — _accrueFee() updates lastTotalAssets to 900
+      5. Their shares are redeemed at the correct 900/supply ratio
+      6. Later users also redeem at 900/supply — no advantage, loss already socialized
+      7. But the sophisticated user acted FIRST, getting liquidity before potential bank run
+    impact: "Information asymmetry — sophisticated users front-run bad debt recognition for priority exit"
+    confidence: 45
+    severity: medium
+    solidity: |
+      function check_bad_debt_loss_bounded() public {
+          uint256 lta = vault.lastTotalAssets();
+          uint256 ta = vault.totalAssets();
+          if (lta > ta) {
+              uint256 loss = lta - ta;
+              t(loss <= lta / 100 + 1, "MM-O-05: unrecognized bad debt >1% — lastTotalAssets >> totalAssets");
+          }
+      }
+    references:
+      - "MetaMorpho.sol L897 zeroFloorSub hides negative interest"
+      - "MetaMorpho.sol L894-906 _accruedFeeShares()"
+
+  - id: MM-O-06
+    title: "Donation to Morpho Blue supply side inflates totalAssets triggering fee on non-yield"
+    description: |
+      totalAssets() sums expectedSupplyAssets across withdrawQueue markets. At the Morpho Blue
+      level, if someone supplies tokens to a market where MetaMorpho has a position, it increases
+      totalSupplyAssets and totalSupplyShares. However, the share-based accounting means MetaMorpho's
+      expectedSupplyAssets = vaultShares * totalSupplyAssets / totalSupplyShares, which is diluted
+      by new supply.
+
+      BUT: If someone calls MORPHO.supply() with 0 shares to a market, or directly transfers
+      tokens to the Morpho singleton and somehow those tokens get accounted in totalSupplyAssets
+      through interest accrual (since interest = totalBorrowAssets * rate, and if borrowers repay
+      to the singleton, totalSupplyAssets increases during accrual), the vault's position grows.
+
+      More concretely: a large borrower repaying interest inflates totalSupplyAssets. This flows
+      through to MetaMorpho's totalAssets() → _accruedFeeShares() treats ALL increase as
+      "interest" → feeShares minted to feeRecipient. The fee is on legitimate interest, but the
+      vault has no way to distinguish organic interest from a deliberate interest-inflating action.
+
+      A malicious feeRecipient could collude with a borrower: borrow large amount, pay massive
+      interest in one block, capture fee on that interest burst. However, the cost (interest paid)
+      exceeds the fee captured, so this is NOT economically viable unless the fee recipient IS the borrower.
+    attack_path: |
+      1. feeRecipient = attacker, fee = 50%
+      2. Attacker borrows massive amount from Morpho Blue market where vault supplies
+      3. Attacker repays with large interest in one block
+      4. totalAssets() jumps by interest amount
+      5. _accrueFee() mints feeShares to attacker for 50% of that interest
+      6. Net cost to attacker: 50% of interest paid (other 50% goes to vault shareholders)
+      7. Not profitable UNLESS attacker IS both borrower and fee recipient (circular — only loses gas)
+    impact: "Not economically viable as standalone attack. Relevant only if feeRecipient is compromised."
+    confidence: 30
+    severity: low
+    solidity: |
+      function check_fee_shares_proportional_to_interest() public {
+          uint256 supplyBefore = vault.totalSupply();
+          uint256 ltaBefore = vault.lastTotalAssets();
+          // Trigger fee accrual via tiny deposit
+          uint256 bal = IERC20(vault.asset()).balanceOf(address(this));
+          if (bal == 0) return;
+          uint256 dep = bal < 1e6 ? bal : 1e6;
+          IERC20(vault.asset()).approve(address(vault), dep);
+          vault.deposit(dep, address(this));
+          uint256 supplyAfter = vault.totalSupply();
+          uint256 feeSharesMinted = supplyAfter - supplyBefore;
+          // Fee shares should not exceed 50% of total supply growth (MAX_FEE = 50%)
+          if (feeSharesMinted > 0 && supplyBefore > 0) {
+              uint256 totalGrowth = supplyAfter - supplyBefore;
+              // feeShares should be < totalGrowth (the rest is user shares)
+              t(feeSharesMinted < totalGrowth, "MM-O-06: fee shares >= total new shares — suspicious");
+          }
+      }
+    references:
+      - "MetaMorpho.sol L585-589 totalAssets()"
+      - "MetaMorpho.sol L894-906 _accruedFeeShares()"
+      - "ConstantsLib.sol L19 MAX_FEE = 0.5e18"
+
+  - id: MM-O-07
+    title: "maxDeposit overestimates due to stale expectedMarketBalances — ERC4626 spec violation"
+    description: |
+      _maxDeposit() (L614-628) computes remaining supply capacity per market using
+      MORPHO.expectedMarketBalances() (view path, stale). Between the view call and the actual
+      supply in _supplyMorpho(), interest accrues via accrueInterest() which may change the
+      actual supply position. Additionally, the comment on L501 explicitly acknowledges:
+      "Warning: May be higher than the actual max deposit due to duplicate markets in the supplyQueue."
+
+      The ERC4626 standard states maxDeposit "MUST return the maximum amount of assets deposit
+      would allow to be deposited for receiver and not cause a revert." An overestimate that
+      causes deposit to revert violates this MUST requirement.
+
+      The same issue affects maxMint() (L508-511) which derives from _maxDeposit.
+
+      However, the warnings in natspec suggest this is a known/documented deviation.
+    attack_path: |
+      1. supplyQueue has markets A, B. Market A has cap=100, current supply=95
+      2. maxDeposit() returns 5 (remaining in A) + capacity(B) via view path
+      3. Between view and deposit, someone supplies 3 to market A on Morpho Blue directly
+      4. After accrueInterest in _supplyMorpho, market A actual supply = 98
+      5. Only 2 available in A, not 5
+      6. If B doesn't have enough capacity for the overflow → AllCapsReached revert
+    impact: "ERC4626 spec non-compliance — maxDeposit can overestimate, causing user reverts"
+    confidence: 55
+    severity: low
+    solidity: |
+      function check_maxDeposit_is_depositable() public {
+          uint256 maxDep = vault.maxDeposit(address(this));
+          if (maxDep == 0) return;
+          uint256 bal = IERC20(vault.asset()).balanceOf(address(this));
+          uint256 toDeposit = maxDep < bal ? maxDep : bal;
+          if (toDeposit == 0) return;
+          IERC20(vault.asset()).approve(address(vault), toDeposit);
+          try vault.deposit(toDeposit, address(this)) {
+              t(true, "maxDeposit deposit succeeded");
+          } catch {
+              t(false, "MM-O-07: deposit(maxDeposit()) reverted — ERC4626 MUST violation");
+          }
+      }
+    references:
+      - "MetaMorpho.sol L614-628 _maxDeposit() uses stale view"
+      - "MetaMorpho.sol L501 warning comment about overestimation"
+      - "MetaMorpho.sol L771-800 _supplyMorpho() uses mutative accrual"

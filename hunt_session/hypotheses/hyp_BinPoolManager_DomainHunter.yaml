@@ -1,0 +1,564 @@
+protocol: pancakeswap-infinity
+component: BinPoolManager
+file: src/pool-bin/BinPoolManager.sol
+domain: dex-liquidity-book
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+#
+# ═══════════════════════════════════════════════════════════════════
+#  SYMMETRIC INSPECTION: mint/burn pair
+# ═══════════════════════════════════════════════════════════════════
+#  1. State: mint updates reserveOfBin, shareOfBin, positions, tree — burn updates all 4. Symmetric.
+#  2. Validations: mint checks ZeroShares — burn checks BurnZeroAmount + ZeroAmountsOut. OK.
+#  3. Events: mint emits Mint — burn emits Burn. Symmetric.
+#  4. Modifiers: mint has whenNotPaused — burn does NOT. ASYMMETRIC (by design — exit always allowed).
+#  5. Edge cases: mint locks MINIMUM_SHARE on first deposit — burn removes tree entry at MINIMUM_SHARE.
+#     The MINIMUM_SHARE (1e3) is never assigned to any owner — permanently locked.
+#
+#  SYMMETRIC INSPECTION: donate
+#  - donate uses accountAppBalanceDelta directly, NOT accountAppDeltaWithHookDelta.
+#    ASYMMETRIC vs mint/burn/swap — hooks cannot return deltas on donate. By design.
+#
+#  CONSTRAINT INFERENCE:
+#  - swap, mint, donate all have whenNotPaused. burn does NOT. 3/4 have it — the exception
+#    is intentional (users must always be able to withdraw).
+#  - swap, mint both call BinHooks.before* and BinHooks.after*. burn calls before and after.
+#    donate calls before and after. All 4 operations are hooked consistently.
+#  - protocolFee extraction: swap extracts in main function, mint extracts in main function,
+#    burn does NOT extract protocol fees (no fees on exit). donate does NOT (direct addition).
+#    2/4 extract — consistent with "fees on entry/swap, not on exit".
+#
+#  BACKWARD TRACE (value exit points):
+#  1. burn() — user receives tokens proportional to shares. Traced back: shares come from
+#     _addShare during mint. Value leak if shares/supply ratio is manipulable.
+#  2. swap() — user receives amountsOutOfBin. Traced back: bounded by binReserves and price.
+#     Value leak if rounding in getAmountsOut/getAmountsIn favors swapper over LP.
+#  3. vault.accountAppDeltaWithHookDelta — hookDelta can redirect tokens. Trusted hooks = out of scope.
+#
+
+- id: BPM-D01
+  tier: 1
+  type: property
+  description: >
+    Pool re-initialization via activeId=0 sentinel collision: initialize() uses
+    activeId == 0 in slot0 as the "not initialized" sentinel (checkPoolInitialized
+    reverts if activeId == 0). The guard in initialize() checks self.slot0.activeId() != 0
+    to prevent re-init. But if someone calls initialize(key, activeId=0), the function
+    stores activeId=0 in slot0, then: (1) pool appears uninitialized to all subsequent
+    calls, and (2) another call to initialize() would pass the guard (activeId still 0),
+    allowing re-initialization with arbitrary parameters. The question is whether
+    PriceHelper.getPriceFromId(0, binStep) reverts — if not, this is Critical.
+  attack_scenario: >
+    1. Atacante llama initialize(key, 0).
+    2. PriceHelper.getPriceFromId(0, binStep) calcula price para binId=0 con exponent
+       = 0 - 8388608 = -8388608. Si no revierte, el pool se inicializa con activeId=0.
+    3. El pool queda en estado "zombie" — inicializado pero checkPoolInitialized siempre
+       revierte (activeId == 0), haciendo el pool inutilizable.
+    4. Peor: alguien puede llamar initialize() de nuevo porque el guard pasa (activeId == 0).
+    5. Si hay LPs que depositaron via una interfaz que no valida activeId, la re-init
+       con un activeId diferente destruye la price reference de sus posiciones.
+    6. La PoolKey queda quemada — nadie puede crear un pool legítimo con esa key.
+  impact: "Pool bricking + potential re-initialization destroying existing positions"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Test: can initialize with activeId=0 succeed?
+    // If yes, can we re-initialize?
+    (uint24 activeId,,) = binPoolManager.getSlot0(poolId);
+    t(activeId != 0, "BPM-D01: pool initialized with activeId=0 — bricked or re-initializable");
+  ghost_vars:
+    - PoolId internal ghost_lastInitializedPoolId;
+  validated: false
+  priority: critical
+  confidence: 75
+  notes: >
+    CLAVE: depende de PriceHelper.getPriceFromId(0, binStep). El exponent sería
+    id - REAL_ID_SHIFT = 0 - 8388608. Si pow() revierte para exponentes muy negativos,
+    esto no es explotable. Verificar PriceHelper y Uint128x128Math.pow.
+
+- id: BPM-D02
+  tier: 1
+  type: property
+  description: >
+    Composition fee evasion via duplicate binId in liquidityConfigs: _mintBins
+    processes liquidityConfigs sequentially, updating bin state after each entry.
+    If the same active binId appears twice, the first entry changes the bin's
+    reserve ratio, potentially reducing or eliminating the composition fee on the
+    second entry. An attacker can split their imbalanced deposit across two entries
+    to the same bin, paying less total composition fee than a single entry would charge.
+  attack_scenario: >
+    1. Active bin tiene ratio 50/50 (tokenX/tokenY). LP fee = 1%.
+    2. Atacante quiere depositar 100% tokenX (0% tokenY) — esto triggerea composition
+       fee máxima en un solo entry.
+    3. En vez de un entry, atacante usa dos liquidityConfigs entries para el mismo binId:
+       - Entry 1: 60% tokenX, 40% tokenY (leve imbalance, baja composition fee).
+       - Entry 2: 40% tokenX, 60% tokenY — pero AHORA el bin ya tiene el ratio cambiado
+         por entry 1, así que esta distribución podría alinearse mejor con el nuevo ratio.
+    4. La composition fee total de 2 entries < la fee de un solo entry equivalente.
+    5. LPs existentes reciben menos fees de lo que deberían.
+    LiquidityConfigurations no parece prohibir IDs duplicados en el array.
+  impact: "Fee evasion on active bin deposits — LPs receive less composition fee revenue"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Compare: composition fee for single entry vs split entry to same active bin
+    // Ghost: track composition fees per mint operation
+    // Single entry fee should be <= sum of split entry fees
+    // If single > split, there's an evasion vector
+    bytes32 singleFee = ghost_compositionFeeSingleEntry;
+    bytes32 splitFee = ghost_compositionFeeSplitEntry;
+    // singleFee should be <= splitFee (splitting should NOT reduce fees)
+    // Using packed comparison on both X and Y components
+    uint128 singleFeeX = PackedUint128Math.decodeX(singleFee);
+    uint128 splitFeeX = PackedUint128Math.decodeX(splitFee);
+    gte(splitFeeX, singleFeeX, "BPM-D02: split deposit evades composition fee on X");
+  ghost_vars:
+    - bytes32 internal ghost_compositionFeeSingleEntry;
+    - bytes32 internal ghost_compositionFeeSplitEntry;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    La segunda iteración del loop ve reserves actualizados por la primera iteración.
+    El ratio del bin cambia, lo que cambia la composition fee calculation.
+    getCompositionFeesAmount usa getAmountOutOfBin con (binReserves + amountsIn)
+    y (totalSupply + shares) — ambos actualizados después de entry 1. La pregunta
+    es si la fee es convexa (splitting costs more) o cóncava (splitting costs less).
+    Fuzzear con distribuciones concretas.
+
+- id: BPM-D03
+  tier: 1
+  type: property
+  description: >
+    Residual reserves trapped in bins at MINIMUM_SHARE: when all user shares are
+    burned from a bin, supply drops to MINIMUM_SHARE (1e3, permanently locked with
+    no owner). The bin is removed from the tree (_removeBinIdToTree on line 338).
+    But getAmountOutOfBin uses mulDivRoundDown, so the burned user receives
+    floor(amountToBurn * reserve / supply), leaving a residual in the bin.
+    These residual tokens are permanently stuck — the bin is not in the tree (so
+    swaps skip it), and nobody owns the MINIMUM_SHARE to burn them.
+  attack_scenario: >
+    1. Atacante es el único LP en un bin (supply = shares + MINIMUM_SHARE).
+    2. Atacante deposita tokens con alto value (e.g., WBTC, WETH).
+    3. Atacante quema todas sus shares (supply → MINIMUM_SHARE).
+    4. getAmountOutOfBin: amountsOut = shares * reserves / (shares + MINIMUM_SHARE).
+       Residual = reserves - amountsOut = reserves * MINIMUM_SHARE / (shares + MINIMUM_SHARE).
+    5. Para shares = 1 (mínimo después de MINIMUM_SHARE deduction), residual =
+       reserves * 1000 / 1001 — atacante pierde ~99.9% en residual. No rentable.
+    6. Para shares grande (e.g., 1e18), residual = reserves * 1000 / (1e18 + 1000) ≈ dust.
+    7. El dust se acumula across all bins ever abandoned. Impacto total = sum of all dust.
+  impact: >
+    Tokens permanentemente locked. Impacto individual es dust (proporcional a
+    MINIMUM_SHARE/totalSupply), pero acumulativo across all pool bins ever created
+    and abandoned. En un pool activo con miles de bins, podría sumar cantidades no
+    triviales over time.
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // After burn that reduces supply to MINIMUM_SHARE:
+    uint256 supply = shareOfBin[binId];
+    bytes32 reserves = reserveOfBin[binId];
+    if (supply == 1e3) { // MINIMUM_SHARE
+        // Reserves should be essentially zero (dust acceptable)
+        (uint128 rx, uint128 ry) = reserves.decode();
+        // Allow up to 1e3 of each token as acceptable dust
+        lte(rx, 1e3, "BPM-D03: significant X reserves trapped in dead bin");
+        lte(ry, 1e3, "BPM-D03: significant Y reserves trapped in dead bin");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    Es by-design (anti-inflation mechanism), pero la cantidad de dust trapped depende
+    del ratio MINIMUM_SHARE / (MINIMUM_SHARE + userShares). Con userShares >> MINIMUM_SHARE,
+    el dust es negligible. Confirmar que no hay forma de tener userShares ≈ MINIMUM_SHARE
+    y reserves significativas simultáneamente (lo cual maximizaría la pérdida).
+
+- id: BPM-D04
+  tier: 1
+  type: property
+  description: >
+    Swap rounding at bin boundaries in exactInput: when a swap drains a bin completely
+    (amountIn128 >= maxAmountIn path in getAmountsOut, line 291), the swapper gets
+    amountOut128 = binReserveOut (full reserve). But maxAmountIn is calculated with
+    roundUp, and maxFee with getFeeAmount (also rounds up). The total paid
+    (maxAmountIn = inversePrice(binReserveOut) + fee) rounds UP, meaning the swapper
+    overpays slightly for the last wei of each bin. Across many bin crossings, this
+    rounding accumulates. The question: does the partial-bin path (line 296-306)
+    also consistently round in favor of the pool?
+  attack_scenario: >
+    1. Pool tiene N bins con small liquidity cada uno en el path de swap.
+    2. Un swap exactInput grande cruza todos los N bins.
+    3. En cada bin, amountIn >= maxAmountIn → full drain, rounding favorable al pool.
+    4. En el ÚLTIMO bin (parcial drain), fee = getFeeAmountFrom(amountIn128, fee)
+       rounds UP, y amountOut = (amountIn - fee) * price rounds DOWN.
+    5. Total: swapper pays more input and receives less output than the "true" price.
+    6. Esto es correcto (favorable a LPs), PERO: ¿hay un path donde el rounding
+       favorece al swapper?
+    7. En exactOutput (getAmountsIn), amountInWithoutFee uses shiftDivRoundUp, pero
+       amountOut es exacto (user-specified). Si shiftDivRoundUp under-rounds for
+       certain price/amount combos, the swapper underpays.
+  impact: "LP value drain through rounding exploitation on exactOutput swaps"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any swap: total value in (input * inputPrice) >= total value out (output)
+    // For exactInput: amountIn is known, verify amountOut * price <= amountIn (net of fees)
+    // For swapForY exactInput:
+    uint128 totalIn = uint128(-delta.amount0()); // X paid by swapper
+    uint128 totalOut = uint128(delta.amount1()); // Y received by swapper
+    uint256 activePrice = PriceHelper.getPriceFromId(activeId, binStep);
+    // Input value in Y terms: totalIn * price / SCALE
+    uint256 inputValueInY = uint256(totalIn) * activePrice >> 128;
+    // Output should be <= inputValue - fees
+    // Allow tolerance for multi-bin price difference
+    // This invariant checks the weaker condition: output > 0 when input > fee
+    if (totalIn > 100) { // above dust threshold
+        gt(totalOut, 0, "BPM-D04: non-trivial swap produced zero output");
+    }
+  ghost_vars:
+    - uint256 internal ghost_swapInputValue;
+    - uint256 internal ghost_swapOutputValue;
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    Los rounding directions en BinHelper parecen correctos: roundDown para output,
+    roundUp para input. Pero la interacción entre precio del bin y fee rounding
+    en multi-bin swaps necesita fuzzing intensivo. Especialmente para bins con
+    precios extremos (near 0 o near max uint128x128).
+
+- id: BPM-D05
+  tier: 1
+  type: property
+  description: >
+    Donate-based share inflation for first depositor: donate() adds reserves to the
+    active bin without minting shares. The minBinShareForDonate (default 2^128) guards
+    against low-share bins, but this is owner-configurable via setMinBinSharesForDonate.
+    If set to 0, the classic vault inflation attack becomes possible on any bin:
+    attacker is first LP (locks MINIMUM_SHARE=1e3, gets 1 share), donates massive
+    amount, victim's mint produces nearly zero shares because userLiquidity * supply
+    / binLiquidity rounds to 0 when binLiquidity is inflated.
+  attack_scenario: >
+    Precondition: minBinShareForDonate set low (owner decision or governance attack).
+    1. Atacante es primer LP en active bin con depósito mínimo: gets userShares = shares - 1e3.
+       Si shares = 1001, attacker gets 1 share. supply = 1001.
+    2. Atacante llama donate(1e18, 0). Active bin reserves increase by 1e18.
+       Bin now has: reserves ≈ 1e18, supply = 1001.
+    3. Víctima mints con 0.5e18 tokens.
+       userLiquidity = 0.5e18 * price. binLiquidity = 1e18 * price.
+       shares = userLiquidity * 1001 / binLiquidity = 500.
+       Victim gets 500 shares. supply = 1501.
+    4. Victim's share value = 500/1501 * (1e18 + 0.5e18) = 500/1501 * 1.5e18 ≈ 0.499e18.
+       Victim deposited 0.5e18. Lost ~0.001e18. Modest loss.
+    5. Con MINIMUM_SHARE = 1e3 y shares grandes, el ataque no escala bien.
+    6. PERO: si atacante usa shares = MINIMUM_SHARE + 1 = 1001 y dona 1e24:
+       victim shares = userLiq * 1001 / (1e24 * price). Para victim deposit < 1e24/1001,
+       shares rounds to 0 → revert (ZeroShares). Victim cannot deposit at all.
+       Griefing attack: block all new deposits to active bin.
+  impact: "Griefing: block new LP deposits to active bin by inflating reserves via donate"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any mint: shares received should be > 0 (already checked by contract)
+    // More importantly: share value should be >= 90% of deposit value
+    if (ghost_lastMintShares > 0 && ghost_lastMintSupplyBefore > 1e3) {
+        uint256 shareValue = ghost_lastMintShares * ghost_lastBinLiqAfterMint / ghost_lastSupplyAfterMint;
+        uint256 depositValue = ghost_lastDepositLiquidity;
+        // Allow up to 11% loss for max composition fee (10% fee * 1.1 = 11%)
+        gte(shareValue * 100, depositValue * 89, "BPM-D05: minter lost >11% of deposit value");
+    }
+  ghost_vars:
+    - uint256 internal ghost_lastMintShares;
+    - uint256 internal ghost_lastMintSupplyBefore;
+    - uint256 internal ghost_lastSupplyAfterMint;
+    - uint256 internal ghost_lastBinLiqAfterMint;
+    - uint256 internal ghost_lastDepositLiquidity;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    El minBinShareForDonate = 2^128 es una protección MUY fuerte (necesitas un bin con
+    >2^128 shares para permitir donate). Pero es owner-configurable. Si se baja a 0,
+    el vector se abre. Verificar si hay path sin donate: ¿puede un primer depositor
+    inflar reserves de otro modo? No — mint siempre da shares proporcionales.
+
+- id: BPM-D06
+  tier: 1
+  type: property
+  description: >
+    Active bin ID must only change via swap: activeId is the core pricing parameter
+    of the pool. mint(), burn(), and donate() must NOT change it. Only swap() should
+    update activeId when crossing bins. If any other operation can shift activeId,
+    an attacker can manipulate the pool's spot price without paying swap fees.
+  attack_scenario: >
+    Code review confirms: solo swap() llama self.slot0.setActiveId() (line 205).
+    mint, burn, donate no lo modifican directamente. PERO: las hooks (afterMint,
+    afterBurn, afterDonate) pueden potencialmente llamar de vuelta a swap() si el
+    hook es un contrato que re-entra. Hooks are trusted per scope, pero el invariante
+    es crítico para verificar que no hay un bug que modifique slot0 fuera de swap.
+  impact: "Price manipulation without swap fees — would allow sandwich attacks at zero cost"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Before and after mint/burn/donate (but NOT swap): activeId must be unchanged
+    uint24 activeIdBefore = ghost_activeIdSnapshot;
+    (uint24 activeIdAfter,,) = binPoolManager.getSlot0(ghost_poolId);
+    // Only check after non-swap operations
+    if (ghost_lastOpType != OpType.SWAP) {
+        eq(activeIdAfter, activeIdBefore, "BPM-D06: activeId changed outside swap");
+    }
+  ghost_vars:
+    - uint24 internal ghost_activeIdSnapshot;
+    - PoolId internal ghost_poolId;
+    - uint8 internal ghost_lastOpType;
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    Altísima confianza de que el código es correcto aquí. El invariante existe como
+    safety net para el fuzzer — si cualquier otro bug o hook interaction causa un
+    cambio inesperado de activeId, lo detectará.
+
+- id: BPM-D07
+  tier: 1
+  type: property
+  description: >
+    Tree-supply consistency invariant: a bin must be in the TreeMath structure if and
+    only if its shareOfBin > MINIMUM_SHARE. If a bin has supply > MINIMUM_SHARE but is
+    NOT in the tree, swaps will skip it entirely — LPs in that bin earn zero fees and
+    cannot be reached by any swap route. If a bin is in the tree but has supply <=
+    MINIMUM_SHARE, swaps will route through it and find empty/dust reserves, wasting
+    gas and potentially causing unexpected behavior.
+  attack_scenario: >
+    La desincronización tree/supply podría ocurrir si:
+    1. _addBinIdToTree o _removeBinIdToTree fallan silently (TreeMath.add/remove
+       return bool pero el resultado no se verifica — solo level0 se actualiza).
+    2. Un overflow en shareOfBin (uint256 += shares) wraps around, making supply
+       appear <= MINIMUM_SHARE when it's actually huge.
+    3. Concurrent modifications (no aplica — single tx execution).
+    TreeMath.add es idempotente (returns false si ya existe). TreeMath.remove es
+    idempotente (returns false si no existe). Esto debería ser safe. Pero el invariante
+    es fundamental para la correctitud del routing.
+  impact: "LP funds stuck in unreachable bins (no swap routing) — permanent loss of fee income"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For a sampled set of bins: verify tree contains bin IFF supply > MINIMUM_SHARE
+    uint256 supply = shareOfBin[ghost_sampleBinId];
+    bool inTree = TreeMath.contains(level2, ghost_sampleBinId);
+    if (supply > 1e3) {
+        t(inTree, "BPM-D07a: bin has supply > MINIMUM_SHARE but is NOT in tree");
+    }
+    if (supply <= 1e3 && supply > 0) {
+        t(!inTree, "BPM-D07b: dead bin (supply <= MINIMUM_SHARE) is still in tree");
+    }
+  ghost_vars:
+    - uint24 internal ghost_sampleBinId;
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    La lógica: _addBinIdToTree cuando supply <= MINIMUM_SHARE en mint (line 476).
+    _removeBinIdToTree cuando supply - burned == MINIMUM_SHARE en burn (line 338).
+    Edge case: mint a un bin donde supply == MINIMUM_SHARE (dead shares from previous
+    LP cycle). supply <= MINIMUM_SHARE → _addBinIdToTree fires → correct.
+    Luego si el nuevo LP burns todo, supply vuelve a MINIMUM_SHARE → _removeBinIdToTree
+    → correct. El ciclo add→remove es consistent.
+
+- id: BPM-D08
+  tier: 1
+  type: property
+  description: >
+    Reserve conservation across swap: the sum of reserves across all bins (weighted by
+    their bin prices) should not decrease after a swap (exclusive of protocol fees).
+    Swap fees remain in the bin as LP revenue, so total liquidity should increase.
+    If total liquidity decreases, value is being extracted from LPs beyond protocol fees.
+  attack_scenario: >
+    1. Un swap cruza N bins. En cada bin, amountsInWithFees se añade y amountsOutOfBin
+       se resta. Los fees (amountsInWithFees - amountsInWithoutFee) quedan en el bin.
+    2. Rounding: getAmountsOut rounds output DOWN (mulShiftRoundDown), input fee UP
+       (getFeeAmountFrom rounds UP). Esto favorece al pool.
+    3. getAmountsIn (exactOut): amountInWithoutFee uses shiftDivRoundUp/mulShiftRoundUp
+       (rounds UP — swapper pays more), fee uses getFeeAmount (rounds UP). También
+       favorece al pool.
+    4. La preocupación: ¿hay un edge case donde estos rounding cancelen y el pool pierda?
+    5. Ejemplo: binReserveOut = 1, price muy alto. amountInWithoutFee = 1 * (SCALE/price)
+       rounded UP = podría ser 0 si SCALE < price (i.e., price > 2^128). Pero price
+       está bounded por bin ID y binStep, así que verificar el rango máximo de price.
+  impact: "LP value drain through accumulated rounding errors on each swap"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Ghost: sum of all bin reserves * price, before and after swap
+    // Simplified: track active bin reserve change only (most swaps affect few bins)
+    uint256 totalLiqBefore = ghost_totalLiquidityBeforeSwap;
+    uint256 protocolFeeValue = ghost_protocolFeeValueThisSwap;
+    uint256 totalLiqAfter = ghost_totalLiquidityAfterSwap;
+    gte(totalLiqAfter + protocolFeeValue, totalLiqBefore,
+        "BPM-D08: total pool liquidity decreased after swap (beyond protocol fees)");
+  ghost_vars:
+    - uint256 internal ghost_totalLiquidityBeforeSwap;
+    - uint256 internal ghost_totalLiquidityAfterSwap;
+    - uint256 internal ghost_protocolFeeValueThisSwap;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    Calcular totalLiquidity across all bins es caro en un test. Alternativa: verificar
+    solo los bins touched durante el swap (track via event). El invariante más práctico
+    es: para cada bin touched, reserveAfter.getLiquidity(price) >= reserveBefore.getLiquidity(price)
+    (porque fees se quedan en el bin). Except para el bin parcialmente drenado donde
+    output se resta — ese bin PUEDE perder liquidez (the output leaves), pero debe
+    ganar el fee amount.
+
+- id: BPM-D09
+  tier: 1
+  type: property
+  description: >
+    Composition fee undercharge when getCompositionFeesAmount calculates fee on the
+    "implicitly swapped" amount. The function simulates what the user would get back
+    if they burned immediately (getAmountOutOfBin with binReserves+amountsIn and
+    totalSupply+shares). If receivedAmountX > amountX, the user implicitly swapped
+    Y→X, and vice versa. The fee is charged on the swapped amount. BUT: the
+    protocolFee direction (getOneForZeroFee vs getZeroForOneFee) must match the
+    implicit swap direction. If the direction is inverted, protocol gets fee on the
+    wrong token, and the LP fee calculation is wrong.
+  attack_scenario: >
+    In getCompositionFeesAmount (BinHelper line 193-194):
+    if receivedAmountX > amountX → user implicitly swapped Y→X.
+    protocolFee = protocolFee.getOneForZeroFee() — this gets the Y→X fee direction.
+    swapFee = calculateSwapFee(uint16(protocolFee), lpFee).
+    Potential issue: calculateSwapFee takes uint16(protocolFee) — truncating protocolFee
+    from uint24 to uint16. If protocolFee has data in the upper 8 bits (which it
+    shouldn't for a single-direction fee), the truncation corrupts the value.
+    ProtocolFeeLibrary.getOneForZeroFee returns the upper 12 bits as uint16. The
+    cast to uint16 should be safe since it's already a uint16-sized value.
+    BUT: calculateSwapFee does protocolFee * lpFee / (protocolFee + lpFee) — if
+    protocolFee is 0, swapFee = lpFee. If protocolFee overflows in the multiply...
+    The real concern: does the composition fee path use the same fee calculation as
+    the swap path? If there's any discrepancy, it creates an arbitrage between
+    swapping and minting-to-swap.
+  impact: "Fee arbitrage between swap and mint if composition fee is lower than swap fee"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For every mint to active bin with composition fee:
+    // Verify composition fee >= what a swap would charge for the same amount
+    if (ghost_lastCompositionFeeX > 0 || ghost_lastCompositionFeeY > 0) {
+        // Composition fee formula: amount * fee * (fee + PRECISION) / PRECISION^2
+        // Swap fee formula: amount * fee / (PRECISION - fee)
+        // Composition should be >= swap for same amount
+        uint128 compFee = ghost_lastCompositionFeeTotal;
+        uint128 swapEquiv = ghost_equivalentSwapFee;
+        gte(compFee, swapEquiv, "BPM-D09: composition fee < equivalent swap fee");
+    }
+  ghost_vars:
+    - uint128 internal ghost_lastCompositionFeeTotal;
+    - uint128 internal ghost_equivalentSwapFee;
+    - uint128 internal ghost_lastCompositionFeeX;
+    - uint128 internal ghost_lastCompositionFeeY;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    La fórmula de composition fee es fee * (fee + 1) que es mayor que fee para
+    cualquier fee > 0. Esto DEBERÍA prevenir el arbitrage. Pero la implementación
+    en getCompositionFee (FeeHelper) usa: amount * totalFee * (totalFee + PRECISION) / SQUARED_PRECISION.
+    Para fee = 1000 (0.1%): totalFee = 1000 * 1e12 = 1e15.
+    compositionFee = amount * 1e15 * (1e15 + 1e18) / 1e36 = amount * 1e15 * 1.001e18 / 1e36
+    = amount * 1.001e33 / 1e36 = amount * 0.001001 = 0.1001%.
+    swapFee = amount * 1e15 / (1e18 - 1e15) = amount * 1e15 / 9.99e17 ≈ 0.1001%.
+    Muy cercanos. Los rounding differences podrían crear un delta explotable.
+
+- id: BPM-D10
+  tier: 1
+  type: optimize
+  description: >
+    Maximize attacker profit from any sequence of mint/burn/swap/donate operations.
+    This is the core economic attack optimization — Echidna maximize mode. The
+    attacker starts with X tokens, executes arbitrary operations, and we track
+    their final balance minus initial balance. Any positive profit indicates a
+    value extraction vector.
+  attack_scenario: >
+    Sequences to explore:
+    1. donate → mint → burn (inflate reserves, mint cheap shares, extract inflated value)
+    2. mint skewed ratio → swap → burn (implicit swap at discount via composition fee)
+    3. mint dust to many bins → large swap → burn (create rounding dust across bins)
+    4. swap exactOut near bin boundary → swap back (cross-bin arbitrage from rounding)
+    5. First depositor: mint minimal → donate → victim mints → burn (inflation attack)
+  impact: "Direct fund theft if optimization finds any positive profit sequence"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Echidna optimization function: return attacker profit
+    int256 profit0 = int256(token0.balanceOf(attacker)) - int256(ghost_attackerInitial0);
+    int256 profit1 = int256(token1.balanceOf(attacker)) - int256(ghost_attackerInitial1);
+    // Convert to single metric using approximate price
+    // Positive return = attacker extracted value
+    return profit0 + profit1;
+  ghost_vars:
+    - uint256 internal ghost_attackerInitial0;
+    - uint256 internal ghost_attackerInitial1;
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    El minBinShareForDonate = 2^128 bloquea la mayoría de donate-based attacks.
+    Pero las sequences mint→swap→burn sin donate son las más interesantes.
+    También: el atacante podría ser el primer LP en un bin nuevo (no el active bin)
+    y explotar rounding en ese bin específico sin necesitar donate.
+
+false_positives:
+- hunter: DomainHunter
+  id: BPM-FP-01
+  reason: >
+    The unchecked block in BinPool.swap() for amount conversion (line 135-137) is safe
+    because the conditional guarantees the sign: if amountSpecified > 0 then uint128(positive)
+    is valid, if < 0 then uint128(-negative) is valid (negating a negative int128 produces
+    a positive value that fits in uint128). Not a bug.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: BPM-FP-02
+  reason: >
+    The donate() function uses accountAppBalanceDelta directly instead of
+    accountAppDeltaWithHookDelta. This means donate hooks cannot return deltas. This is
+    intentional — donate is a gift mechanism and should not have hook-mediated delta
+    adjustments. Not a bug, but a design decision that differs from mint/burn/swap.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: BPM-FP-03
+  reason: >
+    burn() lacks whenNotPaused modifier while swap/mint/donate have it. This is by design —
+    LPs must always be able to exit, even during emergencies. Standard pattern across
+    DeFi protocols (Uniswap V4 does the same). The proportional share-based withdrawal
+    means no price dependency, so paused-state value extraction is not a concern.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: BPM-FP-04
+  reason: >
+    MAX_LIQUIDITY_PER_BIN check in swap (line 178-184) could theoretically revert a swap
+    if fees push a bin over the limit. But MAX_LIQUIDITY_PER_BIN is astronomically large
+    (~6.5e70), so this is practically unreachable. The check is a safety net against
+    accounting overflow, not a denial-of-service vector. Not a bug.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

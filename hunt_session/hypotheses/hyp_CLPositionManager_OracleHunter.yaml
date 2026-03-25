@@ -1,0 +1,446 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: OracleHunter
+generated_at: '2026-03-23T07:00:00Z'
+invariants:
+- id: CLPM-O-01
+  tier: 1
+  type: property
+  description: >
+    _mintFromDeltas y _increaseFromDeltas usan sqrtPriceX96 de slot0 (precio spot manipulable)
+    para calcular la liquidez a aportar. Un atacante puede manipular el precio spot vía un swap
+    grande (flash loan) justo antes de que otro usuario llame mintFromDeltas, causando que el
+    cálculo de getLiquidityForAmounts produzca un valor de liquidity subóptimo: el usuario recibe
+    MENOS liquidity de la que le correspondería al precio real, dejando tokens residuales en el
+    pool manager como créditos no utilizados que se pierden o se resuelven desfavorablemente.
+  attack_scenario: >
+    1. Víctima prepara una tx mintFromDeltas con tokens ya depositados como crédito en el vault.
+    2. Atacante front-runs con un swap gigante (flash loan) que mueve sqrtPriceX96 dramáticamente.
+    3. getLiquidityForAmounts calcula liquidity usando el precio manipulado. Si el precio está
+       sesgado hacia token0, la función toma min(liq0, liq1) → liquidity basada en la cantidad
+       limitante del token "caro". El otro token queda como crédito no consumido.
+    4. La víctima recibe menos liquidity de la que recibiría al precio justo.
+    5. Atacante back-runs deshaciendo el swap y recogiendo el profit del sandwich.
+    La protección de slippage (amount0Max, amount1Max) es un TECHO no un SUELO —
+    validateMaxIn solo revierte si se gasta MÁS de lo esperado, no si se recibe MENOS liquidity.
+  impact: >
+    Pérdida parcial de fondos para el usuario que deposita via mintFromDeltas/increaseFromDeltas.
+    Los tokens residuales no convertidos en liquidity quedan como crédito en el vault, pero si el
+    usuario no los recupera explícitamente (TAKE/CLOSE), se pierden. Incluso si los recupera,
+    recibió menos liquidity de la esperada, dejándolo con una posición más pequeña de la que pagó.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Simular: obtener sqrtPriceX96 antes y después de un swap grande
+    // y comparar la liquidity calculada para los mismos amounts
+    (uint160 sqrtPriceBefore,,,) = clPoolManager.getSlot0(poolKey.toId());
+
+    // Ghost: guardar sqrtPrice al momento de getLiquidityForAmounts
+    // y comparar con TWAP o precio promedio
+    // Si la diferencia excede X%, la liquidity calculada es subóptima
+    uint160 sqrtPriceCurrent = ghost_lastSqrtPriceUsedForMint;
+    uint160 sqrtPriceTWAP = ghost_twapSqrtPrice; // requiere oracle TWAP externo
+    uint256 deviation = sqrtPriceCurrent > sqrtPriceTWAP
+        ? uint256(sqrtPriceCurrent - sqrtPriceTWAP) * 10000 / sqrtPriceTWAP
+        : uint256(sqrtPriceTWAP - sqrtPriceCurrent) * 10000 / sqrtPriceTWAP;
+    // Si deviation > 500 (5%), la liquidity puede ser significativamente subóptima
+    lte(deviation, 500, "CLPM-O-01: spot price deviated >5% from TWAP during fromDeltas");
+  ghost_vars:
+  - uint160 internal ghost_lastSqrtPriceUsedForMint;
+  - uint160 internal ghost_twapSqrtPrice;
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    La severidad real depende de si el frontend/integrador agrega un paso CLOSE/TAKE para
+    recuperar los créditos residuales. Si el batch de acciones incluye TAKE_PAIR al final,
+    el usuario recupera tokens no usados pero sigue teniendo menos liquidity. El ataque es
+    un sandwich clásico pero contra liquidity provision en vez de swap. Confianza moderada
+    porque la mitigación depende de cómo el integrador construye la secuencia de acciones.
+    Uniswap V4 PositionManager tiene el mismo patrón — puede ser "by design" con la
+    expectativa de que el usuario use slippage external.
+
+- id: CLPM-O-02
+  tier: 2
+  type: property
+  description: >
+    _increaseFromDeltas lee sqrtPriceX96 del pool ACTUAL para calcular cuánta liquidity agregar,
+    pero los créditos (deltas) pudieron haberse generado en un paso anterior de la MISMA transacción
+    batch cuando el precio era diferente. En una secuencia SWAP → INCREASE_FROM_DELTAS dentro del
+    mismo modifyLiquidities, el swap mueve el precio, y luego increaseFromDeltas usa ese precio
+    movido para calcular la liquidity. Esto puede ser explotado por un atacante que construye
+    un batch malicioso donde un swap previo sesga el precio antes de agregar liquidity.
+  attack_scenario: >
+    1. Atacante construye un batch atómico: [SWAP_EXACT_IN (mueve precio), INCREASE_FROM_DELTAS]
+    2. El swap genera créditos en token0/token1 y mueve sqrtPriceX96
+    3. increaseFromDeltas lee el sqrtPriceX96 post-swap (sesgado)
+    4. getLiquidityForAmounts calcula liquidity con precio manipulado
+    5. El atacante obtiene más/menos liquidity de la que correspondería al precio pre-swap
+    Nota: este es un auto-sandwich dentro del mismo batch — el atacante se perjudica a sí mismo
+    a menos que haya un beneficio downstream (e.g., posición con tick range favorable al precio
+    manipulado).
+  impact: >
+    Potencialmente bajo — el atacante se perjudica a sí mismo en la mayoría de escenarios.
+    Solo es explotable si hay una víctima cuya posición se ve afectada por el cambio de precio
+    intra-batch, o si el atacante puede extraer valor del pool con un segundo batch posterior.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track: si hubo un swap en el mismo batch antes de increaseFromDeltas
+    // Comparar sqrtPriceX96 al inicio del batch vs al momento del increase
+    uint160 sqrtPriceAtBatchStart = ghost_sqrtPriceAtBatchStart;
+    (uint160 sqrtPriceNow,,,) = clPoolManager.getSlot0(poolKey.toId());
+    uint256 priceDrift = sqrtPriceNow > sqrtPriceAtBatchStart
+        ? uint256(sqrtPriceNow - sqrtPriceAtBatchStart) * 10000 / sqrtPriceAtBatchStart
+        : uint256(sqrtPriceAtBatchStart - sqrtPriceNow) * 10000 / sqrtPriceAtBatchStart;
+    lte(priceDrift, 100, "CLPM-O-02: intra-batch price drift >1% before fromDeltas");
+  ghost_vars:
+  - uint160 internal ghost_sqrtPriceAtBatchStart;
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    Confianza baja porque el auto-sandwich típicamente no es rentable. Podría ser relevante
+    si un hook malicioso modifica el precio durante el callback. El patrón fromDeltas + spot
+    price es idéntico a Uniswap V4 — probablemente "by design" con la expectativa de que
+    integrators protejan con slippage externo.
+
+- id: CLPM-O-03
+  tier: 1
+  type: property
+  description: >
+    initializePool swallows TODAS las excepciones y devuelve type(int24).max en caso de error.
+    Esto incluye errores legítimos como sqrtPriceX96 fuera de rango. Un integrador que no
+    chequee el valor de retorno podría continuar operando contra un pool que no se inicializó
+    correctamente, con un tick de type(int24).max que es inválido.
+  attack_scenario: >
+    1. Integrador llama initializePool con un sqrtPriceX96 inválido (0 o extremo)
+    2. clPoolManager.initialize revierte con error legítimo
+    3. initializePool devuelve type(int24).max sin revertir
+    4. Integrador asume que el pool se inicializó correctamente y procede a mint
+    5. El mint puede fallar o, peor, operar contra un pool en estado inconsistente
+    Nota: si el pool ya existe (PoolAlreadyInitialized), el try-catch también devuelve
+    type(int24).max, ocultando el hecho de que el pool tiene un tick diferente al esperado.
+  impact: >
+    Un integrador puede operar con asunciones incorrectas sobre el estado del pool. Si el pool
+    ya existía con un precio muy diferente al que el integrador esperaba, las posiciones
+    subsiguientes se crean al precio real (no al esperado), resultando en distribución de
+    liquidez inesperada. Impact depende del integrador.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Después de initializePool, verificar que el tick devuelto es válido
+    int24 tick = clPositionManager.initializePool(poolKey, sqrtPriceX96);
+    // type(int24).max indica fallo silencioso
+    t(tick != type(int24).max, "CLPM-O-03: initializePool failed silently");
+    // Además verificar que el pool realmente tiene el sqrtPrice esperado
+    (uint160 actualSqrtPrice,,,) = clPoolManager.getSlot0(poolKey.toId());
+    t(actualSqrtPrice == sqrtPriceX96 || actualSqrtPrice != 0, "CLPM-O-03: pool not initialized as expected");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Aunque el comentario del código dice "Swallow any error", esto es un anti-patrón que puede
+    causar problemas downstream. La intención es idempotencia (si ya está inicializado, no falla),
+    pero oculta TODOS los errores, no solo PoolAlreadyInitialized. Un integrador que confía en
+    el valor de retorno para tomar decisiones (e.g., "si tick == X, entonces mint con rango Y")
+    puede calcular mal los rangos. Uniswap V4 tiene el mismo patrón — probablemente intencional
+    pero riesgoso para integradores.
+
+- id: CLPM-O-04
+  tier: 1
+  type: property
+  description: >
+    SlippageCheck.validateMaxIn NO revierte cuando el delta es POSITIVO (hook devuelve tokens al
+    usuario durante mint/increase). Esto significa que para pools con hooks que devuelven deltas
+    positivos al hacer mint, NO HAY protección de slippage en absoluto. Un hook malicioso podría
+    manipular el precio y devolver un delta positivo pequeño para evitar el revert de slippage,
+    mientras el usuario recibe mucha menos liquidity de la esperada.
+  attack_scenario: >
+    1. Pool con hook malicioso que en el callback de modifyLiquidity devuelve un delta positivo
+       minúsculo (1 wei de cada token)
+    2. El hook simultáneamente manipula el precio del pool
+    3. validateMaxIn ve delta positivo → NO chequea slippage → no revierte
+    4. El usuario recibe liquidity calculada al precio manipulado, sin ninguna protección
+    5. El hook extrae valor del usuario a través de la manipulación de precio
+    Nota: esto requiere un hook malicioso, que está en el ámbito de "trust the hook" para
+    pools con hooks personalizados. Pero el usuario puede no ser consciente de este bypass.
+  impact: >
+    Bypass completo de slippage protection en pools con hooks que devuelven deltas positivos.
+    La pérdida potencial es el 100% del valor depositado si el hook es malicioso. Sin embargo,
+    esto requiere interactuar con un pool que tiene un hook malicioso — el riesgo es del
+    usuario que elige operar en ese pool.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Para cualquier mint/increase: verificar que validateMaxIn realmente se ejecutó
+    // Ghost: trackear si slippage check fue efectivo
+    // Si liquidityDelta - feesAccrued tiene amount0 > 0 Y amount1 > 0,
+    // el slippage check fue bypassed
+    int128 amount0 = int128(int256(uint256(ghost_lastLiquidityDeltaMinusFees >> 128)));
+    int128 amount1 = int128(int256(uint256(ghost_lastLiquidityDeltaMinusFees)));
+    // Si ambos son positivos, el hook devolvió tokens → slippage no verificado
+    if (amount0 > 0 && amount1 > 0) {
+        t(false, "CLPM-O-04: slippage check bypassed — positive delta from hook");
+    }
+  ghost_vars:
+  - uint256 internal ghost_lastLiquidityDeltaMinusFees;
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    Este es un comportamiento DOCUMENTADO en SlippageCheck.sol (ver comentario línea 42-44):
+    "we do NOT revert in the positive delta case". Es intencional pero abre un vector si el
+    usuario no es consciente. Confianza 50% porque es by-design pero puede tener consecuencias
+    no anticipadas con hooks maliciosos. En Uniswap V4 existe el mismo patrón.
+
+- id: CLPM-O-05
+  tier: 2
+  type: property
+  description: >
+    _decrease usa validateMinOut con SafeCast que revierte si el delta es negativo. Esto
+    significa que pools con hooks que cobran un fee en el decrease (devuelven delta negativo)
+    harán que TODA operación de decrease/burn FALLE. El usuario queda con fondos atrapados
+    en la posición sin poder retirar.
+  attack_scenario: >
+    1. Usuario deposita en un pool con hook que cobra fee on decrease/burn
+    2. Al intentar burn/decrease, el hook devuelve un delta negativo
+    3. SafeCast intenta convertir int128 negativo a uint128 → REVERT
+    4. El usuario NO PUEDE retirar su liquidez
+    5. Los fondos quedan permanentemente atrapados en la posición
+    Nota: el código explícitamente dice "this contract will NOT support pools where the hook
+    returns a negative delta on burn/decrease" (SlippageCheck.sol línea 25). Sin embargo, no
+    hay validación al momento de MINT que prevenga depositar en estos pools.
+  impact: >
+    Fondos permanentemente atrapados si el hook devuelve delta negativo en burn/decrease.
+    El usuario pierde el 100% de la posición. Sin embargo, esto requiere un hook específico
+    que no es estándar — más bien un riesgo de compatibilidad que un exploit directo.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: después de decrease, el usuario debe poder retirar
+    // Esto es más un test de compatibilidad que un invariante de fuzzing
+    // Verificar que para cualquier posición con liquidity > 0,
+    // decrease(liquidity) no revierte
+    uint128 liq = clPositionManager.getPositionLiquidity(tokenId);
+    if (liq > 0) {
+        // Intentar decrease — si revierte, los fondos están atrapados
+        try clPositionManager.modifyLiquidities(
+            abi.encode(/* decrease action */),
+            block.timestamp + 1
+        ) {} catch {
+            t(false, "CLPM-O-05: position with liquidity cannot be decreased — funds trapped");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    Documentado como limitación del contrato. El riesgo real es que un usuario deposite en un
+    pool con un hook incompatible sin saber que no podrá retirar. No hay validación upfront.
+    Confianza baja porque es una limitación documentada, no un bug — pero el impacto potencial
+    es alto (fondos atrapados). Clasificar como riesgo de compatibilidad.
+
+- id: CLPM-O-06
+  tier: 2
+  type: property
+  description: >
+    modifyLiquiditiesWithoutLock NO tiene checkDeadline. A diferencia de modifyLiquidities que
+    verifica el deadline, la versión sin lock permite ejecutar acciones sin restricción temporal.
+    Una transacción pendiente en el mempool puede ejecutarse arbitrariamente tarde, cuando el
+    precio del pool ha cambiado significativamente.
+  attack_scenario: >
+    1. Usuario envía modifyLiquiditiesWithoutLock (sin deadline)
+    2. La tx queda pendiente en el mempool por horas/días (gas bajo, congestión)
+    3. El precio del pool cambia significativamente
+    4. La tx se ejecuta al precio nuevo, que es desfavorable para el usuario
+    5. Si las acciones incluyen mint/increase sin slippage estricto, el usuario pierde valor
+    Nota: modifyLiquiditiesWithoutLock requiere que el vault ya esté locked (pre-condición),
+    lo que limita el escenario. Probablemente se usa internamente, no directamente por usuarios.
+  impact: >
+    Ejecución de operaciones a precio desfavorable por falta de protección temporal.
+    La pérdida depende de cuánto se movió el precio entre envío y ejecución.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // No se puede testear directamente con invariantes de fuzzing
+    // Es un análisis estático: modifyLiquiditiesWithoutLock no tiene checkDeadline
+    // Verificar que el precio actual no difiere significativamente del esperado
+    // requiere contexto externo (cuándo se creó la tx)
+    t(true, "CLPM-O-06: static analysis — missing deadline on modifyLiquiditiesWithoutLock");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 55
+  notes: >
+    modifyLiquiditiesWithoutLock tiene isNotLocked pero NO checkDeadline. Esto podría ser
+    intencional — es una función para uso cuando el vault ya está locked (por otro contrato).
+    Uniswap V4 tiene el mismo diseño. El riesgo es bajo si solo se usa internamente.
+    Confianza moderada: es un hecho verificable (falta deadline) pero el impacto depende
+    del contexto de uso.
+
+- id: CLPM-O-07
+  tier: 1
+  type: property
+  description: >
+    En _burn, cuando liquidity == 0, NO se llama a modifyLiquidity, lo que significa que los
+    fees acumulados (feeGrowthInside) NO se cobran. Un usuario que decreaseó toda su liquidity
+    en un paso previo pero no reclamó fees, al hacer burn pierde esos fees permanentemente.
+    El feesAccrued queda como BalanceDelta(0,0) y se pasa así al subscriber notification.
+  attack_scenario: >
+    1. Usuario tiene posición con liquidity=100 y fees acumulados
+    2. Usuario hace decrease(100) → recibe tokens + fees → liquidity queda en 0
+    3. Se acumulan MÁS fees por movimiento de precio en el rango (pero la posición ya tiene
+       liquidity=0, así que feeGrowthInside se actualiza pero no se puede cobrar)
+    ESPERA: en Uniswap V3/V4, feeGrowthInside solo se actualiza cuando hay liquidity > 0.
+    Si liquidity == 0, no se acumulan más fees. Entonces este escenario NO aplica.
+    Revisión: el caso real es si decrease(partial) → fees acumulados → burn(remaining).
+    En ese caso, burn llama modifyLiquidity con liquidityDelta negativo → fees SÍ se cobran.
+    El caso liquidity==0 al momento de burn implica que decrease ya cobró los fees.
+  impact: >
+    Investigado y DESCARTADO — los fees se cobran correctamente durante decrease o durante
+    el modifyLiquidity que se ejecuta en burn cuando liquidity > 0. Cuando liquidity == 0,
+    no hay fees pendientes porque feeGrowthInside no se actualiza sin liquidity activa.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar: después de burn, no quedan fees sin cobrar
+    // Si la posición tenía liquidity > 0 al momento de burn, modifyLiquidity los cobra
+    // Si liquidity == 0, no hay fees que cobrar
+    t(true, "CLPM-O-07: descartado — fees handled correctly in burn path");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    DESCARTADO tras análisis profundo. El patrón es correcto: fees se cobran en modifyLiquidity
+    que se llama siempre que liquidity > 0. Cuando liquidity == 0, feeGrowthInside no cambia
+    (por diseño de CL AMMs). No es un bug.
+
+flash_loan_analysis:
+  _mintFromDeltas:
+    reads_manipulable_state: true  # slot0.sqrtPriceX96
+    affects_fund_movement: true  # determina cuánta liquidity se crea
+    same_tx_consumable: true  # sin timelock
+    post_action_verification: false  # no FREI-PI
+    reentrancy_guard: true  # isNotLocked + vault lock
+    callback_verifies_initiator: N/A  # no callbacks directos
+    uses_spot_vs_twap: spot  # getSlot0 = spot price
+    reward_by_instant_balance: false
+    atomic_threshold_crossing: false
+    self_liquidation: false
+    fee_rounds_to_zero: false  # fees handled by pool manager
+    checkpoint_storage_vs_memory: storage  # positionInfo in storage
+    verdict: >
+      CANDIDATO FUERTE (preguntas 1+2+3 = sí). sqrtPriceX96 de slot0 es manipulable por
+      flash loan → determina liquidity → no hay verificación post-acción. La protección es
+      validateMaxIn que solo verifica techo de gasto, no suelo de liquidity recibida.
+
+  _increaseFromDeltas:
+    reads_manipulable_state: true  # slot0.sqrtPriceX96
+    affects_fund_movement: true  # determina cuánta liquidity se agrega
+    same_tx_consumable: true
+    post_action_verification: false
+    reentrancy_guard: true
+    callback_verifies_initiator: N/A
+    uses_spot_vs_twap: spot
+    reward_by_instant_balance: false
+    atomic_threshold_crossing: false
+    self_liquidation: false
+    fee_rounds_to_zero: false
+    checkpoint_storage_vs_memory: storage
+    verdict: >
+      CANDIDATO FUERTE — mismo patrón que _mintFromDeltas. Spot price manipulable
+      determina liquidity calculation sin verificación de mínimo.
+
+  _decrease:
+    reads_manipulable_state: false  # no lee precio, solo liquidity del storage
+    affects_fund_movement: true
+    same_tx_consumable: true
+    post_action_verification: true  # validateMinOut
+    reentrancy_guard: true
+    verdict: Bajo riesgo — liquidity viene de storage, no de precio manipulable.
+
+  _burn:
+    reads_manipulable_state: false  # liquidity del storage
+    affects_fund_movement: true
+    same_tx_consumable: true
+    post_action_verification: true  # validateMinOut
+    reentrancy_guard: true
+    verdict: Bajo riesgo — mismo razonamiento que _decrease.
+
+  initializePool:
+    reads_manipulable_state: false  # usuario provee sqrtPriceX96
+    affects_fund_movement: false  # solo inicializa
+    same_tx_consumable: true
+    post_action_verification: false  # swallows errors
+    reentrancy_guard: false  # no tiene isNotLocked
+    verdict: >
+      Riesgo medio — no tiene reentrancy guard ni deadline. Swallows errors silenciosamente.
+      No afecta fondos directamente pero puede causar estado inconsistente.
+
+oracle_deep_check:
+  sources:
+  - name: slot0.sqrtPriceX96
+    type: AMM spot price (no Chainlink)
+    used_in:
+    - _mintFromDeltas (línea 346)
+    - _increaseFromDeltas (línea 264)
+    staleness_check: false  # spot price, no aplica staleness
+    answeredInRound_check: N/A
+    price_gt_zero_check: false  # no se verifica sqrtPriceX96 > 0 (pool podría no existir)
+    l2_sequencer_check: N/A  # no es Chainlink
+    min_max_answer: N/A
+    sandwichable: true  # spot price es trivialmente sandwichable
+    manipulation_cost_vs_extraction: >
+      Costo de manipulación: proporcional a la liquidity del pool (swap grande + fees).
+      Extracción: la diferencia entre liquidity obtenida al precio justo vs precio manipulado.
+      En pools con baja liquidez, el ratio puede ser favorable al atacante.
+      En pools con alta liquidez (>$10M TVL), el costo de manipulación excede la extracción.
+    mitigation_present: >
+      validateMaxIn proporciona protección parcial (techo de gasto) pero NO protege contra
+      recibir menos liquidity de la esperada. No hay protección de mínimo de liquidity.
+
+false_positives:
+- hunter: OracleHunter
+  id: CLPM-O-FP-01
+  reason: >
+    CLPM-O-07 (fees perdidos en burn con liquidity==0) es by-design en CL AMMs.
+    feeGrowthInside no se actualiza para posiciones con liquidity==0, por lo que
+    no hay fees pendientes al momento del burn. Documentado en Uniswap V3 whitepaper.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      En CL AMMs, posiciones con liquidity==0 no acumulan fees (feeGrowthInside no se
+      actualiza). burn() con liquidity==0 no necesita llamar modifyLiquidity para cobrar
+      fees — no los hay. No es un bug.
+    briefing_update_applied: false
+- hunter: OracleHunter
+  id: CLPM-O-FP-02
+  reason: >
+    CLPM-O-04 (slippage bypass con positive delta) es DOCUMENTADO en SlippageCheck.sol
+    como comportamiento intencional (líneas 42-44). Es una decisión de diseño consciente
+    para pools con hooks que devuelven tokens al usuario. El riesgo recae en el usuario
+    que elige operar en pools con hooks desconocidos. Mismo patrón en Uniswap V4.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      validateMaxIn en PancakeSwap Infinity / Uniswap V4 NO revierte si el delta es
+      positivo (hook devuelve tokens al usuario). Es by-design. No reportar como bug
+      a menos que se demuestre un hook malicioso concreto que explote esto.
+    briefing_update_applied: false

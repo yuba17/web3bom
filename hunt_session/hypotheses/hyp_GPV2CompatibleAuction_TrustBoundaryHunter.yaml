@@ -1,0 +1,195 @@
+protocol: chainlink-pa-v2
+component: GPV2CompatibleAuction
+file: src/GPV2CompatibleAuction.sol
+domain: dex
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: GPVCA-TB-01
+  tier: 2
+  type: property
+  description: "Approval to vault relayer must always be >= contract balance for any asset with a live auction (approval-balance desync)"
+  attack_scenario: >
+    _onAuctionStart approves the vault relayer for balanceOf(this) at auction start.
+    If additional tokens arrive after auction start (direct transfer, fee aggregator push,
+    or a second auction's tokens), the balance exceeds the approved amount. CowSwap
+    settlement calls transferFrom for the full sellAmount validated in isValidSignature
+    (which checks balanceOf, not allowance), but the relayer's allowance is insufficient.
+    Result: valid orders that pass isValidSignature fail at settlement time, causing
+    solver losses or stuck auctions. Conversely, bid() reduces balance but approval
+    stays high — relayer could pull tokens from a subsequent auction's balance if
+    auctions for different assets share the same token address (unlikely but worth testing).
+  impact: "CowSwap orders validated by isValidSignature cannot settle — auction funds stuck until auction ends and returns to feeAggregator. No direct fund loss but griefing/DoS of the CowSwap settlement path."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For every asset with a live auction, check approval >= balance
+    // This must be called after _onAuctionStart and any subsequent token transfers
+    address asset = _getAuctionedAsset(); // ghost or helper
+    if (ghost_auctionActive[asset]) {
+        uint256 balance = IERC20(asset).balanceOf(address(auction));
+        uint256 allowance = IERC20(asset).allowance(address(auction), auction.getGPV2VaultRelayer());
+        gte(allowance, balance, "GPVCA-TB-01: vault relayer allowance < balance during live auction");
+    }
+  ghost_vars:
+  - "mapping(address => bool) internal ghost_auctionActive;"
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    The approval is set once at _onAuctionStart to the snapshot balance. Any balance
+    increase after that point is not covered. isValidSignature validates against balanceOf
+    (line 160-162) but the relayer can only pull up to the approved amount. This is a
+    consistency gap between validation and execution. Low severity because CowSwap solvers
+    would simply skip the order if settlement would fail, but it could cause economic
+    inefficiency in the auction.
+
+- id: GPVCA-TB-02
+  tier: 1
+  type: property
+  description: "Auction end must not race with pending CowSwap settlement — approval revocation during active batch"
+  attack_scenario: >
+    1. Auction starts for token X, approval granted to vault relayer.
+    2. CowSwap solver creates a batch including an order for token X.
+       isValidSignature validates OK (auction live, balance sufficient, price OK).
+    3. Before the batch settles on-chain, an AUCTION_WORKER calls performUpkeep
+       with token X in endedAuctions (duration elapsed or balance < minAuctionSize).
+    4. _onAuctionEnd revokes approval (forceApprove to 0) and transfers remaining
+       balance back to feeAggregator.
+    5. CowSwap batch tx lands — settlement calls transferFrom but approval is 0.
+       Batch reverts or solver takes a loss.
+    This is a TOCTOU between isValidSignature (check) and settlement (use).
+    The attacker is the AUCTION_WORKER or a frontrunner who triggers performUpkeep
+    between batch creation and settlement.
+  impact: "Solver loss on failed batch settlement. No direct protocol fund loss, but repeated occurrence would cause solvers to avoid the auction contract, degrading CowSwap integration. If settlement is atomic with isValidSignature call, this is not exploitable."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After _onAuctionEnd, approval must be 0 AND no valid order should exist
+    // This is a temporal property — hard to express as a single assertion
+    // Best tested as: if auction ended, approval must be 0
+    address asset = _getEndedAuctionAsset();
+    if (ghost_auctionJustEnded[asset]) {
+        uint256 allowance = IERC20(asset).allowance(address(auction), auction.getGPV2VaultRelayer());
+        eq(allowance, 0, "GPVCA-TB-02: approval not revoked after auction end");
+        // Additionally: balance should be 0 or transferred to feeAggregator
+        uint256 balance = IERC20(asset).balanceOf(address(auction));
+        eq(balance, 0, "GPVCA-TB-02: balance not returned after auction end");
+    }
+  ghost_vars:
+  - "mapping(address => bool) internal ghost_auctionJustEnded;"
+  validated: false
+  priority: high
+  confidence: 35
+  notes: >
+    This is fundamentally a TOCTOU issue between CowSwap's off-chain batch creation
+    and on-chain settlement. The severity depends on whether CowSwap's settlement
+    contract handles transferFrom failures gracefully (partial fills) or reverts the
+    entire batch. If the settlement contract is atomic and isValidSignature is called
+    within the same tx as transferFrom, this race does not exist. Need to verify
+    CowSwap settlement contract behavior. Confidence is low because CowSwap batches
+    are typically atomic (isValidSignature + transferFrom in same tx).
+
+- id: GPVCA-TB-03
+  tier: 1
+  type: property
+  description: "bid() reentrancy guard must block isValidSignature during callback execution"
+  attack_scenario: >
+    1. Attacker calls bid() with a callback (data.length != 0).
+    2. Inside auctionCallback, attacker's contract calls CowSwap settlement
+       which calls isValidSignature on the auction contract.
+    3. s_entered is true (set at line 418), so isValidSignature reverts at line 141-143.
+    4. This is the CORRECT behavior — the invariant verifies the guard works.
+    If the guard were missing, the attacker could get isValidSignature to validate
+    an order using stale state (pre-transfer balance, pre-auction-end state) and
+    have CowSwap settle it in the same tx, potentially double-spending tokens.
+  impact: "If guard fails: double-spend of auctioned tokens via bid() callback + CowSwap settlement in same tx. Tokens transferred to bidder via bid() AND pulled by vault relayer via settlement."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // During bid callback, isValidSignature must revert
+    // This tests the s_entered guard indirectly
+    // After bid() completes, s_entered must be false
+    bool entered = auction.s_entered();
+    t(!entered, "GPVCA-TB-03: s_entered stuck true after bid completion — DoS");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    The reentrancy guard is correctly implemented (s_entered set before callback,
+    checked in isValidSignature). This invariant validates it doesn't get stuck in
+    the true state (which would DoS all future bids and CowSwap orders). The guard
+    IS correct in the code — this invariant is defensive, confirming the property
+    holds under fuzzing. High confidence because the code clearly handles it, but
+    worth testing for edge cases (e.g., bid() reverting after s_entered=true but
+    before s_entered=false — Solidity revert semantics handle this, but verify).
+
+- id: GPVCA-TB-04
+  tier: 2
+  type: property
+  description: "invalidateOrders must not revert-block on a single bad orderUid — external call trust boundary"
+  attack_scenario: >
+    ORDER_MANAGER calls invalidateOrders([uid1, uid2, uid3]). If uid2 causes
+    i_gpV2Settlement.invalidateOrder to revert (e.g., already invalidated, malformed,
+    or settlement contract has a bug), ALL invalidations fail including uid1 and uid3.
+    An attacker who can influence the settlement contract's behavior (or a buggy
+    settlement upgrade) could prevent order invalidation, leaving stale orders
+    valid for settlement.
+  impact: "Inability to invalidate CowSwap orders. Stale orders remain valid and could be settled at outdated prices if the auction is still live. Limited by auction duration and price decay."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After invalidateOrders call, verify all provided orders are actually invalidated
+    // This requires calling the settlement contract to check order status
+    // Simplified: just verify the external call doesn't revert unexpectedly
+    // Best tested via try/catch in a fork test against real GPv2Settlement
+    // For mock testing: verify loop completes for all valid orderUids
+    uint256 gasBeforeCall = gasleft();
+    // If gas drops to near-zero after call, the external call consumed excessive gas
+    t(gasBeforeCall > 10000, "GPVCA-TB-04: invalidateOrders gas griefing");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    This is a standard "loop over external calls" pattern. The risk is low because
+    ORDER_MANAGER_ROLE is trusted and would construct valid UIDs. The GPv2Settlement
+    contract is immutable and well-tested. However, if the settlement contract is
+    ever upgraded or behaves unexpectedly, this could be a DoS vector. Low priority
+    because the trust boundary (ORDER_MANAGER → Settlement) is between two trusted
+    components. Better tested in a fork test with the real settlement contract.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: GPVCA-FP-01
+  reason: >
+    TB-02 from previous analysis (forceApprove with full balance to relayer) is by
+    design. The vault relayer is CowSwap's trusted relayer contract, and the approval
+    is bounded by the contract's balance at auction start. The relayer can only pull
+    tokens during settlement which is validated by isValidSignature. The approval is
+    revoked at auction end. This is the standard CowSwap integration pattern.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "forceApprove(vaultRelayer, balanceOf(this)) is the standard CowSwap EIP-1271 integration pattern — not a bug. Relayer is trusted infrastructure."
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: GPVCA-FP-02
+  reason: >
+    Non-canonical ERC20s (fee-on-transfer, rebasing, ERC777) are explicitly excluded
+    from scope per C4 rules. The forceApprove correctly handles USDT's non-standard
+    approve (requires setting to 0 first). No further token quirk analysis needed
+    for in-scope tokens.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

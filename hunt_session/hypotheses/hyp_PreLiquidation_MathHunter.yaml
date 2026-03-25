@@ -1,0 +1,513 @@
+protocol: morpho-pre-liquidation
+component: PreLiquidation
+file: src/PreLiquidation.sol
+domain: liquidation-mechanics
+hunter: MathHunter
+generated_at: '2026-03-23T12:00:00Z'
+invariants:
+- id: PL-M01
+  tier: 1
+  type: property
+  description: >
+    Rounding asymmetry between seizedAssets-path and repaidShares-path:
+    when liquidator specifies seizedAssets, repaidShares is computed rounding UP
+    (liquidator pays more). When liquidator specifies repaidShares, seizedAssets
+    is computed rounding DOWN (liquidator gets less collateral). This is correct
+    protocol-favoring behavior. But the BORROWER perspective must also be consistent:
+    the value of collateral seized must always be >= value of debt repaid (after preLIF).
+    If preLIF rounds down too aggressively on small amounts, the seized collateral
+    could be worth LESS than what the liquidator repaid, meaning the borrower loses
+    collateral without proportional debt reduction.
+  attack_scenario: >
+    With dust-sized positions (e.g., 1 wei of borrow shares) and low-decimal tokens
+    (6 decimals), toAssetsDown could round borrowed amount to 0, then wMulDown(preLIF)
+    is still 0, and mulDivDown gives 0 seizedAssets. Liquidator repays debt for free
+    (0 collateral seized) — effectively a gift to the borrower. Not a loss for borrower,
+    but the liquidator wastes gas and the borrower gets free debt reduction. However,
+    Morpho's repay with 0 collateral seizure would still work — the question is whether
+    this creates a griefing vector where someone can reduce a borrower's debt for free.
+  impact: "Dust-level: liquidator loses gas cost, borrower gets tiny free debt reduction"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test that seizedAssets > 0 when repaidShares > 0 (repaidShares-path)
+    // Setup: call preLiquidate(borrower, 0, 1, "")
+    // If seizedAssets == 0 and repaidShares == 1, the liquidator repaid debt but seized nothing
+    uint256 repaidSharesInput = 1;
+    // Simulate: toAssetsDown(1, totalBorrowAssets, totalBorrowShares)
+    // With virtual shares (1e6) and virtual assets (1): 1 * (totalBorrowAssets + 1) / (totalBorrowShares + 1e6)
+    // If totalBorrowAssets < totalBorrowShares (early market), this rounds to 0
+    // Then 0.wMulDown(preLIF) = 0, 0.mulDivDown(ORACLE_PRICE_SCALE, price) = 0
+    // seizedAssets = 0, but repaidShares = 1 is used for MORPHO.repay
+    gt(seizedAssets, 0, "PL-M01: zero collateral seized for nonzero repaid shares");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: >
+    Morpho's virtual shares (1e6) mitigate this significantly — 1 share of debt is worth
+    very little. The real question is whether the repay call even succeeds with
+    repaidShares=1 (Morpho might have its own minimum). Likely Low/Info but worth testing.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: PL-M02
+  tier: 1
+  type: property
+  description: >
+    LTV computation rounding can make a healthy position appear pre-liquidatable.
+    Line 145: borrowed = borrowShares.toAssetsUp (rounds UP — inflates debt).
+    Line 144: collateralQuoted = collateral.mulDivDown(price, 1e36) (rounds DOWN — deflates collateral).
+    Line 152: ltv = borrowed.wDivUp(collateralQuoted) (rounds UP — inflates LTV).
+    Three consecutive roundings all in the direction that makes LTV higher.
+    For a position exactly at PRE_LLTV boundary, these roundings could push
+    ltv above PRE_LLTV when the "true" (infinite precision) LTV is exactly at or below it.
+  attack_scenario: >
+    A borrower with true LTV = PRE_LLTV - epsilon (barely healthy) could be
+    pre-liquidated due to rounding. The three-layer rounding inflates LTV by up to
+    3 wei in WAD precision. For a borrower near the PRE_LLTV boundary, this means
+    they can be pre-liquidated 3 wei of LTV earlier than intended. Impact is minimal
+    in value terms but constitutes a correctness violation.
+  impact: "Borrower pre-liquidated slightly earlier than intended — minimal value impact"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify: if true LTV (computed with full precision, no rounding) <= PRE_LLTV,
+    // then preLiquidate should revert.
+    // True LTV = (borrowShares * (totalBorrowAssets + 1) / (totalBorrowShares + 1e6))
+    //            / (collateral * collateralPrice / ORACLE_PRICE_SCALE)
+    // But the contract uses toAssetsUp, mulDivDown, wDivUp — all rounding against borrower
+    // This is BY DESIGN for Morpho (conservative = protect lenders), but worth confirming
+    // the magnitude of the deviation
+    uint256 borrowedUp = uint256(position.borrowShares).toAssetsUp(market.totalBorrowAssets, market.totalBorrowShares);
+    uint256 borrowedDown = uint256(position.borrowShares).toAssetsDown(market.totalBorrowAssets, market.totalBorrowShares);
+    uint256 collateralUp = uint256(position.collateral).mulDivUp(collateralPrice, ORACLE_PRICE_SCALE);
+    uint256 collateralDown = uint256(position.collateral).mulDivDown(collateralPrice, ORACLE_PRICE_SCALE);
+    uint256 ltvMax = borrowedUp.wDivUp(collateralDown);
+    uint256 ltvMin = borrowedDown.wDivDown(collateralUp);
+    // The gap between ltvMax and ltvMin shows rounding impact
+    // If ltvMin <= PRE_LLTV < ltvMax, the position is in the "rounding zone"
+    lte(ltvMax - ltvMin, 1e12, "PL-M02: rounding spread exceeds 1e-6 WAD");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 55
+  notes: >
+    This is likely by-design conservative rounding (protect lenders). Morpho Blue itself
+    uses the same pattern. The rounding spread depends on position size — for very small
+    positions (dust), the spread can be significant in relative terms. For realistic
+    positions, it's negligible. Likely not reportable but good to quantify.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: PL-M03
+  tier: 1
+  type: property
+  description: >
+    Quotient overflow potential when ltv approaches LLTV. Line 153:
+    quotient = (ltv - PRE_LLTV).wDivDown(LLTV - PRE_LLTV).
+    Since ltv is computed with wDivUp (rounds up), ltv could exceed LLTV in theory.
+    But line 148 requires borrowed <= collateralQuoted.wMulDown(LLTV), and
+    ltv = borrowed.wDivUp(collateralQuoted). Due to rounding:
+    borrowed <= collateralQuoted.wMulDown(LLTV) does NOT guarantee
+    borrowed.wDivUp(collateralQuoted) <= LLTV. In fact, wDivUp can produce
+    ltv > LLTV by up to 1 wei. Then quotient = (ltv - PRE_LLTV) / (LLTV - PRE_LLTV)
+    could exceed WAD (1e18), making preLIF > PRE_LIF_2 and preLCF > PRE_LCF_2.
+  attack_scenario: >
+    A position where borrowed = collateralQuoted.wMulDown(LLTV) exactly. Then
+    ltv = borrowed.wDivUp(collateralQuoted) could be LLTV + 1 (due to rounding).
+    quotient = (LLTV + 1 - PRE_LLTV) / (LLTV - PRE_LLTV) > WAD.
+    preLIF = quotient * (PRE_LIF_2 - PRE_LIF_1) + PRE_LIF_1 > PRE_LIF_2.
+    This means the liquidator gets MORE incentive than the maximum configured preLIF_2.
+    If the excess pushes preLIF above 1/LLTV, the withdrawCollateral could fail
+    (position becomes unhealthy after seizure), OR the borrower loses more collateral
+    than the protocol intended at maximum.
+  impact: "Liquidator extracts slightly more collateral than max preLIF_2 allows — borrower disadvantaged"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After computing preLIF in the contract logic:
+    // preLIF = quotient.wMulDown(PRE_LIF_2 - PRE_LIF_1) + PRE_LIF_1
+    // Verify it never exceeds PRE_LIF_2
+    uint256 ltv = borrowed.wDivUp(collateralQuoted);
+    uint256 quotient = (ltv - PRE_LLTV).wDivDown(LLTV - PRE_LLTV);
+    uint256 preLIF = quotient.wMulDown(PRE_LIF_2 - PRE_LIF_1) + PRE_LIF_1;
+    lte(preLIF, PRE_LIF_2, "PL-M03: preLIF exceeds configured maximum PRE_LIF_2");
+    // Also check preLCF
+    uint256 preLCF = quotient.wMulDown(PRE_LCF_2 - PRE_LCF_1) + PRE_LCF_1;
+    lte(preLCF, PRE_LCF_2, "PL-M03b: preLCF exceeds configured maximum PRE_LCF_2");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: >
+    This is the highest-confidence math finding. The rounding mismatch between
+    the healthiness check (line 148: wMulDown) and the LTV computation (line 152: wDivUp)
+    creates a gap. wMulDown(LLTV) produces a threshold that, when divided back with
+    wDivUp, can exceed LLTV. The quotient then exceeds WAD, pushing preLIF/preLCF
+    above their configured maxima. The magnitude is small (1-2 wei in WAD terms)
+    but it violates the protocol's parametric guarantees. Need to verify if wMulDown
+    in quotient computation (line 153) absorbs this — it might truncate quotient
+    back to WAD or just below it, but the math needs careful verification.
+  poc_sketch: |
+    // Foundry test sketch:
+    // 1. Deploy PreLiquidation with PRE_LLTV=0.8e18, LLTV=0.9e18, LIF1=1e18, LIF2=1.11e18
+    // 2. Create a position where borrowed = collateralQuoted.wMulDown(0.9e18) exactly
+    // 3. Call preLiquidate — observe computed preLIF
+    // 4. Assert preLIF <= 1.11e18 (PRE_LIF_2)
+  call_stack: ''
+
+- id: PL-M04
+  tier: 1
+  type: property
+  description: >
+    Bidirectional rounding inconsistency: the two paths (seizedAssets vs repaidShares)
+    should produce consistent results. If a liquidator computes seizedAssets off-chain
+    from a desired repaidShares amount, the on-chain computation when using seizedAssets
+    as input may produce a DIFFERENT repaidShares (higher, due to all-round-up in that path).
+    This means the liquidator can be forced to repay MORE shares than expected.
+    Conversely, using repaidShares as input always gives LESS seized collateral.
+    The asymmetry is protocol-favoring but creates a slippage-like risk for liquidators.
+  attack_scenario: >
+    Liquidator wants to seize exactly X collateral. They call preLiquidate(borrower, X, 0, "").
+    The computed repaidShares = seizedAssetsQuoted.wDivUp(preLIF).toSharesUp(...) rounds UP.
+    The repaidAssets from Morpho's repay could be significantly more than expected for
+    low-liquidity markets. If the liquidator has exactly enough loan tokens for the
+    expected repayment but not the rounded-up amount, the safeTransferFrom in
+    onMorphoRepay will revert. No loss, but failed pre-liquidation.
+    More critically: if PRE_LCF is small and the rounded-up repaidShares exceeds
+    repayableShares (line 172), the pre-liquidation reverts even though the liquidator
+    intended to seize within bounds. This is a griefing/DoS vector against pre-liquidators.
+  impact: "Pre-liquidation reverts unexpectedly for edge-case amounts — DoS for liquidators"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Path A: liquidator specifies seizedAssets=X
+    uint256 seizedAssetsQuotedA = X.mulDivUp(collateralPrice, ORACLE_PRICE_SCALE);
+    uint256 repaidSharesA = seizedAssetsQuotedA.wDivUp(preLIF).toSharesUp(totalBorrowAssets, totalBorrowShares);
+
+    // Path B: liquidator specifies repaidShares=repaidSharesA, expects to get X back
+    uint256 seizedAssetsB = repaidSharesA.toAssetsDown(totalBorrowAssets, totalBorrowShares)
+        .wMulDown(preLIF).mulDivDown(ORACLE_PRICE_SCALE, collateralPrice);
+
+    // seizedAssetsB should be <= X (path B rounds down)
+    lte(seizedAssetsB, X, "PL-M04a: reverse path gives more collateral than forward path");
+    // The gap should be bounded
+    uint256 gap = X - seizedAssetsB;
+    // For 18-decimal tokens, gap of 1-2 wei is acceptable
+    // For 6-decimal tokens, gap should still be < 1 unit
+    lte(gap, 2, "PL-M04b: rounding gap between paths exceeds 2 units");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: >
+    The bidirectional inconsistency is by-design (round in favor of protocol), but
+    the magnitude of the gap depends on token decimals and price. With 6-decimal tokens
+    and high oracle prices, mulDivUp vs mulDivDown can differ by more than dust.
+    The critical check is whether the gap causes the repaidShares > repayableShares
+    revert when the liquidator's intent was within bounds.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: PL-M05
+  tier: 2
+  type: property
+  description: >
+    Low-decimal token precision loss in collateralQuoted computation.
+    Line 144: collateralQuoted = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).
+    ORACLE_PRICE_SCALE = 1e36. If collateral token has 6 decimals and collateral amount
+    is small (e.g., 1e6 = 1 USDC), then collateral * collateralPrice must exceed 1e36
+    for a nonzero result. collateralPrice must be > 1e30 for 1 USDC of collateral to
+    produce nonzero collateralQuoted. This is the Morpho oracle convention
+    (price = collateralToken/loanToken * 10^(36 + loanDecimals - collateralDecimals)),
+    so for USDC(6)/USDC(6) pair, price ~ 1e36, and 1e6 * 1e36 / 1e36 = 1e6.
+    But for exotic token pairs where price is very low, precision loss is possible.
+  attack_scenario: >
+    If a collateral token has very low price relative to loan token (e.g., meme token
+    as collateral, WBTC as loan), collateralPrice could be very small (say 1e20).
+    Then collateralQuoted = collateral * 1e20 / 1e36 = collateral / 1e16.
+    For collateral < 1e16 (0.01 of an 18-decimal token), collateralQuoted rounds to 0.
+    Then wMulDown(LLTV) = 0, and the require borrowed <= 0 fails unless borrowed is 0.
+    This means tiny positions are automatically liquidatable (not pre-liquidatable).
+    Not a loss scenario per se, but positions with dust collateral and any debt can
+    never be pre-liquidated (they jump straight to Morpho liquidation).
+  impact: "Dust positions with low-price collateral cannot be pre-liquidated — minor edge case"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For any position that passes the pre-liquidation checks,
+    // collateralQuoted must be > 0
+    uint256 collateralQuoted = uint256(position.collateral).mulDivDown(collateralPrice, ORACLE_PRICE_SCALE);
+    gt(collateralQuoted, 0, "PL-M05: collateralQuoted is zero for non-zero collateral");
+    // If collateralQuoted == 0 and collateral > 0, we have precision loss
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 50
+  notes: >
+    This is mitigated by Morpho's own oracle price convention which scales prices
+    to compensate for decimal differences. In practice, collateralPrice for a
+    real Morpho market would be large enough. Still, if PRE_LIQUIDATION_ORACLE
+    is different from the main ORACLE and returns a different scale, this could bite.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: PL-M06
+  tier: 1
+  type: property
+  description: >
+    seizedAssets can be 0 when repaidShares > 0 in the repaidShares-path due to
+    cascading round-down operations. Line 162-164:
+    seizedAssets = repaidShares.toAssetsDown(...).wMulDown(preLIF).mulDivDown(ORACLE_PRICE_SCALE, collateralPrice).
+    Three consecutive round-down operations. If repaidShares is small enough that
+    toAssetsDown returns a tiny value, then wMulDown(preLIF) where preLIF ~ 1e18
+    approximately preserves magnitude, but the final mulDivDown(1e36, collateralPrice)
+    divides by collateralPrice. If collateralPrice is very large (expensive collateral),
+    the result truncates to 0. The liquidator pays to repay debt but receives 0 collateral.
+  attack_scenario: >
+    An attacker (or bot) calls preLiquidate(borrower, 0, smallRepaidShares, "") where
+    smallRepaidShares is chosen so that seizedAssets computes to 0. The MORPHO.repay
+    succeeds (reduces borrower's debt), and withdrawCollateral is called with 0 (no-op
+    or very small). The liquidator then pays repaidAssets in loan tokens via
+    safeTransferFrom but receives 0 collateral. This is a direct loss for the liquidator.
+    A malicious borrower could front-run their own pre-liquidation to reduce debt
+    at the liquidator's expense — but only if they control/incentivize someone to
+    call preLiquidate. More practically, this is a footgun for bot operators.
+  impact: "Liquidator loses repaidAssets of loan tokens, receives 0 collateral"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After computing seizedAssets in the repaidShares path:
+    // seizedAssets must be > 0 whenever repaidShares > 0
+    if (repaidSharesInput > 0) {
+        uint256 repaidAssetsDown = repaidSharesInput.toAssetsDown(
+            market.totalBorrowAssets, market.totalBorrowShares
+        );
+        uint256 afterLIF = repaidAssetsDown.wMulDown(preLIF);
+        uint256 seizedAssets = afterLIF.mulDivDown(ORACLE_PRICE_SCALE, collateralPrice);
+        gt(seizedAssets, 0, "PL-M06: zero seized assets for nonzero repaid shares");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: >
+    The key question is whether Morpho.withdrawCollateral(0) reverts or is a no-op.
+    If it's a no-op, the liquidator pays but gets nothing. If it reverts, it's just
+    a DoS (failed tx). Need to check Morpho Blue's withdrawCollateral behavior with 0.
+    Even if it's a no-op, the safeTransferFrom still executes, so the liquidator
+    actually pays the repaidAssets. This is the most likely exploitable math finding.
+  poc_sketch: |
+    // 1. Deploy market with expensive collateral (high collateralPrice)
+    // 2. Create small borrow position
+    // 3. Call preLiquidate(borrower, 0, 1, "")
+    // 4. Check: seizedAssets should be 0 (computed via round-down chain)
+    // 5. Liquidator pays repaidAssets but gets 0 collateral
+  call_stack: ''
+
+- id: PL-M07
+  tier: 2
+  type: property
+  description: >
+    preLCF computation allows quotient > WAD (see PL-M03), which means
+    preLCF = quotient.wMulDown(PRE_LCF_2 - PRE_LCF_1) + PRE_LCF_1 can exceed PRE_LCF_2.
+    If PRE_LCF_2 > WAD (explicitly allowed per code comment on line 167-168:
+    "the pre-liquidation close factor can be greater than WAD (100%)"),
+    and quotient slightly exceeds WAD, then preLCF exceeds PRE_LCF_2.
+    repayableShares = borrowShares.wMulDown(preLCF) uses this inflated value.
+    This allows liquidating MORE of the position than the configured maximum.
+  attack_scenario: >
+    Combined with PL-M03: when ltv rounds up above LLTV (by 1 wei), quotient > WAD,
+    preLCF > PRE_LCF_2. If PRE_LCF_2 = 1.5e18 (150%), and quotient = WAD + 1,
+    preLCF = (WAD + 1) * (PRE_LCF_2 - PRE_LCF_1) / WAD + PRE_LCF_1.
+    The excess is (PRE_LCF_2 - PRE_LCF_1) / WAD which is negligible.
+    But for very wide LCF ranges (e.g., PRE_LCF_1=0.1e18, PRE_LCF_2=2e18),
+    the excess is (2e18 - 0.1e18) / 1e18 = ~2 wei — still negligible.
+    This is technically a violation but the economic impact is sub-wei.
+  impact: "Sub-wei excess in close factor — negligible economic impact"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 ltv = borrowed.wDivUp(collateralQuoted);
+    uint256 quotient = (ltv - PRE_LLTV).wDivDown(LLTV - PRE_LLTV);
+    uint256 preLCF = quotient.wMulDown(PRE_LCF_2 - PRE_LCF_1) + PRE_LCF_1;
+    // preLCF should never exceed PRE_LCF_2 + 1 (rounding tolerance)
+    lte(preLCF, PRE_LCF_2 + 1, "PL-M07: preLCF exceeds max by more than rounding");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 60
+  notes: >
+    Linked to PL-M03. The quotient overflow is bounded by the rounding in wDivUp vs
+    wMulDown interaction. Even in the worst case, the excess is sub-wei in economic
+    terms. However, if someone writes a wrapper contract that relies on preLCF <= PRE_LCF_2
+    as an invariant, this could cause unexpected behavior.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: PL-M08
+  tier: 1
+  type: optimize
+  description: >
+    Maximize the value extracted by a liquidator through rounding in the seizedAssets
+    path. The liquidator specifies seizedAssets (rounds UP in repaidShares computation),
+    meaning they pay MORE shares — this is protocol-favoring. But can the liquidator
+    choose a seizedAssets value where the rounding works IN their favor?
+    Specifically: mulDivUp(collateralPrice, ORACLE_PRICE_SCALE) in line 157, then
+    wDivUp(preLIF) — these round UP, which is AGAINST the liquidator.
+    But the repaidAssets returned by Morpho.repay from repaidShares could be
+    lower than expected (shares → assets rounding in Morpho).
+    Net: collateral seized (real value) vs debt repaid (real value). The gap is the
+    liquidator's profit. Maximize this gap via input selection.
+  attack_scenario: >
+    Liquidator optimizes seizedAssets input to maximize (collateralValue - debtRepaid).
+    The preLIF is supposed to bound this, but rounding at each step could create
+    a situation where the effective incentive exceeds preLIF for specific input values.
+  impact: "Liquidator extracts more than preLIF-warranted value from borrower"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Echidna optimization: maximize liquidator profit
+    // profit = seizedAssets * collateralPrice / ORACLE_PRICE_SCALE - repaidAssets
+    // (both in loan token terms)
+    uint256 seizedValue = seizedAssets.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE);
+    uint256 expectedRepaid = seizedValue.wDivDown(preLIF);
+    // actualRepaid comes from Morpho: repaidShares.toAssetsUp(...)
+    // If actualRepaid < expectedRepaid, liquidator profits
+    int256 profit = int256(seizedValue) - int256(repaidAssets);
+    int256 expectedProfit = int256(seizedValue) - int256(expectedRepaid);
+    // profit should not exceed expectedProfit by more than rounding
+    return profit - expectedProfit;
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    The rounding in the seizedAssets path is consistently UP (against liquidator),
+    so the liquidator should never profit MORE than preLIF intends. But the
+    interaction with Morpho's repay (which converts shares back to assets) adds
+    another rounding layer that could go either way. Need to test empirically.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: PL-M09
+  tier: 1
+  type: property
+  description: >
+    Overflow risk in mulDivDown/mulDivUp with large values. Line 144:
+    position.collateral * collateralPrice could overflow uint256 if both are large.
+    MathLib.mulDivDown uses unchecked (x * y) / d — Solidity 0.8.27 has overflow checks
+    on by default, so x * y WILL revert on overflow. ORACLE_PRICE_SCALE = 1e36.
+    If collateral = type(uint128).max (~3.4e38) and collateralPrice = 1e36,
+    product = 3.4e38 * 1e36 = 3.4e74, which exceeds uint256.max (~1.15e77).
+    Actually 3.4e74 < 1.15e77, so this is fine. But if collateralPrice > 1e38 and
+    collateral > 1e38, the product exceeds uint256.max. In practice, Morpho positions
+    use uint128 for collateral (~3.4e38 max). With standard oracle prices (~1e36),
+    3.4e38 * 1e36 = 3.4e74 — safe. But if PRE_LIQUIDATION_ORACLE returns abnormally
+    high prices, the multiplication could overflow and revert, DOSing pre-liquidation.
+  attack_scenario: >
+    A malicious or buggy PRE_LIQUIDATION_ORACLE returns price = type(uint256).max.
+    collateral * price overflows, preLiquidate reverts. Pre-liquidation is permanently
+    DOSed. The position can only be liquidated via normal Morpho liquidation (which uses
+    the main ORACLE, not PRE_LIQUIDATION_ORACLE). If PRE_LIQUIDATION_ORACLE is
+    manipulable (e.g., spot price oracle), an attacker could manipulate it to DOS
+    pre-liquidations on their own position, forcing the position to skip pre-liquidation
+    and go directly to full Morpho liquidation.
+  impact: "DoS of pre-liquidation mechanism — positions can only be liquidated normally"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that collateral * collateralPrice does not overflow
+    // This is implicitly checked by Solidity 0.8.x, but we want to verify
+    // that realistic values are safe
+    uint256 maxCollateral = type(uint128).max;
+    uint256 maxReasonablePrice = 1e54; // way above any real oracle price
+    // maxCollateral * maxReasonablePrice = 3.4e38 * 1e54 = 3.4e92 < 1.15e77 ... OVERFLOW
+    // So even moderately high prices can cause overflow with max collateral
+    // Test: can we find collateral and price values within Morpho's realistic range
+    // that cause overflow?
+    bool overflows = false;
+    if (collateralPrice > 0 && uint256(position.collateral) > type(uint256).max / collateralPrice) {
+        overflows = true;
+    }
+    t(!overflows, "PL-M09: multiplication overflow in collateralQuoted computation");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 55
+  notes: >
+    Morpho Blue stores collateral as uint128, which limits the max to ~3.4e38.
+    With ORACLE_PRICE_SCALE = 1e36, the oracle price is typically around 1e36 for
+    equal-value tokens. The product 3.4e38 * 1e36 = 3.4e74 is well within uint256.max.
+    Overflow requires price > ~3.4e38 (uint256.max / 3.4e38), which is unrealistic
+    for any real token pair. This is likely safe but depends on PRE_LIQUIDATION_ORACLE
+    being well-behaved.
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: MathHunter
+  id: PL-FP-01
+  reason: >
+    Investigated whether the rounding directions in seizedAssets path (all UP) could
+    cause the liquidator to overpay relative to the seized collateral value.
+    Conclusion: this is BY DESIGN. The protocol intentionally rounds against the
+    liquidator (in favor of the borrower/protocol) in the seizedAssets path, and
+    against the liquidator (less collateral) in the repaidShares path. Both paths
+    favor the protocol. This is standard Morpho rounding convention.
+  investigated_at: '2026-03-23T12:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Morpho PreLiquidation rounding: seizedAssets path rounds all UP (liquidator
+      pays more shares), repaidShares path rounds all DOWN (liquidator gets less
+      collateral). Both consistently favor protocol. Not a bug.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: PL-FP-02
+  reason: >
+    Investigated PRE_LCF_2 > WAD allowing full position liquidation. This is
+    explicitly documented in the code comment (line 167-168): "the pre-liquidation
+    close factor can be greater than WAD (100%). In this case the position can be
+    fully pre-liquidated." This is by design.
+  investigated_at: '2026-03-23T12:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Morpho PreLiquidation PRE_LCF_2 > WAD is by design — allows full position
+      pre-liquidation. Not a bug.
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: PL-FP-03
+  reason: >
+    Investigated potential division by zero in wDivUp(collateralQuoted) on line 152.
+    If collateralQuoted == 0, wDivUp would divide by zero. However, the require on
+    line 150 ensures borrowed > collateralQuoted.wMulDown(PRE_LLTV). If
+    collateralQuoted == 0, then wMulDown(PRE_LLTV) == 0, and borrowed > 0 is needed.
+    But line 148 requires borrowed <= collateralQuoted.wMulDown(LLTV). If
+    collateralQuoted == 0, this requires borrowed <= 0. Combined: borrowed > 0 AND
+    borrowed <= 0 — contradiction. So collateralQuoted == 0 always reverts before
+    line 152. Division by zero is unreachable. By design.
+  investigated_at: '2026-03-23T12:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: liquidation-mechanics.md
+    content: >
+      Morpho PreLiquidation: division by zero in ltv = borrowed.wDivUp(collateralQuoted)
+      is unreachable because lines 148+150 create a contradiction when collateralQuoted==0.
+      Not a bug.
+    briefing_update_applied: false

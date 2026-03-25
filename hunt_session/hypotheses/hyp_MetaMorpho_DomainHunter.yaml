@@ -1,0 +1,846 @@
+protocol: morpho-metamorpho
+component: MetaMorpho
+file: src/MetaMorpho.sol
+domain: vault
+hunter: DomainHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-01: Supply cap enforcement — reallocate cannot exceed market cap
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-01
+  tier: 1
+  type: property
+  description: >
+    En reallocate() (L368), al suministrar a un market, el código verifica
+    `supplyAssets + suppliedAssets > supplyCap` (L404). `supplyAssets` se obtiene
+    de `_accruedSupplyBalance` que llama MORPHO.accrueInterest y lee estado fresh.
+    El cap check usa estado actualizado — correcto.
+    El invariante real: después de cualquier llamada a reallocate, deposit, o
+    _supplyMorpho, ningún market debe tener el supply del vault por encima de su
+    cap configurado. Esto debe mantenerse incluso bajo actividad concurrent de
+    deposit/withdraw, ya que _supplyMorpho (L787) hace su propio cap check
+    independiente usando estado fresh.
+  attack_scenario: >
+    Allocator ejecuta reallocate que empuja market X justo al cap.
+    Simultáneamente, un depositor deposita y _supplyMorpho también suministra a X.
+    Pero _supplyMorpho hace su PROPIO cap check (L787) con estado fresh incluyendo
+    lo de reallocate. Así que el segundo supply vería la posición actualizada y
+    respetaría el cap. Este invariante confirma que el cap nunca se excede.
+  impact: >
+    Si se viola, el vault sobre-asignaría a un market riesgoso, exponiendo a
+    depositantes a más riesgo crediticio del que el curator pretendía.
+  impact_rating: High
+  likelihood: Low
+  severity_final: Medium
+  solidity: |
+    function property_mm_dom_01() public returns (bool) {
+      uint256 wqLen = vault.withdrawQueueLength();
+      for (uint256 i = 0; i < wqLen; i++) {
+        Id id = vault.withdrawQueue(i);
+        (uint184 cap, bool enabled,) = vault.config(id);
+        if (cap == 0) continue;
+        uint256 supplyShares = morpho.supplyShares(id, address(vault));
+        (uint256 totalSupplyAssets, uint256 totalSupplyShares,,) = morpho.expectedMarketBalances(morpho.idToMarketParams(id));
+        uint256 supplyAssets = supplyShares * (totalSupplyAssets + 1) / (totalSupplyShares + 1);
+        t(supplyAssets <= uint256(cap) + 1, "MM-DOM-01: vault supply exceeds market cap");
+      }
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    La tolerancia de +1 es por rounding en la conversión share→asset.
+    El interest accrual entre cap check y supply real podría empujar
+    levemente por encima del cap, pero el protocolo acepta esto como dust.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-02: Reallocate conservation — totalWithdrawn == totalSupplied
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-02
+  tier: 1
+  type: property
+  description: >
+    reallocate() (L368-L417) enforcea totalWithdrawn == totalSupplied en L416.
+    Invariante de conservación core — el vault no debe ganar ni perder assets via
+    reallocación. Cuando allocation.assets == 0 (L383), el código usa todos los
+    supplyShares para withdraw. El withdrawnAssets real (retornado por Morpho.withdraw)
+    puede diferir del supplyAssets calculado por rounding. El acumulador usa los
+    valores retornados reales, no los esperados. La check en L416 es exacta.
+  attack_scenario: >
+    Atacante intenta craftar una secuencia de reallocate donde diferencias de
+    rounding entre withdraw y supply se acumulan. Como la check es sobre montos
+    retornados reales, no esperados, el revert en L416 atraparía cualquier
+    discrepancia. Solo se podría bypassear si Morpho.withdraw/supply retornan
+    valores incorrectos.
+  impact: >
+    Si se viola, assets del vault se fugan durante reallocation. Depositors
+    pierden fondos pro-rata con cada reallocación.
+  impact_rating: Critical
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_02() public returns (bool) {
+      uint256 totalBefore = ghost_totalAssets_before_reallocate;
+      uint256 totalAfter = ghost_totalAssets_after_reallocate;
+      if (totalBefore == 0) return true;
+      uint256 tolerance = ghost_markets_touched_in_reallocate;
+      t(totalAfter >= totalBefore - tolerance && totalAfter <= totalBefore + tolerance,
+        "MM-DOM-02: reallocate changed totalAssets beyond tolerance");
+      return true;
+    }
+  ghost_vars:
+    - ghost_totalAssets_before_reallocate
+    - ghost_totalAssets_after_reallocate
+    - ghost_markets_touched_in_reallocate
+  validated: false
+  priority: critical
+  confidence: 85
+  notes: >
+    La check on-chain es estricta (igualdad exacta). El invariante de fuzzing
+    usa tolerancia porque totalAssets() re-lee desde Morpho que puede incluir
+    micro interest accrual entre las dos lecturas.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-03: Withdraw queue completeness — todos los enabled markets en withdrawQueue
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-03
+  tier: 1
+  type: property
+  description: >
+    Todo market con config[id].enabled == true DEBE estar en el withdrawQueue.
+    Esto es crítico porque totalAssets() (L585-L589) itera SOLO sobre withdrawQueue.
+    Si un market enabled con supply no-zero no está en el queue, totalAssets()
+    sub-contaría, deflacionando el share price. Mantenido por: (1) _setCap añade
+    al queue al habilitar (L746), (2) updateWithdrawQueue solo remueve markets
+    que deshabilita (L358 delete config[id]).
+  attack_scenario: >
+    Si un market pudiera estar enabled pero no en withdrawQueue, deposits a ese
+    market via reallocate incrementarían assets reales sin incrementar totalAssets().
+    Un depositor subsecuente obtendría shares a tasa inflada, diluyendo existentes.
+    El atacante deposita, luego el market se añade al queue (arreglando totalAssets),
+    y el atacante redime al rate verdadero (más alto).
+  impact: >
+    Manipulación de share price. Depositors existentes diluidos si totalAssets
+    sub-cuenta. Nuevos depositors sobrepagan si totalAssets sobre-cuenta.
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: High
+  solidity: |
+    function property_mm_dom_03() public returns (bool) {
+      uint256 wqLen = vault.withdrawQueueLength();
+      for (uint256 i = 0; i < wqLen; i++) {
+        Id id = vault.withdrawQueue(i);
+        (, bool enabled,) = vault.config(id);
+        t(enabled, "MM-DOM-03: market in withdrawQueue but not enabled");
+      }
+      for (uint256 i = 0; i < ghost_known_market_ids.length; i++) {
+        Id id = ghost_known_market_ids[i];
+        (, bool enabled,) = vault.config(id);
+        if (!enabled) continue;
+        bool found = false;
+        for (uint256 j = 0; j < wqLen; j++) {
+          if (Id.unwrap(vault.withdrawQueue(j)) == Id.unwrap(id)) {
+            found = true;
+            break;
+          }
+        }
+        t(found, "MM-DOM-03: enabled market not in withdrawQueue");
+      }
+      return true;
+    }
+  ghost_vars:
+    - ghost_known_market_ids
+  validated: false
+  priority: critical
+  confidence: 90
+  notes: >
+    Invariante estructural fundamental. El código lo mantiene via pairing
+    cuidadoso de _setCap (añade al queue + habilita) y updateWithdrawQueue
+    (remueve del queue + borra config). Cualquier code path que rompa este
+    pairing sería un bug crítico.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-04: Supply queue — deposits nunca fluyen a market con cap == 0
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-04
+  tier: 1
+  type: property
+  description: >
+    setSupplyQueue() (L310) valida cap != 0 para cada entry (L316). Sin embargo,
+    DESPUÉS de setear el queue, el cap puede reducirse a 0 via submitCap (reducción
+    instantánea, L284-285). Esto deja un market con cap == 0 en el supply queue.
+    En _supplyMorpho (L776), el `if (supplyCap == 0) continue` maneja esto
+    correctamente — el market se salta.
+    El invariante funcional que importa: deposits NUNCA fluyen a un market con cap == 0.
+  attack_scenario: >
+    Curator setea supply queue con market X (cap = 100). Luego reduce cap de X a 0.
+    Supply queue ahora tiene X con cap 0. Depositor deposita. _supplyMorpho salta X.
+    No hay fondos a market no autorizado. Si el check faltara, los fondos irían a un
+    market que el curator explícitamente deshabilitó.
+  impact: >
+    Si _supplyMorpho no re-verificara cap, fondos se asignarían a un market que el
+    curator zeroed out, violando la gestión de riesgo del curator.
+  impact_rating: High
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_04() public returns (bool) {
+      uint256 sqLen = vault.supplyQueueLength();
+      for (uint256 i = 0; i < sqLen; i++) {
+        Id id = vault.supplyQueue(i);
+        (uint184 cap,,) = vault.config(id);
+        if (cap == 0) {
+          uint256 currentShares = morpho.supplyShares(id, address(vault));
+          t(currentShares <= ghost_supply_shares_snapshot[Id.unwrap(id)],
+            "MM-DOM-04: supply increased to zero-cap market");
+        }
+      }
+      return true;
+    }
+  ghost_vars:
+    - ghost_supply_shares_snapshot
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    El invariante estructural (supply queue entries tienen cap > 0) se viola
+    transitoriamente por diseño. El invariante funcional (no deposits a cap-0
+    markets) es lo que realmente importa.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-05: Market lifecycle — removal requiere zero cap AND no pending cap
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-05
+  tier: 1
+  type: property
+  description: >
+    submitMarketRemoval() (L294) requiere: (1) removableAt == 0, (2) cap == 0,
+    (3) enabled == true, (4) pendingCap[id].validAt == 0. Esto previene remover
+    un market que podría re-habilitarse via pending cap. _setCap (L758) setea
+    removableAt = 0 cuando cap > 0 — re-habilitar cancela removal.
+    submitCap (L280) revierte si removableAt != 0 — no se puede submitir cap
+    nuevo mientras removal está pending. Lifecycle bien protegido.
+  attack_scenario: >
+    Race condition: curator submite cap = 0 (instantáneo), luego market removal.
+    Otro curator submite nuevo cap > 0 — pero submitCap chequea removableAt != 0
+    y revierte (L280: PendingRemoval). Bien guardado.
+  impact: >
+    Si un market pudiera force-removerse con cap activo y supply, depositantes
+    perderían acceso a esos fondos permanentemente.
+  impact_rating: Critical
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_05() public returns (bool) {
+      uint256 wqLen = vault.withdrawQueueLength();
+      for (uint256 i = 0; i < wqLen; i++) {
+        Id id = vault.withdrawQueue(i);
+        (uint184 cap, bool enabled, uint64 removableAt) = vault.config(id);
+        if (removableAt != 0) {
+          t(cap == 0, "MM-DOM-05: market pending removal has non-zero cap");
+          (uint192 pendingCapValue, uint64 pendingCapValidAt) = vault.pendingCap(id);
+          t(pendingCapValidAt == 0, "MM-DOM-05: market pending removal has pending cap");
+          t(enabled, "MM-DOM-05: market pending removal is not enabled");
+        }
+      }
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    Los guards del lifecycle están bien diseñados. submitCap chequea removableAt,
+    submitMarketRemoval chequea cap y pendingCap. _setCap limpia removableAt.
+    Este invariante valida toda la state machine del lifecycle.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-06: Pending values — solo un pending value por slot a la vez
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-06
+  tier: 1
+  type: property
+  description: >
+    submitTimelock (L217) chequea pendingTimelock.validAt != 0 y revierte.
+    submitGuardian (L261) chequea pendingGuardian.validAt != 0.
+    submitCap (L279) chequea pendingCap[id].validAt != 0.
+    Invariante: pending con validAt != 0 implica que los valores son válidos
+    (dentro de bounds para timelock, no-zero para algunos).
+    Si pendingTimelock.validAt != 0, su value debe ser < timelock actual
+    (solo decreases son pending, increases son instantáneos L220-L227).
+  attack_scenario: >
+    Si dos pending values pudieran coexistir para el mismo slot, el segundo
+    podría sobreescribir el validAt del primero, permitiendo aceptación más
+    temprana. El código previene esto con el check de validAt != 0 antes de update.
+  impact: >
+    Si múltiples pending values coexistieran, las garantías del timelock se romperían.
+  impact_rating: High
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_06() public returns (bool) {
+      (uint192 ptValue, uint64 ptValidAt) = vault.pendingTimelock();
+      if (ptValidAt != 0) {
+        t(uint256(ptValue) >= 1 days, "MM-DOM-06: pending timelock below MIN");
+        t(uint256(ptValue) <= 2 weeks, "MM-DOM-06: pending timelock above MAX");
+        t(uint256(ptValue) < vault.timelock(), "MM-DOM-06: pending timelock is not a decrease");
+      }
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    Claro del código — el if/else en L220-L227 maneja increase (instantáneo)
+    vs decrease (pending). Muy alta confianza.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-07: Fee accrual — lastTotalAssets trackea totalAssets correctamente
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-07
+  tier: 1
+  type: property
+  description: >
+    lastTotalAssets se actualiza en: _deposit (L676), withdraw/redeem (L565/L579),
+    setFee (L237), setFeeRecipient (L251), _setCap (L753 para markets nuevos).
+    Entre updates, lastTotalAssets puede divergir de totalAssets() por interest accrual.
+    La fee se computa como totalInterest = totalAssets().zeroFloorSub(lastTotalAssets).
+    Si lastTotalAssets > totalAssets() (bad debt o market removal), totalInterest = 0.
+    CLAVE: si un market se remueve del withdrawQueue con supply, totalAssets() baja
+    pero lastTotalAssets NO se actualiza. Esto suprime fee accrual hasta que el
+    interest cierre el gap. Documentado como intencional (IMetaMorpho.sol L73-76).
+  attack_scenario: >
+    Curator malicioso force-remueve market con supply pequeño. lastTotalAssets >
+    totalAssets(). No se accrúan fees hasta que el interest cubra el gap.
+    Fee recipient pierde income. Depositors no son perjudicados directamente.
+  impact: >
+    Fee recipient pierde income temporalmente. Documentado como intencional.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dom_07() public returns (bool) {
+      uint256 lta = vault.lastTotalAssets();
+      uint256 ta = vault.totalAssets();
+      if (lta > ta) {
+        t(lta - ta <= ghost_removed_market_value + 1e18,
+          "MM-DOM-07: lastTotalAssets exceeds totalAssets by too much");
+      }
+      return true;
+    }
+  ghost_vars:
+    - ghost_removed_market_value
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    La tolerancia de 1e18 es generosa. En práctica el gap debería ser
+    exactamente el supply del market removido. El comportamiento documentado
+    significa que esto es informacional.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-08: ERC4626 — deposit/mint roundtrip no debe crear shares gratis
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-08
+  tier: 1
+  type: property
+  description: >
+    ERC4626 compliance requiere que deposit(assets) retorne shares tales que
+    redeem(shares) <= assets (sin profit por roundtrip). MetaMorpho usa
+    DECIMALS_OFFSET = max(0, 18 - decimals) para virtual shares.
+    Conversión: shares = assets * (totalSupply + 10^offset) / (totalAssets + 1).
+    Por double-flooring, el depositor debería recibir <= assets depositados.
+    EDGE CASE: con tokens de 18 decimales, DECIMALS_OFFSET = 0, la protección
+    es mínima (virtual share = 1). Un deposit de 1 wei podría dar 0 shares.
+  attack_scenario: >
+    Atacante deposita 1 wei. Obtiene 0 shares si totalSupply es suficientemente
+    grande. Assets donados a shareholders existentes. MetaMorpho mitiga con
+    DECIMALS_OFFSET haciendo que 1 wei siempre produzca al menos 1 share
+    para tokens con <= 18 decimales.
+  impact: >
+    Si shares se pueden mintear gratis o assets extraerse via rounding, es
+    pérdida directa para depositors.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dom_08() public returns (bool) {
+      if (ghost_roundtrip_deposited == 0) return true;
+      t(ghost_roundtrip_redeemed <= ghost_roundtrip_deposited,
+        "MM-DOM-08: deposit-redeem roundtrip was profitable");
+      return true;
+    }
+  ghost_vars:
+    - ghost_roundtrip_deposited
+    - ghost_roundtrip_redeemed
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    Debe testearse con secuencias reales de deposit+redeem en fuzzing.
+    Los ghost variables deben setearse en el handler.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-09: Withdraw queue — sin duplicados después de updateWithdrawQueue
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-09
+  tier: 1
+  type: property
+  description: >
+    updateWithdrawQueue (L325) usa bitmap `seen` para prevenir duplicados.
+    Si seen[prevIndex] es true, revierte con DuplicateMarket. Crítico porque
+    totalAssets() DOBLE-CONTARÍA el supply de un market si aparece dos veces,
+    inflando el share price. Supply queue (L310) SÍ permite duplicados
+    (solo aumenta costo de gas).
+    _setCap (L746) pushea al withdrawQueue al habilitar. El guard
+    `if (!marketConfig.enabled)` en L745 previene push doble.
+  attack_scenario: >
+    Si withdrawQueue contuviera duplicados, totalAssets() sobre-contaría.
+    Depositors existentes se beneficiarían (shares valen más). Nuevos depositors
+    overpagan. Atacante deposita cuando totalAssets está inflado, obtiene menos
+    shares, y cuando se corrige pierde. O bien: atacante es depositor existente,
+    manipula queue para inflar, retira a precio inflado.
+  impact: >
+    Double-counting en totalAssets lleva a pricing incorrecto de shares.
+  impact_rating: Critical
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_09() public returns (bool) {
+      uint256 wqLen = vault.withdrawQueueLength();
+      for (uint256 i = 0; i < wqLen; i++) {
+        Id id_i = vault.withdrawQueue(i);
+        for (uint256 j = i + 1; j < wqLen; j++) {
+          Id id_j = vault.withdrawQueue(j);
+          t(Id.unwrap(id_i) != Id.unwrap(id_j),
+            "MM-DOM-09: duplicate market in withdrawQueue");
+        }
+      }
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 95
+  notes: >
+    El código previene esto via bitmap `seen` y el guard `enabled` en _setCap.
+    Este invariante es safety net — si se rompe, es bug crítico de accounting.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-10: Fee shares — fee <= 50% y feeShares diluyen correctamente
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-10
+  tier: 1
+  type: property
+  description: >
+    Fee capped a MAX_FEE = 0.5e18 (50%) en setFee (L233). Cálculo de fee shares
+    en _accruedFeeShares (L892-906): feeAssets = totalInterest * fee / WAD.
+    feeShares = convertToShares(feeAssets, totalSupply, newTotalAssets - feeAssets).
+    El denominador usa newTotalAssets - feeAssets (NO newTotalAssets). Esto previene
+    que la fee se diluya a sí misma. Correcto.
+    VECTOR: si alguien puede manipular totalAssets() para ser muy grande temporalmente
+    (via donación a markets de Morpho), el interest spike generaría una fee grande.
+    Pero la donación beneficiaría a todos los depositors proporcionalmente, y la fee
+    solo se cobra sobre el interest delta.
+  attack_scenario: >
+    Si el fee calculation usara newTotalAssets (sin restar feeAssets) en el
+    denominador, el fee recipient obtendría menos shares de las que debería.
+    El código actual resta correctamente feeAssets.
+  impact: >
+    Si fee shares se calculan incorrectamente, o fee recipient recibe demasiado
+    (depositors diluidos) o muy poco (fee recipient underpaid).
+  impact_rating: High
+  likelihood: Low
+  severity_final: Medium
+  solidity: |
+    function property_mm_dom_10() public returns (bool) {
+      uint256 currentFee = vault.fee();
+      t(currentFee <= 0.5e18, "MM-DOM-10: fee exceeds MAX_FEE");
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    El cálculo de fee está bien diseñado. La resta de feeAssets del denominador
+    es el approach estándar para fee minting dilutivo. El MAX_FEE check es directo.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-11: ERC4626 — totalAssets >= sum de todos los claims de depositors
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-11
+  tier: 1
+  type: property
+  description: >
+    Invariante de solvencia fundamental de ERC4626: totalAssets() debe ser
+    suficiente para cubrir todas las conversiones share→asset. Específicamente:
+    convertToAssets(totalSupply) <= totalAssets() + rounding_tolerance.
+    En MetaMorpho, totalAssets() = sum de expectedSupplyAssets sobre withdrawQueue.
+    Esto representa la posición REAL del vault en Morpho Blue, incluyendo interest.
+    Si Morpho Blue experimenta bad debt, totalSupplyAssets podría decrecer, haciendo
+    totalAssets() < lastTotalAssets. Manejado por zeroFloorSub (no negative interest).
+  attack_scenario: >
+    Bad debt en un Morpho market reduce totalAssets() del vault. Si un user redime
+    antes de que el bad debt se realize, podría obtener más de su fair share.
+    Sin embargo, _withdrawMorpho usa _accruedSupplyBalance que llama
+    MORPHO.accrueInterest primero, asegurando que el bad debt se realice antes
+    del withdrawal.
+  impact: >
+    Insolvencia — si totalAssets es manipulable, early redeemers roban de
+    late redeemers. El estándar ERC4626 requiere totalAssets honesto.
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: High
+  solidity: |
+    function property_mm_dom_11() public returns (bool) {
+      uint256 ta = vault.totalAssets();
+      uint256 ts = vault.totalSupply();
+      if (ts == 0) return true;
+      uint256 allClaims = vault.convertToAssets(ts);
+      t(allClaims <= ta + 1, "MM-DOM-11: total claims exceed totalAssets");
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 90
+  notes: >
+    La tolerancia de +1 es por rounding en convertToAssets.
+    convertToAssets(totalSupply) = totalSupply * (totalAssets + 1) / (totalSupply + offset).
+    Para offset >> 0, esto es levemente menos que totalAssets.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-12: Timelock decrease es pending, increase es instantáneo
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-12
+  tier: 1
+  type: property
+  description: >
+    submitTimelock (L215-L228): si newTimelock > timelock, se setea INMEDIATAMENTE
+    via _setTimelock (L221). Si newTimelock < timelock, va a pending (L224) con el
+    timelock ACTUAL como delay. Seguridad: aumentar timelock es más seguro, instantáneo.
+    Decrementar es menos seguro, requiere que pase el timelock actual primero.
+    Invariante: si pendingTimelock.validAt != 0, su value DEBE ser < timelock actual.
+  attack_scenario: >
+    Owner malicioso quiere rug: (1) submit timelock decrease 14d→1d, esperar 14d,
+    aceptar. (2) Submit cambios maliciosos con 1d delay. Guardian tiene 1 día para
+    revocar. Si guardian está offline >1 día, rug exitoso. Esto es governance risk,
+    no code bug — el timelock funciona como diseñado.
+  impact: >
+    Governance attack requiriendo owner + 14+ días de paciencia + guardian offline.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dom_12() public returns (bool) {
+      (uint192 ptValue, uint64 ptValidAt) = vault.pendingTimelock();
+      if (ptValidAt != 0) {
+        t(uint256(ptValue) < vault.timelock(),
+          "MM-DOM-12: pending timelock is not a decrease");
+      }
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    Claro del código. Muy alta confianza.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-13: Skim no puede drenar posiciones de Morpho del vault
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-13
+  tier: 2
+  type: property
+  description: >
+    skim() (L483) transfiere todo el balance del vault de cualquier token al
+    skimRecipient. Los assets reales del vault están en Morpho Blue (via supply
+    positions), no en el balance del contrato vault. Skim solo debería transferir
+    tokens "stray" que terminaron en el vault. El vault approves Morpho por max
+    uint256 (L135). Si el asset token tiene transfer hook que llama skim()...
+    el flujo de _deposit es: super._deposit → transferFrom → _supplyMorpho →
+    MORPHO.supply. Si transferFrom tiene hook que llama skim, el balance se
+    enviaría a skimRecipient, y MORPHO.supply fallaría por balance insuficiente.
+    La tx revierte — seguro.
+  attack_scenario: >
+    Atacante envía 1 wei de asset al vault, llama skim(asset). skimRecipient
+    obtiene 1 wei. Sin daño — las posiciones de Morpho son seguras.
+  impact: >
+    skim() solo drena tokens en el contrato vault. Posiciones de Morpho son seguras.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dom_13() public returns (bool) {
+      if (!ghost_skim_called) return true;
+      t(ghost_totalAssets_before_skim == ghost_totalAssets_after_skim,
+        "MM-DOM-13: skim changed totalAssets");
+      return true;
+    }
+  ghost_vars:
+    - ghost_skim_called
+    - ghost_totalAssets_before_skim
+    - ghost_totalAssets_after_skim
+  validated: false
+  priority: medium
+  confidence: 90
+  notes: >
+    Skim está diseñado intencionalmente para sweep tokens stray. El invariante
+    confirma que nunca toca posiciones de Morpho.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-14: _supplyMorpho try/catch — skip silencioso de markets fallidos
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-14
+  tier: 2
+  type: property
+  description: >
+    _supplyMorpho (L771-L800) usa try/catch con MORPHO.supply (L791).
+    Si supply revierte, el market se salta silenciosamente. Mismo patrón en
+    _withdrawMorpho (L815). El try/catch traga TODOS los reverts.
+    Si el catch se trigger durante deposit, los assets del depositor podrían
+    ir todos a un solo market en vez de distribuirse. Concentra riesgo pero
+    el depositor obtiene shares al rate correcto.
+    CLAVE: si NINGÚN market acepta supply, la función revierte con AllCapsReached.
+    Los assets deposited se retornan al caller via revert.
+  attack_scenario: >
+    Atacante manipula un Morpho market para que revierte en supply (via oracle
+    manipulation que hace fallar el oracle call del market). El vault silenciosamente
+    salta ese market y suministra al siguiente. Si el "siguiente" tiene mayor
+    riesgo, el depositor unknowingly obtiene más risk exposure.
+  impact: >
+    Concentración de riesgo en deposit flow. No pérdida directa de fondos pero
+    exposición a mayor riesgo crediticio.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dom_14() public returns (bool) {
+      if (ghost_last_deposit_amount == 0) return true;
+      t(ghost_totalAssets_after_deposit + 2 >= ghost_totalAssets_before_deposit + ghost_last_deposit_amount,
+        "MM-DOM-14: deposited assets not fully accounted in totalAssets");
+      return true;
+    }
+  ghost_vars:
+    - ghost_last_deposit_amount
+    - ghost_totalAssets_before_deposit
+    - ghost_totalAssets_after_deposit
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    La tolerancia de +2 es por rounding en supply de Morpho.
+    Un supply fallido significaría assets quedando en el contrato vault (no en
+    totalAssets) que sería capturado por este invariante.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-15: Queue length bounds — max 30 markets
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-15
+  tier: 2
+  type: property
+  description: >
+    MAX_QUEUE_LENGTH = 30. Enforceado en setSupplyQueue (L313) y _setCap (L748).
+    Medida de seguridad de gas — totalAssets(), _supplyMorpho, _withdrawMorpho
+    iteran sobre las queues. Con 30 markets, el costo de gas es bounded.
+  attack_scenario: >
+    Si queue length fuera unbounded, un curator podría añadir cientos de markets,
+    haciendo que deposit/withdraw/totalAssets excedan el gas limit del bloque.
+    DoS efectivo del vault. Con el cap de 30 markets, gas es bounded.
+  impact: >
+    Prevención de DoS. Si se viola, operaciones del vault podrían ser muy costosas.
+  impact_rating: Medium
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_15() public returns (bool) {
+      t(vault.supplyQueueLength() <= 30, "MM-DOM-15: supplyQueue exceeds MAX_QUEUE_LENGTH");
+      t(vault.withdrawQueueLength() <= 30, "MM-DOM-15: withdrawQueue exceeds MAX_QUEUE_LENGTH");
+      return true;
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 99
+  notes: >
+    Check de bound directo. Enforceado en setSupplyQueue y _setCap. Confianza
+    extremadamente alta.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-16: Pending cap increase — cap decrease es instantáneo, increase es pending
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-16
+  tier: 1
+  type: property
+  description: >
+    submitCap (L274-L291): si newSupplyCap < supplyCap (decrease), se aplica
+    instantáneamente via _setCap (L285). Si newSupplyCap > supplyCap (increase),
+    va a pending (L287). Mirrors el patrón de timelock — decrementar caps es
+    seguro (reduce riesgo), incrementar es peligroso (más exposición).
+    Invariante: si pendingCap[id].validAt != 0, su value DEBE ser > current cap.
+  attack_scenario: >
+    Si cap increases fueran instantáneos, un curator malicioso podría habilitar
+    instantáneamente un market riesgoso con cap enorme. El siguiente deposit
+    fluiría allí. Con pending, depositors/guardian tienen tiempo de reaccionar.
+  impact: >
+    Si cap increase fuera instantáneo sin timelock, depositors no tendrían tiempo
+    de salir antes de exposición a un market riesgoso nuevo.
+  impact_rating: High
+  likelihood: None
+  severity_final: null
+  solidity: |
+    function property_mm_dom_16() public returns (bool) {
+      for (uint256 i = 0; i < ghost_known_market_ids.length; i++) {
+        Id id = ghost_known_market_ids[i];
+        (uint192 pcValue, uint64 pcValidAt) = vault.pendingCap(id);
+        if (pcValidAt != 0) {
+          (uint184 currentCap,,) = vault.config(id);
+          t(uint256(pcValue) > uint256(currentCap),
+            "MM-DOM-16: pending cap is not an increase");
+        }
+      }
+      return true;
+    }
+  ghost_vars:
+    - ghost_known_market_ids
+  validated: false
+  priority: high
+  confidence: 95
+  notes: >
+    Claro del if/else en L284-L290. Cap decrease → _setCap instantáneo.
+    Cap increase → pending. Muy alta confianza.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-17: Share price monotonicity — deposit/mint NO decrementan share price
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-17
+  tier: 1
+  type: property
+  description: >
+    deposit() y mint() NO deben decrementar el share price para holders existentes.
+    El share price conceptual = totalAssets / totalSupply. Después de un deposit,
+    totalAssets sube por deposited amount, totalSupply sube por minted shares.
+    Si las shares se mintean al rate correcto, el price no cambia (o sube levemente
+    por rounding en favor del vault).
+    _accrueFee() mintea feeShares ANTES del cálculo de shares del depositor.
+    Si el rounding de feeShares es off, el nuevo totalSupply podría ser inconsistente
+    con newTotalAssets, causando dilución.
+  attack_scenario: >
+    Si deposit() disminuye share price, un atacante puede hacer deposits repetidos
+    para diluir a holders existentes. Relevante con fee accrual timing.
+  impact: >
+    Dilución gradual de shareholders existentes vía rounding en fee accrual.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: Low
+  solidity: |
+    function property_mm_dom_17() public returns (bool) {
+      uint256 totalAssetsBefore = ghost_totalAssets_before_deposit;
+      uint256 totalSupplyBefore = ghost_totalSupply_before_deposit;
+      uint256 totalAssetsAfter = ghost_totalAssets_after_deposit;
+      uint256 totalSupplyAfter = ghost_totalSupply_after_deposit;
+      if (totalSupplyBefore > 0 && totalSupplyAfter > 0) {
+        t(totalAssetsAfter * totalSupplyBefore + 1 >= totalAssetsBefore * totalSupplyAfter,
+          "MM-DOM-17: share price decreased after deposit");
+      }
+      return true;
+    }
+  ghost_vars:
+    - ghost_totalAssets_before_deposit
+    - ghost_totalSupply_before_deposit
+    - ghost_totalAssets_after_deposit
+    - ghost_totalSupply_after_deposit
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    La fee accrual en deposit() mintea feeShares, luego calcula depositor
+    shares con totalSupply() post-mint. El +1 tolerance es por rounding.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MM-DOM-18: Market removal con non-zero supply — impacto en share price
+# ═══════════════════════════════════════════════════════════════════════════
+- id: MM-DOM-18
+  tier: 1
+  type: property
+  description: >
+    updateWithdrawQueue (L325) puede force-remover un market con supply no-zero SI
+    config[id].removableAt != 0 AND block.timestamp >= removableAt (L351-L355).
+    Cuando pasa, los supply assets del market ya no cuentan en totalAssets().
+    Esto INSTANTÁNEAMENTE reduce el share price para todos los depositors.
+    Los supply shares del vault en Morpho Blue NO se retiran — permanecen allocated.
+    Los fondos se pueden recuperar re-habilitando el market (submitCap con cap > 0).
+    INVARIANTE: totalAssets() debe igualar la suma de supply positions SOLO para
+    markets en el withdrawQueue.
+  attack_scenario: >
+    Curator/allocator malicioso submite removal para market con supply significativo,
+    espera timelock, ejecuta updateWithdrawQueue. Share price baja. Atacante deposita
+    al precio bajo, luego re-habilita el market, share price se recupera, atacante
+    redime con profit. Requiere curator role y timelock patience. Guardian puede
+    revocar durante el timelock.
+  impact: >
+    Caída instantánea de share price para todos los depositors. Potencialmente
+    gran pérdida si el market removido tenía supply significativo.
+  impact_rating: High
+  likelihood: Low
+  severity_final: Medium
+  solidity: |
+    function property_mm_dom_18() public returns (bool) {
+      if (!ghost_market_removed_with_supply) return true;
+      uint256 ta = vault.totalAssets();
+      t(ta < ghost_totalAssets_before_removal,
+        "MM-DOM-18: totalAssets did not decrease after removing market with supply");
+      uint256 diff = ghost_totalAssets_before_removal - ta;
+      t(diff <= ghost_removed_supply_amount + 1e6,
+        "MM-DOM-18: totalAssets dropped more than removed supply");
+      return true;
+    }
+  ghost_vars:
+    - ghost_market_removed_with_supply
+    - ghost_totalAssets_before_removal
+    - ghost_removed_supply_amount
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    Documentado como comportamiento intencional de emergencia. El invariante
+    confirma que el impacto en accounting coincide con lo esperado.
+
+false_positives:
+- hunter: DomainHunter
+  id: MM-DOM-FP-01
+  reason: >
+    "First depositor inflation attack para 18-decimal tokens" — DECIMALS_OFFSET=0
+    da protección mínima (virtual share = 1). Sin embargo, el contrato lo reconoce
+    explícitamente y recomienda initial deposit. Excluded como "deployer parameter
+    choice" y acknowledged behavior.
+  investigated_at: '2026-03-25T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: MM-DOM-FP-02
+  reason: >
+    "maxDeposit/maxMint overestimation con duplicate supplyQueue entries" —
+    setSupplyQueue no verifica duplicados, así que _maxDeposit() puede double-count
+    capacity. Documentado en warnings L496 y L502. ERC4626 spec violation pero
+    el deposit real nunca over-supplies (AllCapsReached). Known issue.
+  investigated_at: '2026-03-25T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: MM-DOM-FP-03
+  reason: >
+    "Allocator puede manipular IRM via reallocate" — el allocator mueve fondos
+    entre markets via reallocate(), temporalmente cambiando balance en Morpho. Si
+    un IRM usa balanceOf(morpho), podría manipularse. PERO: IRM es elegido por
+    market creator en Morpho Blue, no por MetaMorpho. Y reallocate() enforcea
+    totalWithdrawn == totalSupplied. No es exploitable desde MetaMorpho.
+  investigated_at: '2026-03-25T00:00:00Z'
+  pending_briefing_update: null

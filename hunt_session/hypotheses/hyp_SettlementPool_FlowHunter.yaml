@@ -1,0 +1,358 @@
+protocol: variational
+component: SettlementPool
+file: variational-audit/src/SettlementPool.sol
+domain: reentrancy
+hunter: FlowHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: SP-F-01
+  tier: 1
+  type: property
+  description: >
+    withdrawFees() no verifica que el requestor sea una party del pool. A diferencia de
+    _withdrawUSDCOnBehalf() (L270-272 que requiere requestor == creatorAddress || otherAddresses[requestor]),
+    withdrawFees() en L273-286 solo chequea onlyOracle y permite enviar USDC a CUALQUIER
+    dirección arbitraria. Un oracle comprometido o malicioso puede drenar todo el pool
+    a una dirección externa que no es party del pool.
+  attack_scenario: >
+    El Oracle llama withdrawFees(attacker_address, totalBalance, unique_fees_batch_id).
+    El pool transfiere TODO el USDC a attacker_address, que no es ni creatorAddress ni
+    otherAddress. Las parties legítimas pierden todos sus fondos depositados. Esto difiere
+    de withdrawUSDC/_withdrawUSDCOnBehalf donde hay un check explícito de party membership
+    en L270-272.
+  impact: "Pérdida total de fondos del pool si el Oracle es comprometido o malicioso. El Oracle es un single point of failure sin checks de destino."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Comparar: withdrawFees permite requestor arbitrario, _withdrawUSDCOnBehalf no
+    // Este invariante verifica que TODOS los destinatarios de transfers out son parties
+    // Ghost: track de todos los destinatarios de withdrawals
+    bool isParty = (ghost_lastWithdrawFeeRecipient == settlementPool.creatorAddress()) ||
+                   settlementPool.otherAddresses(ghost_lastWithdrawFeeRecipient);
+    t(isParty, "SP-F-01: withdrawFees sent USDC to non-party address");
+  ghost_vars:
+    - address internal ghost_lastWithdrawFeeRecipient;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    El Oracle tiene control total sobre el requestor en withdrawFees(). El contrato
+    confía ciegamente en que el Oracle enviará a una dirección válida. Si el Oracle
+    tiene un bug o es comprometido, no hay protección on-chain. Comparar con
+    _withdrawUSDCOnBehalf que SÍ verifica party membership. Esto podría ser by-design
+    (fees van al protocol treasury, no a parties), pero la falta de whitelist es notable.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: SP-F-02
+  tier: 1
+  type: property
+  description: >
+    En batchDepositUSDCAtomic() L122-157, el creatorPartyAmountRequested se cobra
+    N veces (una por cada item) al creatorPartyAddress, pero el transferUuid se resetea
+    a 0 después del primer depósito del creator en cada iteración. Esto significa que
+    para items[1..N-1], el depósito del creator pasa transferUuid=0 a _depositUSDCOnBehalf,
+    y en L106 el check `if (transferUuid != 0)` es false, así que NO marca
+    transfers_processed[0] = true. El creator es cargado N veces por creatorPartyAmountRequested
+    pero la protección de duplicados NO aplica a los depósitos subsiguientes del creator.
+  attack_scenario: >
+    Oracle llama batchDepositUSDCAtomic(creatorAddr, 1000e6, [item1, item2, item3]) donde
+    cada item tiene parentQuoteUuid distinto. El creator es cargado 3 * 1000e6 = 3000 USDC.
+    Solo el primer depósito del creator tiene protección de duplicados (via parentQuoteUuid
+    del primer item). Los depósitos 2 y 3 del creator usan transferUuid=0, bypaseando
+    el check de duplicados. Si el Oracle llama esta función dos veces con los mismos items
+    pero diferentes parentQuoteUuid en items[0], el creator paga 6000 USDC en lugar de 3000.
+  impact: "Cobro múltiple no protegido al creator party. El creator paga N veces el monto sin protección de replay para las iteraciones 2..N."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track cuánto se ha depositado por el creator en batch vs lo esperado
+    // En una sola llamada a batchDepositUSDCAtomic con N items,
+    // el creator debería ser cargado como máximo creatorPartyAmountRequested * N
+    // PERO el punto es que NO hay protección de replay para los depósitos 2..N del creator
+    uint256 balBefore = ghost_creatorBalanceBefore;
+    uint256 balAfter = usdc.balanceOf(ghost_creatorAddress);
+    // Si el creator fue cargado, verificar que cada cargo tiene un transferUuid único procesado
+    if (balBefore > balAfter) {
+        uint256 totalCharged = balBefore - balAfter;
+        // El creator solo debería ser cargado si cada depósito tiene replay protection
+        t(ghost_allCreatorDepositsHaveUniqueUuid, "SP-F-02: creator charged without replay protection");
+    }
+  ghost_vars:
+    - uint256 internal ghost_creatorBalanceBefore;
+    - address internal ghost_creatorAddress;
+    - bool internal ghost_allCreatorDepositsHaveUniqueUuid;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    El diseño intencional parece ser: usar el parentQuoteUuid del primer item como
+    transferUuid para el primer depósito del creator, luego resetear a 0 para que
+    el segundo depósito (del otherParty) no use el mismo UUID. Pero el efecto secundario
+    es que si items.length > 1, los depósitos del creator para items[1..N-1] también
+    usan transferUuid=0 y no tienen replay protection. Esto es un design flaw: el mismo
+    UUID del loop anterior ya fue procesado, pero los depósitos subsiguientes del creator
+    pasan con transferUuid=0 que bypasea el check de L106.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: SP-F-03
+  tier: 1
+  type: property
+  description: >
+    depositUSDCAtomic() L159-216 emite evento DepositedAtomic con partyOneAmountRequested
+    cuando partyOneAmountRequested > 0 && partyTwoAmountRequested == 0 (L169-180), pero
+    NO ejecuta ningún transferFrom. El comentario en L168 dice "we already completed the
+    single party transfer in the calling function", lo que implica que el Oracle ya movió
+    los fondos antes de llamar esta función. Pero el evento DepositedAtomic se emite como
+    si el depósito ocurrió aquí. Si el Oracle NO movió los fondos, el evento es falso y
+    sistemas off-chain que monitorean eventos creerán que el depósito ocurrió cuando no fue así.
+  attack_scenario: >
+    El Oracle llama depositUSDCAtomic(partyOne, partyTwo, 1000e6, 0, rfqUuid, parentQuoteUuid).
+    La función emite DepositedAtomic indicando que partyOne depositó 1000e6, pero
+    NINGÚN transferFrom se ejecuta en esta transacción. Si el Oracle tiene un bug y no
+    ejecutó el transfer previamente, el pool cree (via eventos) que tiene 1000e6 más de
+    lo que realmente tiene. Cualquier sistema off-chain basado en eventos mostrará un balance
+    inflado.
+  impact: "Divergencia entre eventos emitidos y transfers reales. Riesgo de contabilidad incorrecta off-chain que podría llevar a retiros que excedan el balance real."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Después de depositUSDCAtomic con partyOneAmount > 0, partyTwoAmount == 0:
+    // Verificar que el balance del pool realmente incrementó por partyOneAmountRequested
+    uint256 balBefore = ghost_poolBalanceBefore;
+    uint256 balAfter = usdc.balanceOf(address(settlementPool));
+    if (ghost_depositAtomicOnlyPartyOne) {
+        // Si se emitió evento de depósito, el balance DEBE haber aumentado
+        gte(balAfter, balBefore + ghost_depositAtomicAmount,
+            "SP-F-03: DepositedAtomic event emitted but pool balance did not increase");
+    }
+  ghost_vars:
+    - uint256 internal ghost_poolBalanceBefore;
+    - bool internal ghost_depositAtomicOnlyPartyOne;
+    - uint256 internal ghost_depositAtomicAmount;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Este es un trust assumption fuerte: la función asume que el Oracle ya realizó el
+    transfer antes de llamar esta función. No hay verificación on-chain de que el
+    balance del pool realmente incrementó. Es un patrón de "trust the caller" que
+    puede ser by-design dado que onlyOracle es el gate, pero crea riesgo si el Oracle
+    tiene bugs.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: SP-F-04
+  tier: 1
+  type: property
+  description: >
+    No hay validación de solvencia antes de withdrawals. Las funciones withdrawFees()
+    (L247-260), _withdrawUSDCOnBehalf() (L262-283) no verifican que amountRequested <=
+    _totalBalance(). Dependen del try/catch en usdc.transfer() para fallar si el pool
+    no tiene fondos suficientes. Pero si USDC implementa un fee-on-transfer o el balance
+    es exactamente el monto solicitado, hay edge cases. Más importante: múltiples
+    withdrawals en el mismo bloque podrían drenar más de lo que las parties depositaron
+    individualmente, ya que no hay contabilidad per-party.
+  attack_scenario: >
+    El pool tiene 1000 USDC total. Creator depositó 600, otherParty depositó 400.
+    Oracle llama withdrawUSDC(creatorAddr, 800, uuid1) — éxito, creator obtiene 800.
+    Oracle llama withdrawUSDC(otherPartyAddr, 200, uuid2) — éxito, otherParty obtiene 200.
+    Creator extrajo 200 más de lo que depositó. La falta de contabilidad per-party permite
+    que el Oracle redistribuya fondos arbitrariamente entre parties.
+  impact: "Sin contabilidad per-party, el Oracle puede redistribuir fondos entre parties sin restricción on-chain. Una party puede recibir más de lo que depositó a expensas de otra."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: total withdrawn <= total deposited para cada party
+    // Ghost: track deposits y withdrawals per address
+    if (ghost_totalWithdrawn[ghost_currentRequestor] > 0) {
+        lte(ghost_totalWithdrawn[ghost_currentRequestor],
+            ghost_totalDeposited[ghost_currentRequestor],
+            "SP-F-04: party withdrew more than deposited");
+    }
+  ghost_vars:
+    - mapping(address => uint256) internal ghost_totalDeposited;
+    - mapping(address => uint256) internal ghost_totalWithdrawn;
+    - address internal ghost_currentRequestor;
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Esto probablemente es by-design — el pool es un settlement pool donde las parties
+    negocian off-chain y el Oracle ejecuta settlements. Los balances per-party se calculan
+    off-chain, no on-chain. Pero la falta de cualquier guardrail on-chain significa que
+    un Oracle comprometido tiene poder total sobre la redistribución de fondos.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: SP-F-05
+  tier: 2
+  type: property
+  description: >
+    La protección de replay via transfers_processed[transferUuid] tiene un bypass
+    deliberado cuando transferUuid == 0. En _depositUSDCOnBehalf() L97 el require
+    `transfers_processed[transferUuid] == false` pasa para transferUuid=0 la primera vez,
+    pero en L106 el `if (transferUuid != 0)` previene que se marque como procesado.
+    Esto significa que transferUuid=0 NUNCA se marca como procesado y puede usarse
+    infinitamente. Las funciones depositUSDCNoEvent (L285-296) y las atomic deposits
+    usan transferUuid=0 intencionalmente, pero cualquier path que pase transferUuid=0
+    a _depositUSDCOnBehalf permite depósitos repetidos sin replay protection.
+  attack_scenario: >
+    Oracle llama depositUSDCNoEvent(sender, amount, 0) — deposita con transferUuid=0.
+    El require en L97 pasa porque transfers_processed[0] nunca se setea a true (L106).
+    Oracle puede llamar esta función infinitas veces con transferUuid=0 y cada vez
+    ejecutará el transferFrom. Si el sender tiene allowance suficiente (e.g., max approval),
+    se le drenan fondos repetidamente. Nota: depositUSDCNoEvent no requiere transferUuid != 0
+    (a diferencia de depositUSDC L224 y depositUSDCOnBehalfOfParty L264).
+  impact: "Depósitos repetidos sin replay protection cuando transferUuid=0. Potencial drenaje de fondos del sender si el Oracle reutiliza transferUuid=0."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Después de un depósito con transferUuid=0, verificar que NO se puede repetir
+    // (este invariante DEBERÍA fallar, demostrando el bypass)
+    if (ghost_lastDepositUuid == 0 && ghost_depositCount > 1) {
+        t(false, "SP-F-05: multiple deposits with transferUuid=0 succeeded - no replay protection");
+    }
+  ghost_vars:
+    - uint128 internal ghost_lastDepositUuid;
+    - uint256 internal ghost_depositCount;
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    depositUSDCNoEvent (L285-296) es la función más vulnerable porque no tiene el
+    require(transferUuid != 0) que sí tienen depositUSDC (L224) y depositUSDCOnBehalfOfParty
+    (L264). Combinado con el bypass de transferUuid=0 en _depositUSDCOnBehalf, permite
+    depósitos ilimitados. El vector requiere Oracle malicioso/comprometido, pero
+    depositUSDCNoEvent no tiene ni una capa de defensa contra esto.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: SP-F-06
+  tier: 2
+  type: property
+  description: >
+    El patrón try/catch en _depositUSDCOnBehalf (L105-114) y _withdrawUSDCOnBehalf
+    (L275-282) ejecuta el transfer ANTES de actualizar transfers_processed. Sin embargo,
+    el contrato hereda ReentrancyGuard y todas las funciones externas tienen nonReentrant.
+    Para USDC estándar (no fee-on-transfer, no callback), esto es seguro. Pero si
+    factory.usdcAddress() devuelve un token con callbacks (ERC-777, fee-on-transfer),
+    el estado se actualiza dentro del try block DESPUÉS del transfer externo, violando
+    el patrón CEI (Checks-Effects-Interactions).
+  attack_scenario: >
+    Si _usdc() retorna un token ERC-777 en lugar de USDC real: en _withdrawUSDCOnBehalf
+    L275 se ejecuta transfer(requestor, amount). El requestor recibe un tokensReceived()
+    callback ANTES de que L276 marque transfers_processed[transferUuid] = true. Sin
+    embargo, nonReentrant previene reentrada al mismo contrato. El riesgo real es
+    cross-contract reentrancy: el callback puede llamar a OTRO contrato que lea
+    transfers_processed[transferUuid] como false y actúe sobre esa información stale.
+  impact: "CEI violation en try/catch blocks. Si USDC es reemplazado por token con callbacks, posible lectura de estado inconsistente por contratos externos durante el callback."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que transfers_processed se actualiza ANTES del transfer
+    // En la implementación actual, se actualiza DESPUÉS (dentro del try block, post-transfer)
+    // Este invariante verifica consistencia: si transfer ocurrió, processed debe ser true
+    if (ghost_lastTransferCompleted) {
+        t(settlementPool.transfers_processed(ghost_lastTransferUuid),
+          "SP-F-06: transfer completed but transfers_processed not set");
+    }
+  ghost_vars:
+    - bool internal ghost_lastTransferCompleted;
+    - uint128 internal ghost_lastTransferUuid;
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    USDC (Circle) no tiene callbacks ERC-777. El nonReentrant guard protege contra
+    reentrancy directa. El riesgo real es bajo dado que factory.usdcAddress() debería
+    retornar USDC real. Sin embargo, si el factory es upgradeable y cambia la dirección
+    USDC, el patrón CEI violation se vuelve explotable. Marcar como tier 2 para
+    revisar si factory es upgradeable.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: SP-F-07
+  tier: 1
+  type: property
+  description: >
+    La función depositUSDCAtomic() L169-180 tiene un path donde partyOneAmountRequested > 0
+    y partyTwoAmountRequested == 0, y el parentQuoteUuid NO se valida como != 0 en este
+    path (el require en L181 está DESPUÉS del early return en L180). Tampoco se marca
+    transfers_processed[parentQuoteUuid]. Esto significa que el mismo parentQuoteUuid
+    puede reutilizarse infinitamente para este path específico, emitiendo eventos
+    DepositedAtomic falsos cada vez sin ningún cambio de estado.
+  attack_scenario: >
+    Oracle llama depositUSDCAtomic(partyOne, partyTwo, 1000e6, 0, rfq1, quoteUuid1) —
+    emite evento, no transfiere nada, no marca quoteUuid1 como procesado.
+    Oracle llama OTRA VEZ depositUSDCAtomic(partyOne, partyTwo, 1000e6, 0, rfq1, quoteUuid1) —
+    emite OTRO evento idéntico. Sistemas off-chain que monitorean eventos DepositedAtomic
+    contarán el doble. Si estos eventos se usan para contabilidad o triggers de settlement,
+    la contabilidad off-chain se corrompe.
+  impact: "Replay ilimitado de eventos DepositedAtomic sin cambio de estado. Posible corrupción de contabilidad off-chain y double-counting de depósitos."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Después de depositUSDCAtomic con partyOneAmount > 0 y partyTwoAmount == 0:
+    // Verificar que parentQuoteUuid se marca como procesado para prevenir replay
+    if (ghost_depositAtomicEarlyReturn) {
+        t(settlementPool.transfers_processed(ghost_lastParentQuoteUuid),
+          "SP-F-07: depositUSDCAtomic early return did not mark parentQuoteUuid as processed");
+    }
+  ghost_vars:
+    - bool internal ghost_depositAtomicEarlyReturn;
+    - uint128 internal ghost_lastParentQuoteUuid;
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    Este es el finding más fuerte del FlowHunter. El path L169-180 es un early return
+    que emite un evento pero no marca ningún UUID como procesado y no ejecuta ningún
+    transfer. El require(parentQuoteUuid != 0) en L181 NO protege este path porque
+    está después del return. Esto permite replay infinito de eventos sin costo (solo gas).
+    Combinado con SP-F-03 (no hay transfer real en este path), es un vector de
+    corrupción de contabilidad off-chain significativo.
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: FlowHunter
+  id: SP-FP-01
+  reason: >
+    nonReentrant guard en TODAS las funciones externas previene reentrancy directa.
+    USDC estándar no tiene callbacks. Cross-function reentrancy dentro del mismo contrato
+    es imposible porque todas comparten el mismo ReentrancyGuard lock. La superficie
+    de reentrancy directa está efectivamente cerrada.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: reentrancy-patterns.md
+    content: >
+      Cuando TODAS las funciones externas de un contrato usan el mismo nonReentrant
+      modifier (heredado de OZ ReentrancyGuard), la reentrancy directa y cross-function
+      DENTRO del contrato es imposible. Solo queda cross-contract reentrancy via
+      callbacks a otros contratos que lean estado del contrato víctima.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: SP-FP-02
+  reason: >
+    El check de allowance en L98-102 (_depositUSDCOnBehalf) antes del transferFrom es
+    redundante pero no harmful. transferFrom ya verificará allowance internamente y
+    revertirá si es insuficiente. No es un bug, solo código defensivo extra que gasta
+    gas innecesariamente (1 SLOAD extra para leer allowance).
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

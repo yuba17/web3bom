@@ -1,0 +1,411 @@
+protocol: morpho-bundler3
+component: GeneralAdapter1
+file: src/adapters/GeneralAdapter1.sol
+domain: trust
+hunter: AccessHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════
+# ACCESS CONTROL ANALYSIS — GeneralAdapter1
+# ═══════════════════════════════════════════════════════════════
+#
+# ARCHITECTURE SUMMARY:
+#   Bundler3.multicall(calls[]) → sets initiator = msg.sender (transient)
+#   → calls adapter functions (must pass onlyBundler3 modifier)
+#   → adapter reads initiator() from Bundler3 to identify the user
+#   → callbacks (onMorpho*) verify msg.sender == MORPHO then reenter Bundler3
+#   → Bundler3.reenter() verifies reenterHash matches (sender + data hash)
+#
+# FUNCTION ACCESS CONTROL MAP:
+#   WITH onlyBundler3:
+#     erc4626Mint, erc4626Deposit, erc4626Withdraw, erc4626Redeem,
+#     morphoSupply, morphoSupplyCollateral, morphoBorrow, morphoRepay,
+#     morphoWithdraw, morphoWithdrawCollateral, morphoFlashLoan,
+#     permit2TransferFrom, erc20TransferFrom, wrapNative, unwrapNative
+#   WITHOUT onlyBundler3 (callbacks — have internal MORPHO check):
+#     onMorphoSupply, onMorphoSupplyCollateral, onMorphoRepay, onMorphoFlashLoan
+#   WITHOUT any modifier (inherited from CoreAdapter):
+#     receive() — payable fallback, accepts ETH from anyone
+#
+# KEY OBSERVATIONS:
+#   1. initiator() is read from Bundler3 transient storage — not spoofable
+#      outside a multicall context. Returns address(0) outside bundles.
+#   2. Callbacks check msg.sender == MORPHO but do NOT have onlyBundler3.
+#      This is correct: MORPHO calls the adapter during supply/repay/flashloan,
+#      not Bundler3. The reenterBundler3() then calls back into Bundler3.reenter()
+#      which validates reenterHash.
+#   3. erc4626Withdraw/Redeem restrict owner to {address(this), initiator()}.
+#      This prevents draining other users' vault shares. The initiator must have
+#      pre-approved the adapter for this to work.
+#   4. morphoBorrow/Withdraw/WithdrawCollateral use initiator() as the onBehalf
+#      parameter. The initiator must have authorized the adapter on Morpho.
+#      An attacker cannot borrow from someone else's position — Morpho itself
+#      enforces the isAuthorized check.
+#   5. morphoSupply/SupplyCollateral/Repay prevent onBehalf == address(this)
+#      to avoid the adapter accumulating positions. But they allow ANY other
+#      address for onBehalf — this is by design (supplying/repaying on behalf
+#      of others is a gift, not a theft vector).
+#   6. The Solodit finding about morphoRepay fetching borrowShares of initiator
+#      instead of onBehalf has been FIXED in this version — line 281 correctly
+#      uses onBehalf.
+#
+# ═══════════════════════════════════════════════════════════════
+
+invariants:
+- id: GA-A01
+  tier: 1
+  type: property
+  description: >
+    Callbacks (onMorphoSupply, onMorphoSupplyCollateral, onMorphoRepay,
+    onMorphoFlashLoan) must ONLY be callable by the immutable MORPHO address.
+    If any other address can call them, arbitrary reentry into Bundler3 is possible,
+    allowing an attacker to execute arbitrary call sequences with a spoofed initiator context.
+  attack_scenario: >
+    If msg.sender check in morphoCallback is bypassed or if MORPHO is set to a
+    malicious contract, an attacker could call onMorphoFlashLoan with crafted data
+    that reenters Bundler3 and executes transfers using the current initiator's
+    approvals (Permit2 or ERC20 allowance to the adapter).
+  impact: "Complete drain of any user's tokens that have active Permit2 or ERC20 allowance to the adapter"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: call onMorphoFlashLoan from non-MORPHO address — must revert
+    // This is a negative test — the invariant is that it always reverts
+    // In fuzzing: ghost track if morphoCallback was ever entered from non-MORPHO
+    bool entered = false;
+    try GeneralAdapter1(adapter).onMorphoFlashLoan(0, bytes("")) {
+        entered = true;
+    } catch {}
+    t(!entered, "GA-A01: callback callable by non-MORPHO");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    The check IS present (line 464: require(msg.sender == address(MORPHO))).
+    MORPHO is immutable, set in constructor. This invariant is defensive — confirms
+    the check cannot be bypassed. Low likelihood of failure, but critical if it does.
+
+- id: GA-A02
+  tier: 1
+  type: property
+  description: >
+    erc4626Withdraw and erc4626Redeem must reject any owner that is not
+    address(this) or the current initiator. If owner can be set to an arbitrary
+    third party, their vault shares can be redeemed by the attacker.
+  attack_scenario: >
+    Attacker calls multicall with erc4626Redeem(vault, type(uint256).max, 0,
+    attacker, victim). If the owner check is missing, the adapter would redeem
+    all of victim's shares (if victim had approved the adapter) and send assets
+    to attacker.
+  impact: "Drain any user's ERC4626 vault shares if they approved the adapter"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // The owner parameter must always be address(this) or initiator()
+    // In a handler that calls erc4626Withdraw with arbitrary owner:
+    address owner = _getRandomAddress();
+    bool isAllowed = (owner == address(adapter) || owner == bundler3.initiator());
+    try GeneralAdapter1(adapter).erc4626Withdraw(vault, 1e18, 0, receiver, owner) {
+        t(isAllowed, "GA-A02: withdraw succeeded with unauthorized owner");
+    } catch {}
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 95
+  notes: >
+    Check IS present at lines 110 and 131. This invariant validates it holds under
+    all fuzzing paths. The check uses initiator() which reads from Bundler3 transient
+    storage — correct and not spoofable mid-bundle.
+
+- id: GA-A03
+  tier: 2
+  type: property
+  description: >
+    The reenterBundler3 mechanism must validate that reenterHash was properly set
+    before allowing callback-triggered multicalls. If an attacker can call
+    reenterBundler3 with arbitrary data when reenterHash is zero or predictable,
+    they can inject arbitrary calls into the bundle.
+  attack_scenario: >
+    Attacker triggers a Morpho supply with callback data that reenters Bundler3.
+    The reenterHash is set by _multicall before the call. If the attacker can
+    predict or control callbackHash, they can craft data for reenter() that passes
+    the hash check, executing arbitrary operations under the original initiator's
+    identity (using their Permit2/ERC20 allowances).
+  impact: "Arbitrary call execution under victim's initiator context — full token drain"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track: after any morphoCallback, verify reenterHash was consumed (set to 0)
+    // In Bundler3._multicall line 66: require(reenterHash == bytes32(0))
+    // This means every callback MUST call reenter, and it MUST match
+    bytes32 hashAfter = IBundler3(bundler3).reenterHash();
+    eq(uint256(hashAfter), uint256(0), "GA-A03: reenterHash not consumed after callback");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    The reenterHash mechanism in Bundler3 is the critical security primitive.
+    The hash includes bytes20(msg.sender) + keccak256(calldata[4:]).
+    The callbackHash in the Call struct is set by the initiator and must match
+    hash(reenter_calldata). Since the initiator sets callbackHash AND the callback
+    data in the same bundle, the initiator controls what happens in callbacks.
+    The question is whether an attacker can manipulate the callback data mid-flight.
+    In Morpho callbacks, the data parameter is passed through from the original
+    supply/repay/flashLoan call — which was set by the initiator in the bundle.
+    This appears secure BY DESIGN but is worth fuzz-verifying.
+
+- id: GA-A04
+  tier: 2
+  type: property
+  description: >
+    morphoBorrow, morphoWithdraw, and morphoWithdrawCollateral all use
+    initiator() as the position owner. The initiator must have authorized
+    the adapter on Morpho for this to work. But critically: during a callback
+    reentry, the initiator is STILL the original multicall caller. If a malicious
+    contract triggers a Morpho callback during a legitimate user's bundle, the
+    initiator context could be exploited.
+  attack_scenario: >
+    User A starts a multicall that does morphoSupply with callback data.
+    The callback reenters Bundler3 and executes more calls. If any of these
+    calls interact with a malicious ERC4626 vault or token that itself calls
+    back into the adapter, and that call path allows morphoBorrow, it would
+    borrow using User A's initiator context. However, Bundler3 prevents
+    nested multicall (line 29: require(initiator == address(0))) and reenter
+    validates hash. So this requires the malicious call to be WITHIN the
+    user's own callback chain, which means the user approved it.
+  impact: "Unauthorized borrowing from initiator's Morpho position"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: morphoBorrow always uses the real initiator, not a spoofed one
+    // and that initiator must have authorized the adapter on Morpho
+    address init = IBundler3(bundler3).initiator();
+    bool isAuthorized = IMorpho(morpho).isAuthorized(init, address(adapter));
+    // If not authorized, borrow must revert
+    if (!isAuthorized) {
+        try GeneralAdapter1(adapter).morphoBorrow(marketParams, 1e18, 0, 0, address(this)) {
+            t(false, "GA-A04: borrow succeeded without Morpho authorization");
+        } catch {}
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: >
+    This is defense-in-depth. Morpho itself checks isAuthorized, so even if the
+    adapter's access control is bypassed, Morpho would reject unauthorized borrows.
+    The real risk would be if a user authorizes the adapter AND another user can
+    hijack their initiator context. The reenterHash mechanism prevents this.
+
+- id: GA-A05
+  tier: 1
+  type: property
+  description: >
+    erc20TransferFrom and permit2TransferFrom pull tokens from initiator().
+    If initiator() returns a stale or wrong value during callback reentry,
+    an attacker could drain a different user's tokens. The initiator MUST
+    remain the original multicall caller throughout all reentries.
+  attack_scenario: >
+    User A starts multicall. During a callback, the adapter calls
+    reenterBundler3 which calls Bundler3.reenter(). If Bundler3.reenter
+    somehow changes initiator (it does NOT — initiator is only set in
+    multicall and cleared at the end), then a nested call to
+    erc20TransferFrom would pull from the wrong user. Additionally: if
+    two multicalls could overlap (they can't — line 29 prevents this),
+    initiator could leak across transactions.
+  impact: "Drain tokens from wrong user's Permit2/ERC20 allowance"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // invariant: initiator never changes during a bundle (including reentries)
+    // ghost_initiator is set at start of multicall, checked throughout
+    address current = IBundler3(bundler3).initiator();
+    if (ghost_initiatorSet) {
+        eq(uint256(uint160(current)), uint256(uint160(ghost_initiator)),
+           "GA-A05: initiator changed mid-bundle");
+    }
+  ghost_vars:
+  - "address internal ghost_initiator;"
+  - "bool internal ghost_initiatorSet;"
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    initiator is transient storage, set only in multicall (line 31), cleared
+    at line 35. reenter() does NOT modify initiator. This is secure by design.
+    The invariant confirms it via fuzzing. Transient storage resets per-tx,
+    so cross-tx leaks are impossible.
+
+- id: GA-A06
+  tier: 2
+  type: property
+  description: >
+    The adapter sets unlimited approval (type(uint256).max) to MORPHO for
+    loan/collateral tokens and never resets it ("Morpho's allowance is not
+    reset as it is trusted"). If MORPHO has any vulnerability that allows
+    arbitrary transferFrom calls using existing approvals, the adapter's
+    entire token balance is at risk. For ERC4626 vaults, approval IS reset
+    to 0 after the call.
+  attack_scenario: >
+    If Morpho protocol has a bug that allows arbitrary transferFrom using
+    the adapter's approval, any tokens sitting in the adapter (between
+    bundle steps) could be drained. The adapter is designed to not hold
+    tokens long-term, but within a bundle there may be intermediate balances.
+    For ERC4626 vaults: if the vault is malicious and re-enters during the
+    mint/deposit (after forceApprove(max) but before forceApprove(0)),
+    it could pull more underlying tokens than expected.
+  impact: "Drain adapter's intermediate token balance via malicious vault reentrancy"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After erc4626Mint/Deposit: approval to vault must be 0
+    uint256 allowanceAfter = IERC20(underlyingToken).allowance(address(adapter), vault);
+    eq(allowanceAfter, 0, "GA-A06: vault approval not reset to 0 after ERC4626 op");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    ERC4626 vault approval pattern is approve(max) -> call -> approve(0).
+    A malicious vault could reentrantly call the adapter during mint() to
+    drain tokens. But the adapter has onlyBundler3 on all its functions,
+    so the vault can't call the adapter directly. The vault could however
+    call other contracts that the adapter approved. The real risk is with
+    a vault that takes more tokens than it should via the approval.
+    The approve-call-revoke pattern mitigates this. MORPHO approval is
+    permanent but MORPHO is immutable and trusted. Confidence is moderate.
+
+- id: GA-A07
+  tier: 2
+  type: property
+  description: >
+    morphoSupply and morphoSupplyCollateral prevent onBehalf == address(this)
+    but morphoRepay also prevents onBehalf == address(this). However, none of
+    these functions restrict WHO you can supply/repay on behalf of. An attacker
+    could grief by supplying tiny amounts on behalf of victims (creating
+    positions they didn't want) or repaying others' debt. This is by-design
+    behavior (gift/charity) but worth documenting.
+  attack_scenario: >
+    Attacker calls morphoSupplyCollateral with onBehalf = victim. This creates
+    a collateral position for the victim. In isolation this is harmless (giving
+    free collateral). But combined with a morphoBorrow in the same market, if
+    the victim has authorized the adapter, an attacker in a separate multicall
+    cannot borrow on victim's behalf because initiator() would be the attacker,
+    not the victim. So Morpho's isAuthorized check on borrow/withdraw protects.
+  impact: "Low — can create unwanted positions for others but cannot extract value"
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Verify: supply/repay onBehalf never equals address(adapter)
+    // The adapter should never accumulate Morpho positions
+    uint256 adapterSupplyShares = MorphoLib.supplyShares(MORPHO, marketId, address(adapter));
+    uint256 adapterBorrowShares = MorphoLib.borrowShares(MORPHO, marketId, address(adapter));
+    uint256 adapterCollateral = MorphoLib.collateral(MORPHO, marketId, address(adapter));
+    eq(adapterSupplyShares, 0, "GA-A07: adapter has supply shares");
+    eq(adapterBorrowShares, 0, "GA-A07: adapter has borrow shares");
+    eq(adapterCollateral, 0, "GA-A07: adapter has collateral");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    The onBehalf != address(this) check is present in supply, supplyCollateral,
+    and repay. It is NOT in morphoBorrow/Withdraw/WithdrawCollateral because
+    those use initiator() as onBehalf (the user is always operating on their own
+    position). This is correct by design.
+
+- id: GA-A08
+  tier: 1
+  type: property
+  description: >
+    CRITICAL CHECK (from Solodit): morphoRepay with shares == type(uint256).max
+    must fetch borrowShares of onBehalf (the debtor), NOT initiator(). A previous
+    version had this bug. Current code at line 281 uses onBehalf — verify this
+    invariant holds.
+  attack_scenario: >
+    If morphoRepay fetches initiator's borrow shares instead of onBehalf's, and
+    initiator has 0 borrow shares, passing shares=max would set shares=0 and the
+    repay would either fail or do nothing, even though onBehalf has real debt.
+    Alternatively, if initiator has MORE shares than onBehalf, it would try to
+    repay more than onBehalf's debt — wasting the initiator's loan tokens.
+  impact: "Broken repay-on-behalf functionality, potential loss of initiator's tokens"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: when shares == type(uint256).max in morphoRepay,
+    // the shares resolved are onBehalf's borrow shares, not initiator's
+    // This is a code-level check, not a runtime invariant:
+    // Line 281: shares = MorphoLib.borrowShares(MORPHO, marketParams.id(), onBehalf);
+    // The invariant version: repay with max shares should reduce onBehalf's debt to 0
+    uint256 debtBefore = MorphoLib.borrowShares(MORPHO, marketId, onBehalf);
+    // ... after repay with shares=max and sufficient assets ...
+    uint256 debtAfter = MorphoLib.borrowShares(MORPHO, marketId, onBehalf);
+    eq(debtAfter, 0, "GA-A08: onBehalf debt not fully repaid with max shares");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 95
+  notes: >
+    VERIFIED: Line 281 correctly uses onBehalf, not initiator().
+    This was a known Solodit finding that has been fixed. The invariant confirms
+    the fix is in place. High confidence this is correct in current code.
+
+false_positives:
+- hunter: AccessHunter
+  id: GA-FP-01
+  reason: >
+    Investigated whether initiator() could be spoofed via reentrancy.
+    Bundler3 uses transient storage for initiator — it persists only within
+    the current transaction. multicall() requires initiator == address(0) before
+    setting it (line 29), preventing nested multicalls. reenter() does not modify
+    initiator. Therefore initiator() cannot be spoofed or changed mid-bundle.
+    This is secure by design.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: AccessHunter
+  id: GA-FP-02
+  reason: >
+    Investigated whether callbacks without onlyBundler3 (onMorphoSupply etc.)
+    could be called by non-Morpho contracts. The morphoCallback internal function
+    has require(msg.sender == address(MORPHO)) at line 464. MORPHO is immutable.
+    Even if an attacker deploys a contract that calls onMorphoFlashLoan, it will
+    revert because msg.sender != MORPHO. Secure by design.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: AccessHunter
+  id: GA-FP-03
+  reason: >
+    Investigated erc4626Withdraw/Redeem owner parameter abuse. Owner is restricted
+    to {address(this), initiator()} — lines 110 and 131. An attacker calling
+    multicall would have initiator = attacker_address, so they can only use their
+    own vault shares or shares sitting in the adapter. They cannot specify another
+    user's address as owner. The only way to use initiator's shares is if the
+    initiator previously approved the adapter, which is an intentional user action.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: AccessHunter
+  id: GA-FP-04
+  reason: >
+    Investigated whether the callbackHash mechanism in Bundler3 can be exploited.
+    The initiator sets callbackHash in the Call struct. It must equal
+    keccak256(bytes20(callee) || keccak256(reenter_calldata)). The callee is the
+    adapter being called, and the reenter_calldata contains the encoded Call array
+    for the callback. Since the initiator controls BOTH the callbackHash and the
+    callback data passed to Morpho, they are essentially authorizing the exact
+    callback sequence. An external attacker cannot modify the callback data in
+    flight (it's in calldata). Secure by design.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

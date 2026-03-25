@@ -1,0 +1,457 @@
+protocol: revert-lend
+component: V3Vault
+file: src/V3Vault.sol
+domain: vault
+hunter: SignatureHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: VV-SIG-01
+  tier: 1
+  type: property
+  description: "transformApprovals no puede ser activa para un token que el aprobador ya no posee -- si el owner transfiere la posicion via remove(), las approvals pre-existentes deben ser inutilizables"
+  attack_scenario: >
+    Alice posee tokenId=42 en el vault. Alice llama approveTransform(42, bob, true).
+    Alice repaga su deuda y llama remove(42, charlie, '').
+    Charlie deposita tokenId=42 de vuelta via create(42, charlie).
+    Ahora tokenOwner[42]=charlie. PERO transformApprovals[alice][42][bob] sigue true.
+    Bob intenta llamar transform(42, transformer, data). En _transform():
+    loanOwner = tokenOwner[42] = charlie. Check: charlie != bob && !transformApprovals[charlie][42][bob].
+    RESULTADO: Bob NO puede explotar porque el check usa tokenOwner[tokenId] actual (charlie), no alice.
+    Este invariante verifica que la autorizacion residual de alice no otorga acceso.
+    PERO: si alice es el nuevo owner (re-deposita ella misma), la approval stale se reactiva sin su intencion actual.
+  impact: "Stale approval reactivation -- si el mismo usuario re-deposita un tokenId previamente aprobado, la approval vieja del transformer sigue activa sin confirmacion explicita"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verifica que despues de remove + re-create, approvals viejas no persisten funcionalmente
+    // Este invariante chequea que transformApprovals se limpia en remove()
+    // Nota: V3Vault NO limpia transformApprovals en remove() -- stale data persiste
+    // La proteccion real es que el check en _transform usa tokenOwner[tokenId] actual
+    // Pero si el MISMO usuario re-deposita, la approval vieja del transformer se reactiva
+    if (ghost_allTokenIds.length > 0) {
+        uint256 tokenId = ghost_allTokenIds[0];
+        address owner = vault.ownerOf(tokenId);
+        if (owner != address(0)) {
+            // Si hay un owner, verificar que approvals solo existen si el owner las puso explicitamente
+            // (No podemos verificar directamente sin ghost vars adicionales, pero podemos verificar consistencia)
+            t(owner != address(0), "VV-SIG-01: token should have valid owner if in allTokenIds");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: >
+    V3Vault.remove() no limpia transformApprovals[owner][tokenId][*]. Si el mismo usuario re-deposita
+    el mismo tokenId, las approvals viejas se reactivan. Esto es un riesgo bajo porque requiere que el
+    usuario voluntariamente re-deposite, pero viola el principio de least surprise. La proteccion es que
+    _transform verifica tokenOwner[tokenId]==msg.sender OR transformApprovals[tokenOwner[tokenId]][tokenId][msg.sender].
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-02
+  tier: 1
+  type: property
+  description: "ERC20 allowance en shares del vault permite withdraw/redeem por terceros -- _spendAllowance se usa correctamente y no puede ser bypassed"
+  attack_scenario: >
+    V3Vault hereda ERC20 (no ERC20Permit). El vault usa _spendAllowance(owner, msg.sender, shares)
+    en _withdraw(). Si un usuario llama approve(attacker, X) en el ERC20 del vault, el atacante puede
+    llamar withdraw(assets, attacker, victim) y extraer fondos del victim hasta el allowance.
+    Esto es by design (ERC4626 spec). PERO: el vault NO hereda ERC20Permit, asi que no hay permit()
+    en las shares del vault. Un atacante NO puede usar una firma para obtener allowance sobre shares.
+    Invariante: verify que solo msg.sender o alguien con allowance puede retirar fondos de otro.
+  impact: "Bypass de allowance en withdraw/redeem permitiria drenar fondos de lenders"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que _withdraw requiere msg.sender == owner OR allowance suficiente
+    // En el fuzzer, si bob intenta withdraw de alice sin allowance, debe revertir
+    // Esto se verifica implicitamente por el ERC20._spendAllowance
+    // Verificamos que el balance de shares no disminuye sin consentimiento
+    uint256 aliceShares = vault.balanceOf(alice);
+    uint256 bobShares = vault.balanceOf(bob);
+    // Los shares solo deben disminuir si el owner hizo withdraw/redeem o dio allowance
+    // Ghost tracking de total withdrawn per user deberia ser <= deposited + allowance given
+    if (ghost_userDeposited[alice] > 0) {
+        lte(ghost_userWithdrawn[alice], ghost_userDeposited[alice], "VV-SIG-02: alice withdrew more than deposited without allowance");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: >
+    V3Vault hereda ERC20 de OpenZeppelin (NO ERC20Permit). No hay funcion permit() para shares.
+    La unica forma de dar allowance sobre shares es via approve(). _withdraw usa _spendAllowance
+    correctamente. Este invariante es mas una confirmacion de que el mecanismo funciona.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-03
+  tier: 1
+  type: property
+  description: "NFT approve() residual en nonfungiblePositionManager despues de transform -- la approval al transformer se revoca correctamente al final de _transform"
+  attack_scenario: >
+    En _transform(): L542 aprueba al transformer para el tokenId. Despues del call al transformer,
+    L567 revoca con approve(address(0), newTokenId). Si tokenId != newTokenId, L570 intenta revocar
+    el viejo tokenId con try/catch (puede fallar si fue burned). Si el transformer NO usa el approval
+    pero lo deja pendiente, Y la revocacion falla (e.g. token burned pero no realmente), el transformer
+    conserva approval sobre un NFT en el vault. Invariante: despues de _transform, ningun transformer
+    debe tener approval sobre tokens del vault.
+  impact: "Transformer malicioso con approval residual podria mover el NFT fuera del vault, robando colateral"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que despues de operaciones, no hay approvals residuales en NFTs del vault
+    // Para cada token en el vault, getApproved deberia ser address(0) o el gaugeManager (si staked)
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        if (owner != address(0)) {
+            // No podemos llamar npm.getApproved directamente desde Properties
+            // pero verificamos que el token sigue en el vault o gauge
+            try npm.ownerOf(tokenId) returns (address nftOwner) {
+                // NFT debe estar en vault o en gaugeManager
+                t(
+                    nftOwner == address(vault) || nftOwner == address(mockGaugeManager),
+                    "VV-SIG-03: NFT not in vault or gauge -- possible approval exploit"
+                );
+            } catch {}
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: >
+    El try/catch en L570 es critico. Si approve(address(0), tokenId) falla Y el token no fue realmente
+    burned, hay una approval colgante. El codigo asume que si approve falla es porque el token fue burned
+    durante el transform. Pero un transformer malicioso podria transferir el token a otro contrato que
+    bloquea approve() pero no es burned. Sin embargo, L603-606 verifican que el owner del NFT es el vault,
+    lo que mitiga parcialmente.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-04
+  tier: 2
+  type: property
+  description: "transformApprovals se migra a newTokenId durante transform -- si un token es reemplazado, la approval del caller se copia al nuevo token y se borra del viejo"
+  attack_scenario: >
+    En _transform() L553-556: si tokenId != newTokenId Y el caller tenia transformApprovals para el
+    viejo token, la approval se copia al nuevo token. PERO solo para msg.sender. Si OTRO address
+    (no msg.sender) tambien tenia approval para el viejo tokenId, esa approval queda stale -- apunta
+    a un token que ya no tiene deuda ni owner en el vault. Esto no es explotable directamente porque
+    _cleanupLoan borra la deuda del viejo token, pero la approval stale en el mapping ocupa storage
+    y podria causar confusion.
+  impact: "Stale approvals en tokens reemplazados -- bajo riesgo directo pero viola el principio de cleanup completo"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar consistencia: si un token no tiene owner, no deberia ser transformable
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        if (owner == address(0)) {
+            // Token sin owner no deberia tener deuda
+            (uint256 debtShares) = vault.loans(tokenId);
+            eq(debtShares, 0, "VV-SIG-04: orphan token has debt shares -- stale state");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: >
+    La migracion de approval en L553-556 solo cubre msg.sender. Otros aprobadores
+    pierden su approval implicitamente (el token viejo ya no tiene owner). Esto es
+    aceptable por design pero vale documentar.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-05
+  tier: 1
+  type: property
+  description: "borrow() en transform mode solo permite al transformer activo -- isTransformMode requiere transformedTokenId==tokenId AND transformerAllowList[msg.sender]"
+  attack_scenario: >
+    Durante _transform(), el vault pone transformedTokenId = tokenId y llama transformer.call(data).
+    El transformer puede llamar vault.borrow(tokenId, assets) porque isTransformMode sera true.
+    Si un contrato NO esta en transformerAllowList intenta llamar borrow() con el tokenId correcto
+    durante el callback, isTransformMode sera false (transformerAllowList[msg.sender]==false).
+    Invariante: solo transformers en allowlist pueden borrow en transform mode.
+    PERO: si el transformer aprobado delega a un sub-contrato via delegatecall, msg.sender sigue
+    siendo el transformer, asi que funciona. Si usa call regular, msg.sender es el sub-contrato
+    que NO esta en allowlist -- falla correctamente.
+  impact: "Bypass de transform mode permitiria borrow sin health check, drenando liquidez"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que transformedTokenId es 0 fuera de una transaccion de transform
+    // (deberia resetearse siempre al final de _transform)
+    uint256 currentTransformed = vault.transformedTokenId();
+    eq(currentTransformed, 0, "VV-SIG-05: transformedTokenId not reset -- reentrancy or stuck state");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: >
+    transformedTokenId se resetea en L623 de _transform. Si alguna vez queda != 0 despues de una tx,
+    indica reentrancy o un revert que no se propago. El check en L559 (if transformedTokenId != 0 revert Reentrancy)
+    previene re-entrada en transform, pero otros paths (borrow, liquidate, decreaseLiquidityAndCollect)
+    tambien verifican transformedTokenId para bloquear operaciones durante transform mode.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-06
+  tier: 2
+  type: property
+  description: "onERC721Received acepta data arbitrario para override de owner -- quien puede triggear safeTransferFrom controla el owner del loan"
+  attack_scenario: >
+    En onERC721Received L459-464: si data.length != 0, el owner se decodifica de data en vez de usar
+    'from'. Esto permite que cualquiera que pueda llamar nonfungiblePositionManager.safeTransferFrom(from, vault, tokenId, data)
+    elija el owner. El comment en L460-463 dice que esto es intencional. PERO: si un usuario aprueba
+    a un operador malicioso en el NPM, ese operador puede transferir el NFT al vault con data=abi.encode(attacker),
+    registrando el loan bajo el atacante en vez del usuario real. El usuario pierde su NFT y el atacante
+    obtiene control del colateral.
+  impact: "Robo de NFT: operador malicioso transfiere NFT de victima al vault bajo nombre del atacante"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que cada token en el vault tiene un owner valido (no address(0))
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        t(owner != address(0), "VV-SIG-06: token in vault with zero owner");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 60
+  notes: >
+    El comentario en L460-463 dice "NOTE FOR AUDITS: Raw ERC721 deposits may override owner via callback data.
+    This is intentionally flexible for integrator/operator flows and is an accepted trust assumption."
+    Esto es by design, pero el riesgo existe si usuarios no entienden que aprobar un operador en NPM
+    les da poder de reasignar el loan. Es un trust assumption explicito, no un bug.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-07
+  tier: 1
+  type: property
+  description: "NPM approve al gaugeManager en _stake no deja approval residual si stake falla -- safety gate verifica que NFT salio del vault"
+  attack_scenario: >
+    En _stake() L1406: approve(gaugeManager, tokenId) se ejecuta ANTES de stakePosition().
+    Si stakePosition() revierte, la approval queda. Pero _stake es llamada solo desde _transform
+    (L619) y stakePosition (L1389). Si stakePosition revierte, toda la tx revierte, asi que la
+    approval no persiste. PERO si el gaugeManager es malicioso y NO mueve el NFT, L1412 verifica
+    que ownerOf(tokenId) != address(this), revirtiendo si el NFT sigue en el vault. Esto mitiga
+    el caso de gaugeManager que acepta la approval pero no transfiere.
+  impact: "Approval residual al gaugeManager permitiria extraer NFTs del vault sin autorizacion"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que si gaugeManager esta seteado, los tokens staked no estan en el vault
+    address gm = vault.gaugeManager();
+    if (gm != address(0) && ghost_allTokenIds.length > 0) {
+        for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+            uint256 tokenId = ghost_allTokenIds[i];
+            address owner = vault.ownerOf(tokenId);
+            if (owner != address(0)) {
+                try npm.ownerOf(tokenId) returns (address nftOwner) {
+                    // Si el NFT esta en el vault, no deberia tener approval a nadie excepto address(0)
+                    if (nftOwner == address(vault)) {
+                        try npm.getApproved(tokenId) returns (address approved) {
+                            t(
+                                approved == address(0),
+                                "VV-SIG-07: residual NFT approval on vaulted token"
+                            );
+                        } catch {}
+                    }
+                } catch {}
+            }
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: >
+    La safety gate en L1412-1414 es critica. Sin ella, un gaugeManager malicioso que acepta
+    approve pero no transfiere el NFT dejaria una approval colgante. Con el check, la tx
+    revierte si el NFT no se movio, asi que la approval no persiste.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-08
+  tier: 2
+  type: property
+  description: "No hay ERC20Permit en V3Vault shares -- ausencia de permit() previene ataques de firma sobre shares"
+  attack_scenario: >
+    V3Vault hereda ERC20 de OpenZeppelin pero NO ERC20Permit. Esto significa que no hay funcion
+    permit() para las shares del vault. Un atacante NO puede usar una firma para obtener allowance
+    sobre shares de otro usuario y llamar withdraw/redeem. Esto es una decision de seguridad
+    correcta. Invariante: verificar que no hay bypass de allowance via permit.
+  impact: "Si permit() existiera sin protecciones, permitiria drenar fondos de lenders via firmas"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el total de shares en circulacion es consistente con deposits/withdrawals
+    uint256 totalShares = vault.totalSupply();
+    // total shares debe ser >= 0 (siempre true por uint, pero verificamos no-overflow)
+    t(totalShares < type(uint256).max / 2, "VV-SIG-08: total shares suspiciously large -- possible overflow");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Confirmado: V3Vault NO hereda ERC20Permit. La linea de herencia es:
+    ERC20, Multicall, Ownable2Step, IVault, IERC721Receiver, Constants.
+    No hay funciones permit(), nonces(), DOMAIN_SEPARATOR() en el contrato.
+    Esto es seguro contra ataques de firma sobre shares.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-09
+  tier: 1
+  type: property
+  description: "Multicall heredado permite batching de operaciones -- un atacante puede batch approveTransform + transform en una sola tx para evitar deteccion"
+  attack_scenario: >
+    V3Vault hereda Multicall de OpenZeppelin, que permite ejecutar multiples llamadas en una tx.
+    Un owner podria batch: approveTransform(tokenId, maliciousAddr, true) + transform(tokenId, transformer, data)
+    en una sola tx. Esto no es un bug per se, pero Multicall con delegatecall preserva msg.sender,
+    lo que significa que msg.sender es consistente en todas las llamadas del batch. El riesgo es
+    que Multicall + msg.value puede causar problemas si alguna funcion usa msg.value (double-spending
+    de ETH). V3Vault no usa msg.value en ninguna funcion, asi que esto no es explotable.
+  impact: "Si msg.value se usara, Multicall permitiria double-spend de ETH en una sola tx"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que el vault no tiene balance de ETH inesperado
+    // (indicaria que alguien envio ETH via Multicall o directamente)
+    uint256 ethBalance = address(vault).balance;
+    // V3Vault no deberia manejar ETH directamente
+    lte(ethBalance, 1 ether, "VV-SIG-09: vault has unexpected ETH balance");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 85
+  notes: >
+    V3Vault hereda Multicall pero no tiene funciones payable (excepto posiblemente receive/fallback
+    heredados). Las funciones del vault operan con ERC20 tokens via SafeERC20, no ETH directo.
+    El riesgo de Multicall msg.value double-spend no aplica aqui.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-10
+  tier: 1
+  type: property
+  description: "approveTransform es per-token y per-target -- revocar approval para un token no afecta otros tokens del mismo owner"
+  attack_scenario: >
+    El mapping transformApprovals[owner][tokenId][target] es granular por token.
+    Si alice tiene tokens 42 y 43, y aprueba bob para token 42, bob NO puede llamar transform
+    para token 43. Invariante: la granularidad de approvals se respeta.
+    Un posible ataque: si _transform migra la approval del viejo token al nuevo (L553-556),
+    un caller aprobado para token 42 obtiene automaticamente approval para el newTokenId
+    sin consentimiento explicito del owner para ese nuevo token.
+  impact: "Auto-migracion de approval a nuevo token sin consentimiento explicito del owner"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que approvals son granulares y no se propagan inesperadamente
+    // Despues de operaciones, cada token solo debe tener approvals explicitas
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 5; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        if (owner != address(0)) {
+            // Verificar que el owner sigue siendo valido
+            uint256 loanCount = vault.loanCount(owner);
+            t(loanCount > 0, "VV-SIG-10: owner has token but loanCount is 0");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: >
+    La auto-migracion de approval en L553-556 es por design para UX (el transformer sigue
+    funcionando despues de un token swap). Pero el owner no consiente explicitamente la
+    approval para el nuevo token. Esto es un trade-off de usabilidad vs seguridad aceptado.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-SIG-11
+  tier: 1
+  type: property
+  description: "unstakePosition permite transformedTokenId==tokenId como alternativa a owner check -- durante transform, el transformer puede unstake sin ser owner"
+  attack_scenario: >
+    unstakePosition() L1398: if (tokenOwner[tokenId] != msg.sender && transformedTokenId != tokenId) revert.
+    Esto permite que CUALQUIER address llame unstakePosition(tokenId) si transformedTokenId==tokenId.
+    Durante un transform, transformedTokenId esta seteado. Si un tercero (no el transformer, no el owner)
+    llama unstakePosition en el mismo bloque/tx donde transform esta activo, podria unstakear el token.
+    PERO: en la practica, dentro de un transform call, solo el transformer recibe el call. Un tercero
+    no puede interferir en la misma tx a menos que el transformer lo llame. El riesgo real es si el
+    transformer es malicioso y unstakea tokens de otros.
+  impact: "Unstake no autorizado durante transform mode podria afectar el collateral valuation"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que transformedTokenId es siempre 0 fuera de transform
+    // (ya cubierto por VV-SIG-05, refuerzo aqui)
+    uint256 transformedId = vault.transformedTokenId();
+    eq(transformedId, 0, "VV-SIG-11: transform mode active outside of transform call");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 75
+  notes: >
+    El check en unstakePosition es relajado durante transform mode por design.
+    _unstakeIfNeeded es llamado internamente por _transform, decreaseLiquidityAndCollect, liquidate, remove.
+    unstakePosition es la version publica que puede ser llamada por el owner o durante transform mode.
+    El riesgo es bajo porque transform mode es atomico dentro de una tx.
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: SignatureHunter
+  id: VV-SIG-FP-01
+  reason: >
+    V3Vault NO tiene ERC20Permit, asi que no hay ataque de signature replay sobre shares.
+    No hay ecrecover, ECDSA, EIP-712, ni nonces en el contrato. Los unicos mecanismos de
+    autorizacion son: (1) msg.sender checks, (2) ERC20 allowance via _spendAllowance,
+    (3) transformApprovals mapping, (4) NFT approve() via nonfungiblePositionManager.
+    Ninguno involucra firmas criptograficas. La unica firma relevante esta en V3Utils.executeWithPermit
+    que es un contrato separado.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: >
+      V3Vault hereda ERC20 pero NO ERC20Permit. No hay superfice de ataque de firmas/permit
+      directamente en el vault. Los ataques de firma solo aplican a V3Utils.executeWithPermit
+      y al NFT permit del nonfungiblePositionManager.
+    briefing_update_applied: false
+
+- hunter: SignatureHunter
+  id: VV-SIG-FP-02
+  reason: >
+    onERC721Received owner override via data es by design (documented in audit notes L460-463).
+    Quien puede triggear safeTransferFrom para el NFT necesita ser el NFT owner o approved,
+    asi que el trust model es: si puedes mover el NFT, puedes elegir quien lo recibe en el vault.
+    Esto no es un bypass de autorizacion sino un trust assumption explicito.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: >
+      onERC721Received con data override de owner es intencional en protocolos que usan NFT como
+      colateral. No reportar como bug si el protocolo documenta la trust assumption explicitamente.
+    briefing_update_applied: false

@@ -1,0 +1,384 @@
+protocol: pancakeswap-infinity
+component: Dispatcher
+file: src/base/Dispatcher.sol
+domain: dex
+hunter: MathHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: D-01
+  tier: 1
+  type: property
+  description: >
+    SWEEP amountMin truncado silenciosamente de uint256 a uint160 — el comentario dice
+    abi.decode(inputs, (address, address, uint256)) pero el código declara uint160 amountMin.
+    Si el usuario envía un amountMin > type(uint160).max, los bits superiores se pierden y el
+    check de mínimo se debilita drásticamente (e.g., 2^161 se convierte en 0).
+  attack_scenario: >
+    Un frontend o integrador genera calldata con amountMin = 2^200 (intención: exigir
+    al menos ~1.6e60 tokens, que es equivalente a "nunca sweep por menos de todo").
+    Después de truncación a uint160, amountMin se convierte en un valor mucho menor
+    (posiblemente 0), y el sweep se ejecuta sin protección de mínimo real. Un MEV bot
+    front-runs la transacción, extrae tokens del router, y el sweep recoge menos de lo
+    esperado sin revertir.
+  impact: "Pérdida parcial de fondos del usuario si amountMin se trunca a un valor permisivo"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simulación: codificar amountMin como uint256 > type(uint160).max
+    // y verificar que sweep NO revierte cuando balance < amountMin original
+    uint256 largeAmountMin = type(uint160).max + uint256(1); // 2^160
+    // Después de truncación: amountMin efectivo = 0 (bit 160 se pierde)
+    // Invariante: sweep debe revertir si balance < amountMin_original
+    // Nota: requiere test de integración con calldata crafteado
+    uint160 truncated = uint160(largeAmountMin);
+    t(truncated == largeAmountMin, "D-01: amountMin silently truncated");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    El tipo uint160 para amountMin es inconsistente con el comentario que dice uint256.
+    En la práctica, la mayoría de tokens tienen supply < 2^160, así que el impacto real
+    depende del token. Para tokens con decimales bajos (6), 2^160 > cualquier supply real.
+    Sin embargo, el bug conceptual existe: la decodificación no es fiel al ABI declarado.
+    Verificar si Uniswap UniversalRouter tiene el mismo patrón (probablemente sí — fork).
+
+- id: D-02
+  tier: 2
+  type: property
+  description: >
+    PAY_PORTION con bips < 10000 pierde dust por redondeo hacia abajo. calculatePortion
+    hace (amount * bips) / 10000 — para balances pequeños y bips que no dividen exactamente,
+    el residuo queda atrapado en el router y puede ser extraído por otro usuario/MEV.
+  attack_scenario: >
+    Escenario de extracción de dust: (1) Usuario A ejecuta PAY_PORTION con token USDC,
+    balance=9999 wei, bips=5000 → amount = (9999*5000)/10000 = 4999. Quedan 5000 wei
+    en router. (2) Atacante ejecuta SWEEP inmediatamente después y recoge el dust.
+    Con muchos usuarios acumulando dust, el atacante puede extraer cantidades significativas.
+    En tokens de 6 decimales, 5000 wei USDC = $0.005 — multiplicado por miles de txs.
+  impact: "Pérdida de dust por redondeo acumulativo — bajo impacto individual, potencialmente significativo en agregado"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que PAY_PORTION + SWEEP no deja residuo explotable
+    uint256 balanceBefore = ERC20(token).balanceOf(address(router));
+    // Ejecutar PAY_PORTION(token, recipient, bips)
+    // Ejecutar SWEEP(token, recipient, 0)
+    uint256 balanceAfter = ERC20(token).balanceOf(address(router));
+    // El residuo debe ser <= 1 wei para ser aceptable
+    lte(balanceBefore - balanceAfter, 1, "D-02: dust > 1 wei left after PAY_PORTION");
+  ghost_vars:
+  - uint256 internal ghost_totalDustLost;
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Este es un patrón conocido en Universal Routers (Uniswap V4 también lo tiene).
+    Generalmente se considera "by design" — el usuario es responsable de sweep.
+    Pero la superficie de ataque existe si otro comando en la misma batch puede
+    extraer el dust antes de que el usuario haga sweep.
+
+- id: D-03
+  tier: 1
+  type: property
+  description: >
+    V2 _v2Swap opera dentro de unchecked{} y calcula amountInput como
+    ERC20(input).balanceOf(pair) - reserveInput. Si el token tiene fee-on-transfer,
+    el balance real del pair puede ser menor que reserveInput, causando underflow
+    silencioso (uint256 wrap-around) que produce un amountInput enormemente inflado.
+  attack_scenario: >
+    (1) Atacante selecciona un token fee-on-transfer (ej: STA, PAXG con fee) como input
+    en un V2 swap. (2) payOrPermit2Transfer envía X tokens al pair, pero solo X*(1-fee)
+    llegan. (3) Si la fee es suficiente para que balanceOf(pair) < reserveInput,
+    la resta en unchecked underflows a ~2^256. (4) getAmountOut con amountIn = ~2^256
+    calcula un output enorme y el swap intenta extraer todas las reserves del pair.
+    El swap del pair mismo revertirá por el check de k, pero el cálculo es peligroso.
+  impact: "Potencial drenaje de pool V2 si el check de k no atrapa el underflow — Critical si bypaseable"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // En el contexto de _v2Swap, dentro de unchecked:
+    // uint256 amountInput = ERC20(input).balanceOf(pair) - reserveInput;
+    // Si balanceOf(pair) < reserveInput → underflow
+    uint256 balanceOfPair = ERC20(input).balanceOf(pair);
+    uint256 reserveInput = getReserveInput(); // de getReserves()
+    // Invariante: balanceOf SIEMPRE >= reserveInput al momento del cálculo
+    gte(balanceOfPair, reserveInput, "D-03: V2 pair balance < reserve, unchecked underflow");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    El pair contract de PancakeSwap V2 tiene su propio check de k que revertirá
+    si los amounts son inválidos. Pero el underflow silencioso es un bug de cálculo
+    en el router — el router cree que amountInput es ~2^256 y pasa ese valor a
+    getAmountOut, que a su vez calcula un amountOutput enorme. La pregunta es si
+    el pair.swap() revertirá siempre o si hay edge cases donde pasa.
+    Fee-on-transfer tokens son comunes en BSC (donde PancakeSwap opera principalmente).
+
+- id: D-04
+  tier: 1
+  type: property
+  description: >
+    INFI_CL_POSITION_CALL e INFI_BIN_POSITION_CALL envían address(this).balance
+    completo como value. En un batch de múltiples comandos, si un usuario anterior
+    dejó ETH en el router (o ETH de otros comandos del mismo batch), todo ese ETH
+    se envía al position manager. El ETH no está particionado por usuario/comando.
+  attack_scenario: >
+    (1) Usuario A envía execute() con [WRAP_ETH(self, CONTRACT_BALANCE),
+    INFI_CL_POSITION_CALL(...)], enviando 1 ETH como msg.value. (2) Entre el WRAP_ETH
+    y el POSITION_CALL, un sub-plan o comando previo en otro batch deja 0.5 ETH
+    extra en el router. (3) INFI_CL_POSITION_CALL envía 1.5 ETH al position manager
+    — 0.5 ETH extra que no pertenece al usuario A. Más relevante: si el usuario NO
+    necesita enviar ETH pero el router tiene ETH residual, ese ETH se envía igualmente.
+  impact: "Pérdida de ETH residual del router — cualquier ETH en el router se drena al position manager"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Pre-condición: router tiene ETH residual de otro usuario/comando
+    uint256 routerBalanceBefore = address(router).balance;
+    uint256 userMsgValue = msg.value;
+    // Ejecutar INFI_CL_POSITION_CALL
+    uint256 ethSentToPositionManager = routerBalanceBefore; // address(this).balance
+    // Invariante: ETH enviado al position manager <= msg.value del usuario actual
+    lte(ethSentToPositionManager, userMsgValue, "D-04: router sent more ETH than user provided");
+  ghost_vars:
+  - uint256 internal ghost_ethSentToPositionManager;
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Este patrón es idéntico al de Uniswap V4 Universal Router — es "by design" en el
+    sentido de que el router NO mantiene ETH entre transacciones (todo debe ser swept).
+    Pero si un usuario olvida sweep, o si hay ETH residual de operaciones fallidas con
+    FLAG_ALLOW_REVERT, ese ETH se pierde en la siguiente POSITION_CALL.
+    Verificar: ¿hay mecanismo de refund de ETH no utilizado al final del execute()?
+
+- id: D-05
+  tier: 2
+  type: property
+  description: >
+    INFI_BIN_INITIALIZE_POOL decodifica activeId como uint24 via calldataload (lee 32 bytes)
+    asignado a uint24 — truncación silenciosa si el valor pasado > 2^24-1 (16,777,215).
+    Un activeId incorrecto inicializa el pool en un bin completamente diferente al esperado.
+  attack_scenario: >
+    Un integrador o frontend construye calldata con activeId = 16,777,216 (2^24).
+    Después de truncación a uint24, activeId = 0. El pool se inicializa en bin 0 en
+    lugar de bin 16,777,216. La liquidez se despliega en un rango de precio incorrecto
+    y el primer trader extrae valor arbitrándose contra el precio real.
+  impact: "Pool inicializado con precio incorrecto — fondos de LP iniciales extraíbles por arbitraje"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que activeId se preserva sin truncación
+    uint256 rawActiveId = calldataload(add(inputs.offset, 0xc0));
+    uint24 decodedActiveId; // lo que el código asigna
+    // Invariante: rawActiveId debe caber en uint24
+    t(rawActiveId <= type(uint24).max, "D-05: activeId truncated, value > uint24 max");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Solidity trunca implícitamente al asignar uint256 a uint24. En Solidity 0.8+
+    esto NO genera revert — es comportamiento definido (narrow conversion).
+    Sin embargo, es un error lógico si el caller espera que valores > 2^24 se rechacen.
+    Verificar qué hace IBinPoolManager.initialize con activeId — si tiene validación
+    interna, el impacto se reduce.
+
+- id: D-06
+  tier: 1
+  type: property
+  description: >
+    StableSwap exact output: stableSwapExactOutput() envía exactamente amountOut al
+    recipient pero NO verifica que la swap real produjo >= amountOut. Si el swap produce
+    menos tokens de los esperados (por slippage, fee-on-transfer, etc.), la función
+    intenta transferir más de lo que tiene y revierte — o peor, usa tokens residuales
+    de operaciones anteriores para cubrir la diferencia.
+  attack_scenario: >
+    (1) Router tiene 100 USDC residuales de una operación anterior. (2) Usuario ejecuta
+    STABLE_SWAP_EXACT_OUT con amountOut=1000 USDC. (3) stableSwapExactOutputAmountIn()
+    calcula amountIn basado en un rate que ya cambió. (4) El swap real produce solo 950 USDC.
+    (5) La función pay() envía 1000 USDC al recipient — 950 del swap + 50 de los residuales.
+    El usuario recibe lo esperado pero 50 USDC de fondos ajenos se usaron.
+  impact: "Uso de fondos residuales de otros usuarios para cubrir déficit en exact output swap"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Antes de stableSwapExactOutput
+    uint256 tokenOutBalanceBefore = ERC20(outputToken).balanceOf(address(router));
+    // Ejecutar el swap
+    // Después del swap
+    uint256 tokenOutBalanceAfter = ERC20(outputToken).balanceOf(address(router));
+    uint256 actualReceived = tokenOutBalanceAfter - tokenOutBalanceBefore;
+    // Invariante: lo recibido del swap debe ser >= lo prometido al usuario
+    gte(actualReceived, amountOut, "D-06: stable swap produced less than amountOut");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Comparar con stableSwapExactInput que SÍ verifica el output real
+    (balanceOf after - before >= amountOutMinimum). stableSwapExactOutput NO tiene
+    esta verificación — asume que el cálculo de amountIn es perfecto.
+    Si el rate cambia entre el cálculo y la ejecución, hay un gap.
+
+- id: D-07
+  tier: 2
+  type: property
+  description: >
+    V2 getAmountOut redondea siempre hacia abajo (numerator / denominator floor division).
+    Para tokens de pocos decimales (2-6), el rounding loss puede ser significativo
+    en swaps pequeños. En un round-trip A→B→A, el usuario pierde más que la fee
+    teórica del 0.25%.
+  attack_scenario: >
+    (1) Pool USDC/DAI con reserves 1M/1M. (2) Usuario swapea 1 USDC (1e6 wei) a DAI:
+    amountOut = (1e6 * 9975 * 1e18) / (1e6 * 10000 + 1e6 * 9975) = truncated.
+    (3) Swap back DAI→USDC: de nuevo truncated. (4) Round-trip loss > 0.25% fee.
+    Para micro-swaps (100 wei USDC), la pérdida por rounding puede ser >50%.
+    Un MEV bot puede explotar esto forzando round-trips en pools de baja liquidez.
+  impact: "Pérdida por rounding en round-trips de tokens low-decimal — mayor que fee teórica"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: round-trip loss <= 2 * fee + 1 wei de rounding
+    uint256 amountIn = 1000; // pequeño para maximizar rounding impact
+    uint256 amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
+    uint256 amountBack = getAmountOut(amountOut, reserveOut + amountOut, reserveIn - amountOut);
+    uint256 loss = amountIn - amountBack;
+    uint256 maxAcceptableLoss = (amountIn * 50 / 10000) + 2; // 0.5% + 2 wei rounding
+    lte(loss, maxAcceptableLoss, "D-07: round-trip loss exceeds fee + rounding tolerance");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    Este es un comportamiento estándar de AMMs — el rounding down protege al pool.
+    Sin embargo, para tokens de 2 decimales (como GUSD con 2 decimales), micro-swaps
+    pueden perder 100% del valor. La pregunta es si el router debería rechazar swaps
+    donde rounding > X% del input. Probablemente QA/informational.
+
+- id: D-08
+  tier: 1
+  type: property
+  description: >
+    V2 getAmountIn dentro de unchecked puede overflow en el numerador:
+    reserveIn * amountOut * 10000. Con reserveIn = 1e30 (token de 18 dec con gran supply)
+    y amountOut = 1e30, numerator = 1e64 que excede uint256 max (1.15e77). Sin embargo
+    el getAmountIn NO está en unchecked — solo _v2Swap lo está. Verificar si hay
+    overflow path en la cadena getAmountInMultihop que SÍ esté en unchecked.
+  attack_scenario: >
+    Si algún cálculo en la cadena V2 exact-out overflow, el amountIn calculado sería
+    incorrecto (menor del necesario). El usuario pagaría menos de lo debido y extraería
+    más tokens del pool, causando pérdida a los LPs.
+  impact: "Si overflow bypasea slippage check — drenaje parcial de pool V2"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que getAmountIn no overflow para valores extremos
+    // reserveIn y reserveOut máximos realistas: 1e30 (100B tokens * 1e18)
+    uint256 reserveIn = 1e30;
+    uint256 reserveOut = 1e30;
+    uint256 amountOut = 1e29; // 10% del pool
+    // numerator = 1e30 * 1e29 * 10000 = 1e63 — OK, < 2^256
+    // Pero con amountOut cercano a reserveOut:
+    // denominator = (reserveOut - amountOut) * 9975 podría ser muy pequeño
+    // → amountIn enorme pero correcto
+    uint256 numCheck = reserveIn * amountOut;
+    t(numCheck / reserveIn == amountOut, "D-08: intermediate multiplication overflow");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    Solidity 0.8+ revierte en overflow fuera de unchecked{}, así que getAmountIn
+    y getAmountOut revertirán correctamente si hay overflow. El riesgo real está
+    en _v2Swap que SÍ usa unchecked. El underflow de D-03 es más peligroso que
+    este overflow. Marcado tier 1 por precaución pero probablemente downgrade a tier 2.
+
+- id: D-09
+  tier: 1
+  type: property
+  description: >
+    EXECUTE_SUB_PLAN usa address(this).call() (no delegatecall) para ejecutar un sub-batch.
+    El sub-plan tiene acceso a los mismos fondos del router pero su propio contexto de
+    msg.value. Si el sub-plan revierte con FLAG_ALLOW_REVERT, los tokens/ETH ya transferidos
+    por comandos previos del sub-plan NO se revierten — quedan en el router sin propietario.
+  attack_scenario: >
+    (1) Atacante construye execute([TRANSFER(token, router, X), SUB_PLAN([...reverts...])])
+    con FLAG_ALLOW_REVERT en el sub-plan. (2) TRANSFER mueve X tokens al router. (3) Sub-plan
+    revierte pero el revert es permitido. (4) Los X tokens quedan en el router. (5) En la
+    siguiente transacción, atacante usa SWEEP para extraer los tokens.
+    Pero esto solo funciona si el TRANSFER es del propio atacante — sería self-grief.
+    Vector real: sub-plan parcialmente exitoso deja estado inconsistente.
+  impact: "ETH/tokens huérfanos en el router tras sub-plan revertido — extraíbles por terceros"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Antes de execute con sub-plan
+    uint256 routerEthBefore = address(router).balance;
+    uint256 routerTokenBefore = ERC20(token).balanceOf(address(router));
+    // Ejecutar el batch completo
+    // Después del batch
+    uint256 routerEthAfter = address(router).balance;
+    uint256 routerTokenAfter = ERC20(token).balanceOf(address(router));
+    // Invariante: el router no debe acumular fondos entre transacciones
+    eq(routerEthAfter, 0, "D-09: ETH left in router after execute");
+    eq(routerTokenAfter, routerTokenBefore, "D-09: tokens left in router after execute");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Este es el riesgo clásico de Universal Routers con FLAG_ALLOW_REVERT — los
+    fondos pueden quedar huérfanos. La mitigación estándar es que el usuario agregue
+    SWEEP como último comando. Pero si el usuario no lo hace, y otro batch con
+    POSITION_CALL envía address(this).balance, esos fondos se pierden.
+    Investigar si el execute() padre tiene cleanup de ETH al final.
+
+false_positives:
+- hunter: MathHunter
+  id: D-FP-01
+  reason: >
+    PERMIT2_TRANSFER_FROM usa uint160 para amount — parece truncación pero es correcto:
+    Permit2 define allowances como uint160, no uint256. El tipo es consistente con la
+    interfaz IAllowanceTransfer. No es un bug.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "PERMIT2_TRANSFER_FROM amount es uint160 por diseño — Permit2 usa uint160 para allowances, no es truncación"
+    briefing_update_applied: false
+- hunter: MathHunter
+  id: D-FP-02
+  reason: >
+    PAY_PORTION con bips=0 envía 0 tokens sin revertir — parece bug pero es by design.
+    BipsLibrary.calculatePortion valida bips <= 10000 pero permite 0. Enviar 0 tokens
+    es un no-op válido que no causa pérdida. El frontend es responsable de no pasar bips=0.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "PAY_PORTION con bips=0 es no-op por diseño — no causa pérdida, solo no envía nada"
+    briefing_update_applied: false
+- hunter: MathHunter
+  id: D-FP-03
+  reason: >
+    INFI_CL_INITIALIZE_POOL sqrtPriceX96 usa uint160 — correcto por diseño. sqrtPriceX96
+    en Uniswap V3/V4 y forks siempre es uint160 (Q64.96 fixed-point con 160 bits totales).
+    La asignación de calldataload(32 bytes) a uint160 es la truncación esperada.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "sqrtPriceX96 es uint160 por diseño (Q64.96 format) — no confundir con truncación"
+    briefing_update_applied: false

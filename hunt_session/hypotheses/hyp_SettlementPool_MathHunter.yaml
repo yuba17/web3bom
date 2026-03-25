@@ -1,0 +1,360 @@
+protocol: variational
+component: SettlementPool
+file: variational-audit/src/SettlementPool.sol
+domain: reentrancy
+hunter: MathHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: SP-M-01
+  tier: 1
+  type: property
+  description: >
+    batchDepositUSDCAtomic charges creatorPartyAmountRequested N times (once per batch item)
+    instead of once total. If the oracle calls batchDepositUSDCAtomic with 5 items and
+    creatorPartyAmountRequested=1000 USDC, the creator loses 5000 USDC not 1000.
+    Lines 127-150: the for-loop calls _depositUSDCOnBehalf(creatorPartyAddress,
+    creatorPartyAmountRequested, ...) on EVERY iteration, but creatorPartyAmountRequested
+    is a scalar (not per-item). The duplicate protection is bypassed because each item
+    has a different parentQuoteUuid, so each deposit gets a fresh transferUuid.
+  attack_scenario: >
+    Oracle calls batchDepositUSDCAtomic(creator, 1000e6, [item1, item2, item3]).
+    Loop iteration 0: transfers 1000 USDC from creator (transferUuid = item1.parentQuoteUuid).
+    Loop iteration 1: transfers 1000 USDC from creator (transferUuid = item2.parentQuoteUuid).
+    Loop iteration 2: transfers 1000 USDC from creator (transferUuid = item3.parentQuoteUuid).
+    Creator intended to deposit 1000 USDC total, but 3000 USDC was taken.
+    If this is by-design, the function name and parameters are deeply misleading since
+    creatorPartyAmountRequested is not "per item" yet it is charged per item.
+  impact: >
+    Creator party is overcharged by a factor of items.length. For a batch of 10 items
+    with 10,000 USDC requested, creator loses 100,000 USDC instead of 10,000.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track total USDC transferred from creator across batch
+    // ghost_creatorBalanceBefore is set before batchDepositUSDCAtomic call
+    uint256 creatorBalanceAfter = usdc.balanceOf(creatorAddress);
+    uint256 actualTransferred = ghost_creatorBalanceBefore - creatorBalanceAfter;
+    // If creator amount is charged once (as the scalar parameter suggests),
+    // actualTransferred should equal creatorPartyAmountRequested, not N * creatorPartyAmountRequested
+    if (ghost_batchItemCount > 1 && ghost_creatorAmountRequested > 0) {
+        lte(actualTransferred, ghost_creatorAmountRequested, "SP-M-01: creator overcharged in batch");
+    }
+  ghost_vars:
+  - uint256 internal ghost_creatorBalanceBefore;
+  - uint256 internal ghost_creatorAmountRequested;
+  - uint256 internal ghost_batchItemCount;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    This may be by-design if creatorPartyAmountRequested is meant to be "per trade"
+    not "total for batch". But the parameter name and the fact it's a single scalar
+    (not an array) strongly suggests it should be charged once. Need to check Oracle
+    calling code to determine if amounts are pre-adjusted.
+  poc_sketch: ''
+  call_stack: >
+    batchDepositUSDCAtomic (L122) -> for loop (L127) ->
+    _depositUSDCOnBehalf(creatorPartyAddress, creatorPartyAmountRequested, items[i].parentQuoteUuid)
+    called N times with same amount but different transferUuids -> each call does transferFrom
+
+- id: SP-M-02
+  tier: 1
+  type: property
+  description: >
+    transferUuid=0 completely bypasses duplicate transfer protection in _depositUSDCOnBehalf.
+    Line 97 checks transfers_processed[transferUuid] == false, which passes for 0 since
+    mapping defaults to false. Line 106: if (transferUuid != 0) — so transferUuid=0 is
+    NEVER marked as processed. depositUSDCNoEvent (L285-296) does NOT require transferUuid != 0,
+    unlike depositUSDC (L224) and depositUSDCOnBehalfOfParty (L238). The oracle can call
+    depositUSDCNoEvent with transferUuid=0 unlimited times for the same logical transfer.
+  attack_scenario: >
+    1. Oracle calls depositUSDCNoEvent(sender, 1000e6, 0) — succeeds, transfers 1000 USDC.
+    2. Oracle calls depositUSDCNoEvent(sender, 1000e6, 0) again — succeeds again because
+       transfers_processed[0] was never set to true (L106: if transferUuid != 0).
+    3. Repeat N times — sender is drained of N * 1000 USDC for what should be a single deposit.
+    This vector is available to the oracle (compromised or buggy off-chain component).
+  impact: >
+    Unlimited duplicate deposits drain the sender's USDC. If oracle is compromised or has
+    a replay bug, any party's approved USDC can be repeatedly transferred into the pool.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After calling depositUSDCNoEvent with transferUuid=0, calling it again should revert
+    // but it won't because transfers_processed[0] is never set
+    // Property: for any transferUuid that has been used in a successful deposit,
+    // a second deposit with the same uuid must revert
+    // This invariant can only be tested by attempting double-deposit in a handler
+    bool firstCallSucceeded = ghost_depositNoEventCalled_uuid0;
+    if (firstCallSucceeded) {
+        // If we reach here after a second call with uuid=0, the invariant is broken
+        t(false, "SP-M-02: duplicate deposit with transferUuid=0 succeeded");
+    }
+  ghost_vars:
+  - bool internal ghost_depositNoEventCalled_uuid0;
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    The same bypass exists in the atomic deposit functions via the transferUuid=0 reset
+    (L140, L197), but those are intentional for the second party's deposit in the same
+    atomic op. The real issue is depositUSDCNoEvent having no require(transferUuid != 0).
+
+- id: SP-M-03
+  tier: 1
+  type: property
+  description: >
+    withdrawFees (L247-260) does not verify that requestor is a pool party
+    (creatorAddress or otherAddresses). Unlike _withdrawUSDCOnBehalf (L270-272)
+    which explicitly checks requestor membership, withdrawFees only checks onlyOracle.
+    A compromised or buggy oracle can drain pool funds to any arbitrary address.
+  attack_scenario: >
+    1. Pool has 100,000 USDC balance from legitimate deposits.
+    2. Oracle calls withdrawFees(attackerAddress, 100000e6, fresh_fees_batch_id).
+    3. Transfer succeeds — 100,000 USDC sent to attacker.
+    4. No party membership check prevents this.
+    Compare: _withdrawUSDCOnBehalf (L270-272) requires requestor is party.
+  impact: >
+    Complete pool drainage to arbitrary address. All deposited USDC at risk
+    if oracle is compromised or has a logic bug.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After withdrawFees, verify requestor was a legitimate party
+    // This invariant checks the MISSING validation
+    address lastFeeRequestor = ghost_lastFeeWithdrawRequestor;
+    if (lastFeeRequestor != address(0)) {
+        bool isParty = (lastFeeRequestor == pool.creatorAddress()) ||
+                       pool.checkOtherAddress(lastFeeRequestor);
+        // In a properly designed contract, fees should only go to parties or a known fee collector
+        // This will fail if oracle sends fees to arbitrary address
+        t(isParty, "SP-M-03: withdrawFees sent to non-party address");
+    }
+  ghost_vars:
+  - address internal ghost_lastFeeWithdrawRequestor;
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    This may be by-design if fees are supposed to go to a protocol treasury that
+    is NOT a pool party. However, the asymmetry with _withdrawUSDCOnBehalf which
+    DOES check party membership suggests this is an oversight. Need to verify
+    the fee collection architecture.
+
+- id: SP-M-04
+  tier: 2
+  type: property
+  description: >
+    No balance sufficiency check before withdrawals. Both withdrawFees (L255) and
+    _withdrawUSDCOnBehalf (L275) attempt transfer without verifying
+    amountRequested <= USDC.balanceOf(address(this)). They rely on the try/catch
+    to revert, but the try/catch catches ALL errors including non-balance-related
+    ones, masking the real failure reason. More critically, if USDC is a
+    fee-on-transfer token or rebasing token, the actual balance may differ from
+    what the oracle calculated off-chain.
+  attack_scenario: >
+    1. Pool has 1000 USDC. Oracle calculates off-chain that partyA should withdraw 500.
+    2. Between oracle's calculation and tx execution, another withdrawal of 600 occurs.
+    3. PartyA's withdrawal of 500 fails silently with generic error message.
+    4. If USDC were fee-on-transfer: deposit of 1000 results in balance of 999.
+       Oracle thinks 1000 is available. Last withdrawal of 1 USDC fails.
+    While USDC is not fee-on-transfer today, the contract claims to use
+    _usdc() from factory which could be changed.
+  impact: >
+    Race condition between oracle-calculated amounts and actual pool balance.
+    Last party to withdraw may be unable to claim their funds.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Solvency invariant: pool USDC balance >= 0 (trivially true for uint)
+    // More useful: after all deposits and withdrawals, balance should match
+    // sum(deposits) - sum(withdrawals)
+    uint256 balance = usdc.balanceOf(address(pool));
+    uint256 expectedBalance = ghost_totalDeposited - ghost_totalWithdrawn;
+    // Allow 1 wei tolerance per operation for fee-on-transfer edge case
+    uint256 tolerance = ghost_operationCount;
+    gte(balance + tolerance, expectedBalance, "SP-M-04: pool balance less than expected");
+  ghost_vars:
+  - uint256 internal ghost_totalDeposited;
+  - uint256 internal ghost_totalWithdrawn;
+  - uint256 internal ghost_operationCount;
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    Low confidence because standard USDC is not fee-on-transfer. However, the
+    contract does not hardcode the USDC address — it reads from factory.usdcAddress()
+    which could theoretically be changed to a fee-on-transfer token. The real risk
+    is the race condition between oracle calculations and on-chain state.
+
+- id: SP-M-05
+  tier: 1
+  type: property
+  description: >
+    depositUSDCAtomic (L159-216) emits event and returns early when
+    partyOneAmountRequested > 0 && partyTwoAmountRequested == 0 (L169-180)
+    WITHOUT actually performing any transfer. The comment says "we already
+    completed the single party transfer in the calling function" — but this
+    means the event DepositedAtomic is emitted with partyOneAmountRequested
+    as if that amount was deposited, when in reality NO deposit happened in
+    this function. If the "calling function" (oracle) did NOT actually perform
+    the transfer, the event is a lie.
+  attack_scenario: >
+    1. Oracle calls depositUSDCAtomic(partyOne, partyTwo, 1000e6, 0, rfqUuid, quoteUuid).
+    2. Function hits early return at L179 — emits DepositedAtomic with 1000e6.
+    3. No transferFrom occurs. No USDC moves.
+    4. Off-chain systems tracking DepositedAtomic events believe 1000 USDC was deposited.
+    5. PartyOne later withdraws 1000 USDC they never deposited (oracle trusts event).
+    This depends on whether the calling oracle function ACTUALLY transferred the funds
+    before calling depositUSDCAtomic. If it didn't, this is free money.
+  impact: >
+    Phantom deposit recorded by event. If off-chain systems trust events for accounting,
+    a party can withdraw funds they never deposited.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before and after depositUSDCAtomic call, verify USDC actually moved
+    uint256 poolBalanceAfter = usdc.balanceOf(address(pool));
+    uint256 expectedIncrease = ghost_atomicPartyOneAmount + ghost_atomicPartyTwoAmount;
+    uint256 actualIncrease = poolBalanceAfter - ghost_poolBalanceBeforeAtomic;
+    // If early return path taken (partyOne > 0 && partyTwo == 0), no transfer occurs
+    // Pool balance should still increase by the amount the event claims
+    eq(actualIncrease, expectedIncrease, "SP-M-05: atomic deposit event doesn't match actual transfer");
+  ghost_vars:
+  - uint256 internal ghost_poolBalanceBeforeAtomic;
+  - uint256 internal ghost_atomicPartyOneAmount;
+  - uint256 internal ghost_atomicPartyTwoAmount;
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    This finding depends on whether the Oracle contract actually does the transfer
+    before calling depositUSDCAtomic. Need to read Oracle.sol to confirm. The comment
+    at L168 suggests it does, but we cannot verify without seeing the caller.
+
+- id: SP-M-06
+  tier: 2
+  type: property
+  description: >
+    Allowance check in _depositUSDCOnBehalf (L98-102) is redundant and can be stale.
+    The function checks allowance >= amount, then calls transferFrom which also checks
+    allowance internally. Between the allowance check (L98) and the transferFrom (L105),
+    the allowance can change (e.g., another contract spends it). This is not a direct
+    vulnerability but wastes gas and the error message is misleading when the real failure
+    is different. More importantly: for USDC which has a separate allowance mechanism
+    (permit), the allowance() check may not reflect permit-based approvals correctly
+    in all implementations.
+  attack_scenario: >
+    1. User approves 1000 USDC to pool.
+    2. In same block, another tx (or delegate) spends 500 of that allowance.
+    3. Oracle calls deposit for 800 USDC.
+    4. Allowance check at L98 sees 1000 (stale) — passes.
+    5. transferFrom at L105 fails because real allowance is now 500.
+    6. Generic error "Could not deposit USDC" hides the real reason.
+    Not exploitable for profit but causes confusion and potential griefing.
+  impact: >
+    No direct fund loss. Misleading error messages and potential for griefing
+    by front-running allowance changes.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // The allowance check before transferFrom should match the actual transferable amount
+    // This is a gas optimization / code quality issue more than a security invariant
+    uint256 allowance = usdc.allowance(sender, address(pool));
+    if (allowance >= amount) {
+        // transferFrom should succeed
+        t(true, "SP-M-06: allowance sufficient");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    This is a Low/QA finding. The redundant allowance check is a code smell but
+    not exploitable. The try/catch pattern handles the failure gracefully.
+    Marking as validated:false because impact is negligible.
+
+- id: SP-M-07
+  tier: 1
+  type: property
+  description: >
+    In batchDepositUSDCAtomic (L127-150), when creatorPartyAmountRequested > 0 and
+    there are N items, the first item's parentQuoteUuid is used as transferUuid for
+    the creator's first deposit and marked as processed. For items 2..N, the creator
+    deposits with DIFFERENT transferUuids (items[i].parentQuoteUuid), each passing
+    the duplicate check independently. This means the creator is charged N times
+    the creatorPartyAmountRequested. Combined with SP-M-01: if the oracle passes
+    transferUuid=0 for the other party (after the creator deposit resets it at L140),
+    the other party's deposits with uuid=0 bypass duplicate protection per SP-M-02.
+  attack_scenario: >
+    1. Oracle calls batchDepositUSDCAtomic(creator, 5000e6, [
+         {otherAddr: bob, otherAmt: 1000e6, rfqUuid: 1, parentQuoteUuid: 100},
+         {otherAddr: bob, otherAmt: 1000e6, rfqUuid: 2, parentQuoteUuid: 101},
+         {otherAddr: bob, otherAmt: 1000e6, rfqUuid: 3, parentQuoteUuid: 102}
+       ]).
+    2. Creator deposits: 5000 with uuid=100, 5000 with uuid=101, 5000 with uuid=102.
+       Total: 15,000 USDC from creator (3x the intended 5000).
+    3. Bob deposits: 1000 with uuid=0 (bypassed), 1000 with uuid=0 (bypassed), 1000 with uuid=0.
+       All three pass because uuid=0 is never marked processed.
+    4. Total extracted: 15,000 from creator + 3,000 from Bob = 18,000 USDC.
+       Expected: 5,000 from creator + 3,000 from Bob = 8,000 USDC.
+  impact: >
+    Creator overcharged by factor of batch size. Combined with uuid=0 bypass,
+    systematic over-extraction from depositors. 10,000 USDC excess in this example.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Combined check: after batch, total USDC extracted should match intent
+    uint256 totalExpectedFromCreator = ghost_creatorAmountRequested; // scalar, once
+    uint256 totalExpectedFromOthers = ghost_sumOtherAmounts; // sum of all items
+    uint256 totalExpected = totalExpectedFromCreator + totalExpectedFromOthers;
+    uint256 totalActual = ghost_totalDeposited; // tracked via ghost in handler
+    eq(totalActual, totalExpected, "SP-M-07: batch deposit extracted more than expected");
+  ghost_vars:
+  - uint256 internal ghost_creatorAmountRequested;
+  - uint256 internal ghost_sumOtherAmounts;
+  - uint256 internal ghost_totalDeposited;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    This combines SP-M-01 and SP-M-02 into a single attack scenario. The confidence
+    is 60% because the batch semantics MIGHT intend per-item creator charges, but the
+    API design (single scalar not array) argues against that interpretation.
+
+false_positives:
+- hunter: MathHunter
+  id: SP-FP-01
+  reason: >
+    No complex math in this contract. No share/exchange rate calculations, no
+    interest accrual, no price conversions, no division operations. The contract
+    is purely a custody contract that transfers fixed USDC amounts. Traditional
+    MathHunter targets (rounding, precision loss, first-depositor inflation)
+    are NOT applicable here. The findings above are about logic/accounting
+    errors, not math precision issues.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: reentrancy.md
+    content: >
+      SettlementPool-type contracts with no internal accounting (pure USDC custody)
+      have no traditional math attack surface. Focus on logic bugs: duplicate
+      transfer protection bypasses, batch charging semantics, and missing access
+      checks on withdrawal functions.
+    briefing_update_applied: false
+- hunter: MathHunter
+  id: SP-FP-02
+  reason: >
+    Decimal universality analysis: the contract only handles USDC (6 decimals)
+    read from factory.usdcAddress(). All amounts are passed as raw uint256 with
+    no decimal conversion or scaling. No division, multiplication, or price
+    calculation exists in the contract. Decimal-related bugs are NOT possible
+    in this contract's current code.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

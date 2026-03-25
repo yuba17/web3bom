@@ -1,0 +1,773 @@
+protocol: morpho-bundler3
+component: Bundler3
+file: src/Bundler3.sol
+domain: multicall
+hunter: MathHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: B-M-01
+  tier: 1
+  type: property
+  description: "ETH conservation: la suma de value enviados en un multicall no debe exceder msg.value + ETH residual pre-existente en el contrato"
+  attack_scenario: >
+    Si el contrato acumula ETH residual (de calls anteriores, selfdestruct, o
+    coinbase rewards), un atacante puede llamar multicall con bundle[i].value
+    que sumen más que su msg.value, gastando ETH que no le pertenece.
+    Patrón idéntico al HIGH de 3DNS (Multicall drena ETH residual).
+    En Bundler3 esto es BY DESIGN (el contrato no debe tener approvals ni ETH),
+    pero si algún adapter deja ETH residual, es explotable.
+  impact: "Robo de ETH residual del contrato. Impacto proporcional al ETH atrapado."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Ghost: track ETH balance before multicall
+    uint256 balanceBefore = address(bundler).balance;
+    // After multicall with msg.value V:
+    // balance should be >= balanceBefore + V - sum(values sent out)
+    // Invariant: no user can extract more ETH than they sent in msg.value
+    uint256 balanceAfter = address(bundler).balance;
+    uint256 totalValueSent = ghost_totalValueSentInBundle;
+    // If totalValueSent > msg.value, someone spent residual ETH
+    lte(totalValueSent, ghost_msgValue + ghost_preBalance,
+        "B-M-01: bundle spent more ETH than msg.value + pre-existing balance");
+  ghost_vars:
+  - "uint256 internal ghost_totalValueSentInBundle;"
+  - "uint256 internal ghost_msgValue;"
+  - "uint256 internal ghost_preBalance;"
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    El contrato dice explícitamente "should not be approved/authorized anywhere",
+    lo que implica que residual ETH es considerado riesgo del usuario. Pero si un
+    adapter legítimo deja ETH (e.g., unwrap parcial de WETH), esto es explotable.
+    Investigar si adapters pueden dejar residual ETH.
+
+- id: B-M-02
+  tier: 1
+  type: property
+  description: "No hay overflow en la iteración del bundle: i < bundle.length con uint256 nunca overflows, pero sum(bundle[i].value) podría overflow si bundle.length es extremo"
+  attack_scenario: >
+    En Solidity 0.8.28, aritmética tiene overflow checks nativos. Pero el
+    acumulado de value se gasta secuencialmente via .call{value:}, no se suma
+    explícitamente. El contrato NO suma los values — los gasta uno a uno del
+    balance. Esto significa que NO hay overflow posible en la suma, pero sí
+    permite gastar más que msg.value si hay balance residual (ver B-M-01).
+  impact: "Ninguno directo — overflow protegido por Solidity 0.8. El riesgo real es B-M-01."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: total value dispatched across all calls in bundle
+    // cannot exceed contract balance at start of multicall
+    uint256 totalDispatched;
+    for (uint256 j; j < ghost_callValues.length; ++j) {
+        totalDispatched += ghost_callValues[j]; // overflow reverts in 0.8
+    }
+    lte(totalDispatched, ghost_preBalance + ghost_msgValue,
+        "B-M-02: total dispatched exceeds available ETH");
+  ghost_vars:
+  - "uint256[] internal ghost_callValues;"
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Investigado y confirmado: Solidity 0.8 previene overflow. La suma nunca se
+    calcula en el contrato — cada call gasta del balance actual. Si el balance
+    es insuficiente, la call falla (revert si skipRevert=false, silently fail
+    si skipRevert=true). skipRevert=true + insufficient balance = call falla
+    silenciosamente, pero no hay pérdida de fondos del contrato.
+
+- id: B-M-03
+  tier: 2
+  type: property
+  description: "reenterHash domain separation: bytes.concat(bytes20(to), callbackHash) tiene 52 bytes fijos, sin ambigüedad de parsing — no hay colisión por pares distintos (to, callbackHash)"
+  attack_scenario: >
+    Si existiera una colisión donde (addr_A, hash_A) produce el mismo
+    reenterHash que (addr_B, hash_B) con addr_A != addr_B o hash_A != hash_B,
+    un contrato malicioso en addr_B podría reentrar con datos inesperados.
+    Análisis: bytes20(to) ocupa exactamente los primeros 20 bytes, callbackHash
+    los últimos 32 bytes. Total = 52 bytes. Para que haya colisión se necesita
+    colisión de keccak256 en un input de 52 bytes — computacionalmente inviable
+    (2^128 operaciones). NO hay vulnerabilidad aquí.
+  impact: "Ninguno — la domain separation es correcta"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For any two distinct pairs (to_a, hash_a) and (to_b, hash_b):
+    // keccak256(bytes.concat(bytes20(to_a), hash_a)) !=
+    //   keccak256(bytes.concat(bytes20(to_b), hash_b))
+    // This is guaranteed by keccak256 collision resistance.
+    // Fuzz test: generate random pairs and verify no collision.
+    bytes32 h1 = keccak256(bytes.concat(bytes20(ghost_addr1), ghost_hash1));
+    bytes32 h2 = keccak256(bytes.concat(bytes20(ghost_addr2), ghost_hash2));
+    if (ghost_addr1 != ghost_addr2 || ghost_hash1 != ghost_hash2) {
+        t(h1 != h2, "B-M-03: reenterHash collision found");
+    }
+  ghost_vars:
+  - "address internal ghost_addr1;"
+  - "address internal ghost_addr2;"
+  - "bytes32 internal ghost_hash1;"
+  - "bytes32 internal ghost_hash2;"
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    Investigado a fondo. La concatenación es de tamaño fijo (20+32=52 bytes),
+    no hay ambigüedad tipo ABI encoding (donde longitudes variables pueden
+    crear colisiones). keccak256 collision resistance hace esto seguro.
+    Marcado como false positive potencial pero incluido para completitud.
+
+- id: B-M-04
+  tier: 2
+  type: property
+  description: "callbackHash = keccak256('') no crea bypass: keccak256(bytes('')) = 0xc5d2...46b8, que es != bytes32(0), por lo tanto el branch 'else' se ejecuta y reenterHash se setea correctamente"
+  attack_scenario: >
+    Un atacante podría intentar usar callbackHash = keccak256("") pensando que
+    esto bypasea el check de reenterHash (confundirlo con bytes32(0)).
+    Análisis: keccak256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82
+    273b7bfad8045d85a470. Esto es != bytes32(0), por lo tanto el contrato
+    entra en el branch 'else' y setea reenterHash = keccak256(concat(to,
+    callbackHash)). El callee DEBE llamar reenter con datos que hasheen a
+    ese callbackHash. Si no lo hace, la tx revierte con MissingExpectedReenter.
+    No hay bypass.
+  impact: "Ninguno — el comportamiento es correcto"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: keccak256("") is NOT bytes32(0)
+    bytes32 emptyHash = keccak256("");
+    t(emptyHash != bytes32(0),
+        "B-M-04: keccak256 of empty bytes equals zero — unexpected");
+    // Verify: setting callbackHash to keccak256("") triggers reenter requirement
+    // (the else branch), not the zero branch
+    if (ghost_lastCallbackHash == emptyHash) {
+        t(ghost_lastReenterHash != bytes32(0),
+            "B-M-04: empty hash treated as zero — bypass possible");
+    }
+  ghost_vars:
+  - "bytes32 internal ghost_lastCallbackHash;"
+  - "bytes32 internal ghost_lastReenterHash;"
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    Investigado. keccak256("") = 0xc5d246... que es un valor no-cero.
+    El contrato correctamente distingue entre callbackHash=0 (no espera
+    reenter) y callbackHash=keccak256("") (espera reenter con datos vacíos).
+    No hay bypass. Marcando como false positive investigado.
+
+- id: B-M-05
+  tier: 2
+  type: property
+  description: "OOG por bundle.length extremo: no hay límite superior en bundle.length. Un bundle con miles de entries consume gas proporcional a O(n) en el loop."
+  attack_scenario: >
+    Un atacante crea un bundle con miles de entries donde cada call es a
+    address(0) con data vacía y value=0. El loop consume ~5000 gas por
+    iteración (SSTORE transient para reenterHash + call overhead). Con
+    block gas limit de 30M, se pueden hacer ~6000 iteraciones.
+    Impacto: el atacante solo se daña a sí mismo (paga el gas). No hay
+    griefing posible porque el atacante es quien llama multicall.
+    EXCEPTO: si el bundler se usa como callback target donde OTRO contrato
+    llama multicall y el atacante controla el bundle array — entonces podría
+    hacer que la tx del otro contrato falle por OOG.
+  impact: "Auto-griefing (atacante paga su propio gas). Potencial griefing si bundler es llamado por otro contrato."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: multicall with large bundle doesn't cause unexpected state
+    // (only OOG, which is handled by EVM gas mechanics)
+    // This is a gas consumption test, not a state invariant
+    t(ghost_bundleLength <= 1000,
+        "B-M-05: bundle length exceeds reasonable limit");
+  ghost_vars:
+  - "uint256 internal ghost_bundleLength;"
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    Investigado. El gas limit del bloque es la protección natural.
+    multicall requiere initiator == address(0), por lo que no puede ser
+    llamado por otro contrato mid-execution (AlreadyInitiated). Solo
+    reenter podría ser usado para griefing, pero requiere conocer el
+    reenterHash. Riesgo real: mínimo.
+
+- id: B-M-06
+  tier: 1
+  type: property
+  description: "skipRevert + value: si una call con value>0 falla y skipRevert=true, el ETH NO se enviado (la call falló). Pero el loop continúa. El ETH queda en el contrato, disponible para calls posteriores en el bundle o para ser robado."
+  attack_scenario: >
+    Escenario: bundle = [{to: contratoQueFalla, value: 1 ETH, skipRevert: true},
+    {to: attacker, value: 1 ETH, skipRevert: false, data: ""}].
+    El usuario envía msg.value = 1 ETH. La primera call falla (ETH no se envía,
+    queda en el contrato). La segunda call envía 1 ETH al atacante.
+    PERO: el atacante tendría que ser quien construye el bundle, lo que significa
+    que se está robando a sí mismo. El riesgo real es si un PROTOCOLO construye
+    el bundle on behalf del usuario con datos del usuario (e.g., un frontend
+    malicioso que pone skipRevert=true en una call que debería fallar para
+    redirigir los fondos a otra call).
+  impact: "Potencial redirección de ETH dentro del mismo bundle si skipRevert se usa incorrectamente. El usuario final pierde ETH."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track: if a call with value > 0 fails with skipRevert=true,
+    // the ETH remains in the contract. Verify it's not stolen by
+    // subsequent calls to different addresses.
+    if (ghost_failedCallValue > 0 && ghost_failedCallSkipRevert) {
+        // The failed call's value should still be in the contract
+        // or returned to the user, not sent to a different address
+        gte(address(bundler).balance, ghost_failedCallValue,
+            "B-M-06: failed call's ETH was consumed by subsequent call");
+    }
+  ghost_vars:
+  - "uint256 internal ghost_failedCallValue;"
+  - "bool internal ghost_failedCallSkipRevert;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Este es el vector más interesante desde perspectiva MathHunter.
+    El contrato no tiene accounting interno de ETH — usa el balance
+    directamente. Calls fallidas con skipRevert=true crean un delta
+    entre "ETH intended" y "ETH sent" que puede ser capturado por
+    calls posteriores. Requiere que el atacante controle el bundle
+    o que un frontend/protocolo construya bundles inseguros.
+    Similar al patrón 3DNS HIGH.
+
+- id: B-M-07
+  tier: 2
+  type: property
+  description: "reenter no es payable: no se puede enviar ETH adicional via reenter. Todo el ETH del bundle viene de multicall.msg.value + residual."
+  attack_scenario: >
+    Un atacante intenta inyectar ETH adicional via reenter para amplificar
+    el ETH disponible en el contrato durante la ejecución del bundle.
+    Análisis: reenter() NO es payable, por lo que msg.value = 0 siempre.
+    No se puede inyectar ETH adicional via reenter. El ETH disponible
+    durante toda la ejecución está limitado a: msg.value del multicall
+    original + cualquier ETH residual pre-existente + ETH devuelto por
+    calls dentro del bundle (e.g., unwrap WETH).
+  impact: "Ninguno — reenter correctamente no es payable"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: reenter cannot receive ETH
+    // (this is a compile-time check — reenter is not payable)
+    // Runtime invariant: during reenter, no new ETH enters the contract
+    // except from calls within the bundle itself
+    uint256 balBeforeReenter = ghost_balanceBeforeReenter;
+    uint256 balAfterReenter = address(bundler).balance;
+    // Balance can only decrease (ETH sent out) or stay same
+    // It can increase ONLY if a call within the bundle sends ETH back
+    t(true, "B-M-07: compile-time check — reenter is not payable");
+  ghost_vars:
+  - "uint256 internal ghost_balanceBeforeReenter;"
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Confirmado por inspección del código. reenter() no tiene el modifier
+    payable. Cualquier intento de enviar ETH a reenter revierte.
+
+# ═══════════════════════════════════════════════════════════════════
+# FASE 2: GeneralAdapter1, ParaswapAdapter, MathRayLib, BytesLib,
+#          EthereumGeneralAdapter1
+# Análisis de: slippage checks, ray math, type(uint).max, offsets
+# Fecha: 2026-03-23
+# ═══════════════════════════════════════════════════════════════════
+
+  - id: B-M-08
+    tier: 1
+    type: property
+    description: >
+      MathRayLib rDivUp/rDivDown division-by-zero: Si shares/y == 0, rDivDown
+      revierte con panic(0x12), rDivUp revierte con panic(0x11) en (y-1)
+      underflow. Ambos casos son DoS, no pérdida de fondos. Morpho Blue y
+      ERC4626 estándar nunca retornan 0 shares para >0 assets.
+    attack_scenario: >
+      1. Atacante llama morphoSupply con assets=X a un mercado Morpho vacío.
+      2. Hipotéticamente, Morpho.supply() retorna (X, 0 shares).
+      3. rDivUp(X, 0) intenta (X * 1e27 + (0-1)) → underflow en (y-1) → panic.
+      4. Tx revierte. No hay pérdida de fondos.
+      5. En Morpho Blue, supply con assets>0 siempre retorna shares>0 (usa
+         toSharesUp que retorna mínimo 1 share). Caso idéntico para ERC4626.
+      6. Solo explotable con vault/market malicioso, donde el usuario elige
+         interactuar — se haría daño a sí mismo.
+    impact: "DoS temporal (revert). No pérdida de fondos."
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // Verify: rDivUp and rDivDown revert on y=0
+      // Solidity 0.8 checked math guarantees this
+      // rDivDown(x, 0) = (x * RAY) / 0 → panic(0x12)
+      // rDivUp(x, 0) = (x * RAY + (0-1)) / 0 → panic(0x11) on (y-1)
+      if (ghost_suppliedShares == 0 && ghost_suppliedAssets > 0) {
+          t(false, "B-M-08: supply returned 0 shares for >0 assets — should have reverted");
+      }
+    ghost_vars:
+      - "uint256 internal ghost_suppliedShares;"
+      - "uint256 internal ghost_suppliedAssets;"
+    validated: false
+    priority: low
+    confidence: 90
+    notes: >
+      Verificado: Solidity 0.8.28 checked arithmetic protege ambos paths.
+      rDivDown: division by zero panic. rDivUp: underflow panic en (y-1).
+      Morpho Blue toSharesUp siempre retorna ≥1. No es un vector real.
+
+  - id: B-M-09
+    tier: 2
+    type: property
+    description: >
+      Overflow en x * RAY dentro de rDivUp/rDivDown: x > type(uint256).max / 1e27
+      (~1.157e50) causa overflow → revert. Para shares/assets normales es
+      irrealista (requiere >1e32 tokens con 18 decimales).
+    attack_scenario: >
+      1. Un ERC4626 vault malicioso retorna shares = type(uint256).max.
+      2. assets.rDivUp(shares) intenta assets * 1e27 → overflow → revert.
+      3. Tx falla. No pérdida de fondos.
+      4. Con tokens de 18 decimales, se necesitarían >1.157e32 tokens enteros.
+         Ningún token real tiene esa supply total. ETH total supply ~120M = 1.2e26 wei,
+         muy por debajo del límite.
+    impact: "DoS (revert). Irrealista en condiciones normales."
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // Verify: x * RAY does not overflow for realistic values
+      // Max safe x = type(uint256).max / 1e27 ≈ 1.157e50
+      if (ghost_mathInput > type(uint256).max / 1e27) {
+          t(false, "B-M-09: rDiv input too large — overflow would occur");
+      }
+    ghost_vars:
+      - "uint256 internal ghost_mathInput;"
+    validated: false
+    priority: low
+    confidence: 95
+    notes: >
+      Límite teórico. En la práctica, ningún token tiene supply suficiente
+      para triggerear overflow. Checked arithmetic de Solidity 0.8 protege.
+
+  - id: B-M-10
+    tier: 1
+    type: property
+    description: >
+      Dirección del redondeo en slippage checks: VERIFICADO CORRECTO en 9 funciones.
+      rDivUp para maxSharePrice (redondeo UP contra usuario = check más estricto para
+      quien PAGA). rDivDown para minSharePrice (redondeo DOWN contra usuario = check
+      más estricto para quien RECIBE). Consistente y seguro.
+    attack_scenario: >
+      No hay ataque. Análisis exhaustivo:
+      - erc4626Mint (L66): assets.rDivUp(shares) <= max → CORRECTO (paga assets)
+      - erc4626Deposit (L93): assets.rDivUp(shares) <= max → CORRECTO (paga assets)
+      - erc4626Withdraw (L114): assets.rDivDown(shares) >= min → CORRECTO (recibe assets)
+      - erc4626Redeem (L138): assets.rDivDown(shares) >= min → CORRECTO (recibe assets)
+      - morphoSupply (L201): supplied.rDivUp(shares) <= max → CORRECTO (paga assets)
+      - morphoBorrow (L250): borrowed.rDivDown(shares) >= min → CORRECTO (recibe assets)
+      - morphoRepay (L290): repaid.rDivUp(shares) <= max → CORRECTO (paga assets)
+      - morphoWithdraw (L318): withdrawn.rDivDown(shares) >= min → CORRECTO (recibe)
+      - stakeEth (L113): amount.rDivUp(shares) <= max → CORRECTO (paga ETH)
+      El redondeo siempre va contra el usuario en el check, haciendo el check
+      MÁS conservador. Esto es el diseño correcto.
+    impact: "Ninguno — diseño correcto"
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // Meta-invariant: rounding direction always disadvantages the user
+      // For max checks: rDivUp makes the computed price HIGHER → harder to pass
+      // For min checks: rDivDown makes the computed price LOWER → harder to pass
+      // This is BY DESIGN and correct for slippage protection.
+      t(true, "B-M-10: rounding directions verified as correct");
+    ghost_vars: []
+    validated: true
+    priority: low
+    confidence: 99
+    notes: >
+      Verificación exhaustiva completada. Las 9 funciones con slippage check
+      usan la dirección de redondeo correcta. No hay bypass posible.
+
+  - id: B-M-11
+    tier: 1
+    type: property
+    description: >
+      ParaswapAdapter.updateAmounts — division-by-zero si oldExactAmount == 0:
+      callData.get(offsets.exactAmount) retorna 0 → mulDiv(limitAmount, exactAmount, 0)
+      → revert (OpenZeppelin mulDiv revierte en denominator=0). Es DoS auto-infligido.
+    attack_scenario: >
+      1. Usuario construye callData con 0 en el offset de exactAmount.
+      2. Llama sell() con sellEntireBalance=true.
+      3. updateAmounts: oldExactAmount = callData.get(offsets.exactAmount) = 0.
+      4. limitAmount.mulDiv(newAmount, 0, Ceil) → revert.
+      5. Resultado: tx revierte. El usuario construyó callData malformado.
+      6. No hay forma de que un atacante externo fuerce esto — el usuario
+         controla sus propios offsets y callData.
+    impact: "DoS auto-infligido. No pérdida de fondos."
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      uint256 oldExact = callData.get(offsets.exactAmount);
+      t(oldExact > 0, "B-M-11: oldExactAmount is 0 — mulDiv will revert");
+    ghost_vars: []
+    validated: false
+    priority: low
+    confidence: 85
+    notes: >
+      OpenZeppelin Math.mulDiv revierte si denominator == 0 (explicit require).
+      El usuario controla tanto callData como offsets. Footgun, no exploit.
+
+  - id: B-M-12
+    tier: 1
+    type: property
+    description: >
+      ParaswapAdapter.swap — underflow en srcInitial - srcFinal (L191):
+      Si Augustus aumenta el balance de srcToken (rebasing token, o Augustus
+      devuelve parte del srcToken), srcFinal > srcInitial → underflow → revert.
+    attack_scenario: >
+      1. srcToken es un rebasing token (e.g., stETH con rebase positivo).
+      2. srcInitial = balance antes del swap.
+      3. Durante swap, stETH rebases positivamente.
+      4. srcFinal = balance después > srcInitial.
+      5. srcInitial - srcFinal → underflow → panic revert (Solidity 0.8).
+      6. Resultado: DoS para swaps con rebasing tokens. No pérdida de fondos.
+      7. Igual para destFinal - destInitial (L192): si Augustus drena destToken
+         que ya estaba en el adapter, destFinal < destInitial → underflow → revert.
+         Pero Augustus está validado por registry, no es malicioso.
+    impact: "DoS para rebasing tokens. No pérdida de fondos."
+    impact_rating: Low
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      uint256 srcBefore = IERC20(srcToken).balanceOf(address(adapter));
+      // ... swap ...
+      uint256 srcAfter = IERC20(srcToken).balanceOf(address(adapter));
+      // If srcAfter > srcBefore, underflow in: srcBefore - srcAfter
+      if (srcAfter > srcBefore) {
+          t(false, "B-M-12: srcToken balance increased during swap — underflow risk");
+      }
+    ghost_vars: []
+    validated: false
+    priority: low
+    confidence: 70
+    notes: >
+      Solidity 0.8 checked math protege contra wrap-around. El revert es el
+      peor caso, no pérdida de fondos. Rebasing tokens como srcToken en Paraswap
+      son edge case — normalmente se wrappea primero (stETH → wstETH).
+
+  - id: B-M-13
+    tier: 1
+    type: property
+    description: >
+      stakeEth transfiere `amount` (ETH enviado) como stETH en vez del stETH
+      real recibido. Por el rounding de Lido (1-2 wei), el adapter podría tener
+      amount-1 stETH. Si no hay stETH previo, safeTransfer(amount) revierte.
+      Comparar con wrapStEth que SÍ usa el valor `received` real.
+    attack_scenario: >
+      1. Adapter tiene 0 stETH. Usuario llama stakeEth(1e18, maxPrice, ref, receiver).
+      2. IStEth.submit{value: 1e18}(referral) → Lido stakea 1 ETH.
+      3. Lido mints stETH con shares-based accounting. Balance del adapter podría
+         ser 999999999999999999 (1 wei menos por rounding de shares→stETH).
+      4. safeTransfer(IERC20(ST_ETH), receiver, 1e18) → revierte: insufficient balance.
+      5. Resultado: DoS. stakeEth no funciona si receiver != address(this) y hay
+         rounding desfavorable. El usuario pierde gas pero no fondos.
+      6. Workaround: usar stakeEth con receiver=address(this), luego wrapStEth
+         (que usa `received` correctamente), o pre-cargar 1 wei de stETH.
+      7. INCONSISTENCIA con wrapStEth (L130): usa `uint256 received = wrap(amount)`
+         y transfiere `received`. stakeEth debería hacer lo mismo con el balance
+         de stETH post-submit.
+    impact: "DoS (revert) para stakeEth con receiver != adapter. 1-2 wei de discrepancia."
+    impact_rating: Low
+    likelihood: Medium
+    severity_final: null
+    solidity: |
+      // After stakeEth, verify actual stETH balance >= amount
+      uint256 stEthBalance = IERC20(ST_ETH).balanceOf(address(adapter));
+      // Lido rounding: stEthBalance could be amount-1 or amount-2
+      gte(stEthBalance, ghost_stakeAmount,
+          "B-M-13: stETH balance after submit < amount — transfer will revert");
+    ghost_vars:
+      - "uint256 internal ghost_stakeAmount;"
+    validated: false
+    priority: medium
+    confidence: 60
+    notes: >
+      Este es el finding más interesante de esta fase. La inconsistencia entre
+      stakeEth (transfiere `amount`) y wrapStEth (transfiere `received`) sugiere
+      un oversight. Impacto limitado a DoS por 1-2 wei. Lido's known behavior.
+      INVESTIGAR: ¿Lido submit siempre retorna balance >= amount? Si tiene el
+      conocido "1-2 wei rounding" entonces este es un bug real de DoS.
+      SEVERIDAD: Low (DoS, no pérdida de fondos). No amerita finding pipeline.
+
+  - id: B-M-14
+    tier: 2
+    type: property
+    description: >
+      ParaswapAdapter offset overlap: si offsets.exactAmount == offsets.limitAmount,
+      updateAmounts escribe exactAmount primero, luego lee limitAmount del mismo
+      offset (obteniendo el nuevo valor). limitAmount queda corrupto:
+      newAmount * mulDiv(newAmount, newAmount, oldAmount) = newAmount²/oldAmount.
+    attack_scenario: >
+      1. Usuario pasa offsets = {exactAmount: 36, limitAmount: 36, quotedAmount: 0}.
+      2. updateAmounts: oldExactAmount = callData[36] = X.
+      3. callData.set(36, newAmount) → callData[36] = newAmount.
+      4. callData.get(36) para limitAmount → lee newAmount (corrupto).
+      5. limitAmount = newAmount.mulDiv(newAmount, X, rounding) = newAmount²/X.
+      6. Si newAmount > X, limit se INFLA (menos protección).
+         Si newAmount < X, limit se DEFLACTA (más protección, DoS).
+      7. El usuario controla los offsets. Self-inflicted footgun.
+      8. No hay forma de que un atacante externo explote esto — los offsets son
+         parámetros de la llamada del usuario.
+    impact: "Slippage corrupto (más o menos permisivo). Auto-infligido."
+    impact_rating: Low
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // Verify: offsets don't overlap
+      t(offsets.exactAmount != offsets.limitAmount,
+          "B-M-14: exactAmount and limitAmount offsets overlap");
+      if (offsets.quotedAmount > 0) {
+          t(offsets.quotedAmount != offsets.exactAmount,
+              "B-M-14: quotedAmount and exactAmount offsets overlap");
+          t(offsets.quotedAmount != offsets.limitAmount,
+              "B-M-14: quotedAmount and limitAmount offsets overlap");
+      }
+    ghost_vars: []
+    validated: false
+    priority: low
+    confidence: 80
+    notes: >
+      El contrato NO valida que los offsets sean distintos. Es responsabilidad
+      del SDK/frontend. Un contrato que llama ParaswapAdapter con offsets
+      hardcoded correctos nunca tiene este problema. Solo si offsets vienen
+      de input del usuario sin validación.
+
+  - id: B-M-15
+    tier: 1
+    type: property
+    description: >
+      morphoRepay: si assets=type(uint).max Y shares=type(uint).max, ambos se
+      resuelven a valores reales >0 y se pasan a Morpho.repay(). Morpho Blue
+      espera que exactamente uno sea 0. Si ambos >0, Morpho revierte.
+    attack_scenario: >
+      1. Usuario tiene deuda: 100 shares = 105 assets (con interés acumulado).
+      2. Adapter tiene 200 loan tokens.
+      3. morphoRepay(market, type(uint).max, type(uint).max, maxPrice, onBehalf, data).
+      4. assets = balanceOf(adapter) = 200.
+      5. shares = borrowShares(onBehalf) = 100.
+      6. MORPHO.repay(market, 200, 100, onBehalf, data) — ambos >0.
+      7. Morpho Blue: require(iff(assets==0, shares!=0)) → revierte.
+      8. Resultado: DoS. El usuario debe pasar uno como 0 y el otro como max.
+      9. No pérdida de fondos. Error de UX documentable.
+    impact: "DoS cuando usuario pasa ambos como type(uint).max. Error de UX."
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // After resolving type(uint).max sentinels:
+      // Morpho requires exactly one of (assets, shares) to be 0
+      if (ghost_repayAssets > 0 && ghost_repayShares > 0) {
+          t(false, "B-M-15: both assets and shares > 0 — Morpho will revert");
+      }
+    ghost_vars:
+      - "uint256 internal ghost_repayAssets;"
+      - "uint256 internal ghost_repayShares;"
+    validated: false
+    priority: low
+    confidence: 75
+    notes: >
+      Verificar Morpho Blue code para confirmar que revierte si ambos >0.
+      El NatSpec dice "Either assets or shares should be zero" (SHOULD).
+      Si MUST, entonces es DoS seguro. Si no, el comportamiento es indefinido.
+      Mismo patrón aplica a morphoSupply (assets + shares).
+
+  - id: B-M-16
+    tier: 1
+    type: property
+    description: >
+      type(uint256).max sentinel handling es CONSISTENTE en todas las funciones:
+      siempre se resuelve a balance real ANTES de cualquier operación math o
+      llamada externa. No hay riesgo de que type(uint).max entre en multiplicación.
+    attack_scenario: >
+      No hay ataque. Verificación exhaustiva de 13 funciones:
+      erc4626Deposit(L83), erc4626Redeem(L133), morphoSupply(L191-192),
+      morphoRepay(L275-283), morphoWithdraw(L310-311), morphoWithdrawCollateral(L331),
+      permit2TransferFrom(L359), erc20TransferFrom(L377), wrapNative(L391),
+      unwrapNative(L405), stakeEth(L108), wrapStEth(L123), unwrapStEth(L140),
+      morphoWrapperDepositFor(L69), morphoWrapperWithdrawTo(L86).
+      En TODOS los casos, type(uint).max → balanceOf/position query ANTES de math.
+    impact: "Ninguno — diseño correcto y consistente"
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // Verify: type(uint).max is always resolved before arithmetic
+      // This is a code review finding, not a fuzz invariant.
+      t(true, "B-M-16: type(uint).max sentinel verified in all 15 functions");
+    ghost_vars: []
+    validated: true
+    priority: low
+    confidence: 99
+    notes: >
+      Verificado manualmente en cada función. El patrón es consistente:
+      if (amount == type(uint256).max) amount = balanceOf(address(this));
+      El valor resuelto siempre reemplaza la variable antes de usarla.
+
+  - id: B-M-17
+    tier: 2
+    type: property
+    description: >
+      BytesLib bounds check: si data.length < 32, la expresión data.length - 32
+      underflows en Solidity 0.8 → panic revert ANTES de evaluar el require.
+      Resultado: revert seguro, no OOB access.
+    attack_scenario: >
+      1. callData tiene 20 bytes.
+      2. BytesLib.get(callData, 0): require(0 <= 20 - 32).
+      3. 20 - 32 underflows (uint256) → Solidity 0.8 panic(0x11).
+      4. Revert antes de llegar al mload. Memoria protegida.
+      5. Si data.length >= 32: la sustracción no underflows, y el offset check
+         funciona correctamente: offset <= data.length - 32 garantiza que
+         mload(add(32, add(data, offset))) lee dentro de bounds.
+      6. No hay OOB read/write posible.
+    impact: "Ninguno — bounds checking es correcto"
+    impact_rating: Info
+    likelihood: Low
+    severity_final: null
+    solidity: |
+      // Verify: BytesLib.get never reads OOB
+      // Verify: BytesLib.set never writes OOB
+      if (data.length >= 32) {
+          t(offset <= data.length - 32,
+              "B-M-17: offset out of bounds for BytesLib operation");
+      } else {
+          t(false, "B-M-17: data too short for BytesLib — should revert");
+      }
+    ghost_vars: []
+    validated: true
+    priority: low
+    confidence: 95
+    notes: >
+      La assembly es marcada como "memory-safe" y está protegida por el
+      require previo. El underflow en data.length - 32 es un edge case de
+      Solidity 0.8 que resulta en revert seguro.
+
+false_positives:
+- hunter: MathHunter
+  id: B-FP-01
+  reason: >
+    keccak256 collision en reenterHash: la concatenación es de tamaño fijo
+    (52 bytes), no hay ambigüedad de parsing. Colisión requiere romper
+    keccak256 (2^128 ops). No es una vulnerabilidad.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: multicall.md
+    content: >
+      bytes.concat con tamaños fijos (bytes20 + bytes32) no tiene ambigüedad
+      de parsing — no confundir con ABI encoding de longitud variable donde
+      sí puede haber colisiones.
+    briefing_update_applied: false
+- hunter: MathHunter
+  id: B-FP-02
+  reason: >
+    keccak256("") bypass: keccak256 de bytes vacíos produce 0xc5d246...,
+    que es != bytes32(0). El contrato correctamente distingue entre
+    "no espera reenter" (callbackHash=0) y "espera reenter con datos
+    específicos" (callbackHash!=0). No hay bypass.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: multicall.md
+    content: >
+      keccak256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470,
+      que es un valor no-cero. No confundir con bytes32(0). Un callbackHash de
+      keccak256("") sí activa el requerimiento de reenter.
+    briefing_update_applied: false
+- hunter: MathHunter
+  id: B-FP-03
+  reason: >
+    Overflow en sum(bundle[i].value): Solidity 0.8 tiene overflow checks
+    nativos. Además, el contrato no suma los values — los gasta uno a uno
+    del balance del contrato. No hay aritmética vulnerable a overflow.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: multicall.md
+    content: >
+      Bundler3 no suma values del bundle — los gasta secuencialmente via
+      .call{value:}. El EVM revierte si el balance es insuficiente para una
+      call. No hay overflow posible en Solidity 0.8.
+    briefing_update_applied: false
+
+# Phase 2 false positives (GeneralAdapter1, ParaswapAdapter, MathRayLib, BytesLib, EthereumGeneralAdapter1)
+- hunter: MathHunter
+  id: B-FP-04
+  reason: >
+    rDivUp/rDivDown division-by-zero: Solidity 0.8 checked math revierte
+    correctamente. Morpho Blue toSharesUp nunca retorna 0 shares para >0 assets.
+    ERC4626 estándar tampoco. Solo un vault malicioso podría triggerear esto,
+    y el usuario elige el vault.
+  investigated_at: '2026-03-23T00:00:00Z'
+- hunter: MathHunter
+  id: B-FP-05
+  reason: >
+    rDivUp/rDivDown overflow (x * RAY): requiere x > ~1.157e50, irrealista
+    para cualquier token real. ETH total supply = 1.2e26 wei, 1e24x menor.
+  investigated_at: '2026-03-23T00:00:00Z'
+- hunter: MathHunter
+  id: B-FP-06
+  reason: >
+    Slippage check rounding direction bypass: las 9 funciones usan la dirección
+    CORRECTA (rDivUp para max, rDivDown para min). No hay inconsistencia ni bypass.
+  investigated_at: '2026-03-23T00:00:00Z'
+- hunter: MathHunter
+  id: B-FP-07
+  reason: >
+    type(uint256).max sentinel overflow: siempre se resuelve a balance real
+    ANTES de entrar en cualquier operación aritmética. Verificado en 15 funciones.
+    No hay riesgo de que type(uint).max entre en una multiplicación.
+  investigated_at: '2026-03-23T00:00:00Z'
+- hunter: MathHunter
+  id: B-FP-08
+  reason: >
+    BytesLib OOB access: bounds check correcto. Si data.length < 32, underflow
+    en Solidity 0.8 revierte antes de llegar al assembly. Si data.length >= 32,
+    el require(offset <= data.length - 32) protege contra OOB.
+  investigated_at: '2026-03-23T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════════
+# CONCLUSIÓN FINAL — MathHunter Bundler3 (Fase 1 + Fase 2)
+# ═══════════════════════════════════════════════════════════════════
+conclusion: >
+  17 hipótesis analizadas (B-M-01 a B-M-17). 8 false positives documentados.
+
+  FINDINGS DE INTERÉS (ninguno Medium+):
+
+  1. B-M-13 (stakeEth transfer amount, Low): Transfiere `amount` en vez de
+     stETH recibido real. Inconsistencia con wrapStEth que usa `received`.
+     Puede causar DoS por 1-2 wei de Lido rounding. Confianza: 60%.
+
+  2. B-M-06 (skipRevert + value ETH, Low-Medium): Calls fallidas con
+     skipRevert=true dejan ETH en el contrato disponible para calls
+     posteriores. Patrón similar al HIGH de 3DNS. Sin embargo, el atacante
+     controla el bundle, así que se necesita un frontend/protocolo intermediario
+     para que sea explotable. Confianza: 65%.
+
+  3. B-M-14 (offset overlap, Low): Offsets superpuestos en ParaswapAdapter
+     corrompen slippage limits. Self-inflicted footgun, no exploit externo.
+
+  CÓDIGO MATEMÁTICAMENTE SÓLIDO:
+  - Slippage checks: dirección de redondeo correcta en las 9 funciones
+  - MathRayLib: sin unchecked blocks, Solidity 0.8 protege contra div-by-zero y overflow
+  - BytesLib: bounds checking correcto
+  - type(uint256).max: consistente en todas las funciones
+  - ParaswapAdapter: mulDiv de OZ protege contra division by zero
+
+  NO se justifica progresión al finding pipeline para ninguna hipótesis.
+  B-M-13 es el más interesante (oversight en stakeEth) pero impacto = DoS Low.

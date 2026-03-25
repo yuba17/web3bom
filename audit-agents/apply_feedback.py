@@ -3,12 +3,14 @@
 apply_feedback.py — L8 Feedback Loop Automatizado
 Lee pending_briefing_updates de fichas y los aplica a los briefings.
 También procesa archivos de SYNTHESIS generados por work-completion.sh
+y archivos de hipótesis en hunt_session/hypotheses/hyp_*.yaml.
 
 Uso:
-    python3 apply_feedback.py                    # procesa fichas del hunt activo
+    python3 apply_feedback.py                    # procesa fichas e hipótesis del hunt activo
     python3 apply_feedback.py --dry-run          # muestra qué haría sin cambiar nada
     python3 apply_feedback.py --synthesis-only   # solo procesa archivos de SYNTHESIS
     python3 apply_feedback.py --ficha FILE.yaml  # procesa una ficha específica
+    python3 apply_feedback.py --hypotheses       # procesa solo archivos de hipótesis
 """
 
 import sys
@@ -221,14 +223,8 @@ def process_ficha(ficha_path: Path, dry_run: bool) -> int:
     applied = 0
     source = f"{ficha.get('protocol', 'unknown')}/{ficha.get('component', ficha_path.stem)}"
 
-    # Buscar pending_briefing_updates en false_positives
-    false_positives = ficha.get("false_positives", [])
-    for fp in false_positives:
-        if isinstance(fp, dict) and "pending_briefing_update" in fp:
-            update = fp["pending_briefing_update"]
-            print(f"  Procesando trampa de {fp.get('hunter', 'unknown')}: {fp.get('reason', '')[:50]}")
-            if process_update(update, source, dry_run):
-                applied += 1
+    # NOTA: false_positives de fichas NO se aplican automáticamente.
+    # Solo se aplican pending_briefing_updates manuales (confirmados por humano o fork PoC).
 
     # Buscar pending_briefing_updates directos
     direct_updates = ficha.get("pending_briefing_updates", [])
@@ -238,6 +234,82 @@ def process_ficha(ficha_path: Path, dry_run: bool) -> int:
                 applied += 1
 
     return applied
+
+
+def process_hypothesis(hyp_path: Path, dry_run: bool) -> int:
+    """Procesa un archivo de hipótesis YAML y aplica sus pending_briefing_updates.
+
+    Reads:
+      - false_positives[].pending_briefing_update  (singular dict per entry)
+      - top-level pending_briefing_updates[]        (list of dicts)
+
+    Skips entries that already have briefing_update_applied: true.
+    After applying, writes briefing_update_applied: true back into the entry
+    so the file is not processed twice.
+    """
+    try:
+        with open(hyp_path) as f:
+            hyp = yaml.safe_load(f)
+    except Exception as e:
+        print(f"  ✗ Error leyendo {hyp_path.name}: {e}")
+        return 0
+
+    if not hyp:
+        return 0
+
+    applied = 0
+    dirty = False  # track whether we need to write back
+    source = f"hyp/{hyp.get('hunter', hyp_path.stem)}/{hyp.get('component', '')}"
+
+    # NOTA: false_positives de hipótesis NO se aplican automáticamente.
+    # Un hunter de IA diciendo "esto es false positive" no es validación suficiente.
+    # Solo se aplican cuando hay confirmación externa (plataforma) o fork PoC ejecutado por humano.
+
+    # --- top-level pending_briefing_updates[] ---
+    direct_updates = hyp.get("pending_briefing_updates", [])
+    for update in direct_updates:
+        if not isinstance(update, dict):
+            continue
+        if update.get("briefing_update_applied"):
+            continue
+        if process_update(update, source, dry_run):
+            applied += 1
+            if not dry_run:
+                update["briefing_update_applied"] = True
+                dirty = True
+
+    # Write back modified structure only when something changed
+    if dirty and not dry_run:
+        try:
+            with open(hyp_path, "w") as f:
+                yaml.dump(hyp, f, default_flow_style=False, allow_unicode=True, indent=2,
+                          sort_keys=False)
+            print(f"  ✓ {hyp_path.name} actualizado con briefing_update_applied markers")
+        except Exception as e:
+            print(f"  ✗ No se pudo escribir de vuelta {hyp_path.name}: {e}")
+
+    return applied
+
+
+def process_hypothesis_files(hyp_dir: Path, dry_run: bool) -> int:
+    """Procesa todos los archivos hyp_*.yaml en hyp_dir."""
+    if not hyp_dir.exists():
+        print(f"Directorio de hipótesis no encontrado: {hyp_dir}")
+        return 0
+
+    hyp_files = sorted(hyp_dir.glob("hyp_*.yaml"))
+    if not hyp_files:
+        print(f"No hay archivos hyp_*.yaml en {hyp_dir}")
+        return 0
+
+    print(f"Encontrados {len(hyp_files)} archivos de hipótesis en {hyp_dir}")
+    total = 0
+    for hyp_path in hyp_files:
+        print(f"\nProcesando hipótesis: {hyp_path.name}")
+        applied = process_hypothesis(hyp_path, dry_run)
+        print(f"  → {applied} updates aplicados")
+        total += applied
+    return total
 
 
 def process_synthesis_files(dry_run: bool) -> int:
@@ -296,8 +368,10 @@ def main():
     parser = argparse.ArgumentParser(description="Aplica pending_briefing_updates a briefings")
     parser.add_argument("--dry-run", action="store_true", help="Muestra qué haría sin modificar nada")
     parser.add_argument("--synthesis-only", action="store_true", help="Solo procesa archivos SYNTHESIS")
+    parser.add_argument("--hypotheses", action="store_true", help="Solo procesa archivos de hipótesis hyp_*.yaml")
     parser.add_argument("--ficha", type=str, help="Procesa una ficha específica")
     parser.add_argument("--fichas-dir", type=str, help="Directorio de fichas (default: hunt_session/fichas)")
+    parser.add_argument("--hyp-dir", type=str, help="Directorio de hipótesis (default: hunt_session/hypotheses)")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -325,6 +399,12 @@ def main():
     elif args.synthesis_only:
         print("Procesando archivos SYNTHESIS...")
         total_applied += process_synthesis_files(args.dry_run)
+
+    # Modo: solo hipótesis
+    elif args.hypotheses:
+        hyp_dir = Path(args.hyp_dir) if args.hyp_dir else HUNT_SESSION_DIR / "hypotheses"
+        print("Procesando archivos de hipótesis...")
+        total_applied += process_hypothesis_files(hyp_dir, args.dry_run)
 
     # Modo: todas las fichas del hunt activo
     else:
@@ -358,6 +438,9 @@ def main():
         # Procesar synthesis
         print("\nProcesando archivos SYNTHESIS...")
         total_applied += process_synthesis_files(args.dry_run)
+
+        # NOTA: hipótesis no se procesan en modo default.
+        # Los false_positives de hunters solo se aplican con confirmación externa.
 
     # Resumen
     print(f"\n{'='*50}")

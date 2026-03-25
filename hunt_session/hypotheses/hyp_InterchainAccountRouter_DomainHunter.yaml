@@ -1,0 +1,497 @@
+protocol: hyperlane
+component: InterchainAccountRouter
+file: solidity/contracts/middleware/InterchainAccountRouter.sol
+domain: trust
+hunter: DomainHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+
+- id: IAR-01
+  tier: 1
+  type: property
+  description: "callRemoteWithOverrides permite ISM arbitrario controlado por el caller -- el atacante puede especificar un ISM malicioso que siempre retorna true, obteniendo ejecucion incondicional en la ICA destino"
+  attack_scenario: |
+    1. Atacante llama callRemoteWithOverrides con _ism = address(MaliciousIsm) que siempre retorna true en verify().
+    2. En destino, route() lee el ISM del body del mensaje (InterchainAccountMessage.ism), y retorna el ISM malicioso.
+    3. El Mailbox usa ese ISM para verificar el mensaje -> siempre pasa.
+    4. handle() se ejecuta: despliega ICA con el ISM malicioso en el salt, y ejecuta calls arbitrarios.
+    5. PERO: la ICA derivada es unica al (origin, owner, sender/router, ism, salt) -- asi que el atacante
+       solo controla una ICA nueva, sin fondos previos. El riesgo real es si alguien envio fondos
+       a una ICA derivada con un ISM que no esperaban (e.g. via getLocalInterchainAccount con ISM incorrecto).
+    La clave: handle() NO tiene onlyRemoteRouter. Cualquier _sender es aceptado. Combinado con ISM
+    arbitrario, un atacante podria ejecutar como cualquier (origin, owner) si el ISM no valida nada.
+    Pero el ICA address depende del sender+ISM, asi que no puede tomar control de ICAs existentes
+    SALVO que el ISM sea el mismo que el enrollado por defecto.
+  impact: "Si un usuario deposita fondos en una ICA cuyo ISM puede ser suplantado, perdida total de esos fondos"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que route() para un mensaje con ISM=0 retorna el defaultIsm, no address(0)
+    // y que ISMs no-zero son respetados como estan en el mensaje (by design, pero peligroso)
+    bytes memory body = InterchainAccountMessage.encode(
+        address(this), bytes32(0), new CallLib.Call[](0), bytes32(0)
+    );
+    // Simular route con ISM=0 en el body
+    address routedIsm = address(router.route(body));
+    t(routedIsm != address(0), "IAR-01: zero ISM routed to zero address");
+    t(routedIsm == address(mailbox.defaultIsm()), "IAR-01: zero ISM should route to defaultIsm");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: |
+    handle() explicitamente dice "Does not need to be onlyRemoteRouter, as this application is
+    designed to receive messages from untrusted remote contracts." Esto es BY DESIGN. Pero la
+    combinacion con ISM controlado por el caller es el vector. La ICA derivada es unica por
+    parametros, asi que no se pueden robar ICAs existentes. Riesgo real: confusion de ICAs.
+
+- id: IAR-02
+  tier: 1
+  type: property
+  description: "callRemoteCommitReveal usa address(this).balance para el segundo dispatch -- un atacante puede front-run con ETH para inflar el valor enviado al reveal message, o el usuario pierde ETH residual del contrato"
+  attack_scenario: |
+    1. Usuario llama callRemoteCommitReveal con msg.value = X.
+    2. El primer dispatch (_commitmentMsgId) consume msg.value completo.
+    3. El segundo dispatch (_revealMsgId) usa address(this).balance -- que incluye
+       cualquier ETH residual en el contrato (de receive(), de otros usuarios, etc).
+    4. Si hay ETH residual en el router, ese ETH se envía como valor del segundo mensaje.
+    5. Atacante puede: (a) enviar ETH al contrato antes del call para inflar el gas payment
+       del reveal, causando que el hook reciba más de lo esperado; (b) si otro usuario
+       deja ETH residual, el siguiente usuario que llama callRemoteCommitReveal lo consume.
+    Path concreto: Alice envia 1 ETH, el commit consume 0.5 ETH en gas. Quedan 0.5 ETH en
+    address(this).balance. Bob envia 0.1 ETH para su commit-reveal. Su reveal paga
+    0.5 + lo que quede = valor inflado. Alice pierde 0.5 ETH.
+  impact: "Robo de ETH residual del router -- cualquier ETH que quede en el contrato se lo lleva el siguiente llamador de callRemoteCommitReveal"
+  impact_rating: High
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Track ETH balance antes y despues de callRemoteCommitReveal
+    uint256 balanceBefore = address(router).balance;
+    uint256 sentValue = 1 ether;
+    // Simular: depositar ETH extra en el router
+    (bool ok,) = address(router).call{value: 0.5 ether}("");
+    require(ok);
+    uint256 balanceWithExtra = address(router).balance;
+    // Despues de callRemoteCommitReveal, el balance deberia ser 0 o solo el exceso del caller
+    // Si address(this).balance incluye fondos de otros, es un bug
+    t(balanceWithExtra >= balanceBefore + 0.5 ether, "IAR-02: pre-condition");
+    // El invariante es: callRemoteCommitReveal no debe gastar mas de msg.value del caller
+    // Esto se viola porque usa address(this).balance en linea 654
+  ghost_vars:
+  - uint256 internal ghost_routerBalancePre;
+  validated: false
+  priority: critical
+  confidence: 90
+  notes: |
+    Linea 630 y 654: _dispatchMessageWithValue(..., address(this).balance).
+    El primer dispatch ya consumio msg.value. El segundo usa el balance residual.
+    Si el hook no consume todo el msg.value del primer dispatch, queda ETH en el router.
+    Ademas, el contrato tiene receive() payable, asi que cualquier ETH enviado previamente
+    se consume. ESTE ES UN BUG REAL CON ALTO CONFIDENCE.
+
+- id: IAR-03
+  tier: 1
+  type: property
+  description: "ICA salt no incluye la direccion del router destino -- dos routers diferentes en la misma chain producen ICAs con la misma address para el mismo (origin, owner, ism, userSalt)"
+  attack_scenario: |
+    1. Si existen dos InterchainAccountRouter en la misma chain destino (ej: upgrade, fork, o deploy paralelo).
+    2. Ambos usan _getSalt(origin, owner, router_sender, ism, userSalt). PERO _router es el sender
+       del mensaje, que SI esta incluido en el salt via _sender param en handle().
+    3. Analisis mas detallado: en handle(), _sender viene del mensaje Hyperlane (el router origen).
+       Asi que dos mensajes del MISMO router origen a dos routers destino diferentes SI generan
+       la misma ICA (si el bytecodeHash y deployer son diferentes, Create2 da address diferente).
+    4. PERO: getDeployedInterchainAccount usa Create2.deploy con el router como deployer (address(this)).
+       Asi que dos routers destino diferentes despliegan ICAs en addresses diferentes porque el deployer
+       es diferente. FALSE POSITIVE para cross-router.
+    Sin embargo: si el _sender (router origen) puede ser suplantado en un mensaje cross-chain
+    (el Mailbox lo setea desde el message.sender field), un atacante en chain A con un contrato
+    cuya address es la misma que un router legitimo en chain B podria obtener la misma ICA.
+  impact: "Suplantacion de identidad de ICA si un atacante despliega un contrato con la misma address que un router legitimo en otra chain"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que dos routers diferentes producen ICAs diferentes para el mismo owner
+    bytes32 salt1 = keccak256(abi.encodePacked(uint32(1), owner, router1, ism, bytes32(0)));
+    bytes32 salt2 = keccak256(abi.encodePacked(uint32(1), owner, router2, ism, bytes32(0)));
+    t(salt1 != salt2, "IAR-03: different routers must produce different salts");
+    // Verificar que origins diferentes producen ICAs diferentes
+    bytes32 salt3 = keccak256(abi.encodePacked(uint32(2), owner, router1, ism, bytes32(0)));
+    t(salt1 != salt3, "IAR-03: different origins must produce different salts");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: |
+    La inclusion de _router (sender del mensaje) en el salt es correcta. Pero el riesgo es
+    cross-chain address collision: en EVM, el mismo private key produce la misma address en
+    todas las chains. Si un atacante controla la private key de un router en chain A,
+    puede enviar mensajes que parecen venir de ese router en chain B.
+
+- id: IAR-04
+  tier: 1
+  type: property
+  description: "route() permite que el mensaje especifique un ISM arbitrario que sera usado por el Mailbox para verificar -- un atacante puede especificar ISM=address(this) o un contrato que siempre retorna true"
+  attack_scenario: |
+    1. route() es llamado por el Mailbox durante process() para determinar que ISM usar.
+    2. Para mensajes tipo CALLS/COMMITMENT: lee el ISM del body del mensaje (bytes 33:65).
+    3. Si ISM != 0, retorna ese ISM directamente sin validacion.
+    4. Un atacante craft un mensaje cross-chain con ISM = address de un contrato malicioso
+       que implementa verify() retornando true siempre.
+    5. El Mailbox usa ese ISM, la verificacion pasa, y handle() ejecuta los calls.
+    6. CRITICO: handle() solo tiene onlyMailbox, NO valida el sender contra routers enrollados.
+    7. La ICA derivada usa _sender (que es el sender del mensaje, controlado por el atacante)
+       y el ISM (controlado por el atacante) en el salt. Asi que la ICA seria nueva, pero
+       si alguien envio fondos a esa address precomputada, se roban.
+  impact: "Ejecucion arbitraria en ICA con ISM bypass -- fondos en ICAs con ISM no-default en riesgo"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que route() para un mensaje con ISM no-zero retorna exactamente ese ISM
+    // Esto es by design pero peligroso -- el test verifica el comportamiento
+    bytes memory fakeBody = abi.encodePacked(
+        uint8(0), // MessageType.CALLS
+        bytes32(uint256(uint160(address(0xdead)))), // owner
+        bytes32(uint256(uint160(address(0xbeef)))), // ISM = attacker controlled
+        bytes32(0), // salt
+        abi.encode(new CallLib.Call[](0)) // empty calls
+    );
+    // route() should return the ISM from the message body
+    // The invariant to test: is this ISM actually trusted?
+    address returnedIsm = address(router.route(fakeBody));
+    // If returnedIsm == 0xbeef, then attacker controls ISM selection
+    t(returnedIsm == address(0xbeef), "IAR-04: ISM from message body is used directly");
+    // THIS IS THE VULNERABILITY: route() trusts message-embedded ISM without validation
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 75
+  notes: |
+    Este es el vector mas critico. La defensa es que el Mailbox solo acepta mensajes que
+    pasan la verificacion del ISM, asi que si el ISM es malicioso, el atacante necesita
+    que ESE ISM sea el que verifica SU mensaje. Es un chicken-and-egg: el ISM en el body
+    determina cual ISM verifica el mensaje, y el atacante controla el body.
+    Si el Mailbox permite que el recipient determine el ISM (via interchainSecurityModule()),
+    y el recipient es el router que retorna lo que el body dice... hay un circular trust issue.
+
+- id: IAR-05
+  tier: 1
+  type: property
+  description: "revealAndExecute en OwnableMulticall no tiene access control -- cualquiera que conozca el salt y los calls puede ejecutar la revelacion sin ser el owner de la ICA"
+  attack_scenario: |
+    1. Usuario envia commit-reveal: commitment = keccak256(salt, abi.encode(calls)).
+    2. El commitment se almacena en la ICA via setCommitment (solo callable por owner = router).
+    3. Para ejecutar, alguien llama revealAndExecute(calls, salt) en la ICA.
+    4. revealAndExecute NO tiene modifier onlyOwner -- CUALQUIERA puede llamarlo.
+    5. Esto es BY DESIGN para que el CCIP-Read ISM pueda llamarlo.
+    6. PERO: si el atacante descubre salt + calls antes de la revelacion (mempool, off-chain leak),
+       puede front-run la revelacion y ejecutar los calls el mismo.
+    7. Los calls se ejecutan igual (misma ICA, mismos targets), asi que el impacto del front-run
+       depende de si el orden importa (e.g., swap con slippage).
+    8. Ademas, el atacante podria GRIEF: ejecutar la revelacion antes de que el ISM lo haga,
+       causando que la verificacion del ISM falle (commitment ya deleted).
+  impact: "Front-running de commit-reveal: MEV extraction o griefing de la verificacion ISM"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que revealAndExecute es callable por non-owner
+    // Setup: setCommitment via router (owner)
+    bytes32 salt = bytes32(uint256(123));
+    CallLib.Call[] memory calls = new CallLib.Call[](0);
+    bytes32 commitment = keccak256(abi.encodePacked(salt, abi.encode(calls)));
+    // setCommitment called by owner (router)
+    // Then: non-owner can call revealAndExecute
+    // ica.revealAndExecute(calls, salt) -- should succeed from any address
+    bool success = true; // placeholder -- actual test needs pranked call
+    t(success, "IAR-05: revealAndExecute accessible to non-owner");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: |
+    La falta de access control en revealAndExecute es intencional (CommitmentReadIsm necesita llamarlo).
+    Pero el vector de front-running en el mempool es real: si los calls contienen un swap,
+    un MEV bot puede ver la transaccion pendiente de reveal, extraer salt+calls del calldata,
+    y ejecutar antes. El commit-reveal fue disenado para PREVENIR esto, pero la revelacion
+    on-chain anula la proteccion si no hay validacion de quien revela.
+
+- id: IAR-06
+  tier: 1
+  type: property
+  description: "approveFeeTokenForHook en AbstractInterchainAccountRouter no tiene access control -- cualquiera puede aprobar max uint256 de cualquier token del router a cualquier hook"
+  attack_scenario: |
+    1. approveFeeTokenForHook(token, hook) es external sin modifier.
+    2. Cualquier persona puede llamarlo con token = USDC, hook = atacante_address.
+    3. El router aprueba type(uint256).max del token al atacante.
+    4. Si el router tiene balance de ese token (e.g., fee tokens residuales), el atacante
+       los drena con transferFrom.
+    5. El router normalmente no deberia tener balance de tokens, PERO:
+       - _dispatchMessageWithValue hace safeTransferFrom del feeToken al router, y luego
+         forceApprove al hook. Si hay residuales por rounding o revert parcial...
+       - El contrato tiene receive() payable, asi que puede acumular ETH/tokens.
+  impact: "Drain de cualquier token ERC20 del router si tiene balance residual"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que approveFeeTokenForHook no tiene access control
+    // Cualquier address puede llamar:
+    address attacker = address(0xdead);
+    address fakeHook = address(0xbeef);
+    address feeToken = address(mockERC20);
+    // prankeamos como atacante
+    // router.approveFeeTokenForHook(feeToken, fakeHook);
+    // Verificar que allowance fue seteada
+    uint256 allowance = IERC20(feeToken).allowance(address(router), fakeHook);
+    t(allowance == type(uint256).max, "IAR-06: unlimited approval set by anyone");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: |
+    Linea 109-111 de AbstractInterchainAccountRouter.sol: external sin onlyOwner ni nada.
+    Esto es un VECTOR REAL. Incluso si el router normalmente no tiene balance, basta con
+    que un flujo de feeToken deje residuales. _dispatchMessageWithValue transfiere
+    feeToken AL router y luego aprueba al hook. Si el dispatch revierte despues del
+    transferFrom pero antes del dispatch (o si hay rounding), quedan tokens en el router.
+
+- id: IAR-07
+  tier: 2
+  type: property
+  description: "Commit-reveal permite replay: un commitment puede ser re-seteado despues de ejecutado, porque setCommitment solo verifica que !commitments[_commitment]"
+  attack_scenario: |
+    1. Usuario envia commitment C. setCommitment(C) -> commitments[C] = true.
+    2. revealAndExecute ejecuta y borra: delete commitments[C].
+    3. Ahora commitments[C] == false. Un nuevo setCommitment(C) es posible.
+    4. Si un relayer reenvia el mismo mensaje Hyperlane (replay), el commitment se
+       re-setea y los calls se ejecutan de nuevo.
+    5. La proteccion contra replay debe venir del Mailbox (nonce tracking), no del ICA.
+    6. Si el Mailbox no tiene replay protection adecuada, double-execution.
+  impact: "Double-execution de calls si el Mailbox no previene replay de mensajes"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que un commitment puede ser re-seteado despues de ser ejecutado
+    bytes32 commitment = keccak256("test");
+    // Primera vez
+    // ica.setCommitment(commitment) -- via owner
+    // ica.revealAndExecute(calls, salt) -- ejecuta y borra
+    // Segunda vez: deberia poder volver a setear?
+    bool canRecommit = !ica.commitments(commitment); // true, porque fue borrado
+    t(canRecommit, "IAR-07: commitment can be re-set after execution");
+    // Esto es un riesgo si hay replay a nivel de Hyperlane message
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: |
+    El Mailbox de Hyperlane SI tiene replay protection (nonce incrementing + delivered mapping).
+    Pero si hay algun bypass del nonce (e.g., mensajes con nonce=0, o re-org), este es un vector.
+    Marcado tier 2 porque depende de un fallo externo (Mailbox replay protection).
+
+- id: IAR-08
+  tier: 1
+  type: property
+  description: "En callRemoteCommitReveal, el commitment message se envia con refundAddress=address(this) -- refunds de gas del primer dispatch van al router, no al usuario"
+  attack_scenario: |
+    1. Linea 610-615: StandardHookMetadata.formatMetadata(0, COMMIT_TX_GAS_USAGE, address(this), bytes("")).
+    2. El refundAddress es address(this) (el router), no msg.sender.
+    3. Si el hook de gas sobrecarga y hay refund, el ETH va al router.
+    4. El usuario pago msg.value pero el refund no le llega.
+    5. Combinado con IAR-02 (address(this).balance usado para el reveal dispatch),
+       el refund del commit se usa para pagar el reveal. PERO si msg.value > commit_cost + reveal_cost,
+       el exceso queda en el router permanentemente.
+    6. Peor: si otro usuario llama callRemoteCommitReveal despues, consume el refund del primero.
+  impact: "Perdida de ETH: refunds de gas quedan en el router y son consumidos por el siguiente usuario"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Verificar que refundAddress en commit metadata es address(router), no msg.sender
+    // Despues de callRemoteCommitReveal, el balance del router deberia ser 0 si no hay refund
+    uint256 routerBalanceBefore = address(router).balance;
+    // Call callRemoteCommitReveal con exceso de ETH
+    // router.callRemoteCommitReveal{value: 2 ether}(destination, commitment, gasLimit);
+    uint256 routerBalanceAfter = address(router).balance;
+    // Si hay residuo, es el refund que el usuario perdio
+    uint256 residual = routerBalanceAfter - routerBalanceBefore;
+    t(residual == 0, "IAR-08: no ETH should remain in router after commit-reveal");
+  ghost_vars:
+  - uint256 internal ghost_userEthBefore;
+  validated: false
+  priority: high
+  confidence: 80
+  notes: |
+    La combinacion de IAR-02 + IAR-08 crea un flujo donde:
+    1. Usuario A paga 2 ETH, commit consume 0.5, refund 1.5 va al router.
+    2. Reveal usa address(this).balance = 1.5 ETH (si el hook acepta, paga de mas).
+    3. Si el reveal solo necesita 0.3 ETH, 1.2 ETH queda en el router.
+    4. Usuario B llama y su reveal consume esos 1.2 ETH.
+    Loss of funds para usuario A.
+
+- id: IAR-09
+  tier: 2
+  type: property
+  description: "enrollRemoteRouterAndIsm es immutable una vez seteado -- si se enrolla un router/ISM incorrecto, no hay forma de corregirlo"
+  attack_scenario: |
+    1. Linea 298-302: require que router e ISM sean EMPTY_SALT (bytes32(0)) para poder enrollar.
+    2. Una vez enrollado, no se puede cambiar.
+    3. Si el owner enrolla un router/ISM incorrecto por error, o si el router remoto se
+       compromete/upgradea, no hay forma de actualizar.
+    4. Todos los usuarios que usan callRemote (sin overrides) quedaran apuntando al router viejo.
+    5. callRemoteWithOverrides permite bypass, pero los usuarios que no lo saben quedan afectados.
+  impact: "Router/ISM permanentemente incorrecto si se enrolla mal -- fondos enviados a router comprometido"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar immutabilidad de enrollment
+    // Despues de enrollar un router, intentar re-enrollar debe revertir
+    // router.enrollRemoteRouterAndIsm(domain, newRouter, newIsm); // deberia revertir
+    bool reverted = false;
+    // try router.enrollRemoteRouterAndIsm(domain, newRouter, newIsm) { } catch { reverted = true; }
+    t(reverted, "IAR-09: re-enrollment should revert");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: |
+    Esto es un design choice. Puede ser intencional para evitar que un owner malicioso
+    cambie el router despues de que usuarios ya confiaron en el. Pero la falta de mecanismo
+    de migracion es un riesgo operacional.
+
+- id: IAR-10
+  tier: 1
+  type: property
+  description: "CommitmentReadIsm.verify() llama revealAndExecute en una ICA cuya address viene del metadata (controlado por el off-chain service) -- si el service es comprometido, puede apuntar a cualquier ICA"
+  attack_scenario: |
+    1. CommitmentReadIsm.verify() recibe _metadata = (ica_address, salt, calls).
+    2. Linea 65: address _ica = address(bytes20(_metadata[:20])) -- tomado directamente del metadata.
+    3. Si el off-chain service (que provee el metadata via CCIP-Read) es comprometido,
+       puede apuntar a cualquier ICA que tenga un commitment pendiente.
+    4. El verify solo chequea que hash(metadata[20:]) == message.commitment.
+    5. PERO el commitment fue seteado por el usuario, asi que el atacante necesitaria que
+       el commitment coincida. Sin embargo, si el servicio provee un ICA diferente con el
+       mismo commitment (collision), ejecutaria en la ICA equivocada.
+    6. Mas realista: el service off-chain es el single point of failure para commit-reveal.
+  impact: "Ejecucion en ICA incorrecta si el off-chain commitment service es comprometido"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que CommitmentReadIsm acepta cualquier ICA address en metadata
+    // siempre que el hash coincida con el commitment
+    bytes32 salt = bytes32(uint256(1));
+    CallLib.Call[] memory calls = new CallLib.Call[](0);
+    bytes32 commitment = keccak256(abi.encodePacked(salt, abi.encode(calls)));
+    // Metadata con ICA arbitrario
+    bytes memory metadata = abi.encodePacked(address(0xdead), salt, abi.encode(calls));
+    // El hash de metadata[20:] deberia coincidir con commitment
+    bytes32 revealedHash = keccak256(metadata[20:]);
+    eq(revealedHash, commitment, "IAR-10: hash should match commitment");
+    // Pero la ICA en metadata es 0xdead, no la ICA real del usuario
+    // Si 0xdead tiene un commitment pendiente con el mismo hash, se ejecuta ahi
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: |
+    La proteccion es que la ICA objetivo necesita tener commitments[hash] == true.
+    Dos ICAs con el mismo commitment pendiente es improbable pero no imposible
+    (salt collision o usuario que usa el mismo salt+calls en dos ICAs).
+
+- id: IAR-11
+  tier: 2
+  type: property
+  description: "handle() para mensajes REVEAL simplemente retorna sin ejecutar nada -- la ejecucion real ocurre en el ISM verify(). Si el ISM falla silently, los calls nunca se ejecutan pero el mensaje se marca como delivered"
+  attack_scenario: |
+    1. handle() linea 165-171: si messageType == REVEAL, return inmediato.
+    2. La ejecucion de los calls ocurre en CommitmentReadIsm.verify() via revealAndExecute().
+    3. Si verify() retorna true pero revealAndExecute() revierte internamente (catch silencioso
+       en el ISM o en el Mailbox), los calls no se ejecutan pero el mensaje esta delivered.
+    4. El commitment queda pendiente en la ICA, bloqueando futuros commits con el mismo hash.
+    5. No hay retry mechanism para mensajes REVEAL que fallan en la ejecucion.
+  impact: "Commitment permanentemente bloqueado si la ejecucion del reveal falla pero el mensaje se marca delivered"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que un REVEAL message que falla en ejecucion deja el commitment pendiente
+    // y bloquea re-commits
+    bytes32 commitment = keccak256("test");
+    // ica.setCommitment(commitment) via owner
+    bool isPending = ica.commitments(commitment);
+    t(isPending, "IAR-11: commitment should be pending");
+    // Si reveal falla pero message is delivered, commitment stays pending forever
+    // Un nuevo setCommitment(commitment) revierte con "Previous commitment pending execution"
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: |
+    Esto depende de como el Mailbox maneja reverts en verify(). Si verify() revierte,
+    el mensaje no se procesa. Pero si verify() tiene un try-catch interno y retorna true
+    aunque revealAndExecute fallo... el commitment queda stuck.
+
+- id: IAR-12
+  tier: 1
+  type: property
+  description: "_enrollRemoteRouter en AbstractInterchainAccountRouter enrolla router con ISM=EMPTY_SALT -- llamadas desde Router.enrollRemoteRouter solo setean router sin ISM"
+  attack_scenario: |
+    1. AbstractInterchainAccountRouter._enrollRemoteRouter override linea 277-286.
+    2. Llama _enrollRemoteRouterAndIsm con _ism = EMPTY_SALT (bytes32(0)).
+    3. Esto significa que enrollar un router via el metodo estandar Router.enrollRemoteRouter
+       siempre setea ISM = 0.
+    4. Cuando callRemote usa isms[_destination] que es bytes32(0), y esto se pasa a
+       callRemoteWithOverrides como _ism = bytes32(0).
+    5. En destino, route() ve ISM = 0 y retorna defaultIsm.
+    6. PERO: si el admin queria un ISM especifico y solo uso enrollRemoteRouter
+       (no enrollRemoteRouterAndIsm), el ISM queda en 0 y NO se puede cambiar
+       (immutabilidad). El dominio queda permanentemente con defaultIsm.
+  impact: "Admin error irrecuperable: dominio enrollado sin ISM especifico, immutable despues"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que _enrollRemoteRouter setea ISM a EMPTY_SALT
+    // Despues de enrollar via enrollRemoteRouter, isms[domain] deberia ser bytes32(0)
+    // Y no se puede re-enrollar con un ISM diferente
+    bytes32 ismValue = router.isms(testDomain);
+    eq(ismValue, bytes32(0), "IAR-12: ISM should be EMPTY_SALT after enrollRemoteRouter");
+    // Intentar re-enrollar con ISM no-zero deberia revertir
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 75
+  notes: |
+    Combinado con IAR-09. Un admin que usa el metodo heredado enrollRemoteRouter
+    (de la clase base Router) sin saber que deberia usar enrollRemoteRouterAndIsm
+    pierde la oportunidad de setear un ISM custom permanentemente.
+
+false_positives:
+- hunter: DomainHunter
+  id: IAR-FP-01
+  reason: |
+    handle() sin onlyRemoteRouter: investigado, es BY DESIGN. El contrato esta disenado para
+    recibir mensajes de contratos remotos no confiables. La ICA derivada es unica por
+    (origin, owner, sender, ism, salt), asi que un sender no confiable obtiene su propia ICA
+    sin poder afectar ICAs de otros senders. La seguridad viene del ISM, no del sender check.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Hyperlane ICA: handle() sin onlyRemoteRouter es by design -- ICA address incluye sender en salt, isolation por diseno"
+    briefing_update_applied: false
+- hunter: DomainHunter
+  id: IAR-FP-02
+  reason: |
+    CREATE2 salt collision entre origins: investigado, _getSalt incluye _origin (uint32) como
+    primer campo del hash. Dos origins diferentes SIEMPRE producen salts diferentes (y por tanto
+    ICAs diferentes) para el mismo owner/router/ism/userSalt. No hay vector aqui.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null

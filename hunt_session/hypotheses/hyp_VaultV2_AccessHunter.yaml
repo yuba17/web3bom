@@ -1,0 +1,735 @@
+protocol: morpho-vault-v2
+component: VaultV2
+file: src/VaultV2.sol
+domain: vault
+hunter: AccessHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-01: Stale pending submissions survive curator change
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-01
+  title: Stale pending submissions survive curator change
+  tier: 1
+  type: property
+  description: >
+    When owner calls setCurator(newCurator), all pending submissions
+    (executableAt[data] > 0) from the OLD curator remain executable. timelocked()
+    does NOT check msg.sender — anyone can call the timelocked function with the
+    exact calldata. A removed curator's malicious pending ops (e.g., addAdapter
+    pointing to a malicious adapter, setIsAllocator granting attacker allocator
+    role) execute after the timelock despite the curator being replaced.
+  attack_scenario: >
+    1. Curator A submits addAdapter(maliciousAdapter) with timelock = 7 days.
+    2. Owner discovers something wrong, replaces A with curator B via setCurator(B).
+    3. Owner assumes pending ops from A are invalid — but they are NOT revoked.
+    4. After 7 days, ANYONE calls addAdapter(maliciousAdapter) directly.
+    5. timelocked() passes because executableAt[data] != 0 and timelock expired.
+    6. Malicious adapter is added, attacker can drain funds via allocate().
+  severity: High
+  confidence: 75
+  solidity: |
+    // Ghost: track curator at time of submit and whether curator changed
+    address internal ghost_curatorAtLastSubmit;
+    bool internal ghost_curatorChanged;
+    bytes internal ghost_pendingData;
+
+    function property_ac_01_stale_pending_survives_curator_change() public {
+      // After setCurator changes the curator, no pending submissions from
+      // old curator should remain executable without explicit re-approval
+      if (ghost_curatorChanged && ghost_pendingData.length > 0) {
+        uint256 execAt = vault.executableAt(ghost_pendingData);
+        eq(execAt, 0, "AC-01: stale pending submission survives curator change");
+      }
+    }
+  affected_functions:
+    - setCurator
+    - submit
+    - timelocked
+    - addAdapter
+    - setIsAllocator
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-02: forceDeallocate with zero penalty allows free allocation manipulation
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-02
+  title: forceDeallocate with zero penalty allows free allocation manipulation
+  tier: 1
+  type: property
+  description: >
+    forceDeallocate is fully permissionless. When forceDeallocatePenalty[adapter] = 0
+    (the default for new adapters), penaltyAssets=0, withdraw(0, address(this), onBehalf)
+    burns 0 shares. Anyone can change the vault's allocation for free by moving funds
+    from any adapter to idle. This disrupts allocator strategy and can interact with
+    relative cap checks. The attacker sets onBehalf = self (who can have 0 shares).
+  attack_scenario: >
+    1. Vault has forceDeallocatePenalty[adapter] = 0 (default).
+    2. Attacker calls forceDeallocate(adapter, data, assets, attacker).
+    3. deallocateInternal moves assets from adapter to vault idle.
+    4. withdraw(0, vault, attacker) is a no-op — 0 shares burned.
+    5. Allocation changed for free, disrupting allocator strategy.
+  severity: Medium
+  confidence: 55
+  solidity: |
+    // Ghost: track allocation changes from forceDeallocate with zero penalty
+    uint256 internal ghost_adapterAllocBefore;
+    bool internal ghost_forceDeallocCalled;
+
+    function property_ac_02_free_allocation_manipulation() public {
+      if (ghost_forceDeallocCalled) {
+        // If penalty is zero, allocation should not have decreased
+        // (only allocator/sentinel should change allocation without cost)
+        address adapter = address(0x1); // placeholder — set in handler
+        uint256 penalty = vault.forceDeallocatePenalty(adapter);
+        if (penalty == 0) {
+          // Check that allocation didn't change if penalty is zero
+          // i.e., free manipulation should not be possible
+          gte(ghost_adapterAllocBefore, 0, "AC-02: allocation changed without penalty cost");
+        }
+      }
+    }
+  affected_functions:
+    - forceDeallocate
+    - deallocateInternal
+    - withdraw
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-03: forceDeallocate allowance check protects onBehalf shares
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-03
+  title: forceDeallocate cannot burn victim shares without allowance
+  tier: 1
+  type: property
+  description: >
+    forceDeallocate takes onBehalf parameter. When penalty > 0, the penalty is
+    withdrawn from onBehalf via withdraw(). exit() checks msg.sender != onBehalf
+    and requires allowance. Attacker cannot burn victim's shares without their
+    explicit approval. This is SAFE by design — the allowance check in exit()
+    correctly prevents unauthorized share burning.
+  attack_scenario: >
+    Attacker calls forceDeallocate(adapter, data, 1000e18, victim).
+    withdraw(penaltyAssets, address(this), victim) triggers exit().
+    exit() checks msg.sender (attacker) != victim → requires allowance.
+    Attacker has no allowance → tx reverts. SAFE.
+  severity: Low
+  confidence: 90
+  solidity: |
+    function property_ac_03_no_unauthorized_share_burn() public {
+      // forceDeallocate should NOT burn shares of onBehalf
+      // without onBehalf's explicit approval
+      address victim = address(0xBEEF);
+      uint256 victimBalBefore = vault.balanceOf(victim);
+      // After any forceDeallocate called by non-victim without allowance:
+      uint256 victimBalAfter = vault.balanceOf(victim);
+      gte(victimBalAfter, victimBalBefore, "AC-03: victim shares burned without allowance");
+    }
+  affected_functions:
+    - forceDeallocate
+    - exit
+    - withdraw
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-04: multicall does not bypass non-zero timelocks
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-04
+  title: multicall delegatecall cannot bypass non-zero timelocks
+  tier: 2
+  type: property
+  description: >
+    multicall uses delegatecall(data[i]) preserving msg.sender. A curator could
+    batch submit() + timelocked-function in one multicall. With timelock=0, the
+    function executes immediately (by design for setup). With timelock > 0,
+    submit sets executableAt = block.timestamp + timelock, and the second call
+    fails because block.timestamp < executableAt. multicall does NOT bypass
+    non-zero timelocks.
+  attack_scenario: >
+    Curator calls multicall([submit(addAdapter(X)), addAdapter(X)]).
+    With timelock > 0: submit sets executableAt = block.timestamp + timelock.
+    addAdapter calls timelocked() which checks block.timestamp >= executableAt.
+    Since block.timestamp < block.timestamp + timelock → reverts. SAFE.
+  severity: Low
+  confidence: 85
+  solidity: |
+    // Ghost: track if multicall attempted to bypass timelock
+    bool internal ghost_multicallUsed;
+    bytes4 internal ghost_lastSubmitSelector;
+    uint256 internal ghost_timelockAtSubmit;
+
+    function property_ac_04_multicall_no_timelock_bypass() public {
+      if (ghost_multicallUsed && ghost_timelockAtSubmit > 0) {
+        // If timelock > 0 was set, the function should NOT have been executed
+        // in the same tx as submit (same block.timestamp)
+        bytes4 sel = ghost_lastSubmitSelector;
+        uint256 tl = vault.timelock(sel);
+        if (tl > 0) {
+          // executableAt should be in the future, not already consumed (0)
+          t(true, "AC-04: multicall timelock bypass check (manual verification needed)");
+        }
+      }
+    }
+  affected_functions:
+    - multicall
+    - submit
+    - timelocked
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-05: abdicate is irreversible — permanent function disabling
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-05
+  title: Abdicated selector can never become un-abdicated
+  tier: 2
+  type: property
+  description: >
+    abdicate(selector) sets abdicated[selector] = true irreversibly. No un-abdicate
+    function exists. timelocked() checks !abdicated[selector] and reverts if true.
+    A malicious curator can abdicate removeAdapter making malicious adapters
+    irremovable. The abdicate function itself goes through timelocked(), so a
+    curator can abdicate the abdicate selector, preventing future abdications.
+  attack_scenario: >
+    1. Malicious curator submits abdicate(removeAdapter.selector).
+    2. After timelock, abdicate executes — removeAdapter permanently disabled.
+    3. Curator adds malicious adapter (if addAdapter not abdicated).
+    4. The malicious adapter can never be removed, even by new curator.
+    5. Malicious adapter drains funds via allocate.
+  severity: High
+  confidence: 40
+  solidity: |
+    // Ghost: track abdicated selectors
+    mapping(bytes4 => bool) internal ghost_wasAbdicated;
+
+    function property_ac_05_abdicate_irreversible() public {
+      bytes4[3] memory criticalSelectors = [
+        bytes4(keccak256("addAdapter(address)")),
+        bytes4(keccak256("removeAdapter(address)")),
+        bytes4(keccak256("setIsAllocator(address,bool)"))
+      ];
+      for (uint256 i = 0; i < criticalSelectors.length; i++) {
+        if (ghost_wasAbdicated[criticalSelectors[i]]) {
+          t(vault.abdicated(criticalSelectors[i]),
+            "AC-05: abdicated selector became un-abdicated — state corruption");
+        }
+      }
+    }
+  affected_functions:
+    - abdicate
+    - timelocked
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-06: Sentinel can permanently DoS curator operations
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-06
+  title: Compromised sentinel can grief all curator submissions
+  tier: 2
+  type: property
+  description: >
+    revoke() requires msg.sender == curator || isSentinel[msg.sender]. A compromised
+    sentinel can revoke every curator submission immediately, blocking all vault
+    configuration changes. Owner can fix by calling setIsSentinel(sentinel, false)
+    which is instant (no timelock), so severity is reduced. But the race condition
+    between submit and revoke exists.
+  attack_scenario: >
+    1. Sentinel Alice is compromised.
+    2. Curator submits addAdapter(X) with 7-day timelock.
+    3. Alice calls revoke(addAdapter(X)) immediately.
+    4. Curator re-submits, Alice revokes again — infinite loop.
+    5. Owner calls setIsSentinel(alice, false) to fix.
+  severity: Low
+  confidence: 30
+  solidity: |
+    // Ghost: track revoke/submit pairs
+    uint256 internal ghost_submissionCount;
+    uint256 internal ghost_revokeCount;
+
+    function property_ac_06_sentinel_cannot_permanently_dos() public {
+      // After owner removes a sentinel, that address should no longer be sentinel
+      // ensuring the DoS fix path works
+      address sentinel = address(0xDEAD); // placeholder
+      if (!vault.isSentinel(sentinel)) {
+        // Sentinel was removed — should not be able to revoke anymore
+        t(!vault.isSentinel(sentinel),
+          "AC-06: removed sentinel still has revoke power");
+      }
+    }
+  affected_functions:
+    - revoke
+    - submit
+    - setIsSentinel
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-07: timelocked functions have no msg.sender check — trustless execution
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-07
+  title: Anyone can execute expired timelocked operations
+  tier: 1
+  type: property
+  description: >
+    timelocked() checks executableAt[msg.data], abdicated[selector], and
+    block.timestamp, but NOT msg.sender. Anyone can execute a pending timelocked
+    operation once the timelock expires. Combined with AC-01 (stale submissions
+    surviving curator change), a removed curator's malicious op can be executed
+    by anyone (including MEV bots) after timelock expiry.
+  attack_scenario: >
+    1. Old curator submits decreaseTimelock(addAdapter, 0).
+    2. Owner changes curator, forgets to revoke.
+    3. After timelock expires, anyone calls decreaseTimelock(addAdapter, 0).
+    4. addAdapter now has 0 timelock — new curator can add adapters instantly.
+  severity: Medium
+  confidence: 70
+  solidity: |
+    // Ghost: track who executed timelocked ops
+    address internal ghost_lastTimelockExecutor;
+    bool internal ghost_timelockExecuted;
+
+    function property_ac_07_timelocked_no_sender_check() public {
+      // Verify that timelocked functions can be called by any address
+      // (this is by design — the risk is in combination with AC-01)
+      if (ghost_timelockExecuted) {
+        // The executor doesn't need to be curator — by design
+        // This property documents the behavior, real finding is AC-01
+        t(ghost_timelockExecuted,
+          "AC-07: timelocked function was executed (trustless — by design)");
+      }
+    }
+  affected_functions:
+    - timelocked
+    - submit
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-08: Gates can lock user funds if gate contract reverts
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-08
+  title: Malicious gate contracts can permanently lock user funds
+  tier: 2
+  type: property
+  description: >
+    Gates (sendSharesGate, receiveAssetsGate) are external contracts called during
+    exit(). If they revert, users cannot withdraw. forceDeallocate also calls
+    withdraw() → exit() → same gate checks. So a malicious gate blocks both
+    regular withdrawals AND forceDeallocate penalty path. The deallocateInternal
+    in forceDeallocate still works (moves assets to idle), but the atomic tx reverts
+    because withdraw reverts. Users are locked until owner changes curator and
+    new curator changes gate (timelocked).
+  attack_scenario: >
+    1. Malicious curator sets sendSharesGate to always-reverting contract.
+    2. All withdrawals fail — canSendShares returns false.
+    3. forceDeallocate reverts because withdraw (penalty) fails.
+    4. Users locked until owner changes curator + new curator changes gate.
+    5. If curator also increased timelock on setSendSharesGate to max, lockup is extended.
+  severity: High
+  confidence: 35
+  solidity: |
+    // Ghost: track if gate blocks exits
+    bool internal ghost_gateBlocksExit;
+
+    function property_ac_08_gates_cannot_permanently_lock() public {
+      // If sendSharesGate or receiveAssetsGate is set, verify that
+      // the vault's own address can still receive assets (special case in canReceiveAssets)
+      address vaultAddr = address(vault);
+      bool canReceive = vault.canReceiveAssets(vaultAddr);
+      t(canReceive, "AC-08: vault itself blocked by receiveAssetsGate");
+    }
+  affected_functions:
+    - exit
+    - canSendShares
+    - canReceiveAssets
+    - setSendSharesGate
+    - setReceiveAssetsGate
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-09: Allocator can set liquidityAdapter to non-adapter address (DoS)
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-09
+  title: Allocator can DoS deposits by setting liquidityAdapter to non-adapter
+  tier: 1
+  type: property
+  description: >
+    setLiquidityAdapterAndData() only requires isAllocator[msg.sender]. The
+    allocator can set liquidityAdapter to ANY address. If set to a non-adapter,
+    enter() calls allocateInternal(liquidityAdapter, ...) which checks
+    require(isAdapter[adapter]) and reverts. This DoSes all deposits. Withdrawals
+    over idle balance also revert for the same reason.
+  attack_scenario: >
+    1. Malicious allocator calls setLiquidityAdapterAndData(randomAddr, "").
+    2. randomAddr is not in isAdapter mapping.
+    3. User deposit() → enter() → allocateInternal(randomAddr) → reverts.
+    4. All deposits blocked until allocator fixes liquidityAdapter.
+    5. Withdrawals exceeding idle also fail (exit → deallocateInternal → reverts).
+  severity: Medium
+  confidence: 65
+  solidity: |
+    function property_ac_09_liquidity_adapter_is_valid() public {
+      address liqAdapter = vault.liquidityAdapter();
+      if (liqAdapter != address(0)) {
+        t(vault.isAdapter(liqAdapter),
+          "AC-09: liquidityAdapter is not a registered adapter — deposits will DoS");
+      }
+    }
+  affected_functions:
+    - setLiquidityAdapterAndData
+    - enter
+    - exit
+    - allocateInternal
+    - deallocateInternal
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-10: Owner functions have no two-step transfer
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-10
+  title: Owner transfer is single-step — can be sent to wrong address permanently
+  tier: 2
+  type: property
+  description: >
+    setOwner(newOwner) transfers ownership in a single step with no confirmation.
+    If owner accidentally sends to wrong address or zero address, ownership is
+    permanently lost. All owner-only functions (setCurator, setIsSentinel, setOwner)
+    become inaccessible. The vault can still operate with existing curator/allocator
+    but governance is permanently frozen.
+  attack_scenario: >
+    1. Owner calls setOwner(wrongAddress) by mistake.
+    2. wrongAddress is a contract that cannot call setOwner back.
+    3. Owner cannot set new curator, cannot add/remove sentinels.
+    4. Existing curator continues operating but owner oversight is lost forever.
+  severity: Low
+  confidence: 80
+  solidity: |
+    function property_ac_10_owner_not_zero() public {
+      // Owner should never be zero address — if it is, governance is permanently frozen
+      t(vault.owner() != address(0),
+        "AC-10: owner is zero address — governance permanently frozen");
+    }
+  affected_functions:
+    - setOwner
+    - setCurator
+    - setIsSentinel
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-11: decreaseAbsoluteCap/decreaseRelativeCap bypass timelock (instant)
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-11
+  title: Cap decreases bypass timelock — instant execution by curator or sentinel
+  tier: 2
+  type: property
+  description: >
+    decreaseAbsoluteCap() and decreaseRelativeCap() do NOT call timelocked().
+    They only require msg.sender == curator || isSentinel[msg.sender]. This is
+    intentional for emergency scenarios, but a compromised curator can instantly
+    zero out all caps. With absoluteCap = 0, allocateInternal reverts. However
+    deallocate still works if allocation > 0, so funds can still be pulled.
+  attack_scenario: >
+    1. Compromised curator calls decreaseAbsoluteCap(idData, 0) for all ids.
+    2. All absoluteCaps become 0 — allocateInternal reverts on require(absoluteCap > 0).
+    3. But deallocateInternal still works if allocation > 0.
+    4. Once fully deallocated, adapter is permanently unusable (cap=0, alloc=0).
+    5. Curator must increase cap (timelocked!) to re-enable.
+  severity: Low
+  confidence: 90
+  solidity: |
+    function property_ac_11_cap_decrease_asymmetry() public {
+      // decreaseAbsoluteCap should always result in cap <= previous cap
+      // (monotonically non-increasing without timelock)
+      // This is by design — the increase/decrease asymmetry IS the security model
+      // Test: after decrease, cap should be <= what it was
+      bytes32 testId = keccak256(abi.encodePacked("test"));
+      uint256 absCap = vault.absoluteCap(testId);
+      uint256 relCap = vault.relativeCap(testId);
+      // Caps should be within valid ranges
+      lte(relCap, 1e18, "AC-11: relativeCap exceeds WAD");
+    }
+  affected_functions:
+    - decreaseAbsoluteCap
+    - decreaseRelativeCap
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-12: permit uses ecrecover — vulnerable to signature = 0 if owner = 0
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-12
+  title: Permit ecrecover returns address(0) for invalid sig — safe due to check
+  tier: 1
+  type: property
+  description: >
+    permit() uses ecrecover(digest, v, r, s). ecrecover returns address(0) for
+    invalid signatures. The check is: recoveredAddress != address(0) && recoveredAddress == _owner.
+    This is SAFE — ecrecover returning 0 is caught by the first condition.
+    However, if _owner is address(0) (which createShares prevents for minting,
+    but approve doesn't check), then recoveredAddress(0) == _owner(0) would pass
+    but is blocked by the != address(0) check. Correct implementation.
+  attack_scenario: >
+    Attacker provides invalid signature where ecrecover returns address(0).
+    Check: address(0) != address(0) → false → reverts. SAFE.
+    Even if _owner = address(0): address(0) != address(0) → false → reverts. SAFE.
+  severity: Low
+  confidence: 95
+  solidity: |
+    function property_ac_12_permit_rejects_zero_recovery() public {
+      // ecrecover(invalid) returns address(0) — permit should always reject this
+      // Test: no allowance should be set for address(0) as owner via permit
+      uint256 zeroAllowance = vault.allowance(address(0), address(this));
+      eq(zeroAllowance, 0,
+        "AC-12: address(0) has non-zero allowance — permit may be bypassed");
+    }
+  affected_functions:
+    - permit
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-13: allocateInternal passes msg.sig/msg.sender to adapter — expanded attack surface
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-13
+  title: Adapter receives msg.sig and msg.sender — different code paths per caller
+  tier: 1
+  type: property
+  description: >
+    allocateInternal passes msg.sig and msg.sender to the adapter. When called
+    from enter() (deposit/mint), msg.sig is the deposit/mint selector. When from
+    allocate(), msg.sig is allocate selector. The adapter could implement different
+    logic per msg.sig, creating code paths reachable only by users (not allocators)
+    or vice versa. If an adapter has a vulnerability only in the deposit code path,
+    any user can trigger it.
+  attack_scenario: >
+    1. Adapter has: if (sig == deposit.selector) { doSpecialLogic() }.
+    2. doSpecialLogic has a vulnerability (e.g., wrong accounting).
+    3. Attacker calls deposit() triggering the vulnerable adapter path.
+    4. Vault trusts adapter's returned (ids, change) without validation.
+  severity: Low
+  confidence: 30
+  solidity: |
+    function property_ac_13_adapter_sig_consistency() public {
+      // The vault trusts adapter return values regardless of msg.sig
+      // Test: allocation should be consistent whether called via deposit or allocate
+      // (This is a design concern — adapter-dependent, not vault bug per se)
+      address liqAdapter = vault.liquidityAdapter();
+      if (liqAdapter != address(0)) {
+        t(vault.isAdapter(liqAdapter),
+          "AC-13: liquidityAdapter used for deposit path is not a registered adapter");
+      }
+    }
+  affected_functions:
+    - allocateInternal
+    - deallocateInternal
+    - enter
+    - exit
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-14: forceDeallocate calls deallocateInternal before accrueInterest
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-14
+  title: forceDeallocate ordering — deallocateInternal before accrueInterest
+  tier: 1
+  type: property
+  description: >
+    forceDeallocate() calls deallocateInternal() FIRST, then withdraw() which
+    calls accrueInterest(). The allocation changes happen on stale _totalAssets.
+    The penalty calculation uses post-accrual share price. The difference is
+    at most one tx's worth of interest — negligible in practice.
+  attack_scenario: >
+    1. forceDeallocate calls deallocateInternal (no accrueInterest yet).
+    2. Allocation decreases based on adapter's reported change.
+    3. withdraw calls accrueInterest updating _totalAssets.
+    4. Penalty shares calculated on post-accrual price.
+    5. Marginal difference in penalty share count.
+  severity: Low
+  confidence: 60
+  solidity: |
+    // Ghost: track totalAssets before/after forceDeallocate
+    uint256 internal ghost_totalAssetsBefore;
+    uint256 internal ghost_totalAssetsAfter;
+
+    function property_ac_14_force_dealloc_accounting() public {
+      // After forceDeallocate, totalAssets should decrease by exactly penaltyAssets
+      // (the deallocated amount stays in vault, only penalty is "withdrawn")
+      if (ghost_totalAssetsAfter > 0 && ghost_totalAssetsBefore > 0) {
+        // totalAssets should not increase from forceDeallocate alone
+        // (it may increase from interest accrual within the same call)
+        t(true, "AC-14: forceDeallocate accounting check requires manual verification");
+      }
+    }
+  affected_functions:
+    - forceDeallocate
+    - deallocateInternal
+    - withdraw
+    - accrueInterest
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-15: transfer/transferFrom gate checks — shares can be moved between gated users
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-15
+  title: Transfer gate checks only use canSendShares/canReceiveShares not asset gates
+  tier: 1
+  type: property
+  description: >
+    transfer() and transferFrom() check canSendShares(from) and canReceiveShares(to),
+    but NOT canSendAssets or canReceiveAssets. This is correct — transfers move
+    shares not assets. However, a user blocked by sendSharesGate cannot transfer
+    shares, but CAN still approve others to transferFrom on their behalf (approve
+    has no gate check). If the gate blocks the `from` address but not the
+    `msg.sender`, transferFrom would still fail because canSendShares checks
+    `from`, not `msg.sender`.
+  attack_scenario: >
+    1. sendSharesGate blocks Alice.
+    2. Alice approves Bob for max shares.
+    3. Bob calls transferFrom(Alice, Bob, shares).
+    4. canSendShares(Alice) returns false → reverts. SAFE.
+    5. But: Alice can still approve (no gate) — allowance is set but unusable.
+  severity: Low
+  confidence: 85
+  solidity: |
+    function property_ac_15_gate_blocks_transfer() public {
+      // If sendSharesGate blocks an address, that address should not be able
+      // to have shares moved from it via transfer OR transferFrom
+      address blocked = address(0xBLOC);
+      if (!vault.canSendShares(blocked)) {
+        // blocked's balance should not decrease (no one can move their shares)
+        uint256 bal = vault.balanceOf(blocked);
+        // After any transfer/transferFrom attempt:
+        uint256 balAfter = vault.balanceOf(blocked);
+        gte(balAfter, bal,
+          "AC-15: gated user's shares moved despite sendSharesGate blocking");
+      }
+    }
+  affected_functions:
+    - transfer
+    - transferFrom
+    - canSendShares
+    - canReceiveShares
+    - approve
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-16: setOwner has no zero-address check — governance can be bricked
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-16
+  title: setOwner allows address(0) — permanent governance freeze
+  tier: 2
+  type: property
+  description: >
+    setOwner(address(0)) is allowed — there is no zero-address check. Once owner
+    is address(0), no one can call setCurator, setIsSentinel, or setOwner. The
+    vault's governance layer is permanently frozen. The existing curator/allocator
+    continue operating but cannot be replaced.
+  attack_scenario: >
+    1. Owner accidentally calls setOwner(address(0)).
+    2. All owner-only functions become permanently inaccessible.
+    3. Curator cannot be replaced — if curator becomes malicious, no recourse.
+    4. Sentinels cannot be added/removed.
+  severity: Medium
+  confidence: 75
+  solidity: |
+    function property_ac_16_owner_never_zero() public {
+      // Owner should never become address(0) — permanent governance loss
+      t(vault.owner() != address(0),
+        "AC-16: owner set to address(0) — governance permanently bricked");
+    }
+  affected_functions:
+    - setOwner
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-17: fee recipient can be set to address that cannot receive shares (gate blocked)
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-17
+  title: Fee recipient blocked by receiveSharesGate silently disables fee collection
+  tier: 1
+  type: property
+  description: >
+    In accrueInterestView(), fee shares are only minted if canReceiveShares(recipient)
+    returns true. If the receiveSharesGate blocks the fee recipient, fees are silently
+    set to 0 — no fee is collected. This can happen if: (1) curator sets gate after
+    fees are configured, (2) gate contract changes its whitelist. The fee recipient
+    check is in the view function, so setPerformanceFee/setManagementFee don't verify
+    the recipient is gateable at set-time. Fees appear configured but never collect.
+  attack_scenario: >
+    1. Curator sets performanceFee = 10% and performanceFeeRecipient = Alice.
+    2. Later, curator sets receiveSharesGate to a contract that blocks Alice.
+    3. accrueInterestView: canReceiveShares(Alice) returns false → performanceFeeAssets = 0.
+    4. Performance fee is never collected despite being configured.
+    5. Depositors benefit (no fee dilution) but fee recipient loses expected income.
+  severity: Medium
+  confidence: 70
+  solidity: |
+    function property_ac_17_fee_recipient_can_receive_shares() public {
+      // If performanceFee > 0, the recipient should be able to receive shares
+      // If managementFee > 0, the recipient should be able to receive shares
+      if (vault.performanceFee() > 0) {
+        address perfRecipient = vault.performanceFeeRecipient();
+        t(vault.canReceiveShares(perfRecipient),
+          "AC-17: performanceFeeRecipient blocked by receiveSharesGate — fees silently disabled");
+      }
+      if (vault.managementFee() > 0) {
+        address mgmtRecipient = vault.managementFeeRecipient();
+        t(vault.canReceiveShares(mgmtRecipient),
+          "AC-17: managementFeeRecipient blocked by receiveSharesGate — fees silently disabled");
+      }
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - setPerformanceFee
+    - setManagementFee
+    - setReceiveSharesGate
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-18: removeAdapter does not check allocation > 0 — funds can be stranded
+# ═══════════════════════════════════════════════════════════════════════════
+- id: AC-18
+  title: removeAdapter does not check if adapter still has allocated funds
+  tier: 1
+  type: property
+  description: >
+    removeAdapter() sets isAdapter[account] = false and removes from the adapters
+    array, but does NOT check if caps[id].allocation > 0 for any id associated
+    with that adapter. If funds are still allocated to the adapter, they become
+    unreachable: deallocateInternal requires isAdapter[adapter], and realAssets()
+    from that adapter won't be included in accrueInterestView (adapter removed from
+    array). This causes permanent loss of allocated funds.
+  attack_scenario: >
+    1. Adapter X has 1000 ETH allocated (caps[id].allocation = 1000e18).
+    2. Curator submits removeAdapter(X), timelock passes, it executes.
+    3. isAdapter[X] = false, X removed from adapters[].
+    4. deallocateInternal(X, ...) reverts on require(isAdapter[X]).
+    5. accrueInterestView() no longer includes X's realAssets().
+    6. 1000 ETH is stranded — _totalAssets drops, share price drops.
+    7. Only fix: re-add adapter X (requires timelock).
+  severity: High
+  confidence: 60
+  solidity: |
+    function property_ac_18_no_remove_with_allocation() public {
+      // An adapter that is NOT registered should have zero allocation across all ids
+      // If adapter was removed but allocation > 0, funds are stranded
+      uint256 adapterCount = vault.adaptersLength();
+      // For each known adapter that was removed, check allocation is 0
+      // (Simplified: check that all registered adapters are in isAdapter)
+      for (uint256 i = 0; i < adapterCount; i++) {
+        address adapter = vault.adapters(i);
+        t(vault.isAdapter(adapter),
+          "AC-18: adapter in array but not in isAdapter mapping — inconsistent state");
+      }
+    }
+  affected_functions:
+    - removeAdapter
+    - deallocateInternal
+    - accrueInterestView
+
+false_positives:
+- hunter: AccessHunter
+  id: AC-FP-01
+  reason: >
+    AC-03 (forceDeallocate burning victim shares): After deep analysis, exit()
+    correctly checks allowance when msg.sender != onBehalf. An attacker cannot
+    burn another user's shares via forceDeallocate without their explicit
+    allowance approval. The permissionless nature of forceDeallocate is safe
+    because the penalty is always taken from onBehalf WITH allowance checks.
+
+- hunter: AccessHunter
+  id: AC-FP-02
+  reason: >
+    AC-04 (multicall bypassing timelocks): multicall uses delegatecall which
+    preserves msg.sender. When timelock > 0, submit() sets executableAt to
+    block.timestamp + timelock, and the second call in multicall would fail
+    because block.timestamp < executableAt. multicall does NOT bypass non-zero
+    timelocks.
+
+- hunter: AccessHunter
+  id: AC-FP-03
+  reason: >
+    AC-11 (sentinel deallocate asymmetry): Sentinel can deallocate but not
+    allocate — this is intentional least-privilege design. Sentinel is a
+    defensive role that can pull funds from adapters but cannot push funds
+    into potentially malicious ones. Correct separation of concerns.

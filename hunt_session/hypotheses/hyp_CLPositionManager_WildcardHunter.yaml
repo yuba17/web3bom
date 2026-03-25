@@ -1,0 +1,445 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: WildcardHunter
+generated_at: '2026-03-23T07:00:00Z'
+invariants:
+- id: CLPM-W01
+  tier: 1
+  type: property
+  description: "Multicall + msg.value re-use: un usuario que envía ETH con multicall puede reutilizar msg.value en múltiples sub-llamadas (modifyLiquidities, initializePool, subscribe) porque delegatecall preserva msg.value a lo largo de todo el loop del multicall"
+  attack_scenario: >
+    El atacante envía 1 ETH con multicall([modifyLiquidities_A, modifyLiquidities_B]).
+    Cada delegatecall dentro del loop de multicall ve msg.value = 1 ETH.
+    La primera llamada usa 1 ETH para mint con WETH (WRAP action).
+    La segunda llamada también ve msg.value=1 ETH y puede intentar WRAP de nuevo.
+    Si el contrato no verifica el balance real de ETH vs msg.value antes de wrapping,
+    el atacante duplica su depósito gastando solo 1 ETH.
+    Ref: SushiSwap MISO batch auction exploit — exactamente este vector.
+  impact: "Duplicación de depósitos nativos ETH — pérdida directa de fondos del contrato"
+  impact_rating: Critical
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Pre: enviar X ETH con multicall que tiene 2 calls con WRAP
+    // La protección está en _mapWrapUnwrapAmount que chequea balance real
+    // PERO: si wrap(CONTRACT_BALANCE) se usa, ambas calls ven el mismo balance
+    // antes de que el WETH.deposit lo consuma
+    // Test: hacer multicall con 2 modifyLiquidities que ambos hacen WRAP+SETTLE
+    uint256 contractEthBefore = address(positionManager).balance;
+    // Después de multicall con msg.value=X y 2 wraps:
+    // Si el bug existe, el vault recibió 2X de WETH pero solo se envió X de ETH
+    uint256 vaultWethAfter = WETH9.balanceOf(address(vault));
+    lte(vaultWethAfter, contractEthBefore + msg.value, "CLPM-W01: msg.value double-spent via multicall");
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 70
+  notes: >
+    _mapWrapUnwrapAmount chequea balance real (inputCurrency.balanceOf(address(this))),
+    lo cual DEBERÍA prevenir double-wrap porque después del primer WETH.deposit el ETH
+    ya no está. Pero hay un edge case: si la primera call usa SETTLE con native currency
+    (que envía ETH al vault directamente sin wrap), el ETH sale, y la segunda call
+    con WRAP revertiría por InsufficientBalance. Necesita PoC para confirmar si hay
+    un path donde el ETH persiste entre calls. El riesgo real depende de si vault.settle{value:X}
+    se puede combinar con WRAP en la misma multicall de forma que el balance se "recargue".
+
+- id: CLPM-W02
+  tier: 1
+  type: property
+  description: "initializePool silently swallows ALL errors incluyendo errores críticos — un usuario que cree que su pool fue inicializada puede hacer mint/increase en una pool inicializada por otro con parámetros distintos"
+  attack_scenario: >
+    1. Atacante front-runs la transacción de la víctima que hace multicall([initializePool, mint]).
+    2. Atacante inicializa la misma pool con un sqrtPriceX96 extremo (precio muy bajo o muy alto).
+    3. La llamada initializePool de la víctima falla silenciosamente (try-catch devuelve type(int24).max).
+    4. La víctima NO revierte — su multicall continúa con la mint action.
+    5. La mint deposita liquidez al precio extremo del atacante, recibiendo una posición
+       severamente desbalanceada. El atacante inmediatamente swap en la dirección opuesta
+       para extraer valor.
+    El return value type(int24).max NO es chequeado por nadie en la cadena de acciones.
+  impact: "Pérdida de fondos del LP por inicialización front-run con precio manipulado"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Simular: initializePool devuelve type(int24).max (error silenciado)
+    // Luego mint se ejecuta al precio que el atacante puso
+    int24 result = positionManager.initializePool(key, attackerSqrtPrice);
+    // Si result == type(int24).max, la pool ya fue inicializada por otro
+    // PERO la siguiente acción en el batch NO chequea este valor
+    t(result != type(int24).max, "CLPM-W02: initializePool failed silently");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    El diseño intencional es que initializePool no revierta para permitir
+    multicall idempotentes. Pero el problema es que NO hay forma de que el caller
+    distinga entre "pool ya existe con MI precio" vs "pool fue front-runned con
+    OTRO precio". La slippage check en mint (amount0Max/amount1Max) es la
+    única protección — si el usuario pone slippage generoso, pierde.
+    Comparable al ataque de first depositor en Uniswap V3 donde el inicializador
+    elige el precio.
+
+- id: CLPM-W03
+  tier: 1
+  type: property
+  description: "transferFrom fuerza unsubscribe pero NO notifica al subscriber sobre el cambio de owner — el subscriber puede seguir operando con datos stale del owner anterior"
+  attack_scenario: >
+    1. Alice tiene posición tokenId=5 con subscriber (e.g., un auto-compounder).
+    2. Alice transfiere la posición a Bob via transferFrom.
+    3. transferFrom llama _unsubscribe(id) que borra el subscriber y llama notifyUnsubscribe.
+    4. PERO: _unsubscribe usa try-catch con gas limit (unsubscribeGasLimit).
+       Si el subscriber consume más gas que el límite, la notificación falla SILENCIOSAMENTE.
+    5. El subscriber puede tener estado interno que sigue asociando tokenId=5 a Alice.
+    6. Si el subscriber tiene un fallback o es re-suscrito, opera sobre la posición de Bob
+       con la lógica/permisos de Alice.
+  impact: "Estado stale en subscriber puede causar operaciones no autorizadas sobre posición transferida"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Pre: position tokenId tiene subscriber activo
+    // Action: transferFrom
+    // Post: subscriber mapping limpio PERO subscriber contract puede tener estado stale
+    bool hadSubscriber = positionInfo[tokenId].hasSubscriber();
+    positionManager.transferFrom(alice, bob, tokenId);
+    bool hasSubscriberAfter = positionInfo[tokenId].hasSubscriber();
+    // Invariante: si tenía subscriber, después de transfer no debe tener
+    if (hadSubscriber) {
+        t(!hasSubscriberAfter, "CLPM-W03: subscriber not cleared on transfer");
+    }
+    // NOTA: esto solo verifica el estado del mapping, no el estado interno del subscriber
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    El diseño es intencional — la unsubscribe con gas limit es una protección contra
+    griefing (subscriber malicioso que revierte para bloquear transfers). Pero el trade-off
+    es que subscribers legítimos pueden perder sincronización. La pregunta clave es:
+    ¿hay un subscriber en el ecosistema PCS Infinity que mantiene estado interno
+    sobre el owner y no maneja correctamente notifyUnsubscribe? Necesita análisis
+    de los subscribers concretos deployed.
+
+- id: CLPM-W04
+  tier: 1
+  type: property
+  description: "nextTokenId overflow via unchecked increment — después de 2^256-1 mints, nextTokenId wraps a 0 y la siguiente mint sobreescribe positionInfo[0] (que es EMPTY_POSITION_INFO)"
+  attack_scenario: >
+    Teóricamente, si nextTokenId llega a type(uint256).max, el unchecked{nextTokenId++}
+    wraps a 0. La siguiente mint asignaría tokenId=0 y _mint(owner, 0) podría
+    tener comportamiento inesperado en ERC721 (tokenId 0 a veces se usa como sentinel).
+    Más importante: positionInfo[0] se sobreescribiría con datos reales, y poolKeys
+    podría tener colisión.
+  impact: "Teórico — requiere 2^256 mints, impracticable. Pero el patrón unchecked es notable."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Este invariante es teórico pero documenta el unchecked pattern
+    uint256 currentNextTokenId = positionManager.nextTokenId();
+    t(currentNextTokenId > 0, "CLPM-W04: nextTokenId wrapped to 0");
+    t(currentNextTokenId < type(uint256).max, "CLPM-W04: nextTokenId at max");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 20
+  notes: >
+    Impracticable en la realidad. 2^256 transacciones es imposible incluso con
+    todo el gas de todas las blockchains. Incluido solo como documentación del
+    patrón y como referencia de que el contrato usa unchecked.
+
+- id: CLPM-W05
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock NO tiene checkDeadline — acciones ejecutadas sin lock pueden ser incluidas en bloques arbitrariamente futuros sin protección de deadline"
+  attack_scenario: >
+    1. Un usuario llama modifyLiquiditiesWithoutLock para ajustar su posición.
+    2. La transacción queda en mempool durante horas/días (gas price bajo, congestión).
+    3. Cuando finalmente se incluye, el precio del pool ha cambiado significativamente.
+    4. La operación se ejecuta a precios desfavorables.
+    5. A diferencia de modifyLiquidities que tiene checkDeadline, esta función NO protege al usuario.
+    La slippage protection (amount0Max/amount1Max) existe pero NO es equivalente a deadline:
+    el precio puede volver al rango del slippage check pero en un momento donde la
+    ejecución ya no es económicamente deseable para el usuario.
+  impact: "Ejecución de operaciones en momento no deseado — pérdida por timing adverso"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // No hay forma de testear esto como invariante puro en Solidity
+    // Es un design issue: modifyLiquiditiesWithoutLock carece de deadline
+    // Verificar: ¿la función es accesible externamente sin deadline?
+    // Sí: es external payable sin modifier checkDeadline
+    // El test sería: llamar modifyLiquiditiesWithoutLock con warp(1 year)
+    // y verificar que la tx no revierte por deadline
+    vm.warp(block.timestamp + 365 days);
+    // Esta llamada DEBERÍA fallar pero NO falla por falta de deadline
+    positionManager.modifyLiquiditiesWithoutLock(actions, params);
+    t(false, "CLPM-W05: modifyLiquiditiesWithoutLock executed without deadline");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    modifyLiquiditiesWithoutLock está diseñada para ser llamada desde contextos
+    donde el vault ya está locked (hook callbacks, etc.). En esos contextos,
+    el caller ya tuvo un deadline en la operación original. Pero la función es
+    external y cualquiera puede llamarla directamente. El modificador isNotLocked
+    verifica que NO hay lock activo, lo cual significa que esta función es para
+    uso FUERA del lock — exactamente el caso donde el deadline sería necesario.
+    CONTRAARGUMENTO: puede ser que el design intent es que los integradores
+    manejen el deadline a nivel de su propio contrato. Aún así, es una ausencia
+    notable comparada con modifyLiquidities.
+
+- id: CLPM-W06
+  tier: 1
+  type: property
+  description: "Subscriber notifyBurn reverts bloquean el burn de la posición — un subscriber malicioso puede impedir que el usuario burn su NFT permanentemente"
+  attack_scenario: >
+    1. Usuario suscribe su posición a un contrato subscriber malicioso.
+    2. El subscriber implementa notifyBurn() que siempre revierte.
+    3. En _burn(), si info.hasSubscriber() es true, llama _removeSubscriberAndNotifyBurn().
+    4. _removeSubscriberAndNotifyBurn hace _call() al subscriber y si falla,
+       hace bubbleUpAndRevertWith → REVIERTE toda la transacción de burn.
+    5. A diferencia de _unsubscribe (que usa try-catch con gas limit),
+       _removeSubscriberAndNotifyBurn NO tiene try-catch para notifyBurn.
+    6. El usuario NO puede hacer burn de su posición.
+    7. El usuario puede hacer unsubscribe() primero (que sí usa try-catch),
+       pero si no lo sabe, queda bloqueado.
+    PERO: unsubscribe() existe y funciona con try-catch. El vector es que el
+    usuario no sabe que debe unsubscribe ANTES de burn.
+  impact: "Posición NFT no-burnable mientras subscriber malicioso esté activo — fondos temporalmente bloqueados"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Test: crear subscriber que revierte en notifyBurn
+    // Suscribir posición a ese subscriber
+    // Intentar burn → debería revertir con BurnNotificationReverted
+    // Workaround: unsubscribe primero, luego burn
+    // El invariante es: un usuario SIEMPRE puede recuperar sus fondos
+    // via decrease(all) + take, sin necesidad de burn
+    bool canDecrease = true;
+    try positionManager.modifyLiquidities(decreasePayload, deadline) {
+        canDecrease = true;
+    } catch {
+        canDecrease = false;
+    }
+    t(canDecrease, "CLPM-W06: user cannot decrease liquidity due to subscriber");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    La mitigación es que el usuario puede: (1) unsubscribe primero (try-catch protege),
+    (2) decrease toda la liquidez sin burn, (3) transferFrom a otro address
+    (que auto-unsubscribe). Pero si notifyModifyLiquidity del subscriber TAMBIÉN
+    revierte, el usuario no puede ni decrease. Esto sería un deadlock real.
+    Necesita verificar si _notifyModifyLiquidity también revierte (sí — bubbleUpAndRevertWith).
+    Path de deadlock potencial: subscriber malicioso que revierte en notifyModifyLiquidity
+    Y en notifyBurn. El usuario solo puede salir vía transferFrom (que llama _unsubscribe
+    con try-catch). La pregunta es: ¿transferFrom revierte si el vault está locked?
+    Sí — onlyIfVaultUnlocked. Pero el vault normalmente está unlocked.
+
+- id: CLPM-W07
+  tier: 2
+  type: property
+  description: "PoolId truncation collision: poolId se trunca a bytes25 (200 bits) del hash completo bytes32 — dos pools diferentes podrían mapear al mismo bytes25, causando que poolKeys[poolId] devuelva la PoolKey de la pool equivocada"
+  attack_scenario: >
+    1. Dos pools con PoolKeys diferentes producen PoolIds (bytes32) que comparten
+       los mismos 200 bits más significativos (colisión de truncación).
+    2. La primera pool se registra en poolKeys[poolId].
+    3. Cuando se mint en la segunda pool, poolKeys[poolId] ya tiene datos,
+       así que el check `if (poolKeys[poolId].parameters == bytes32(0))` es false
+       y NO sobreescribe.
+    4. Ahora getPoolAndPositionInfo para la segunda posición devuelve la PoolKey
+       de la PRIMERA pool.
+    5. Operaciones subsecuentes (increase, decrease, burn) usan la PoolKey incorrecta
+       y operan en la pool equivocada.
+    La probabilidad de colisión natural es ~2^(-200), despreciable.
+    Pero un atacante que pueda controlar los parámetros de PoolKey podría intentar
+    grinding — aún así, 200 bits hacen esto impracticable con tecnología actual.
+  impact: "Teórico — colisión de truncación causaría operaciones en pool incorrecta"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Para dos positions con tokenIds distintos pero en pools diferentes
+    // verificar que sus poolIds truncados son diferentes
+    CLPositionInfo info1 = positionManager.positionInfo(tokenId1);
+    CLPositionInfo info2 = positionManager.positionInfo(tokenId2);
+    bytes25 pid1 = info1.poolId();
+    bytes25 pid2 = info2.poolId();
+    // Si las pools son diferentes, los poolIds truncados deben ser diferentes
+    if (keccak256(abi.encode(poolKey1)) != keccak256(abi.encode(poolKey2))) {
+        t(pid1 != pid2, "CLPM-W07: poolId truncation collision detected");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 25
+  notes: >
+    200 bits de espacio hacen la colisión computacionalmente impracticable.
+    Incluido como documentación del pattern y porque el comentario en el código
+    dice explícitamente "This poolId is NOT compatible with the poolId used in
+    infinity core. It is truncated to 25 bytes." Si algún día se reduce el
+    espacio o se encuentra un atajo criptográfico, este sería el vector.
+
+- id: CLPM-W08
+  tier: 1
+  type: property
+  description: "permit2.transferFrom en _pay puede fallar silenciosamente o transferir menos tokens que amount con fee-on-transfer tokens, dejando la settle del vault sin cubrir el delta completo"
+  attack_scenario: >
+    1. Pool usa un token con fee-on-transfer (e.g., USDT con fee activado).
+    2. Usuario hace mint/increase con ese token.
+    3. _pay() llama permit2.transferFrom(payer, vault, amount, token).
+    4. El vault recibe amount - fee, pero vault.settle() calcula basándose en
+       la diferencia de balance (sync → transfer → settle).
+    5. Si vault.sync() se llamó ANTES del transfer, el settle calculará
+       correctamente la cantidad recibida (amount - fee).
+    6. PERO: _settle() llama vault.sync(currency) ANTES de _pay(),
+       y luego vault.settle() DESPUÉS. El vault calcula balance_after - balance_before.
+    7. La diferencia será amount-fee, que es MENOR que el delta requerido.
+    8. Resultado: la transacción revierte porque el delta no se cubre completamente.
+    Esto NO es un exploit — es un problema de compatibilidad que bloquea
+    operaciones con fee-on-transfer tokens. El usuario no puede mint/increase
+    con la cantidad exacta que necesita.
+  impact: "Incompatibilidad con fee-on-transfer tokens — operaciones bloqueadas, no pérdida directa"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Este es más un test de compatibilidad que un invariante de seguridad
+    // Verificar que después de settle, el delta del vault para este currency es 0
+    int256 delta = vault.currencyDelta(address(positionManager), currency);
+    eq(delta, 0, "CLPM-W08: delta not fully settled after _pay with FoT token");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    Esto es un known issue en la mayoría de protocolos Uniswap-style.
+    Fee-on-transfer tokens simplemente no son compatibles con el pattern
+    sync-transfer-settle si el caller no ajusta el amount para compensar la fee.
+    Documentado como false positive potencial pero relevante para completeness.
+
+- id: CLPM-W09
+  tier: 1
+  type: property
+  description: "Subscriber deadlock completo: si notifyModifyLiquidity revierte, el usuario NO puede decrease liquidity, y si notifyBurn revierte, NO puede burn. El único escape es transferFrom (que auto-unsubscribes con try-catch). Pero si el vault está locked durante la operación, transferFrom también revierte."
+  attack_scenario: >
+    1. Usuario suscribe posición a subscriber malicioso vía subscribe().
+    2. El subscriber implementa:
+       - notifyModifyLiquidity() → revert siempre
+       - notifyBurn() → revert siempre
+       - notifyUnsubscribe() → consume todo el gas (>unsubscribeGasLimit) o revert
+    3. El usuario intenta decrease → _modifyLiquidity → _notifyModifyLiquidity → revierte.
+    4. El usuario intenta burn → _burn → _removeSubscriberAndNotifyBurn → revierte.
+    5. El usuario intenta unsubscribe → _unsubscribe → try-catch con gas limit.
+       Si notifyUnsubscribe consume más gas que el límite, el catch absorbe el error.
+       _unsubscribe DEBERÍA funcionar y liberar al usuario.
+    6. PERO: si el subscriber es un contrato que consume EXACTAMENTE el unsubscribeGasLimit,
+       la llamada falla pero el try-catch absorbe. ¿Se ejecuta el resto de _unsubscribe?
+       SÍ — delete subscriber[tokenId] ocurre ANTES del try-catch. Correcto.
+    CONCLUSIÓN: unsubscribe() es siempre el escape válido. El deadlock TOTAL no existe
+    gracias al order de operaciones en _unsubscribe (delete ANTES de try-catch).
+    PERO: el usuario necesita SABER que debe unsubscribe antes de decrease/burn.
+    Si el UX no lo comunica, el usuario puede quedarse bloqueado temporalmente.
+  impact: "Bloqueo temporal de operaciones — workaround disponible vía unsubscribe()"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // El escape siempre funciona porque delete subscriber[tokenId] es ANTES del try-catch
+    // Verificar que después de unsubscribe, decrease funciona
+    positionManager.unsubscribe(tokenId);
+    bool canDecrease = true;
+    try positionManager.modifyLiquidities(decreasePayload, deadline) {} catch {
+        canDecrease = false;
+    }
+    t(canDecrease, "CLPM-W09: cannot decrease after unsubscribe");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    Confirmado leyendo _unsubscribe(): línea 70 hace delete subscriber[tokenId]
+    ANTES de la llamada try-catch en línea 79. Esto es correcto y previene el
+    deadlock total. La posición se marca como unsubscribed y el subscriber se borra
+    independientemente de si notifyUnsubscribe revierte o no. El riesgo residual
+    es puramente de UX — el usuario podría no saber del workaround.
+
+- id: CLPM-W10
+  tier: 1
+  type: property
+  description: "_mint permite mint a owner=address(0) via _mapRecipient si el caller pasa address(0) como owner, ya que address(0) no es MSG_SENDER ni ADDRESS_THIS, se pasa directo. ERC721._mint a address(0) debería revertir, pero depende de la implementación de Solmate."
+  attack_scenario: >
+    1. Atacante llama mint con owner=address(0).
+    2. _mapRecipient(address(0)) devuelve address(0) porque no es address(1) ni address(2).
+    3. _mint(address(0), tokenId) se llama en ERC721.
+    4. Solmate ERC721._mint revierte con "INVALID_RECIPIENT" si to == address(0).
+    5. NO hay exploit — Solmate protege contra esto.
+    Sin embargo, si _mapRecipient devuelve address(0) por OTRO camino
+    (e.g., msgSender() devuelve address(0) cuando no hay locker), podría haber un issue.
+    msgSender() devuelve _getLocker() que lee de transient storage. Si tload devuelve
+    0 cuando no hay locker, y el owner es MSG_SENDER, _mapRecipient devuelve address(0).
+    PERO: modifyLiquidities tiene isNotLocked que verifica _getLocker() == address(0)
+    y luego SETS msg.sender como locker. Así que dentro del lock, _getLocker() nunca es 0.
+  impact: "Ninguno — Solmate previene mint a address(0)"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que no se puede mint a address(0)
+    address owner = positionManager.ownerOf(tokenId);
+    t(owner != address(0), "CLPM-W10: position minted to address(0)");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    Investigado y descartado — Solmate ERC721 revierte en mint a address(0).
+    Pero el pattern de _mapRecipient que pasa address(0) sin check es notable
+    como defense-in-depth concern.
+
+false_positives:
+- hunter: WildcardHunter
+  id: CLPM-FP-01
+  reason: >
+    nextTokenId overflow (CLPM-W04) es impracticable — requiere 2^256 mints.
+    Incluso a 1M mints/segundo, tomaría 10^63 años. No es un finding reportable.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "unchecked increment de tokenId en position managers es safe dado 2^256 espacio — no reportar como finding"
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: CLPM-FP-02
+  reason: >
+    Mint a address(0) (CLPM-W10) — Solmate ERC721._mint tiene require(to != address(0), "INVALID_RECIPIENT").
+    La protección existe en la capa base. No es un finding.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: CLPM-FP-03
+  reason: >
+    Fee-on-transfer incompatibility (CLPM-W08) es un known limitation de
+    todos los protocolos Uniswap V4-style. El vault pattern (sync-transfer-settle)
+    maneja esto correctamente al calcular la diferencia real de balance.
+    El usuario simplemente necesita enviar amount+fee. Es by design, no un bug.
+  investigated_at: '2026-03-23T07:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "El pattern sync-transfer-settle en Infinity vault maneja FoT tokens correctamente — el settle usa balance diff real"
+    briefing_update_applied: false

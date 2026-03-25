@@ -1,0 +1,341 @@
+protocol: morpho-metamorpho
+component: MetaMorpho
+file: src/MetaMorpho.sol
+domain: trust
+hunter: MathHunter
+generated_at: '2026-03-25T00:00:00Z'
+
+# ANALYSIS SUMMARY:
+# MetaMorpho math is well-designed. All rounding directions favor the vault (existing depositors).
+# OZ mulDiv handles overflow. Virtual shares via DECIMALS_OFFSET mitigate inflation (partially for 18-dec tokens).
+# Fee accrual rounds down (conservative). Solodit toSupply rounding fix already applied.
+# The invariants below codify the critical math properties that MUST hold for the vault to be safe.
+
+invariants:
+- id: MM-M-01
+  tier: 1
+  type: property
+  description: "ERC4626 roundtrip: redeem(deposit(X)) <= X — depositor cannot profit from immediate deposit+redeem"
+  attack_scenario: "User deposits X assets, receives shares via Floor rounding, then redeems all shares via Floor rounding. Both roundings are against the user. If this breaks, attacker cycles deposit/redeem to drain vault. The virtual offset (10^DECIMALS_OFFSET) and +1 in the conversion formula should prevent profitable roundtrips, but edge cases with very small amounts or specific totalSupply/totalAssets ratios could create rounding in attacker's favor."
+  impact: "Value extraction from existing vault depositors on every cycle"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 testAmount = _clampBetween(1, 1e24);
+    uint256 shares = vault.previewDeposit(testAmount);
+    if (shares > 0) {
+        uint256 assetsBack = vault.previewRedeem(shares);
+        lte(assetsBack, testAmount, "MM-M-01: roundtrip profit - depositor extracted value");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Deposit uses Floor (fewer shares for depositor), redeem uses Floor (fewer assets back). Both round against user. For any given totalSupply/totalAssets, previewRedeem(previewDeposit(X)) <= X by construction of mulDiv Floor. Safe by design but worth testing across extreme ranges."
+  poc_sketch: ''
+  call_stack: 'deposit() L538 Floor -> redeem() L576 Floor'
+
+- id: MM-M-02
+  tier: 1
+  type: property
+  description: "Share price monotonicity: assets-per-share must be non-decreasing across operations"
+  attack_scenario: "If totalAssets()/totalSupply() decreases, all shareholders lose value. Interest accrual increases totalAssets. Fee accrual mints new shares against (newTotalAssets - feeAssets), which is designed to preserve share price. If _accrueFee over-mints feeShares (e.g., due to rounding in feeAssets computation), the share price could drop below pre-interest level, meaning fee extraction exceeds the interest earned."
+  impact: "All vault depositors lose a fraction of their deposits per fee accrual"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 currentTotalAssets = vault.totalAssets();
+    uint256 currentTotalSupply = vault.totalSupply();
+    uint256 offset = uint256(vault.DECIMALS_OFFSET());
+    uint256 currentPrice = 0;
+    if (currentTotalSupply > 0) {
+        currentPrice = (currentTotalAssets + 1) * 1e18 / (currentTotalSupply + 10 ** offset);
+    }
+    if (ghost_lastSharePrice > 0 && currentTotalSupply > 0) {
+        gte(currentPrice + 1, ghost_lastSharePrice, "MM-M-02: share price decreased");
+    }
+    ghost_lastSharePrice = currentPrice;
+  ghost_vars:
+    - "uint256 ghost_lastSharePrice;"
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "+1 tolerance for rounding dust. Fee shares are computed as _convertToSharesWithTotals(feeAssets, totalSupply, newTotalAssets - feeAssets, Floor). The resulting share price for existing holders should be (newTotalAssets - feeAssets + 1) / (totalSupply + 10^offset), which equals the pre-fee price since feeAssets is subtracted from numerator. The feeShares just represent the fee portion. Safe by construction."
+  poc_sketch: ''
+  call_stack: '_accrueFee() -> _accruedFeeShares() -> _mint(feeRecipient, feeShares)'
+
+- id: MM-M-03
+  tier: 1
+  type: property
+  description: "Fee shares value must not exceed total interest earned"
+  attack_scenario: "Each _accrueFee call mints feeShares worth feeAssets = totalInterest * fee / WAD. If the value of feeShares (convertToAssets) exceeds totalInterest, the fee recipient is extracting more than the interest, reducing depositors' share price. The formula mints against (newTotalAssets - feeAssets) denominator, so share value should equal feeAssets. But Floor rounding on feeShares means value <= feeAssets <= totalInterest. This should hold."
+  impact: "Fee recipient extracts more than interest earned, depositors suffer loss"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 feeRecBefore = vault.balanceOf(vault.feeRecipient());
+    uint256 lastTABefore = vault.lastTotalAssets();
+    // After any operation that triggers _accrueFee:
+    uint256 feeRecAfter = vault.balanceOf(vault.feeRecipient());
+    uint256 newShares = feeRecAfter > feeRecBefore ? feeRecAfter - feeRecBefore : 0;
+    if (newShares > 0) {
+        uint256 feeValue = vault.convertToAssets(newShares);
+        uint256 totalAssetsNow = vault.totalAssets();
+        uint256 interest = totalAssetsNow > lastTABefore ? totalAssetsNow - lastTABefore : 0;
+        lte(feeValue, interest + 2, "MM-M-03: fee shares value exceeds interest earned");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "Tolerance of 2 wei for rounding. feeAssets = totalInterest * fee / WAD (Floor). feeShares = feeAssets * (totalSupply + 10^offset) / (totalAssets - feeAssets + 1) (Floor). Both round down, so feeValue should be <= feeAssets <= totalInterest * 50%. Safe by construction."
+  poc_sketch: ''
+  call_stack: '_accruedFeeShares() L894-905'
+
+- id: MM-M-04
+  tier: 1
+  type: property
+  description: "lastTotalAssets tracks totalAssets within bounded drift after fee accrual"
+  attack_scenario: "After _accrueFee(), lastTotalAssets = totalAssets(). But deposit updates it as lastTotalAssets + assets, and withdraw as newTotalAssets.zeroFloorSub(assets). These approximations cause drift. If drift accumulates, _accrueFee computes wrong totalInterest. If lastTotalAssets < totalAssets persistently, phantom interest is charged as fee. If lastTotalAssets > totalAssets, fees are skipped."
+  impact: "Cumulative drift causes incorrect fee accrual — either overcharge or undercharge"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 lastTA = vault.lastTotalAssets();
+    uint256 actualTA = vault.totalAssets();
+    uint256 maxDrift = actualTA / 1000 + 10;
+    if (actualTA >= lastTA) {
+        lte(actualTA - lastTA, maxDrift, "MM-M-04: lastTotalAssets drifted too low vs totalAssets");
+    } else {
+        lte(lastTA - actualTA, maxDrift, "MM-M-04: lastTotalAssets drifted too high vs totalAssets");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "After any deposit/withdraw, the drift per operation is bounded by Morpho supply/withdraw rounding (~1 wei). Over N operations, drift is at most N wei. For realistic operation counts this is negligible. But the invariant catches if something goes structurally wrong."
+  poc_sketch: ''
+  call_stack: '_deposit() L676 | withdraw() L565'
+
+- id: MM-M-05
+  tier: 1
+  type: property
+  description: "Inflation attack protection: second depositor must not lose >1% to first depositor manipulation"
+  attack_scenario: "Classic ERC4626 inflation: (1) attacker deposits 1 wei, gets minimal shares. (2) attacker donates to inflate totalAssets. (3) victim deposits large amount, gets 0 or few shares due to inflated ratio. For 18-decimal tokens DECIMALS_OFFSET=0, virtual shares = 1. Formula: shares = assets * (totalSupply + 1) / (totalAssets + 1). With 1 share, 1+D totalAssets, victim gets V * 2 / (2+D) shares — 0 if D >> V. NOTED: this is a known/documented risk in MetaMorpho for 18-dec tokens."
+  impact: "Second depositor loses entire deposit to first depositor"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 ts = vault.totalSupply();
+    uint256 ta = vault.totalAssets();
+    uint256 victimDeposit = 1e18;
+    if (ts > 0 && ts < 1e6) {
+        uint256 victimShares = vault.previewDeposit(victimDeposit);
+        if (victimShares > 0) {
+            uint256 victimValue = vault.previewRedeem(victimShares);
+            gte(victimValue, victimDeposit * 99 / 100, "MM-M-05: inflation attack - victim loses >1%");
+        } else {
+            t(false, "MM-M-05: inflation attack - victim gets 0 shares");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 65
+  notes: "KNOWN ISSUE documented in code comments. For 18-decimal tokens with offset=0, the inflation protection is minimal. Morpho Blue's underlying 1e6 virtual shares provide secondary protection at the market level. For 6-decimal tokens offset=12 provides strong protection. This invariant documents the risk boundary."
+  poc_sketch: 'Deposit 1 wei -> donate directly to Morpho markets -> victim deposits'
+  call_stack: 'constructor() L130 | _convertToSharesWithTotals() L654'
+
+- id: MM-M-06
+  tier: 1
+  type: property
+  description: "Withdraw rounding direction: previewWithdraw(X) >= previewDeposit(X) for same asset amount"
+  attack_scenario: "withdraw() uses Ceil rounding for shares (burns MORE shares per asset), deposit() uses Floor rounding (mints FEWER shares per asset). previewWithdraw(X) >= previewDeposit(X) must always hold. If violated, attacker deposits X, gets S shares, then withdraws X assets burning < S shares, keeping leftover shares for free."
+  impact: "Attacker creates free shares by cycling deposit/withdraw"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 testAmount = _clampBetween(1, 1e24);
+    uint256 depositShares = vault.previewDeposit(testAmount);
+    uint256 withdrawShares = vault.previewWithdraw(testAmount);
+    gte(withdrawShares, depositShares, "MM-M-06: withdraw burns fewer shares than deposit mints");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "By construction: previewDeposit uses Floor, previewWithdraw uses Ceil. For same inputs, Ceil(a*b/c) >= Floor(a*b/c). Both call _accruedFeeShares() so state is consistent. This is a fundamental ERC4626 safety property."
+  poc_sketch: ''
+  call_stack: 'previewDeposit() -> _convertToShares(Floor) | previewWithdraw() -> _convertToShares(Ceil)'
+
+- id: MM-M-07
+  tier: 1
+  type: property
+  description: "Mint/redeem rounding direction: previewMint(S) >= previewRedeem(S) for same share amount"
+  attack_scenario: "mint() uses Ceil rounding for assets (charges MORE assets per share), redeem() uses Floor rounding (returns FEWER assets per share). previewMint(S) >= previewRedeem(S) must hold. If violated, attacker mints S shares cheaply, then redeems them for more assets."
+  impact: "Attacker profits by minting shares cheaply and redeeming for more"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 testShares = _clampBetween(1, 1e24);
+    uint256 mintAssets = vault.previewMint(testShares);
+    uint256 redeemAssets = vault.previewRedeem(testShares);
+    gte(mintAssets, redeemAssets, "MM-M-07: mint charges less than redeem returns");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "Symmetric to MM-M-06. previewMint uses Ceil, previewRedeem uses Floor. Ceil(a*b/c) >= Floor(a*b/c). Safe by construction of OZ mulDiv."
+  poc_sketch: ''
+  call_stack: 'previewMint() -> _convertToAssets(Ceil) | previewRedeem() -> _convertToAssets(Floor)'
+
+- id: MM-M-08
+  tier: 1
+  type: property
+  description: "zeroFloorSub in withdraw must not zero out lastTotalAssets when vault has significant assets"
+  attack_scenario: "withdraw() L565: _updateLastTotalAssets(newTotalAssets.zeroFloorSub(assets)). If assets > newTotalAssets, lastTotalAssets = 0. Next _accrueFee sees totalInterest = totalAssets() - 0 = totalAssets(), charging fee on ENTIRE vault balance as if it were all interest. This requires withdraw to pass assets > newTotalAssets, which should be impossible because shares-to-assets conversion bounds the withdrawal. But concurrent interest accrual could create a gap."
+  impact: "Fee recipient gets fee on entire vault balance — massive theft from depositors"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 lastTA = vault.lastTotalAssets();
+    uint256 actualTA = vault.totalAssets();
+    uint256 ts = vault.totalSupply();
+    if (ts > 1e6 && actualTA > 1e6) {
+        gt(lastTA, 0, "MM-M-08: lastTotalAssets is 0 while vault has significant assets and shares");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "In normal flow, newTotalAssets = totalAssets() and the withdrawal amount comes from shares * (totalAssets+1) / (totalSupply+offset) which is bounded by totalAssets. So assets <= newTotalAssets should always hold. The zeroFloorSub is a safety net. But if Morpho returns more assets than expected from withdraw (e.g., due to interest accrual during the tx), the gap could appear."
+  poc_sketch: ''
+  call_stack: 'withdraw() L565: _updateLastTotalAssets(newTotalAssets.zeroFloorSub(assets))'
+
+- id: MM-M-09
+  tier: 1
+  type: property
+  description: "Reallocate conservation: totalWithdrawn must equal totalSupplied (enforced by L416 revert)"
+  attack_scenario: "reallocate() accumulates totalWithdrawn from Morpho.withdraw() return values and totalSupplied from the assets passed to Morpho.supply(). L416 requires strict equality. But Morpho rounding could cause withdrawnAssets (Morpho's return) to differ from the requested amount, making it impossible to balance. This is by design — forces the allocator to handle dust. However, if Morpho rounds UP on withdraw (gives more than requested), totalWithdrawn > expected and the allocator must supply more to balance."
+  impact: "Accounting mismatch between vault and Morpho if equality check is ever bypassed"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 vaultBalance = IERC20(vault.asset()).balanceOf(address(vault));
+    // Vault should hold 0 tokens (everything in Morpho), or at most dust from rounding
+    lte(vaultBalance, 100, "MM-M-09: vault holds unexpected token balance after reallocate");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "The strict equality check on L416 is the primary defense. Morpho.withdraw returns actual withdrawn assets, and Morpho.supply takes exact assets. The allocator must craft allocations that balance perfectly. If they cannot (due to rounding), the tx reverts. No accounting gap possible as long as L416 check exists."
+  poc_sketch: ''
+  call_stack: 'reallocate() L368-416'
+
+- id: MM-M-10
+  tier: 2
+  type: property
+  description: "Supply cap rounding consistency: _supplyMorpho uses toAssetsUp (conservative) while reallocate uses toAssetsDown"
+  attack_scenario: "In _supplyMorpho L784-785: supplyAssets = supplyShares.toAssetsUp(...) — rounds UP the current supply, meaning less room under cap. In reallocate L375: _accruedSupplyBalance uses toAssetsDown — rounds DOWN current supply, meaning more room under cap. This means reallocate allows slightly more supply than _supplyMorpho for the same state. Difference is at most 1-2 wei per market."
+  impact: "Supply cap exceeded by 1-2 wei via reallocate path vs deposit path"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that after any supply operation, actual supply <= cap + 2 (rounding tolerance)
+    uint256 queueLen = vault.withdrawQueueLength();
+    for (uint256 i = 0; i < queueLen; i++) {
+        Id id = vault.withdrawQueue(i);
+        (uint184 cap,,) = vault.config(id);
+        if (uint256(cap) > 0) {
+            uint256 supplied = MORPHO.expectedSupplyAssets(_marketParams(id), address(vault));
+            lte(supplied, uint256(cap) + 2, "MM-M-10: supply exceeds cap beyond rounding tolerance");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 55
+  notes: "The rounding inconsistency is by design — _supplyMorpho is conservative (protects cap), reallocate is more permissive (allows allocator flexibility). The 1-2 wei difference is not exploitable. Solodit previously flagged this for the old code where _supplyMorpho used toAssetsDown, which has been fixed."
+  poc_sketch: ''
+  call_stack: '_supplyMorpho() L784-785 toAssetsUp | reallocate() L375 -> _accruedSupplyBalance L712 toAssetsDown'
+
+- id: MM-M-11
+  tier: 2
+  type: property
+  description: "Fee accrual with empty vault: feeShares should be 0 or negligible when totalSupply is 0"
+  attack_scenario: "If all users withdraw and totalSupply() = 0, but Morpho markets retain dust from rounding, totalAssets() > 0. _accrueFee computes feeShares = feeAssets * (0 + 10^offset) / (newTotalAssets - feeAssets + 1). For offset=0: feeShares = feeAssets * 1 / (totalAssets - feeAssets + 1). If feeAssets << totalAssets, this rounds to 0. But if fee is 50% and there's significant unclaimed interest, feeShares could be non-zero, minting phantom shares to fee recipient."
+  impact: "Fee recipient mints shares from dust assets that belong to no one"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 ts = vault.totalSupply();
+    uint256 ta = vault.totalAssets();
+    if (ts == 0 && ta > 0) {
+        // With 0 supply but positive assets, any fee mint creates value from nothing
+        // (though the assets are real dust from Morpho rounding)
+        uint256 feeRecBal = vault.balanceOf(vault.feeRecipient());
+        lte(feeRecBal, 1e6, "MM-M-11: fee recipient has significant shares in empty vault");
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 60
+  notes: "Low severity because the dust amounts involved are typically negligible (<1 wei per operation). The fee recipient would need enormous operation counts to accumulate meaningful dust. Not practically exploitable."
+  poc_sketch: ''
+  call_stack: '_accruedFeeShares() when totalSupply()=0'
+
+- id: MM-M-12
+  tier: 1
+  type: property
+  description: "Conversion functions are inverse-consistent: convertToShares(convertToAssets(S)) >= S for Floor/Ceil"
+  attack_scenario: "convertToAssets(S, Floor) gives the minimum assets for S shares. convertToShares(assets, Ceil) gives the maximum shares needed for those assets. The roundtrip should give back >= S shares (no shares created from nothing). If convertToShares(convertToAssets(S)) < S, it means the conversion pair is inconsistent and value can leak."
+  impact: "Inconsistent conversions allow arbitrage between deposit/withdraw paths"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 testShares = _clampBetween(1e6, 1e24);
+    uint256 assets = vault.convertToAssets(testShares);
+    if (assets > 0) {
+        uint256 sharesBack = vault.previewWithdraw(assets);
+        gte(sharesBack, testShares, "MM-M-12: share->asset->share roundtrip loses shares");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: "convertToAssets uses Floor (gives less). previewWithdraw uses Ceil (burns more). So sharesBack should be >= testShares. This is the dual of MM-M-01. Both should hold by construction of OZ mulDiv rounding."
+  poc_sketch: ''
+  call_stack: 'convertToAssets(Floor) -> previewWithdraw(Ceil)'
+
+- id: MM-M-13
+  tier: 2
+  type: property
+  description: "DECIMALS_OFFSET is correctly computed as max(0, 18 - asset.decimals())"
+  attack_scenario: "DECIMALS_OFFSET = uint8(uint256(18).zeroFloorSub(IERC20Metadata(_asset).decimals())). This is set once in constructor and is immutable. For tokens with decimals > 18, offset = 0 and virtual shares = 1, providing minimal inflation protection. The calculation itself cannot be wrong post-deployment, but verifying it ensures the vault was constructed correctly for the given asset."
+  impact: "Wrong offset would compromise all share/asset conversion math"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint8 offset = vault.DECIMALS_OFFSET();
+    uint8 assetDecimals = IERC20Metadata(vault.asset()).decimals();
+    uint256 expected = assetDecimals <= 18 ? 18 - uint256(assetDecimals) : 0;
+    eq(uint256(offset), expected, "MM-M-13: DECIMALS_OFFSET computed incorrectly");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: "Constructor-time property. Cannot change post-deployment. Included for completeness and to verify test setup."
+  poc_sketch: ''
+  call_stack: 'constructor() L130'

@@ -1,0 +1,405 @@
+protocol: pancakeswap-infinity
+component: CLPoolManager
+file: src/pool-cl/CLPoolManager.sol
+domain: dex
+hunter: WildcardHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+- id: CLPM-W01
+  tier: 1
+  type: property
+  description: "beforeSwap hook can reduce amountToSwap to 0, causing pool.swap early return with ZERO_DELTA, but hook's beforeSwapDelta is still processed in afterSwap — hook extracts value without pool doing work"
+  attack_scenario: |
+    A malicious hook with HOOKS_BEFORE_SWAP_RETURNS_DELTA enabled returns a hookDeltaSpecified
+    that exactly cancels amountToSwap to 0. CLPool.swap() at line 247 does:
+    `if (params.amountSpecified == 0) return (ZERO_DELTA, state)` — the pool does zero work,
+    delta is (0,0). But beforeSwapDelta is preserved and passed to afterSwap. In afterSwap,
+    hookDeltaUnspecified from beforeSwapDelta still gets applied:
+    `delta = delta - hookDelta` where hookDelta is built from beforeSwapDelta.
+    The hook can set hookDeltaUnspecified to extract output tokens from the caller without
+    the pool ever executing a swap. The caller pays (via vault.accountAppDeltaWithHookDelta)
+    for tokens the hook claims, but the pool never moved any tokens.
+
+    Key: This only affects pools with malicious hooks. But since PancakeSwap Infinity allows
+    permissionless hooks, users interacting with such pools via a router would be drained.
+    The initial check `params.amountSpecified == 0` at CLPoolManager line 184 passes because
+    the ORIGINAL amount is non-zero — only the hook-modified amount becomes 0.
+  impact: "Users interacting with pools that have malicious beforeSwap hooks lose funds — hook extracts output tokens without performing any swap"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Test: after a swap where beforeSwap reduces amountToSwap to 0,
+    // the caller's net delta should be (0, 0) — no tokens should move
+    // If hook extracts value via beforeSwapDelta while pool does ZERO_DELTA,
+    // the caller pays for nothing
+    BalanceDelta delta = poolManager.swap(key, swapParams, hookData);
+    int128 amt0 = delta.amount0();
+    int128 amt1 = delta.amount1();
+    // If amountToSwap was reduced to 0, both should be 0
+    // If not, the hook extracted value without pool work
+    if (amountToSwapWasReducedToZero) {
+        eq(amt0, int128(0), "CLPM-W01: delta0 should be 0 when swap amount is 0");
+        eq(amt1, int128(0), "CLPM-W01: delta1 should be 0 when swap amount is 0");
+    }
+  ghost_vars:
+  - bool internal amountToSwapWasReducedToZero;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: |
+    The key question is whether vault.accountAppDeltaWithHookDelta properly handles the case
+    where pool delta is ZERO but hookDelta is non-zero. The hookDelta gets charged to the hook
+    address — so it may be the hook paying itself, which would be neutral. Need to trace the
+    full vault accounting to confirm if caller actually loses. If the hook address is the one
+    debited for hookDelta, then this is by-design (hook pays for its own delta). Confidence
+    reduced because vault accounting may prevent actual loss. BUT: `delta = delta - hookDelta`
+    means the CALLER's delta is modified by hookDelta. If hookDelta is positive for the hook,
+    callerDelta becomes more negative = caller pays more.
+
+- id: CLPM-W02
+  tier: 1
+  type: property
+  description: "Hook calling poolManager.swap/modifyLiquidity/donate during its own callback bypasses hook-is-sender check only for its OWN hooks, but can manipulate pool state mid-operation"
+  attack_scenario: |
+    The `shouldCall` function in Hooks.sol (line 71-73) prevents hooks from being called
+    recursively: `hasOffsetEnabled(parameters, offset) && address(hook) != msg.sender`.
+    When a hook calls back into poolManager during its callback (e.g., beforeSwap hook calls
+    poolManager.swap on the SAME pool), msg.sender is the hook, so the hook's own callbacks
+    are skipped. But the pool state IS modified:
+
+    1. beforeSwap is called, hook gains control
+    2. Hook calls poolManager.swap() on the same pool
+    3. Inner swap executes fully (pool state changes: price, liquidity, fees)
+    4. Control returns to outer swap's pool.swap() which uses STALE cached values
+
+    Specifically in CLPoolManager.swap(), `pool` is a storage reference, but `state` in
+    CLPool.swap() caches `slot0Start` at the beginning. The inner swap modifies slot0 in
+    storage, but the outer swap's `slot0Start` was already cached. The outer swap then
+    overwrites storage with its stale cached values at the end (lines 345-350).
+
+    This effectively REVERSES the inner swap's price/tick changes while keeping the inner
+    swap's token transfers — the pool's accounting becomes inconsistent.
+  impact: "Pool price state corruption — inner swap's price changes are overwritten by outer swap. Tokens transferred but price not updated = free arbitrage opportunity"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: sqrtPriceX96 after swap must be consistent with the tokens transferred
+    // If hook re-enters swap, the final price may not reflect cumulative token movements
+    (uint160 priceBefore,,,) = poolManager.getSlot0(poolId);
+    uint128 liqBefore = poolManager.getLiquidity(poolId);
+
+    // Execute swap (hook may re-enter)
+    BalanceDelta delta = poolManager.swap(key, params, hookData);
+
+    (uint160 priceAfter,,,) = poolManager.getSlot0(poolId);
+    uint128 liqAfter = poolManager.getLiquidity(poolId);
+
+    // Price should move in the direction of the swap
+    if (params.zeroForOne) {
+        lte(priceAfter, priceBefore, "CLPM-W02: price should decrease for zeroForOne");
+    } else {
+        gte(priceAfter, priceBefore, "CLPM-W02: price should increase for oneForZero");
+    }
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 55
+  notes: |
+    Confidence moderate because: (1) the vault's lock mechanism may prevent re-entrant
+    operations — need to check if vault.lock() prevents nested calls; (2) the hook would
+    need to be specifically crafted for this attack; (3) if CLPool.swap uses storage refs
+    consistently, the inner swap changes may be visible to the outer. BUT: the outer swap
+    caches slot0Start at the beginning and uses it for the final state comparison at line
+    345 — if inner swap changes slot0, the outer's comparison `state.tick != slot0Start.tick()`
+    may produce wrong results. This is the strongest wildcard hypothesis.
+
+- id: CLPM-W03
+  tier: 2
+  type: property
+  description: "protocolFeesAccrued uses unchecked += which cannot overflow uint256, but feeAmountToProtocol accumulation in SwapState (also unchecked) could overflow uint256 in extremely long swap sequences"
+  attack_scenario: |
+    In CLPool.swap() line 293-303, `state.feeAmountToProtocol += delta` is in an unchecked
+    block. The comment says "cannot overflow due to limits on the size of protocolFee and
+    params.amountSpecified". This is true for a single swap step, but state.feeAmountToProtocol
+    accumulates across ALL steps in the while loop. With enough tick crossings in a single
+    swap and large enough amountSpecified, the cumulative feeAmountToProtocol could theoretically
+    overflow.
+
+    Then in CLPoolManager line 203-207, `protocolFeesAccrued[currency] += state.feeAmountToProtocol`
+    is also unchecked. If state.feeAmountToProtocol overflowed to a small value in the swap,
+    the protocol loses fees silently.
+
+    However: protocolFee is max 4000 pips (0.4%), amountSpecified is int256 (max ~2^255),
+    and each step's delta is bounded by step.amountIn. The cumulative across all steps
+    cannot exceed the total amountIn which is bounded by amountSpecified. So overflow
+    of uint256 is practically impossible.
+  impact: "Protocol fee accounting silently wraps around, protocol loses accrued fees"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track protocolFeesAccrued before and after swap
+    uint256 feesBefore = protocolFeesAccrued[currency];
+    poolManager.swap(key, params, hookData);
+    uint256 feesAfter = protocolFeesAccrued[currency];
+    // Fees should only increase (never wrap around)
+    gte(feesAfter, feesBefore, "CLPM-W03: protocolFeesAccrued decreased — possible overflow");
+  ghost_vars:
+  - uint256 internal ghost_protocolFeesBefore;
+  validated: false
+  priority: low
+  confidence: 30
+  notes: |
+    After analysis, this is almost certainly NOT exploitable. uint256 overflow requires
+    cumulative fees > 2^256 which is impossible with any realistic token. The unchecked
+    is safe. Keeping as Tier 2 for completeness of the wildcard search but confidence is
+    very low. The comment in the code is correct.
+
+- id: CLPM-W04
+  tier: 1
+  type: property
+  description: "initialize() is permissionless — attacker can front-run pool creation with adversarial sqrtPriceX96 to grief first LPs"
+  attack_scenario: |
+    initialize() has no access control beyond poolManagerMatch (which just checks the key
+    references this contract). Anyone can call it with any sqrtPriceX96.
+
+    Attack: User A plans to create a pool WETH/USDC at ~$3000. Attacker sees the pending
+    tx (or knows the pool key params), front-runs with initialize(key, extremePrice).
+    The pool is now initialized at price 1 wei per WETH. When User A tries to add liquidity
+    at the expected price range, their position is entirely single-sided and worthless.
+
+    The attacker can then:
+    1. Add liquidity at the extreme price
+    2. Swap to move price back to fair value
+    3. Profit from the LPs who added liquidity at wrong ranges
+
+    Mitigation check: PoolAlreadyInitialized prevents double-init, so the attacker
+    permanently locks the pool at their chosen price. A new pool with different parameters
+    (e.g., different tickSpacing) could be created, but the exact same key can never be
+    re-initialized.
+
+    Note: This is a KNOWN pattern in Uniswap v4 style pools. PancakeSwap may consider this
+    acceptable since sophisticated users will initialize and add liquidity atomically.
+    But unsophisticated integrators may not.
+  impact: "First LPs lose value by providing liquidity at wrong price — attacker arbitrages the mispricing"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariant: price at initialization should be within reasonable bounds
+    // of oracle/market price (can't enforce on-chain without oracle, so test
+    // that init + add liquidity in same tx prevents front-running)
+    (uint160 sqrtPrice, int24 tick,,) = poolManager.getSlot0(poolId);
+    // After initialization, tick should be in expected range
+    // This is more of a test than an invariant — verify atomic init+addLiq
+    t(sqrtPrice > 0, "CLPM-W04: pool must be initialized");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: |
+    This is a well-known pattern (Uniswap v4 has the same design). The standard mitigation
+    is to initialize and add liquidity in the same multicall/batch transaction. However,
+    if PancakeSwap's router doesn't enforce atomic init+addLiquidity, this becomes a real
+    grief vector. Confidence 70% because the pattern is known and may be documented as
+    acceptable risk.
+
+- id: CLPM-W05
+  tier: 1
+  type: property
+  description: "modifyLiquidity with liquidityDelta=0 during paused state routes through beforeRemoveLiquidity hook, which may block fee collection"
+  attack_scenario: |
+    When paused, modifyLiquidity checks: `if (params.liquidityDelta > 0 && paused()) revert`.
+    So liquidityDelta=0 passes through (it's not > 0). But in CLHooks.beforeModifyLiquidity(),
+    liquidityDelta <= 0 routes to `beforeRemoveLiquidity` hook. If the hook's
+    beforeRemoveLiquidity reverts, users cannot collect accumulated fees even during emergency.
+
+    The pool is paused (emergency), users want to collect fees (liquidityDelta=0), but the
+    hook blocks it by reverting in beforeRemoveLiquidity. User's fees are trapped.
+
+    Furthermore: liquidityDelta=0 still calls pool.modifyLiquidity which calls _updatePosition
+    which calls position.update — this collects fees. So fee collection is gated by the hook.
+
+    Deadlock: User has fees owed in a paused pool with a malicious/broken hook. Cannot
+    collect fees, cannot swap (paused), cannot add liquidity (paused). Only exit is
+    remove liquidity (liquidityDelta < 0), which ALSO goes through beforeRemoveLiquidity.
+    If hook blocks remove liquidity, funds are permanently locked.
+  impact: "User fees and liquidity permanently locked in paused pool if hook's beforeRemoveLiquidity reverts"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: removing liquidity should NEVER be blockable during paused state
+    // Even if hook reverts, users must be able to exit
+    // Test: pause the pool, then try modifyLiquidity with negative liquidityDelta
+    // through a hook that reverts on beforeRemoveLiquidity
+    bool canExit = false;
+    try poolManager.modifyLiquidity(key, removeParams, "") returns (BalanceDelta, BalanceDelta) {
+        canExit = true;
+    } catch {
+        canExit = false;
+    }
+    t(canExit, "CLPM-W05: users must be able to exit during paused state");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 60
+  notes: |
+    This is a composability/trust boundary issue. Users who opt into a pool with a hook
+    are trusting the hook not to be malicious. PancakeSwap's design philosophy may be that
+    hook trust is the user's responsibility. However, the pause mechanism is meant for
+    EMERGENCY protection, and a hook that blocks exits during emergency defeats the purpose.
+    The question is whether this is "user's fault for using bad hook" or a systemic design
+    flaw. For bug bounty purposes, this is likely considered a known tradeoff, reducing
+    confidence. But it IS a real deadlock vector.
+
+- id: CLPM-W06
+  tier: 2
+  type: property
+  description: "Extsload allows reading ANY storage slot — including private pools mapping — enabling off-chain state reconstruction for MEV"
+  attack_scenario: |
+    CLPoolManager inherits Extsload which exposes extsload(bytes32 slot) and
+    extsload(bytes32[] slots). The `pools` mapping is private, but Extsload bypasses
+    Solidity's access control entirely — anyone can read any storage slot by computing
+    the correct slot offset.
+
+    For MEV: an attacker can read the exact pool state (sqrtPriceX96, tick, liquidity,
+    feeGrowthGlobals, individual position data, tick bitmap) in real-time without relying
+    on view functions. This enables precise sandwich calculations.
+
+    More critically: the pools mapping is private for a reason. If there are state variables
+    that should be hidden (e.g., pending state during a lock), Extsload exposes them.
+
+    This is BY DESIGN in Uniswap v4 (Extsload is intentional for gas-efficient reads).
+    But it completely negates any privacy benefit of marking state as private.
+  impact: "MEV extraction — attackers can read precise pool state for sandwich attacks. No direct fund loss from Extsload itself, but enables other attacks."
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // This is informational — Extsload is by design
+    // Verify that reading pool state via extsload matches view functions
+    bytes32 slot0Data = poolManager.extsload(slot0StorageSlot);
+    // If data is readable, the invariant is that it matches getSlot0()
+    (uint160 sqrtPrice,,,) = poolManager.getSlot0(poolId);
+    // Just confirming the data is accessible — not a bug per se
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: |
+    This is definitively by design (copied from Uniswap v4). NOT a bug. Including it as
+    a wildcard observation because it has security implications for integrators who assume
+    private state is truly private. False positive for bug bounty purposes.
+
+- id: CLPM-W07
+  tier: 1
+  type: property
+  description: "afterModifyLiquidity passes delta+feeDelta to hook but hook can return hookDelta that exceeds the actual pool delta, shifting costs to caller"
+  attack_scenario: |
+    In CLPoolManager.modifyLiquidity() line 156, the pool calculates (delta, feeDelta).
+    Line 172: afterModifyLiquidity receives `delta + feeDelta` as the combined delta.
+    The hook can return a hookDelta via afterAddLiquidity/afterRemoveLiquidity return value.
+    Line 106 in CLHooks: `callerDelta = callerDelta - hookDelta`.
+
+    If hookDelta is positive (hook claims tokens), callerDelta becomes more negative
+    (caller pays more). The vault then settles:
+    - caller pays callerDelta
+    - hook pays/receives hookDelta
+
+    A malicious hook can return a large positive hookDelta, making the caller pay extra
+    tokens beyond what the pool requires. The hook receives these tokens via the vault.
+
+    The check is whether the vault's settlement properly validates that the total delta
+    (callerDelta + hookDelta) equals the pool's actual delta. If vault just blindly
+    accounts both deltas, the hook effectively steals from the caller.
+
+    From VaultAppDeltaSettlement line 19: it calls vault.accountAppBalanceDelta with
+    both delta (caller) and hookDelta (hook) separately. The vault should ensure
+    callerDelta + hookDelta = original pool delta. If it doesn't... the hook steals.
+  impact: "Malicious hook extracts tokens from LP users by returning inflated hookDelta in afterModifyLiquidity"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariant: callerDelta + hookDelta must equal pool's original (delta + feeDelta)
+    // from modifyLiquidity
+    (BalanceDelta poolDelta, BalanceDelta poolFeeDelta) = pool.modifyLiquidity(modParams);
+    BalanceDelta expectedTotal = poolDelta + poolFeeDelta;
+    // After hook processing:
+    // callerDelta + hookDelta should == expectedTotal
+    int256 totalAmount0 = int256(callerDelta.amount0()) + int256(hookDelta.amount0());
+    int256 totalAmount1 = int256(callerDelta.amount1()) + int256(hookDelta.amount1());
+    eq(totalAmount0, int256(expectedTotal.amount0()), "CLPM-W07: amount0 conservation violated");
+    eq(totalAmount1, int256(expectedTotal.amount1()), "CLPM-W07: amount1 conservation violated");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: |
+    Looking at CLHooks.afterModifyLiquidity more carefully: callerDelta starts as
+    (delta + feeDelta), then callerDelta = callerDelta - hookDelta. So callerDelta + hookDelta
+    = original (delta + feeDelta). The math IS conserved at the CLHooks level.
+
+    But vault.accountAppDeltaWithHookDelta passes (callerDelta, hookDelta) to vault. The
+    vault implementation needs to verify these sum correctly. If vault.accountAppBalanceDelta
+    with 6 params just accounts them independently without checking the sum, and the hook
+    returned an arbitrary hookDelta... the conservation IS maintained by CLHooks math
+    (callerDelta = delta - hookDelta), so callerDelta + hookDelta = delta always.
+
+    CONCLUSION: This is actually safe by construction. The hook can shift WHO pays, but
+    the total is conserved. If hookDelta is +X for the hook, callerDelta is -X more for
+    caller, and total is the same. The hook still needs to settle its own delta with the
+    vault. So this is by-design hook subsidizing/taxing LPs. Downgrading confidence but
+    keeping because the attack surface (hook taxing LPs) is real — users must trust hooks.
+
+false_positives:
+- hunter: WildcardHunter
+  id: CLPM-WFP-01
+  reason: |
+    poolIdToPoolKey storage manipulation — investigated whether the stored PoolKey could be
+    manipulated to create confusion. PoolId = keccak256(PoolKey), so the mapping is deterministic.
+    The stored key is ONLY used for reading (public getter) — all pool operations receive the
+    key as a parameter and hash it to get the PoolId. An attacker cannot change the stored key
+    after initialization, and the stored key has no effect on pool operations. The only use is
+    off-chain convenience. NOT a bug.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "poolIdToPoolKey in Uniswap v4-style pools is informational only — not used in any security-critical path. Pool operations always receive PoolKey as param and hash it."
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: CLPM-WFP-02
+  reason: |
+    protocolFeesAccrued uint256 overflow — investigated the unchecked += in CLPoolManager
+    lines 203-207. The value is uint256 (2^256 - 1 max). Protocol fee is max 0.4% of swap
+    amount. Even with the largest possible swap (type(int256).max), a single swap adds at most
+    ~0.4% * 2^255 ≈ 2^243 to protocolFeesAccrued. It would take 2^13 = 8192 max-value swaps
+    to overflow. With realistic token decimals (18), this requires cumulative swap volume of
+    2^256 / 10^18 ≈ 10^59 tokens. Impossible in any realistic scenario. The unchecked is
+    gas optimization, not a vulnerability.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "unchecked += on uint256 protocolFeesAccrued is safe — overflow requires cumulative fees > 2^256, impossible with realistic token supplies"
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: CLPM-WFP-03
+  reason: |
+    Extsload exposing private pool state — this is intentionally inherited from Uniswap v4
+    design pattern. Extsload allows gas-efficient state reads for off-chain integrations.
+    While it negates Solidity's `private` visibility, this is by-design and well-documented.
+    The blockchain is transparent anyway — private only prevents on-chain contract reads,
+    not off-chain reads. Not a vulnerability.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Extsload in Uniswap v4 / PancakeSwap Infinity is by design — do not report as a vulnerability. Private state on-chain is never truly private."
+    briefing_update_applied: false

@@ -1,0 +1,792 @@
+protocol: morpho-metamorpho
+component: MetaMorpho
+file: src/MetaMorpho.sol
+domain: vault
+hunter: FlowHunter
+generated_at: '2026-03-25T00:00:00Z'
+state_machine:
+  states:
+  - UNINITIALIZED
+  - EMPTY_NO_MARKETS
+  - CONFIGURED
+  - ACTIVE
+  - PARTIALLY_DRAINED
+  - FULLY_ILLIQUID
+  - REALLOCATING
+  market_states:
+  - DISABLED
+  - PENDING_CAP
+  - ENABLED_CAPPED
+  - CAP_ZERO_ENABLED
+  - PENDING_REMOVAL
+  - REMOVED
+  transitions:
+  - from: EMPTY_NO_MARKETS
+    to: CONFIGURED
+    via: submitCap() + acceptCap() — first market enabled
+    guard: marketParams.loanToken == asset(), MORPHO.lastUpdate(id) != 0
+  - from: CONFIGURED
+    to: ACTIVE
+    via: deposit() / mint()
+    guard: supplyQueue has >=1 market with cap > 0
+  - from: ACTIVE
+    to: PARTIALLY_DRAINED
+    via: 'External: borrowers drain liquidity on Morpho Blue'
+    guard: none — automatic by market state
+  - from: PARTIALLY_DRAINED
+    to: FULLY_ILLIQUID
+    via: All markets hit 100% utilization
+    guard: none — automatic
+  - from: FULLY_ILLIQUID
+    to: ACTIVE
+    via: Borrowers repay on Morpho Blue, or reallocate() moves funds
+    guard: none
+  - from: ACTIVE
+    to: CONFIGURED
+    via: All users redeem/withdraw all shares
+    guard: totalSupply() == 0 after withdrawal
+  - from: DISABLED
+    to: PENDING_CAP
+    via: submitCap(mp, newCap) where newCap > 0
+    guard: onlyCuratorRole, loanToken == asset()
+  - from: PENDING_CAP
+    to: ENABLED_CAPPED
+    via: acceptCap(mp) after timelock
+    guard: block.timestamp >= pendingCap[id].validAt
+  - from: ENABLED_CAPPED
+    to: CAP_ZERO_ENABLED
+    via: submitCap(mp, 0) — instant because newCap < supplyCap
+    guard: onlyCuratorRole
+  - from: CAP_ZERO_ENABLED
+    to: PENDING_REMOVAL
+    via: submitMarketRemoval(mp)
+    guard: onlyCuratorRole, config[id].enabled, config[id].cap == 0
+  - from: PENDING_REMOVAL
+    to: REMOVED
+    via: updateWithdrawQueue() omitting this market
+    guard: block.timestamp >= config[id].removableAt OR supplyShares == 0
+  - from: PENDING_CAP
+    to: DISABLED
+    via: revokePendingCap(id)
+    guard: onlyCuratorOrGuardianRole
+  anomalies:
+  - type: potential_stuck_state
+    state: FULLY_ILLIQUID
+    description: 'If ALL markets in withdrawQueue have 100% utilization (totalBorrowAssets
+      == totalSupplyAssets) AND Morpho singleton has 0 token balance, withdrawals
+      revert with NotEnoughLiquidity. Users cannot exit. This is BY DESIGN (lending
+      risk), but worth monitoring for edge cases where reallocate() could help but
+      allocator is inactive.
+
+      '
+  - type: transient_inconsistency
+    state: REALLOCATING
+    description: 'During reallocate(), between MORPHO.withdraw() and MORPHO.supply()
+      calls, the vault holds tokens in its own balance. totalAssets() would be wrong
+      during this window. The lastTotalAssets is NOT updated during reallocate — only
+      the final totalWithdrawn == totalSupplied check ensures balance. If a callback
+      from Morpho.withdraw could trigger a deposit/withdraw on the vault, lastTotalAssets
+      would be stale.
+
+      '
+  - type: market_removal_with_supply
+    state: REMOVED
+    description: 'Market can be force-removed via submitMarketRemoval + updateWithdrawQueue
+      even with non-zero supplyShares, IF removableAt has elapsed. This permanently
+      removes those assets from totalAssets() (no longer in withdrawQueue loop), causing
+      instant share price drop. This is documented but creates a grief vector if the
+      vault has forced-removal markets with donated supply.
+
+      '
+invariants:
+- id: MM-FL-01
+  tier: 1
+  type: property
+  description: 'reallocate() (L368-L417) enforces totalWithdrawn == totalSupplied
+    at L416. This ensures no assets are created or destroyed during reallocation.
+    However, the check happens AFTER all external calls to MORPHO.withdraw() and MORPHO.supply().
+    If Morpho Blue''s withdraw returns fewer assets than expected (e.g., due to rounding
+    in share-to-asset conversion), totalWithdrawn could be less than the sum of intended
+    withdrawals. The vault tracks totalWithdrawn via the return value of MORPHO.withdraw()
+    (withdrawnAssets), which is the actual amount withdrawn. Similarly, totalSupplied
+    uses suppliedAssets which is calculated before the MORPHO.supply() call. If supply()
+    silently accepts fewer assets, the check would still pass but the vault would
+    hold dust. Key concern: the assets == 0 path (L383-385) sets withdrawn = 0 but
+    uses shares to withdraw. The withdrawnAssets return could be > 0 while withdrawn
+    was set to 0 — this correctly tracks via totalWithdrawn += withdrawnAssets. The
+    net-zero invariant is critical: if broken, the vault either leaked tokens or inflated
+    its position.
+
+    '
+  attack_scenario: 'Attacker cannot directly break this — the revert on L416 prevents
+    completion. The real risk is if a Morpho Blue market has unusual rounding that
+    causes the invariant check to revert on legitimate reallocations, creating a DoS
+    for allocators. For example, if withdrawing all shares from a market returns supplyAssets
+    - 1 due to rounding, and the supply target expects exact amounts.
+
+    '
+  impact: 'If broken (bypassed): vault leaks or creates assets. If DoS (always reverts):
+    allocator cannot rebalance the vault.
+
+    '
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: "function property_mm_fl_01() public {\n  // After any reallocate call,\
+    \ the vault's token balance should not change\n  // (all withdrawn tokens should\
+    \ have been re-supplied to other markets).\n  // We track this via ghost variable\
+    \ that snapshots balance before reallocate.\n  uint256 vaultBalanceBefore = ghost_vaultBalanceBeforeReallocate;\n\
+    \  uint256 vaultBalanceAfter = IERC20(asset()).balanceOf(address(metamorpho));\n\
+    \  // Allow 1 wei tolerance for rounding\n  uint256 diff = vaultBalanceAfter >\
+    \ vaultBalanceBefore\n    ? vaultBalanceAfter - vaultBalanceBefore\n    : vaultBalanceBefore\
+    \ - vaultBalanceAfter;\n  lte(diff, 1, \"MM-FL-01: reallocate changed vault token\
+    \ balance by > 1 wei\");\n}\n"
+  ghost_vars:
+  - uint256 internal ghost_vaultBalanceBeforeReallocate
+  validated: false
+  priority: high
+  confidence: 75
+  notes: 'The net-zero check at L416 is strong. The real question is whether rounding
+    in Morpho Blue''s share math can cause systematic drift. Needs fuzzing with multiple
+    markets and small amounts.
+
+    '
+- id: MM-FL-02
+  tier: 1
+  type: property
+  description: 'In _deposit() (L670-L677), after super._deposit() transfers tokens
+    from caller to vault, _supplyMorpho(assets) is called to push all received tokens
+    into Morpho markets. If _supplyMorpho cannot allocate ALL assets (all markets
+    at cap), it reverts with AllCapsReached (L799). After _supplyMorpho succeeds,
+    lastTotalAssets is updated to lastTotalAssets + assets (L676). The invariant is:
+    after deposit, the vault should hold 0 (or near-0) idle asset tokens — everything
+    must be deployed to Morpho. The _supplyMorpho try/catch on L791 could silently
+    skip a market that reverts, potentially leaving assets in the vault if later markets
+    also fail. However, the final check at L799 ensures assets == 0. Key subtlety:
+    the IRM callback vector from Solodit. A malicious IRM contract queried during
+    MORPHO.accrueInterest (L780) inside _supplyMorpho could read the vault''s idle
+    token balance (deposited but not yet supplied) and exploit it. The try/catch at
+    L791 wraps MORPHO.supply but NOT MORPHO.accrueInterest at L780.
+
+    '
+  attack_scenario: "1. Vault uses a Morpho Blue market with a malicious IRM. 2. User\
+    \ deposits X tokens. super._deposit transfers X to vault. 3. _supplyMorpho iterates\
+    \ supplyQueue. First market has malicious IRM. 4. MORPHO.accrueInterest(marketParams)\
+    \ at L780 calls IRM which reads\n   IERC20(asset).balanceOf(vault) = X (tokens\
+    \ sitting idle).\n5. IRM triggers a callback that calls skim(asset) or another\
+    \ exploit vector. 6. Tokens drained before MORPHO.supply executes. NOTE: MORPHO.accrueInterest\
+    \ does call the IRM, but the IRM only returns a borrow rate — it shouldn't have\
+    \ a callback vector to the vault. The IRM's borrowRate() is a view-like function.\
+    \ But if implemented as non-view with side effects, it could be dangerous. This\
+    \ requires curator to approve a malicious market — a governance trust assumption.\n"
+  impact: 'Tokens stuck in vault = skimmable by skimRecipient. But this requires a
+    malicious IRM in a curator-approved market — governance/trust issue, not a code
+    bug.
+
+    '
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: "function property_mm_fl_02() public {\n  // After deposit, vault should\
+    \ hold near-zero idle tokens\n  // (some dust from rounding is acceptable)\n \
+    \ uint256 idleBalance = IERC20(metamorpho.asset()).balanceOf(address(metamorpho));\n\
+    \  lte(idleBalance, 1, \"MM-FL-02: vault holds idle tokens after deposit\");\n\
+    }\n"
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: 'The IRM callback vector was reported as LOW on Solodit. It requires a malicious
+    IRM which would be a governance/trust issue. But in permissionless Morpho Blue
+    markets, anyone can create a market with a malicious IRM. The vault curator must
+    only approve safe markets. Worth testing with a mock malicious IRM.
+
+    '
+- id: MM-FL-03
+  tier: 1
+  type: property
+  description: "lastTotalAssets is a cached value updated in specific places: - deposit/mint:\
+    \ L536 sets it to newTotalAssets (accrueFee result), then L676\n  sets it to lastTotalAssets\
+    \ + assets. The L536 write is explicitly for reentrancy\n  protection.\n- withdraw/redeem:\
+    \ L565/L579 sets it to newTotalAssets.zeroFloorSub(assets). - setFee/setFeeRecipient:\
+    \ L237/L251 via _updateLastTotalAssets(_accrueFee()). The invariant: lastTotalAssets\
+    \ should approximately equal totalAssets() after any state-changing operation.\
+    \ Divergence means fees are miscalculated. If lastTotalAssets > totalAssets(),\
+    \ the fee accrual sees negative interest (zeroFloorSub returns 0), so no fees\
+    \ are charged even when there IS interest. If lastTotalAssets < totalAssets(),\
+    \ extra fees are charged on phantom interest. Critical edge case: when updateWithdrawQueue\
+    \ removes a market with non-zero supply, totalAssets() DROPS (removed market no\
+    \ longer in loop) but lastTotalAssets is NOT updated. This means lastTotalAssets\
+    \ > totalAssets() until interest catches up. During this gap, NO fees accrue —\
+    \ feeRecipient loses revenue.\n"
+  attack_scenario: 'Malicious curator suppresses fee accrual: 1. Curator sets cap
+    to 0 on a market with significant vault supply. 2. Curator submits market removal,
+    waits for timelock. 3. Allocator removes market from withdrawQueue (supply still
+    in Morpho). 4. totalAssets() drops by the removed market''s supply amount. 5.
+    lastTotalAssets stays inflated from before removal. 6. Fee accrual: totalInterest
+    = totalAssets().zeroFloorSub(lastTotalAssets) = 0. 7. No fees charged until real
+    interest closes the gap. This is a known design trade-off documented in the interface,
+    but a malicious curator could exploit it to avoid paying fees.
+
+    '
+  impact: 'Fee recipient loses fees when markets are force-removed. Magnitude depends
+    on the supply in the removed market relative to total vault assets. Could be significant
+    if a large market is removed.
+
+    '
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: "function property_mm_fl_03() public {\n  // lastTotalAssets should be\
+    \ within reasonable bounds of totalAssets()\n  uint256 lastTA = metamorpho.lastTotalAssets();\n\
+    \  uint256 currentTA = metamorpho.totalAssets();\n  // Allow divergence up to\
+    \ 1% for interest accrual between txs\n  if (currentTA > 0) {\n    uint256 diff\
+    \ = lastTA > currentTA ? lastTA - currentTA : currentTA - lastTA;\n    uint256\
+    \ threshold = currentTA / 100; // 1%\n    lte(diff, threshold, \"MM-FL-03: lastTotalAssets\
+    \ diverged > 1% from totalAssets\");\n  }\n}\n"
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: 'The market removal case is the most interesting. When updateWithdrawQueue
+    removes a market with non-zero supply, totalAssets() drops instantly but lastTotalAssets
+    stays inflated. Documented in interface comments. A malicious curator could exploit
+    this to suppress fee accrual.
+
+    '
+- id: MM-FL-04
+  tier: 2
+  type: property
+  description: '_withdrawMorpho() (L803-L824) iterates withdrawQueue in order. For
+    each market, _withdrawable() at L858 computes min(supplyAssets, availableLiquidity)
+    where availableLiquidity = min(totalSupply - totalBorrow, balanceOf(MORPHO)).
+    The balanceOf(MORPHO) check (L866) accounts for flash loan state: during a Morpho
+    Blue flash loan, the singleton''s token balance could be 0 even though accounting
+    liquidity (totalSupply - totalBorrow) is positive. This would limit _withdrawable
+    to 0 for ALL markets sharing that loan token, causing the entire vault withdrawal
+    to revert with NotEnoughLiquidity.
+
+    '
+  attack_scenario: '1. Attacker takes maximum flash loan from Morpho Blue (drains
+    singleton balance). 2. In same tx, victim''s withdraw() call to MetaMorpho is
+    included (sandwich). 3. _withdrawable() sees balanceOf(MORPHO) = 0 for all markets.
+    4. Withdrawal reverts with NotEnoughLiquidity. 5. Attacker repays flash loan.
+    Cost: flash loan fee. Gain: temporary DoS on vault withdrawals. This is not profitable
+    unless combined with another position that benefits from blocked withdrawals (e.g.,
+    preventing a liquidation).
+
+    '
+  impact: 'Temporary DoS on withdrawals during flash loan on Morpho Blue. No fund
+    loss. Low economic incentive for attacker.
+
+    '
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: "function property_mm_fl_04() public {\n  // The sum of withdrawable across\
+    \ all markets should be >= maxWithdraw report\n  uint256 totalWithdrawable = 0;\n\
+    \  uint256 wqLen = metamorpho.withdrawQueueLength();\n  for (uint256 i = 0; i\
+    \ < wqLen; i++) {\n    Id id = metamorpho.withdrawQueue(i);\n    uint256 supplyShares\
+    \ = MORPHO.supplyShares(id, address(metamorpho));\n    if (supplyShares > 0) {\n\
+    \      MarketParams memory mp = MORPHO.idToMarketParams(id);\n      (uint256 totalSupplyAssets,\
+    \ uint256 totalSupplyShares, uint256 totalBorrowAssets,) =\n        MORPHO.expectedMarketBalances(mp);\n\
+    \      uint256 supplyAssets = supplyShares * totalSupplyAssets / totalSupplyShares;\n\
+    \      uint256 liquidity = totalSupplyAssets - totalBorrowAssets;\n      uint256\
+    \ morphoBalance = IERC20(metamorpho.asset()).balanceOf(address(MORPHO));\n   \
+    \   uint256 available = supplyAssets < liquidity ? supplyAssets : liquidity;\n\
+    \      available = available < morphoBalance ? available : morphoBalance;\n  \
+    \    totalWithdrawable += available;\n    }\n  }\n  // totalWithdrawable should\
+    \ be consistent with maxWithdraw\n  uint256 maxW = metamorpho.maxWithdraw(address(this));\n\
+    \  gte(totalWithdrawable + 2, maxW, \"MM-FL-04: withdrawable sum inconsistent\
+    \ with maxWithdraw\");\n}\n"
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: 'Known pattern. The balanceOf(MORPHO) check in _withdrawable is the defense
+    against accounting vs actual liquidity mismatch, but it also enables the grief.
+    This is an inherent trade-off, not a bug.
+
+    '
+- id: MM-FL-05
+  tier: 1
+  type: property
+  description: 'MetaMorpho has NO reentrancy guard (no nonReentrant modifier). It
+    relies on careful state ordering and Morpho Blue''s own protections. Critical
+    deposit() flow: 1. _accrueFee() → mints feeShares, returns newTotalAssets 2. lastTotalAssets
+    = newTotalAssets (L536) — early write for reentrancy safety 3. shares computed
+    via _convertToSharesWithTotals 4. super._deposit() → SafeERC20.safeTransferFrom(caller,
+    vault, assets) then _mint(receiver, shares) 5. _supplyMorpho(assets) → external
+    calls to MORPHO 6. lastTotalAssets = lastTotalAssets + assets (L676) If an ERC-777
+    tokensToSend callback fires during step 4''s transferFrom, the attacker can re-enter
+    deposit(). The reentrant call sees: lastTotalAssets already set to newTotalAssets
+    (step 2), but totalSupply() does NOT yet include the first deposit''s shares (not
+    yet minted — OZ ERC4626 does transferFrom THEN mint). Wait: checking OZ ERC4626._deposit
+    ordering — it does SafeERC20.safeTransferFrom THEN _mint. So during the transferFrom
+    callback, shares are NOT yet minted. The reentrant deposit computes shares using
+    totalSupply() that excludes first deposit''s shares. With lower totalSupply, each
+    share is worth MORE assets, so the reentrant depositor gets FEWER shares — not
+    more. Actually: shares = assets * (totalSupply + offset) / (totalAssets + 1) Lower
+    totalSupply → fewer shares per asset. So the reentrant depositor gets a WORSE
+    rate, not better. The first depositor''s shares (minted after) also use the original
+    totalSupply. Both get correct rates for the pre-deposit state. HOWEVER: the _supplyMorpho
+    in step 5 of the reentrant call tries to supply to Morpho. If it succeeds, those
+    tokens leave the vault. Then the original call''s _supplyMorpho also tries to
+    supply. Both see the same caps. This could over-supply past a cap, or the second
+    one could fail silently (try/catch). If it reverts at AllCapsReached, the original
+    deposit reverts entirely.
+
+    '
+  attack_scenario: 'With ERC-777 token: reentrant deposit causes double _supplyMorpho.
+    Both try to supply to the same markets. If caps are tight, the second (original)
+    deposit''s _supplyMorpho may fail with AllCapsReached, reverting the outer deposit.
+    This is a DoS, not a theft — but only affects ERC-777 tokens. For share inflation:
+    the math actually DISFAVORS the reentrant depositor (lower totalSupply = fewer
+    shares per asset), so no profit extraction.
+
+    '
+  impact: 'Potential DoS on deposits with ERC-777 tokens. No share inflation because
+    lower totalSupply during reentrant call gives worse rate. Morpho Blue does not
+    support ERC-777, so this is theoretical only.
+
+    '
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: "function property_mm_fl_05() public {\n  // Share price should not decrease\
+    \ after any deposit\n  uint256 totalAssetsBefore = ghost_totalAssetsBeforeDeposit;\n\
+    \  uint256 totalSupplyBefore = ghost_totalSupplyBeforeDeposit;\n  uint256 totalAssetsAfter\
+    \ = metamorpho.totalAssets();\n  uint256 totalSupplyAfter = metamorpho.totalSupply();\n\
+    \  if (totalSupplyBefore > 0 && totalSupplyAfter > 0) {\n    // sharePrice = totalAssets\
+    \ * 1e18 / totalSupply\n    uint256 priceBefore = totalAssetsBefore * 1e18 / totalSupplyBefore;\n\
+    \    uint256 priceAfter = totalAssetsAfter * 1e18 / totalSupplyAfter;\n    //\
+    \ Share price should not decrease after deposit (allow 1 wei rounding)\n    gte(priceAfter\
+    \ + 1, priceBefore, \"MM-FL-05: share price decreased after deposit\");\n  }\n\
+    }\n"
+  ghost_vars:
+  - uint256 internal ghost_totalAssetsBeforeDeposit
+  - uint256 internal ghost_totalSupplyBeforeDeposit
+  validated: false
+  priority: high
+  confidence: 55
+  notes: 'Deep analysis shows ERC-777 reentrancy on deposit actually gives the reentrant
+    caller a WORSE rate, not better. The lack of reentrancy guard is safe for standard
+    ERC-20 tokens. The early lastTotalAssets update at L536 is effective.
+
+    '
+- id: MM-FL-06
+  tier: 2
+  type: property
+  description: 'skim() (L483-L491) is permissionless and transfers the ENTIRE balanceOf(token)
+    to skimRecipient. If token == asset(), this sends all idle asset tokens. The vault
+    should normally have 0 idle assets. During deposit, between super._deposit() (token
+    transfer IN) and _supplyMorpho() (supply to Morpho), there IS a window with idle
+    tokens. However, skim cannot be called during this window without reentrancy (the
+    deposit is a single tx). Via Multicall: deposit() + skim() would execute sequentially
+    — deposit completes first (including _supplyMorpho), then skim finds 0 balance.
+    No theft possible via multicall. Via reentrancy: only possible with callback tokens
+    (ERC-777). Even then, skim sends to skimRecipient (owner-set), not msg.sender.
+    So the attacker would need to BE the skimRecipient or control it. The real concern:
+    if _supplyMorpho''s try/catch silently fails for ALL markets (all supply calls
+    revert), the function reverts at L799 AllCapsReached — so tokens can never remain
+    idle after a successful deposit. Safe.
+
+    '
+  attack_scenario: 'No viable attack. skim() cannot be called during deposit''s idle-token
+    window without reentrancy, and the destination (skimRecipient) is admin-controlled.
+    Even if called, the deposit would revert because _supplyMorpho would have 0 tokens
+    to supply.
+
+    '
+  impact: 'No vulnerability. Vault correctly never holds idle asset tokens after any
+    operation.
+
+    '
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_06() public {\n  // Vault should hold 0 idle\
+    \ assets of its own token outside of active txs\n  uint256 idleAssets = IERC20(metamorpho.asset()).balanceOf(address(metamorpho));\n\
+    \  lte(idleAssets, 1, \"MM-FL-06: vault holds idle asset tokens\");\n}\n"
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: 'Thoroughly investigated. _supplyMorpho either deploys all tokens or reverts.
+    The try/catch per-market combined with the final AllCapsReached check prevents
+    idle tokens. skim() cannot race with deposit flow without reentrancy.
+
+    '
+- id: MM-FL-07
+  tier: 1
+  type: property
+  description: 'In _withdraw() override (L685-L692): 1. _withdrawMorpho(assets) —
+    external calls to MORPHO.withdraw per market 2. super._withdraw() — burns shares,
+    then safeTransfer to receiver lastTotalAssets is already updated BEFORE _withdraw
+    is called (L565/L579). Between steps 1 and 2: vault holds idle tokens (from Morpho),
+    shares not yet burned, lastTotalAssets already decremented by `assets`. If a callback
+    occurred during _withdrawMorpho (from Morpho Blue''s internal token transfer to
+    vault), the vault state would be: has extra tokens, shares still exist, lastTotalAssets
+    is lower than totalAssets() + idle tokens. A reentrant deposit() would see lastTotalAssets
+    (already decremented) but totalAssets() not yet updated (Morpho positions reduced
+    but idle tokens compensate). The share computation would use _accrueFee() which
+    calls totalAssets() — this correctly reflects reduced Morpho positions. So shares
+    are priced correctly even in reentrant context. Actually: totalAssets() (L585)
+    sums expectedSupplyAssets across withdrawQueue markets. After _withdrawMorpho,
+    the vault''s Morpho positions ARE reduced (withdraw already executed). So totalAssets()
+    is lower. But lastTotalAssets was set to newTotalAssets - assets BEFORE the Morpho
+    withdrawal — where newTotalAssets was the pre-withdrawal totalAssets(). So lastTotalAssets
+    ~ actual totalAssets() after withdrawal. The reentrant _accrueFee would compute
+    correct fee shares. The reentrant deposit gets shares at the correct (post-withdrawal)
+    price. Safe.
+
+    '
+  attack_scenario: 'No exploit. Even in a reentrant scenario, the early lastTotalAssets
+    update at L565/L579 ensures that fee accrual and share pricing are correct. The
+    totalAssets() view function reflects the actual Morpho positions (which were already
+    reduced by _withdrawMorpho). Share price is consistent.
+
+    '
+  impact: 'No vulnerability confirmed. The CEI violation is mitigated by the early
+    lastTotalAssets update. State is consistent at all observable points.
+
+    '
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_07() public {\n  // After withdraw, share price\
+    \ should not increase (no free value created)\n  uint256 totalAssetsBefore = ghost_totalAssetsBeforeWithdraw;\n\
+    \  uint256 totalSupplyBefore = ghost_totalSupplyBeforeWithdraw;\n  uint256 totalAssetsAfter\
+    \ = metamorpho.totalAssets();\n  uint256 totalSupplyAfter = metamorpho.totalSupply();\n\
+    \  if (totalSupplyBefore > 0 && totalSupplyAfter > 0 && totalAssetsAfter > 0)\
+    \ {\n    uint256 priceBefore = totalAssetsBefore * 1e18 / totalSupplyBefore;\n\
+    \    uint256 priceAfter = totalAssetsAfter * 1e18 / totalSupplyAfter;\n    //\
+    \ Share price may increase slightly (rounding in vault's favor) but\n    // should\
+    \ not decrease (no value extracted beyond what user is owed)\n    gte(priceAfter,\
+    \ priceBefore - 1, \"MM-FL-07: share price dropped after withdraw\");\n  }\n}\n"
+  ghost_vars:
+  - uint256 internal ghost_totalAssetsBeforeWithdraw
+  - uint256 internal ghost_totalSupplyBeforeWithdraw
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: 'The early lastTotalAssets update is the key reentrancy mitigation. Analyzed
+    all reentrant paths — state is consistent.
+
+    '
+- id: MM-FL-08
+  tier: 2
+  type: property
+  description: 'In reallocate() L383-386: when allocation.assets == 0, the code sets
+    shares = supplyShares (entire position) and withdrawn = 0. Then MORPHO.withdraw()
+    is called with (withdrawn=0, shares=supplyShares, ...) — withdrawing by shares.
+    The return value (withdrawnAssets, withdrawnShares) is tracked in totalWithdrawn.
+    This path allows withdrawing the ENTIRE vault position including donations. The
+    concern: _accruedSupplyBalance (L704-L713) calls MORPHO.accrueInterest first,
+    then reads the market state. Between accrueInterest and the subsequent MORPHO.withdraw,
+    another tx could modify the market state (in the same block via a bundle). But
+    since reallocate is a single tx, no interleaving is possible. The only risk is
+    if the market''s state changes between _accruedSupplyBalance (which accrues interest)
+    and the MORPHO.withdraw call — but these are in the same tx, so no external state
+    change can occur.
+
+    '
+  attack_scenario: 'No exploit. The assets == 0 path correctly uses share-based withdrawal
+    to exit the entire position. The totalWithdrawn += withdrawnAssets tracks the
+    actual amount. The final net-zero check at L416 prevents any leakage.
+
+    '
+  impact: No vulnerability. The full-share withdrawal path is correct.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_08() public {\n  // After reallocate, sum of\
+    \ vault positions should approximately equal\n  // what it was before (net-zero\
+    \ reallocation)\n  uint256 totalBefore = ghost_totalPositionBeforeReallocate;\n\
+    \  uint256 totalAfter = metamorpho.totalAssets();\n  if (totalBefore > 0) {\n\
+    \    uint256 diff = totalAfter > totalBefore\n      ? totalAfter - totalBefore\n\
+    \      : totalBefore - totalAfter;\n    // Allow rounding: 2 wei per market involved\n\
+    \    uint256 tolerance = metamorpho.withdrawQueueLength() * 2;\n    lte(diff,\
+    \ tolerance, \"MM-FL-08: reallocate changed total positions beyond rounding\"\
+    );\n  }\n}\n"
+  ghost_vars:
+  - uint256 internal ghost_totalPositionBeforeReallocate
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: 'The assets == 0 path is safe. Confirmed by the airtight net-zero check at
+    L416.
+
+    '
+- id: MM-FL-09
+  tier: 2
+  type: property
+  description: '_supplyMorpho (deposit path, L786): uses toAssetsUp() to compute existing
+    supply → conservative, slightly under-supplies. This is the CORRECT rounding direction
+    (vault can never exceed cap from deposit path). reallocate (L375): uses _accruedSupplyBalance
+    → toAssetsDown() for supplyAssets. Then L404: if (supplyAssets + suppliedAssets
+    > supplyCap) revert. Because supplyAssets is rounded DOWN, the actual on-chain
+    supply (in shares) could represent slightly more assets → cap exceeded by 1 wei.
+    This was reported as MEDIUM on Solodit: "Wrong rounding direction for tosupply
+    in _supplymorpho" — but actually the _supplyMorpho direction is correct; the concern
+    is in reallocate''s direction. Known finding.
+
+    '
+  attack_scenario: 'Via reallocate: allocator can exceed a market''s supply cap by
+    1 wei due to rounding in _accruedSupplyBalance. This is negligible financial impact
+    but violates the strict cap invariant. Already reported and known.
+
+    '
+  impact: 'Supply cap exceeded by 1 wei via reallocate rounding. Negligible impact.
+
+    '
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: "function property_mm_fl_09() public {\n  // For each enabled market,\
+    \ vault supply should not exceed cap\n  uint256 wqLen = metamorpho.withdrawQueueLength();\n\
+    \  for (uint256 i = 0; i < wqLen; i++) {\n    Id id = metamorpho.withdrawQueue(i);\n\
+    \    (uint184 cap, bool enabled,) = metamorpho.config(id);\n    if (enabled &&\
+    \ cap > 0) {\n      uint256 supplyShares = MORPHO.supplyShares(id, address(metamorpho));\n\
+    \      if (supplyShares > 0) {\n        MarketParams memory mp = MORPHO.idToMarketParams(id);\n\
+    \        (uint256 totalSupplyAssets, uint256 totalSupplyShares,,) =\n        \
+    \  MORPHO.expectedMarketBalances(mp);\n        // Use toAssetsUp for conservative\
+    \ check\n        uint256 supplyAssets = (supplyShares * totalSupplyAssets + totalSupplyShares\
+    \ - 1) / totalSupplyShares;\n        // Allow 2 wei for rounding\n        lte(supplyAssets,\
+    \ uint256(cap) + 2, \"MM-FL-09: supply exceeds cap beyond rounding tolerance\"\
+    );\n      }\n    }\n  }\n}\n"
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: 'Known Solodit finding. The rounding inconsistency is real but impact is
+    negligible (1 wei). Not worth re-reporting.
+
+    '
+- id: MM-FL-10
+  tier: 2
+  type: property
+  description: 'MetaMorpho inherits Multicall. Verified that submit + accept cannot
+    execute in the same multicall: validAt = block.timestamp + timelock, where timelock
+    >= MIN_TIMELOCK = 1 day. The afterTimelock modifier checks block.timestamp >=
+    validAt, which is impossible in the same tx. For submitTimelock with newTimelock
+    > current: _setTimelock is called immediately (L220-221). An owner could multicall
+    submitTimelock(higher) + submitCap in same tx. This is safe — increasing timelock
+    is always safe (more protection). For decreasing timelock: goes through pending
+    flow, cannot bypass.
+
+    '
+  attack_scenario: 'No bypass possible. Timelock mechanism is sound.
+
+    '
+  impact: No vulnerability.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_10() public {\n  // Timelock should always be\
+    \ within bounds\n  uint256 tl = metamorpho.timelock();\n  gte(tl, 1 days, \"MM-FL-10:\
+    \ timelock below MIN_TIMELOCK\");\n  lte(tl, 2 weeks, \"MM-FL-10: timelock above\
+    \ MAX_TIMELOCK\");\n  // If pending timelock exists, validAt should be in the\
+    \ future or 0\n  (uint192 pendingVal, uint64 validAt) = metamorpho.pendingTimelock();\n\
+    \  if (validAt != 0) {\n    // pendingTimelock value should be within bounds\n\
+    \    gte(uint256(pendingVal), 1 days, \"MM-FL-10: pending timelock below min\"\
+    );\n    lte(uint256(pendingVal), 2 weeks, \"MM-FL-10: pending timelock above max\"\
+    );\n  }\n}\n"
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: 'Thoroughly verified. MIN_TIMELOCK = 1 day prevents same-block accept.
+
+    '
+- id: MM-FL-11
+  tier: 1
+  type: property
+  description: '_accrueFee() (L883-L890) mints feeShares to feeRecipient when there
+    is positive interest (totalAssets() > lastTotalAssets) and fee > 0. The fee shares
+    should only ever increase the feeRecipient''s balance, never decrease it (no burning).
+    The feeRecipient could transfer their shares, reducing their balance, but that''s
+    voluntary. The invariant is: _accrueFee should never burn or reduce shares. Edge
+    case: if feeRecipient is changed via setFeeRecipient(), pending interest is first
+    accrued to the OLD recipient (L251). Then new feeRecipient starts fresh. The old
+    recipient keeps their shares. No loss. Edge case: if fee is set to 0 via setFee(),
+    pending interest at the old rate is accrued first (L237). Then no more fees. Correct.
+    Edge case: if feeRecipient == address(0) and fee > 0, setFee reverts (L234). If
+    fee == 0, feeRecipient can be address(0) safely. setFeeRecipient to address(0)
+    requires fee == 0 (L248). So feeShares are never minted to address(0).
+
+    '
+  attack_scenario: 'No exploit. Fee accrual is correctly ordered — always accrue BEFORE
+    changing parameters. The feeRecipient''s balance is monotonically non-decreasing
+    from the contract''s perspective (only _mint, never _burn). The owner cannot steal
+    accrued fees by changing feeRecipient — old fees stay with old recipient.
+
+    '
+  impact: No vulnerability — fee mechanism is correct.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_11() public {\n  // feeRecipient balance should\
+    \ be >= previous observation\n  // (only increases via _mint in _accrueFee)\n\
+    \  address feeRecip = metamorpho.feeRecipient();\n  if (feeRecip != address(0))\
+    \ {\n    uint256 currentBalance = metamorpho.balanceOf(feeRecip);\n    gte(currentBalance,\
+    \ ghost_feeRecipSharesLast,\n      \"MM-FL-11: feeRecipient shares decreased (should\
+    \ only increase)\");\n    ghost_feeRecipSharesLast = currentBalance;\n  }\n}\n"
+  ghost_vars:
+  - uint256 internal ghost_feeRecipSharesLast
+  validated: false
+  priority: medium
+  confidence: 90
+  notes: 'Note: this property could false-positive if feeRecipient transfers their
+    shares voluntarily. Need to track only contract-minted amounts, not total balance,
+    to avoid false positives. Could use a ghost that only increments on _accrueFee.
+
+    '
+- id: MM-FL-12
+  tier: 1
+  type: property
+  description: 'totalAssets() (L585-L589) iterates withdrawQueue, not supplyQueue.
+    This means any market in supplyQueue but NOT in withdrawQueue is not counted in
+    totalAssets(). In normal operation, every enabled market with cap > 0 is in withdrawQueue
+    (added by _setCap at L746). supplyQueue can contain any subset of these markets.
+    The invariant: every market where the vault has supply shares MUST be in withdrawQueue,
+    otherwise totalAssets() understates the vault''s actual value. If a market is
+    somehow in supplyQueue but not withdrawQueue, deposits to that market via _supplyMorpho
+    would increase the vault''s Morpho position but NOT increase totalAssets(). This
+    would deflate share price — existing shareholders lose value, new depositors get
+    cheap shares. Can this happen? setSupplyQueue (L310) only requires config[id].cap
+    > 0. A market with cap > 0 is always in withdrawQueue (added by _setCap). So in
+    normal flow, supplyQueue is a subset of withdrawQueue''s enabled markets. The
+    only way to break this is: add market to supplyQueue, then remove from withdrawQueue
+    WITHOUT removing from supplyQueue. But updateWithdrawQueue removes market from
+    config (L358 delete config[id]), which sets cap to 0. setSupplyQueue requires
+    cap > 0. So a market can''t be in supplyQueue after removal from withdrawQueue.
+    Safe by construction.
+
+    '
+  attack_scenario: 'No exploit possible. The cap > 0 requirement in setSupplyQueue
+    ensures only withdrawQueue-listed markets (which all have cap > 0 when enabled)
+    can be in supplyQueue. Market removal from withdrawQueue deletes config, setting
+    cap to 0, preventing it from being added to supplyQueue.
+
+    '
+  impact: No vulnerability — invariant maintained by construction.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_12() public {\n  // Every market in supplyQueue\
+    \ must also be in withdrawQueue\n  uint256 sqLen = metamorpho.supplyQueueLength();\n\
+    \  uint256 wqLen = metamorpho.withdrawQueueLength();\n  for (uint256 i = 0; i\
+    \ < sqLen; i++) {\n    Id sqId = metamorpho.supplyQueue(i);\n    bool found =\
+    \ false;\n    for (uint256 j = 0; j < wqLen; j++) {\n      if (Id.unwrap(metamorpho.withdrawQueue(j))\
+    \ == Id.unwrap(sqId)) {\n        found = true;\n        break;\n      }\n    }\n\
+    \    t(found, \"MM-FL-12: supplyQueue market not in withdrawQueue\");\n  }\n}\n"
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 95
+  notes: 'Strong structural invariant. The cap > 0 check in setSupplyQueue and the
+    config deletion in updateWithdrawQueue ensure this holds. Worth fuzzing to confirm
+    no edge case breaks it.
+
+    '
+- id: MM-FL-13
+  tier: 1
+  type: property
+  description: 'For a lending vault, share price (totalAssets / totalSupply) should
+    generally not decrease. Interest accrual increases totalAssets → price goes up.
+    Fee minting increases totalSupply → price goes down slightly (fee dilution). Withdrawals
+    and deposits should maintain price (no arbitrage). Bad debt on Morpho Blue markets
+    could decrease totalAssets → price drops. This is a valid market risk, not a bug.
+    The key flow invariant: no single user action (deposit, withdraw, mint, redeem)
+    should decrease the share price for other users. Rounding should always favor
+    the vault (existing shareholders), not the transactor. deposit: shares = assets
+    * totalSupply / totalAssets (Floor) → user gets fewer shares → vault benefits
+    withdraw: shares = assets * totalSupply / totalAssets (Ceil) → user burns more
+    shares → vault benefits mint: assets = shares * totalAssets / totalSupply (Ceil)
+    → user pays more → vault benefits redeem: assets = shares * totalAssets / totalSupply
+    (Floor) → user gets less → vault benefits All rounding directions are correct
+    — they favor the vault.
+
+    '
+  attack_scenario: 'If rounding directions were wrong, an attacker could deposit-then-withdraw
+    repeatedly, extracting 1 wei per round-trip. With the correct rounding (verified
+    above), each round-trip costs the attacker >= 1 wei. No extraction possible. The
+    first depositor attack (inflation attack) is mitigated by DECIMALS_OFFSET which
+    adds virtual shares. With offset = max(0, 18 - decimals), the initial share price
+    is anchored and cannot be manipulated by small deposits.
+
+    '
+  impact: No vulnerability — rounding directions are correct.
+  impact_rating: Info
+  likelihood: None
+  severity_final: null
+  solidity: "function property_mm_fl_13() public {\n  // Share price should not decrease\
+    \ between any two observations\n  // (excluding fee minting and bad debt)\n  uint256\
+    \ ta = metamorpho.totalAssets();\n  uint256 ts = metamorpho.totalSupply();\n \
+    \ if (ts > 0 && ghost_lastTotalSupply > 0) {\n    // pricePerShare = (ta + 1)\
+    \ / (ts + 10^offset)\n    // Using the same formula as the contract for consistency\n\
+    \    uint256 offset = metamorpho.DECIMALS_OFFSET();\n    uint256 currentPrice\
+    \ = (ta + 1) * 1e18 / (ts + 10 ** offset);\n    uint256 lastPrice = (ghost_lastTotalAssets\
+    \ + 1) * 1e18 / (ghost_lastTotalSupply + 10 ** offset);\n    // Allow 1 wei tolerance\
+    \ for rounding\n    gte(currentPrice + 1, lastPrice, \"MM-FL-13: share price decreased\"\
+    );\n  }\n  ghost_lastTotalAssets = ta;\n  ghost_lastTotalSupply = ts;\n}\n"
+  ghost_vars:
+  - uint256 internal ghost_lastTotalAssets
+  - uint256 internal ghost_lastTotalSupply
+  validated: false
+  priority: high
+  confidence: 85
+  notes: 'This is the most important ERC4626 invariant. Fee minting can cause slight
+    price decrease (dilution), which is by-design. Bad debt can also decrease it.
+    For fuzzing, need to distinguish intentional price changes from bugs.
+
+    '
+false_positives:
+- id: MM-FL-FP-01
+  description: '"infinite approval to Morpho at L135 is dangerous": The forceApprove(morpho,
+    max) is set once in constructor. Since Morpho is immutable and the vault NEEDS
+    to supply tokens to Morpho, this approval is correct and required. The approval
+    is to a trusted immutable contract, not a user-controlled address.
+
+    '
+  lesson: Infinite approvals to immutable, trusted protocol contracts are standard
+    and safe.
+- id: MM-FL-FP-02
+  description: '"deposit/withdraw don''t have reentrancy guards": MetaMorpho mitigates
+    reentrancy by updating lastTotalAssets early (L536/L549 for deposit/mint, L565/L579
+    for withdraw/redeem). Without ERC-777 or callback-enabled tokens, there''s no
+    reentrancy vector. Morpho Blue has its own protections. Analyzed reentrant share
+    pricing — math actually disfavors reentrant caller.
+
+    '
+  lesson: 'Reentrancy guards are unnecessary when: (1) no callback tokens, (2) critical
+    state updated before external calls, (3) downstream contracts have own guards.
+
+    '
+- id: MM-FL-FP-03
+  description: '"skim() can be called by anyone for any token": By design. The function
+    sends to skimRecipient (owner-set). If skimRecipient is address(0), skim reverts.
+    The vault never holds idle asset tokens (always deployed to Morpho). Permissionless
+    skim is safe because the destination is admin-controlled.
+
+    '
+  lesson: Permissionless functions are safe when the beneficiary is admin-controlled.
+- id: MM-FL-FP-04
+  description: '"Fee accrual timing window between setFee/setFeeRecipient": Both setFee
+    (L237) and setFeeRecipient (L251) call _updateLastTotalAssets(_accrueFee()) BEFORE
+    changing the parameter. All pending fees accrue at old rate to old recipient,
+    then parameter changes. Textbook correct implementation.
+
+    '
+  lesson: Always accrue pending rewards BEFORE changing reward parameters.
+- id: MM-FL-FP-05
+  description: '"Deposit/Withdraw lastTotalAssets asymmetry": Deposit writes lastTotalAssets
+    twice (L536 early for reentrancy, L676 final). Withdraw writes once before _withdrawMorpho
+    (L565). The asymmetry is intentional — deposit needs the early write because super._deposit
+    has external call (transferFrom) before _supplyMorpho. Withdraw has the external
+    calls (MORPHO.withdraw) first, then super._withdraw. Both paths maintain consistent
+    state at all observable points.
+
+    '
+  lesson: Asymmetric state update patterns can be correct when the call ordering differs.

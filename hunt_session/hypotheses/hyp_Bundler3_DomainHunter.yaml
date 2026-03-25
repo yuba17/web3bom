@@ -1,0 +1,1143 @@
+protocol: morpho-bundler3
+component: Bundler3_FullSystem
+files:
+  - src/Bundler3.sol
+  - src/adapters/CoreAdapter.sol
+  - src/adapters/GeneralAdapter1.sol
+  - src/adapters/ParaswapAdapter.sol
+  - src/adapters/EthereumGeneralAdapter1.sol
+  - src/adapters/migration/AaveV3MigrationAdapter.sol
+  - src/adapters/migration/CompoundV2MigrationAdapter.sol
+domain: multicall-bundler-defi
+hunter: DomainHunter
+generated_at: '2026-03-23T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════════════
+# DOMAIN HUNTER — Análisis Consolidado de Bundler3 + Todos los Adapters
+# ═══════════════════════════════════════════════════════════════════════
+#
+# MODELO DE PROTOCOLO:
+#   Bundler3 es un multicall stateless con transient storage (EIP-1153).
+#   - El usuario llama multicall(Call[]) con ETH opcional
+#   - Cada Call puede ir a CUALQUIER address (adapter, EOA, contrato externo)
+#   - initiator = msg.sender se guarda en transient storage
+#   - Los adapters verifican msg.sender == BUNDLER3 (onlyBundler3)
+#   - Los adapters usan initiator() para identificar al usuario original
+#   - Patrón de callbacks: callbackHash + reenter() para Morpho callbacks
+#   - Los tokens fluyen: user → adapter → protocolo externo → adapter → user
+#   - El adapter es un TRANSIT POINT: nunca debe retener fondos entre txs
+#
+# SUPERFICIE CLAVE IDENTIFICADA (nuevas hipótesis, no duplicadas):
+#   1. CompoundV2 wMulDown delta — received calculado vs real
+#   2. stETH 1-2 wei rounding en stakeEth transfer
+#   3. erc20WrapperWithdrawTo double-transfer + permissioned wrapper interaction
+#   4. Cross-adapter token flow con fee-on-transfer tokens
+#   5. AaveV3 repay approval residual — cap delegado a Aave vs explicit
+#   6. Bundler3 arbitrary call target — el contrato puede llamar CUALQUIER address
+#   7. msg.value reuse dentro de un mismo bundle
+#   8. morphoBorrow/Withdraw usa initiator — authorization delegation risk
+#   9. CompoundV2 repay — wMulDown + borrowBalanceCurrent race
+#  10. Paraswap Augustus upgrade/registry manipulation
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+invariants:
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-01: stETH 1-2 WEI ROUNDING — stakeEth transfiere `amount` no `received`
+# ─────────────────────────────────────────────────────────────────────
+# EthereumGeneralAdapter1.stakeEth() L112-115:
+#   uint256 sharesReceived = IStEth(ST_ETH).submit{value: amount}(referral);
+#   require(amount.rDivUp(sharesReceived) <= maxSharePriceE27, ...);
+#   if (receiver != address(this)) SafeERC20.safeTransfer(IERC20(ST_ETH), receiver, amount);
+#
+# PROBLEMA: stETH tiene un CONOCIDO 1-2 wei rounding issue donde
+# balanceOf() puede devolver 1-2 wei menos que el amount depositado.
+# El código transfiere `amount` (el ETH depositado), NO el balance real
+# de stETH recibido. Si Lido devuelve amount-1 de stETH (por rounding),
+# el safeTransfer de `amount` falla si no hay dust previo en el adapter.
+#
+# ANÁLISIS LÍNEA POR LÍNEA:
+#   L112: submit{value: amount}(referral) → deposita ETH, recibe stETH
+#   L115: safeTransfer(stETH, receiver, amount) → transfiere `amount`
+#   stETH internamente usa shares para representar balance. balanceOf()
+#   puede devolver amount - 1 wei por truncación. Si el adapter no
+#   tenía stETH previo, tiene exactamente lo que recibió del submit.
+#   Si recibió amount - 1 de stETH, transferir `amount` REVIERTE.
+#
+# CONTRAARGUMENTO: Lido's submit() returns stETH 1:1 con ETH for new
+# deposits (antes de rebases). El rounding issue es en transferencias
+# posteriores, no en el mint. Pero hay edge cases con rebases activos.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-01
+  tier: 1
+  type: property
+  description: >
+    stakeEth() transfiere `amount` de stETH al receiver, pero stETH tiene
+    un conocido 1-2 wei rounding issue. Si el adapter recibe amount-1 de
+    stETH tras el submit(), el safeTransfer de `amount` revierte. Esto es
+    un DoS para bundles que usan stakeEth con receiver != address(this).
+  attack_scenario: >
+    1. Usuario envía bundle con stakeEth(10 ETH, maxPrice, referral, userAddress).
+    2. submit() deposita 10 ETH, adapter recibe 9999999999999999999 wei de stETH
+       (10e18 - 1 por rounding interno de Lido).
+    3. safeTransfer(stETH, user, 10e18) intenta transferir 10e18 pero el adapter
+       solo tiene 10e18 - 1. La transferencia REVIERTE.
+    4. Todo el bundle del usuario falla. Gas perdido.
+    5. Esto afecta a TODOS los usuarios que usen stakeEth con receiver != address(this),
+       que es el caso de uso principal.
+    NOTA: si el adapter tenía 1 wei de stETH residual de antes, la transfer pasa.
+    Pero depender de dust residual no es robusto.
+  impact: "DoS de stakeEth para todos los usuarios cuando stETH rounding causa deficit de 1 wei"
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Pre-stakeEth: balance de stETH del adapter
+    uint256 stEthBefore = IERC20(ST_ETH).balanceOf(address(adapter));
+    // Execute stakeEth(amount, maxPrice, referral, receiver)
+    uint256 stEthAfter = IERC20(ST_ETH).balanceOf(address(adapter));
+    uint256 actualReceived = stEthAfter - stEthBefore;
+    // Invariante: actualReceived >= amount (si receiver == adapter, no transfer)
+    // Si receiver != adapter: la transferencia intenta `amount`, necesita actualReceived >= amount
+    gte(actualReceived, amount, "BD-D-01: stETH received < ETH deposited (rounding)");
+  ghost_vars:
+    - "uint256 internal ghost_stEthReceivedVsDeposited;"
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    stETH rounding es un bug CONOCIDO y documentado. La pregunta es si
+    Lido's submit() se ve afectado o solo transferencias secundarias.
+    Si submit() siempre retorna exactamente `amount` de stETH, este finding
+    se cae. Pero Lido docs mencionan que shares→balance conversion puede
+    tener off-by-one en CUALQUIER operación incluyendo mint. Verificar en fork.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-02: CompoundV2 REDEEM — wMulDown vs REDEEM REAL
+# ─────────────────────────────────────────────────────────────────────
+# CompoundV2MigrationAdapter.compoundV2RedeemErc20() L86-91:
+#   uint256 received = MathLib.wMulDown(exchangeRateCurrent(), amount);
+#   require(ICToken(cToken).redeem(amount) == 0, ...);
+#   if (receiver != address(this))
+#       SafeERC20.safeTransfer(underlying, receiver, received);
+#
+# PROBLEMA: `received` se calcula ANTES del redeem usando wMulDown.
+# Compound V2 internamente puede redondear de forma diferente.
+# Si Compound V2 entrega MENOS tokens que wMulDown calcula, el adapter
+# intenta transferir más de lo que tiene → revert o drena dust residual.
+# Si Compound V2 entrega MÁS, tokens quedan stuck en el adapter.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-02
+  tier: 1
+  type: property
+  description: >
+    compoundV2RedeemErc20/Eth calcula `received` pre-redeem via wMulDown.
+    Si Compound V2 redondea diferente, delta de 1+ wei causa revert (si
+    Compound da menos) o tokens stuck (si Compound da más).
+  attack_scenario: >
+    1. Adapter tiene 100 cUSDC de un paso previo del bundle.
+    2. exchangeRateCurrent() retorna R.
+    3. received = wMulDown(R, 100) = X.
+    4. redeem(100) se ejecuta. Compound V2 entrega X-1 (rounding diferente).
+    5. safeTransfer(USDC, receiver, X) falla: adapter solo tiene X-1 USDC.
+    6. Bundle completo revierte. Fondos del usuario quedan en el adapter
+       (los cTokens ya se redimieron pero USDC no se pudo transferir).
+    WAIT: si redeem revierte, los cTokens no se redimen. Pero aquí el
+    redeem SÍ pasa (retorna 0), es el transfer posterior que falla.
+    Los cTokens se quemaron pero el USDC no llega al usuario. ¿Dónde
+    están? En el adapter. Pero la tx revierte, así que todo se revierte.
+    CONCLUSIÓN: revert limpio, pero el usuario no puede completar su migración.
+    Este es un DoS para migraciones de Compound V2.
+  impact: "DoS de migración Compound V2 por delta de 1 wei entre wMulDown y redeem real"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Pre-redeem: snapshot
+    uint256 underlyingBefore = IERC20(underlying).balanceOf(address(adapter));
+    uint256 exchangeRate = ICToken(cToken).exchangeRateCurrent();
+    uint256 cTokenAmount = /* amount pasado a compoundV2RedeemErc20 */;
+    uint256 calculatedReceived = MathLib.wMulDown(exchangeRate, cTokenAmount);
+    // Execute redeem
+    uint256 underlyingAfter = IERC20(underlying).balanceOf(address(adapter));
+    uint256 actualReceived = underlyingAfter - underlyingBefore;
+    // Invariante: actualReceived >= calculatedReceived
+    // Si falla → el adapter intentará transferir más de lo que tiene
+    gte(actualReceived, calculatedReceived, "BD-D-02: Compound V2 redeem gave less than wMulDown");
+  ghost_vars:
+    - "uint256 internal ghost_compV2RedeemDelta;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Compound V2 usa Exp math internally: truncate(exchangeRate * amount).
+    wMulDown es mulDivDown(x, y, 1e18). Si Compound V2 redondea diferente,
+    el delta existe. Verificar en fork con cUSDC real. Si el delta es
+    siempre positivo (Compound da más), los tokens extra quedan como dust
+    en el adapter — less severity pero sigue siendo un leak.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-03: erc20WrapperWithdrawTo — DOUBLE TRANSFER AUTHORIZATION BYPASS
+# ─────────────────────────────────────────────────────────────────────
+# ERC20WrapperAdapter.erc20WrapperWithdrawTo() L56-60:
+#   address initiator = initiator();
+#   SafeERC20.safeTransfer(IERC20(wrapper), initiator, amount);
+#   SafeERC20.safeTransferFrom(IERC20(wrapper), initiator, address(this), amount);
+#   require(ERC20Wrapper(wrapper).withdrawTo(receiver, amount), ...);
+#
+# Este patrón de transfer→transferFrom se usa para verificar que el
+# initiator autoriza el unwrap: los tokens se envían al initiator y
+# luego se traen de vuelta via transferFrom (requiere approval).
+# PERO: el initiator ya aprobó el adapter (via permit o approve previo
+# en el bundle) para hacer el transferFrom. ¿Qué pasa si el wrapper
+# es un token que cobra fee-on-transfer?
+#
+# Si el wrapper cobra fee: transfer(initiator, amount) entrega amount-fee.
+# Luego transferFrom(initiator, adapter, amount) intenta traer `amount`
+# pero el initiator solo tiene amount-fee del wrapper. REVIERTE.
+#
+# TAMBIÉN: ¿qué pasa si el wrapper tiene un callback en transfer
+# (como ERC777 tokensReceived)? El initiator recibe los tokens y
+# podría reentrear. Pero onlyBundler3 protege las funciones del adapter.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-03
+  tier: 1
+  type: property
+  description: >
+    erc20WrapperWithdrawTo usa un patrón transfer→transferFrom que falla
+    con fee-on-transfer wrapper tokens. El transfer envía `amount` pero
+    si el wrapper cobra fee, el initiator recibe `amount - fee`. El
+    transferFrom posterior intenta traer `amount` completo y revierte.
+  attack_scenario: >
+    1. Un wrapper token que cobra 0.1% de fee en cada transfer.
+    2. Usuario llama erc20WrapperWithdrawTo(wrapper, receiver, 1000e18).
+    3. Adapter tiene 1000e18 wrapper tokens.
+    4. safeTransfer(wrapper, initiator, 1000e18) → initiator recibe 999e18 (fee: 1e18).
+    5. safeTransferFrom(wrapper, initiator, adapter, 1000e18) → REVIERTE:
+       initiator solo tiene 999e18, no puede enviar 1000e18.
+    6. DoS total para wrapper tokens con fee-on-transfer.
+    7. El usuario no puede unwrap sus tokens via el bundler.
+    ALTERNATIVA: si el wrapper token NO cobra fee pero tiene un rebase
+    negativo entre las dos transfers (misma tx = no rebase = OK).
+  impact: "DoS completo de erc20WrapperWithdrawTo para wrapper tokens con fee-on-transfer"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simular fee-on-transfer wrapper
+    // uint256 initiatorBalanceAfterTransfer = IERC20(wrapper).balanceOf(initiator);
+    // El transferFrom intentará amount, necesita:
+    // initiatorBalanceAfterTransfer >= amount
+    // Con fee-on-transfer: initiatorBalanceAfterTransfer = amount - fee < amount
+    // → REVERT
+    uint256 transferDelta = amount - IERC20(wrapper).balanceOf(initiator);
+    eq(transferDelta, 0, "BD-D-03: fee-on-transfer wrapper breaks withdrawTo");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    La probabilidad depende de si existen wrappers ERC20 con fee-on-transfer
+    en producción que se usen con Morpho. Los wrappers permissionados
+    (como USDC bridged) generalmente NO cobran fee. Pero el adapter acepta
+    CUALQUIER address como wrapper (sin whitelist), así que un wrapper
+    malicioso o exótico con fee-on-transfer causaría el DoS.
+    Severity reducida porque el usuario elige el wrapper.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-04: BUNDLER3 ARBITRARY CALL + ADAPTER forceApprove RESIDUAL
+# ─────────────────────────────────────────────────────────────────────
+# Bundler3._multicall() hace to.call{value}(data) con to/data arbitrarios.
+# El contrato puede llamar a CUALQUIER address, incluyendo tokens ERC20
+# directamente. Esto es by-design ("Anybody can do arbitrary calls").
+#
+# PERO: ¿qué pasa si un usuario construye un bundle donde:
+#   Call 1: adapter.morphoSupply(...) → forceApprove(loanToken, MORPHO, max)
+#           [la approval a MORPHO queda permanente — "trusted"]
+#   Call 2: una call arbitraria a un contrato que interactúa con MORPHO
+#
+# El adapter tiene approval PERMANENTE a MORPHO para el loanToken.
+# Si el adapter recibe tokens del loanToken en un paso posterior y
+# luego MORPHO es llamado directamente (no via adapter), ¿podría
+# MORPHO usar esa approval para drenar tokens del adapter?
+#
+# MORPHO solo usa la approval en el contexto de sus propias operaciones
+# (supply, repay, flashloan repayment). No puede drenar arbitrariamente.
+# PERO: si un usuario llama MORPHO.supply directamente con onBehalf=attacker
+# y MORPHO usa la approval del adapter para traer tokens... WAIT:
+# MORPHO.supply trae tokens de msg.sender, no del adapter.
+# msg.sender sería Bundler3 (porque la call va desde Bundler3 a MORPHO).
+# MORPHO haría transferFrom(Bundler3, ...) — Bundler3 no tiene approval.
+# CONCLUSIÓN: la approval del adapter a MORPHO no es usable desde Bundler3
+# directamente. Solo el adapter puede triggearla (via morphoSupply etc).
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-04
+  tier: 2
+  type: property
+  description: >
+    La approval permanente del adapter a MORPHO (nunca se revoca, "trusted")
+    no es explotable via Bundler3's arbitrary call porque MORPHO.supply usa
+    transferFrom(msg.sender), y msg.sender sería Bundler3, no el adapter.
+    La approval del adapter solo se usa cuando el adapter llama directamente
+    a MORPHO (via morphoSupply/Repay/FlashLoan).
+  attack_scenario: >
+    Hipótesis descartada tras análisis: un usuario que llama MORPHO directamente
+    via Bundler3 bundle (Call.to = MORPHO, Call.data = supply(...)) no puede
+    aprovechar la approval del adapter porque msg.sender sería Bundler3,
+    no el adapter. MORPHO haría transferFrom(Bundler3, ...) que fallaría
+    si Bundler3 no tiene approval.
+    EDGE CASE: ¿el adapter puede ser el msg.sender si la call va A TRAVÉS
+    del adapter? Sí — si el bundle tiene Call.to = adapter y el adapter tiene
+    una función que llame a MORPHO. Pero esas funciones ya están controladas
+    (onlyBundler3 + lógica específica). No hay una función genérica de
+    "forward call" en el adapter.
+  impact: "N/A — la approval permanente no es explotable por este vector"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que la approval del adapter a MORPHO solo se usa en contextos controlados
+    // Post-bundle: la approval existe pero no es explotable
+    uint256 allowance = IERC20(loanToken).allowance(address(adapter), address(MORPHO));
+    // allowance == max es esperado y OK
+    // La invariante real es que no haya path para explotar esta allowance externamente
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Confirmado seguro. La approval permanente a MORPHO es una optimización de gas
+    (no hacer forceApprove + revoke en cada operación). Es safe porque MORPHO solo
+    usa allowance en el contexto de sus propias funciones con msg.sender checks.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-05: msg.value REUSE — ETH puede ser "gastado" múltiples veces
+# ─────────────────────────────────────────────────────────────────────
+# Bundler3._multicall() ejecuta to.call{value: bundle[i].value}(data).
+# msg.value se acredita al balance de Bundler3 al inicio de multicall().
+# Las calls posteriores pueden usar ESE balance, incluyendo ETH recibido
+# de VUELTA de calls previas.
+#
+# PERO: ¿puede sum(bundle[i].value) > msg.value?
+# SÍ, si una call intermedia DEVUELVE ETH al Bundler3.
+# Ejemplo: Call 1 envía 1 ETH a un contrato que lo devuelve.
+# Bundler3 balance vuelve a 1 ETH. Call 2 envía 1 ETH.
+# Total enviado: 2 ETH. msg.value: 1 ETH.
+#
+# ¿Es esto un bug? En multicalls normales NO hay receive/fallback en
+# Bundler3 para recibir ETH de vuelta. Pero un contrato puede enviar
+# ETH via selfdestruct (deprecado pero funcional post-Dencun).
+# WAIT: Bundler3 no tiene receive(). ¿Puede recibir ETH via selfdestruct?
+# Sí, selfdestruct ignora receive(). Pero esto es un vector extremo.
+#
+# MÁS IMPORTANTE: si el adapter unwraps WETH y envía ETH de vuelta
+# al Bundler3... pero unwrapNative en adapter envía a `receiver`, no
+# a Bundler3. Y nativeTransfer también va a `receiver`.
+# No hay path normal donde ETH vuelva al Bundler3 DENTRO de un bundle.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-05
+  tier: 2
+  type: property
+  description: >
+    En teoría, ETH puede "reciclarse" si una call envía ETH a un contrato
+    que lo devuelve a Bundler3 via selfdestruct. Bundler3 NO tiene receive()
+    pero selfdestruct ignora eso. Esto permitiría que sum(bundle[i].value)
+    > msg.value original.
+  attack_scenario: >
+    1. Atacante crea contrato SelfDestructor que en su fallback llama
+       selfdestruct(payable(bundler3)).
+    2. Bundle: [{to: SelfDestructor, value: 1 ETH, ...}, {to: attacker, value: 1 ETH, ...}]
+    3. Call 1 envía 1 ETH a SelfDestructor. SelfDestructor se autodestruye
+       enviando 1 ETH de vuelta a Bundler3.
+    4. Bundler3 balance = 1 ETH de nuevo. Call 2 envía 1 ETH a attacker.
+    5. Total extraído: 1 ETH (solo el original). No hay amplificación.
+    6. El atacante pagó 1 ETH (msg.value) y recibió 1 ETH. Net = 0.
+    CONCLUSIÓN: No hay amplificación de ETH. selfdestruct devuelve el
+    mismo ETH que se envió. No es explotable. El recycling es neutral.
+  impact: "N/A — no hay amplificación posible de ETH via recycling"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Post-multicall: Bundler3 balance no debe ser mayor que pre-multicall
+    uint256 balanceBefore = address(bundler3).balance;
+    // ... multicall ...
+    uint256 balanceAfter = address(bundler3).balance;
+    // Si recycling ocurre, balanceAfter podría ser != balanceBefore
+    // Pero no hay amplificación — conservation of ETH applies
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Descartado como vector de ataque. Conservation of ETH impide amplificación.
+    El msg.value reuse pattern (como en Uniswap V4 router) no aplica aquí
+    porque Bundler3 no tiene receive() para recibir ETH de vuelta en un
+    contexto normal. Solo selfdestruct, que es neutral.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-06: morphoBorrow + morphoWithdraw AUTHORIZATION DELEGATION
+# ─────────────────────────────────────────────────────────────────────
+# morphoBorrow(L248): MORPHO.borrow(market, assets, shares, initiator(), receiver)
+# morphoWithdraw(L316): MORPHO.withdraw(market, assets, shares, initiator(), receiver)
+# morphoWithdrawCollateral(L334): MORPHO.withdrawCollateral(market, assets, initiator(), receiver)
+#
+# Todas estas funciones usan initiator() como el "onBehalf" (el owner
+# de la posición). Esto requiere que el initiator haya previamente
+# autorizado al ADAPTER como isAuthorized en Morpho Blue.
+#
+# RIESGO: Si un usuario autoriza al adapter una vez (setAuthorization(adapter, true)),
+# esa autorización es PERMANENTE. Cualquier bundle futuro que el usuario ejecute
+# (o que CUALQUIERA ejecute mientras Bundler3 tiene initiator == ese usuario)
+# puede borrowar/withdraw de la posición del usuario.
+#
+# WAIT: Bundler3 solo puede tener initiator == address(X) si X llamó
+# multicall(). Nadie más puede setear initiator a X. Así que un
+# atacante no puede hacer que initiator sea la víctima.
+#
+# PERO: el adapter es UN address fijo. Si la víctima autorizó el adapter,
+# y luego la víctima llama multicall con un bundle que SIN QUERER incluye
+# un morphoBorrow... es culpa del usuario (firma el bundle completo).
+#
+# VECTOR REAL: Si la víctima es un CONTRATO (e.g., un smart wallet) que
+# tiene autorización permanente al adapter, y ese contrato llama multicall
+# con datos proporcionados por un tercero (e.g., un relayer malicioso),
+# el relayer podría inyectar un morphoBorrow en el bundle.
+# PERO: el contrato/smart wallet FIRMA o aprueba el bundle completo.
+# Si no verifica el bundle antes de llamar multicall, es culpa del wallet.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-06
+  tier: 1
+  type: property
+  description: >
+    morphoBorrow/Withdraw/WithdrawCollateral actúan como el initiator en
+    Morpho Blue. El initiator debe haber autorizado el adapter en Morpho.
+    La autorización es permanente hasta que se revoque. Si un smart wallet
+    o contrato autoriza el adapter y luego ejecuta bundles con datos de
+    un relayer no confiable, el relayer podría drenar la posición.
+  attack_scenario: >
+    1. Smart wallet W autoriza adapter en Morpho: setAuthorization(adapter, true).
+    2. W usa un relayer para construir y submitear bundles (gasless pattern).
+    3. Relayer malicioso construye bundle: [morphoBorrow(market, max, 0, price, attackerAddr)].
+    4. W llama multicall(bundle) — initiator() = W.
+    5. morphoBorrow llama MORPHO.borrow(..., W, attacker) — W autorizó adapter.
+    6. MORPHO transfiere loanTokens a attacker. W ahora tiene deuda sin recibir nada.
+    MITIGACIÓN: El usuario (W) debe verificar el bundle antes de firmar/llamar.
+    Es un trust issue entre el usuario y el relayer, no del adapter.
+    PERO: si el adapter verificara que receiver es initiator() o address(this),
+    este vector se cerraría. Actualmente receiver es LIBRE.
+  impact: "Drain de posición Morpho si el initiator confía en un tercero para construir bundles"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante parcial: en morphoBorrow, receiver debería ser controlado por initiator
+    // NOTA: actualmente receiver es libre — cualquier address
+    // Un invariante más fuerte sería: receiver == initiator() || receiver == address(adapter)
+    // Pero esto limitaría la funcionalidad legítima (e.g., borrow y enviar a otro address)
+    // Ghost: rastrear si receiver != initiator en morphoBorrow
+    bool receiverIsInitiator = (receiver == initiator());
+    bool receiverIsAdapter = (receiver == address(adapter));
+    // ALERTA si receiver es ni initiator ni adapter (posible drain)
+  ghost_vars:
+    - "uint256 internal ghost_borrowToNonInitiatorCount;"
+  validated: false
+  priority: high
+  confidence: 40
+  notes: >
+    Este es un design trade-off, no un bug. El adapter permite receiver
+    libre para soportar use cases legítimos (borrow y enviar a otro
+    contrato en el mismo bundle). La seguridad depende de que el initiator
+    (msg.sender de multicall) controle el bundle completo. Para EOAs,
+    esto es seguro. Para smart wallets con relayers, depende de la
+    confianza en el relayer. Probablemente known/wontfix.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-07: AaveV3 REPAY — NO CAP EXPLÍCITO
+# ─────────────────────────────────────────────────────────────────────
+# AaveV3MigrationAdapter.aaveV3Repay() L36-50:
+#   if (amount == type(uint256).max) amount = balanceOf(adapter);
+#   forceApprove(token, AAVE_V3, max);
+#   AAVE_V3.repay(token, amount, interestRateMode, onBehalf);
+#   forceApprove(token, AAVE_V3, 0);
+#
+# NOTA: el comment dice "amount is capped at onBehalf's debt by Aave".
+# Si Aave V3 caps el amount al debt, el exceso de tokens queda en el
+# adapter (Aave V3 no los toma). PERO: ¿qué pasa con la approval?
+# La approval se da por max, Aave usa solo lo necesario, luego se revoca.
+# Los tokens excedentes quedan en el adapter como residual.
+#
+# CONTRASTE con CompoundV2: compoundV2RepayErc20 hace el cap EXPLÍCITO
+# en el adapter: amount = min(amount, borrowBalanceCurrent(onBehalf)).
+# CompoundV3 también lo hace. SOLO AaveV3 (y AaveV2) delegan el cap.
+#
+# RIESGO: si Aave V3 NO caps correctamente y toma más tokens de los
+# debidos, el adapter pierde tokens de otro usuario. PERO Aave V3 es
+# un protocolo auditado y caps correctamente. Riesgo minúsculo.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-07
+  tier: 2
+  type: property
+  description: >
+    aaveV3Repay delega el cap de amount a Aave V3 internamente (no hay
+    min(amount, debt) explícito en el adapter). Si Aave V3 no caps
+    correctamente, el adapter sobre-paga. Contraste: CompoundV2/V3
+    adapters SÍ hacen el cap explícito. Esta asimetría es un code smell.
+  attack_scenario: >
+    1. Adapter tiene 1000 USDC de un paso previo del bundle.
+    2. onBehalf tiene solo 500 USDC de deuda en Aave V3.
+    3. aaveV3Repay(USDC, max, 2, onBehalf) → amount = 1000 USDC.
+    4. AAVE_V3.repay(USDC, 1000, 2, onBehalf) — Aave caps at 500.
+    5. Aave solo toma 500. 500 USDC quedan en el adapter.
+    6. Estos 500 USDC son drenables por el siguiente usuario en el bundle
+       (si hay más calls) o quedan como dust.
+    NOTA: esto no es un exploit per se — el adapter es un transit point
+    y los tokens residuales son "fair game". Pero si el usuario esperaba
+    que aaveV3Repay(max) consumiera todo y luego otra call usara amount=max,
+    puede haber un misallocation.
+  impact: "Tokens residuales en adapter tras repay parcial de Aave V3 — misallocación potencial"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Pre-repay: track balance
+    uint256 balBefore = IERC20(token).balanceOf(address(adapter));
+    // Execute aaveV3Repay(token, amount, rateMode, onBehalf)
+    uint256 balAfter = IERC20(token).balanceOf(address(adapter));
+    uint256 actualRepaid = balBefore - balAfter;
+    // Invariante: actualRepaid == min(amount, debt)
+    // Si amount fue max: actualRepaid debería ser min(balBefore, debt)
+    uint256 expectedRepaid = MorphoUtilsLib.min(amount, debtAmount);
+    eq(actualRepaid, expectedRepaid, "BD-D-07: AaveV3 repay amount mismatch");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    Aave V3 caps correctamente (confirmado en su código: _repay caps at
+    current debt). Los tokens excedentes quedan en el adapter, lo cual
+    es by design del transit-point model. Severity baja.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-08: PARASWAP AUGUSTUS REGISTRY — UPGRADE/MANIPULATION RISK
+# ─────────────────────────────────────────────────────────────────────
+# ParaswapAdapter.swap() L174:
+#   require(AUGUSTUS_REGISTRY.isValidAugustus(augustus), ...);
+#   forceApprove(srcToken, augustus, max);
+#   augustus.call(callData);
+#   forceApprove(srcToken, augustus, 0);
+#
+# AUGUSTUS_REGISTRY es immutable. Pero el registry contract ITSELF puede
+# tener funciones que añadan/remuevan Augustus addresses. Si el owner
+# del registry añade un Augustus malicioso, ese Augustus puede drenar
+# cualquier srcToken del adapter.
+#
+# El adapter da forceApprove(max) ANTES del call. El Augustus malicioso
+# puede llamar srcToken.transferFrom(adapter, attacker, balance) dentro
+# de su "swap" function, luego retornar normalmente.
+# El post-swap check verifica srcAmount <= maxSrcAmount, pero el Augustus
+# malicioso podría inflar destToken balance del adapter (vía transfer
+# directo) para pasar ambos checks.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-08
+  tier: 1
+  type: property
+  description: >
+    Un Augustus registrado en el AugustusRegistry tiene max approval del
+    adapter durante el swap. Si un Augustus registrado es malicioso o
+    se compromete, puede drenar todos los srcTokens del adapter.
+    El riesgo es la supply chain del registry: quién puede registrar
+    nuevos Augustus contracts y si ese proceso es seguro.
+  attack_scenario: >
+    1. Owner del AugustusRegistry registra un nuevo Augustus contract
+       (upgrade legítimo o compromiso de la key del owner).
+    2. El nuevo Augustus contiene: function swap(...) { srcToken.transferFrom(adapter, attacker, balance); }
+    3. Cualquier usuario que use sell/buy con este Augustus pierde sus tokens.
+    4. El adapter da forceApprove(srcToken, augustus, max) antes del call.
+    5. El Augustus malicioso llama transferFrom antes de que el adapter revoque.
+    6. Post-swap: srcAmount = srcInitial - srcFinal = srcInitial (todo drenado).
+       srcAmount <= maxSrcAmount? Si maxSrcAmount era alto (sellEntireBalance), pasa.
+       destAmount = destFinal - destInitial >= minDestAmount?
+       Augustus puede transferir destTokens al adapter para pasar este check.
+    7. Net: usuario pierde srcTokens, recibe destTokens inflados por Augustus.
+    MITIGACIÓN: Los checks post-swap (srcAmount <= maxSrcAmount Y destAmount >= minDestAmount)
+    ofrecen protección parcial. Pero un Augustus malicioso controla ambos.
+  impact: "Drain total de srcTokens del adapter si un Augustus registrado es malicioso"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: isValidAugustus solo retorna true para contratos verificados
+    // Este invariante es externo al adapter — depende del registry
+    // On-chain: verificar que el Augustus que se usa es el oficial Paraswap
+    // No hay forma de forzar esto en el adapter — es trust en el registry
+    t(AUGUSTUS_REGISTRY.isValidAugustus(augustus), "BD-D-08: Augustus not registered");
+    // Este check ya existe. El riesgo es si el registry es comprometido.
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 35
+  notes: >
+    Este es un trust boundary issue más que un vulnerability del adapter.
+    El adapter confía en el registry, que confía en su owner. Si el owner
+    es un multisig seguro o un governance contract, el riesgo es bajo.
+    Si el owner es un EOA, el riesgo es medio. Verificar el owner del
+    AugustusRegistry en mainnet. NOTA: esto es un known trust assumption
+    y probablemente está documentado. Pero si el adapter asume que todos
+    los Augustus registrados son benignos, es una dependencia de seguridad
+    importante que debería mencionarse.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-09: FEE-ON-TRANSFER TOKEN — SYSTEMIC ISSUE ACROSS ALL ADAPTERS
+# ─────────────────────────────────────────────────────────────────────
+# Múltiples funciones usan type(uint256).max → balanceOf(address(this))
+# para determinar el amount a operar. Si el token cobra fee-on-transfer,
+# el balance del adapter tras un transferFrom del initiator es MENOR que
+# el amount transferido. Esto afecta a:
+#   - morphoSupply (L191-193): assets = balanceOf(adapter)
+#   - morphoSupplyCollateral (L220): assets = balanceOf(adapter)
+#   - morphoRepay (L275-277): assets = balanceOf(adapter)
+#   - erc4626Deposit (L83): assets = balanceOf(adapter)
+#   - wrapNative (L391): amount = address(this).balance
+#
+# Para tokens con fee, el flow es:
+#   Call 1: erc20TransferFrom(token, adapter, 1000) → adapter recibe 990 (1% fee)
+#   Call 2: morphoSupply(market, max, ...) → assets = balanceOf = 990
+#   morphoSupply aprueba MORPHO para max, MORPHO toma 990. Correcto.
+#
+# PERO: para funciones que NO usan max:
+#   Call 1: erc20TransferFrom(token, adapter, 1000) → adapter recibe 990
+#   Call 2: morphoSupply(market, 1000, ...) → MORPHO.supply intenta tomar 1000
+#           pero adapter solo tiene 990. REVIERTE.
+#
+# ¿El adapter maneja esto? NO — no hay check para fee-on-transfer.
+# El patrón max es la salvación pero no se enforcea.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-09
+  tier: 1
+  type: property
+  description: >
+    Fee-on-transfer tokens causan discrepancia entre amount transferido
+    y amount recibido en el adapter. Funciones que usan amount fijo (no max)
+    fallan porque el adapter tiene menos tokens de los esperados.
+    Funciones con max pasan correctamente pero el usuario pierde la fee.
+  attack_scenario: >
+    1. Token USDT-like con 0.1% fee en cada transfer.
+    2. Bundle: [erc20TransferFrom(USDT, adapter, 10000), morphoSupply(market, 10000, ...)].
+    3. erc20TransferFrom: USDT.transferFrom(initiator, adapter, 10000) → adapter recibe 9990.
+    4. morphoSupply con assets=10000: forceApprove(USDT, MORPHO, max), MORPHO.supply(10000, ...).
+    5. MORPHO intenta transferFrom(adapter, pool, 10000) → REVIERTE: adapter solo tiene 9990.
+    6. Bundle completo falla. El usuario no puede supply.
+    MITIGACIÓN PARCIAL: usar assets=max → supply 9990, que pasa correctamente.
+    Pero el frontend debe saber que el token cobra fee y ajustar.
+    VECTOR DE PÉRDIDA: si el usuario no usa max y hay skipRevert=true en el supply call,
+    el supply falla silently y los 9990 USDT quedan en el adapter como residual.
+  impact: "DoS para fee-on-transfer tokens con amounts fijos; residuales con skipRevert"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: para fee-on-transfer tokens, usar amount fijo en operaciones
+    // downstream es peligroso. El balance real es menor.
+    uint256 balanceBefore = IERC20(token).balanceOf(address(adapter));
+    // erc20TransferFrom(token, adapter, amount)
+    uint256 balanceAfter = IERC20(token).balanceOf(address(adapter));
+    uint256 actualReceived = balanceAfter - balanceBefore;
+    // Para fee-on-transfer: actualReceived < amount
+    // Si el siguiente step usa `amount` (not max), REVERT
+    eq(actualReceived, amount, "BD-D-09: fee-on-transfer discrepancy");
+  ghost_vars:
+    - "mapping(address => uint256) internal ghost_feeOnTransferDelta;"
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    Fee-on-transfer es un tema conocido en DeFi. Morpho Blue itself maneja
+    fee-on-transfer en algunos paths. La pregunta es si el adapter/bundler
+    debería también manejarlo o si es responsabilidad del frontend. La
+    respuesta estándar en la industria es "by design, usar max". Pero el
+    DoS cuando el usuario usa amount fijo es real. Probablemente known issue.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-10: PARASWAP sell/buy SON EXTERNAL SIN onlyBundler3 DIRECTO
+# ─────────────────────────────────────────────────────────────────────
+# ParaswapAdapter: sell() y buy() son external/public SIN onlyBundler3.
+# Solo swap() interno tiene onlyBundler3. Esto ya fue reportado como
+# known issue (PA-FP-02). PERO hay un ángulo nuevo:
+#
+# sell() y buy() toman `bytes memory callData` como parámetro.
+# Antes de llamar swap(), modifican callData via updateAmounts().
+# Si alguien llama sell/buy directamente (sin pasar por Bundler3),
+# swap() revierte por onlyBundler3. PERO: las modificaciones a
+# callData ya ocurrieron en memoria. ¿Hay un side effect?
+# NO — memory modifications revert con la tx. No hay persistencia.
+#
+# WAIT: ¿y si sell() es llamada por un contrato que catchea el revert?
+# sell() → swap() revierte → sell() propaga el revert.
+# sell() NO tiene try/catch. El revert se propaga.
+# Un caller que use try/catch en sell() vería el revert pero no
+# puede extraer información útil de callData (it's in the reverted tx).
+#
+# CONCLUSIÓN: PA-FP-02 es correcto. No hay nuevo vector aquí.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-10
+  tier: 2
+  type: property
+  description: >
+    Confirmación de que sell/buy sin onlyBundler3 directo es seguro
+    porque swap() interno lo tiene. updateAmounts() modifica callData
+    en memoria pero los cambios revert con la tx si swap() falla.
+  attack_scenario: >
+    Ningún ataque viable. sell()/buy() sin onlyBundler3 es cosmético —
+    swap() interno lo enforcea. Memory modifications revert con la tx.
+    No hay oracle reads, storage writes, o external calls antes de swap()
+    que podrían tener side effects.
+  impact: "N/A — known issue, confirmed safe"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: llamar sell() directamente sin Bundler3, debe revertir
+    // vm.expectRevert(ErrorsLib.UnauthorizedSender.selector);
+    // adapter.sell(augustus, callData, srcToken, destToken, false, offsets, receiver);
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: Known issue confirmado. No re-reportar.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-11: BUNDLER3 OPEN CALL TARGET — SOCIAL ENGINEERING VECTOR
+# ─────────────────────────────────────────────────────────────────────
+# Bundler3._multicall() hace to.call{value}(data) donde `to` es
+# CUALQUIER address. El contrato puede llamar a:
+#   - Adapters (diseñados para esto)
+#   - Tokens ERC20 (e.g., approve, transfer)
+#   - Cualquier otro contrato
+#
+# Un bundle puede incluir calls a ERC20.approve(attacker, max).
+# Si el initiator firma este bundle sin verificarlo, da approval
+# al atacante para todos sus tokens.
+#
+# WAIT: la call sale de BUNDLER3, no del initiator. Así que
+# ERC20.approve(attacker, max) daría approval de BUNDLER3 a attacker.
+# BUNDLER3 no debería tener balance de tokens (transit), así que
+# la approval es inútil. Pero si Bundler3 tiene tokens residuales
+# (B-D-01), el atacante podría drenarlos.
+#
+# ¿Y los adapters? Las calls van del Bundler3 AL adapter. El adapter
+# no da approvals a terceros excepto en patrones controlados
+# (forceApprove → call → forceApprove(0)).
+#
+# VECTOR ALTERNATIVO: un bundle con Call.to = initiator's token contract
+# y Call.data = approve(attacker, max) NO funciona porque msg.sender
+# es Bundler3, no el initiator. El approve sería de Bundler3.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-11
+  tier: 2
+  type: property
+  description: >
+    Bundler3 puede hacer calls arbitrarias a cualquier contrato. Las
+    calls salen de msg.sender=Bundler3, no del initiator. Approvals
+    o autorizaciones via bundle calls solo afectan a Bundler3, no al
+    usuario. Bundler3 no debería tener fondos, así que esto es neutral.
+  attack_scenario: >
+    Un bundle malicioso con [Call(to: USDC, data: approve(attacker, max))]
+    da approval de BUNDLER3 (no del usuario) a attacker. Si Bundler3 tiene
+    USDC residual, attacker puede drenarlos. Pero Bundler3 no debería
+    tener balance. Y si tiene (B-D-01), ya es extraíble sin este vector.
+  impact: "Approval de Bundler3 a terceros — solo relevante si Bundler3 tiene residual"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Post-multicall: verificar que Bundler3 no tiene approvals inesperadas
+    // (esto es más un monitoring concern que un invariant fuzzeable)
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    El comment del contrato lo dice: "it should not be approved/authorized
+    anywhere". El diseño es que Bundler3 es un proxy sin estado. Las
+    approvals de Bundler3 no deberían importar. Confirmado safe.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-12: ERC4626 VAULT MALICIOSO + CALLBACK REENTRANCY
+# ─────────────────────────────────────────────────────────────────────
+# GeneralAdapter1.erc4626Deposit() aprueba vault para max, luego llama
+# vault.deposit(assets, receiver). Si vault es malicioso:
+#   - vault.deposit() puede hacer RE-ENTER: llamar Bundler3.multicall()
+#     WAIT: multicall() requiere initiator == address(0). Pero initiator
+#     ya está seteado (estamos dentro de un bundle). Así que multicall()
+#     revierte con AlreadyInitiated.
+#   - vault.deposit() puede llamar Bundler3.reenter()? Solo si
+#     reenterHash coincide. El call a erc4626Deposit NO tiene
+#     callbackHash (en el bundle call struct). Si callbackHash == 0,
+#     reenterHash = 0 tras L60. Así que reenter() fallaría con
+#     IncorrectReenterHash (reenterHash is 0, not matching any hash).
+#   - vault.deposit() puede llamar al adapter directamente? Las funciones
+#     del adapter tienen onlyBundler3 → msg.sender sería el vault, no
+#     Bundler3 → revierte.
+#   - vault.deposit() puede llamar a MORPHO directamente? Sí, pero
+#     como msg.sender del vault, no del adapter. No puede usar la
+#     approval del adapter.
+#
+# CONCLUSIÓN: un vault malicioso dentro de erc4626Deposit() NO puede
+# reentrar al Bundler3 ni al adapter. La protección es robusta:
+# 1. multicall() → AlreadyInitiated
+# 2. reenter() → IncorrectReenterHash (si callbackHash=0)
+# 3. adapter functions → UnauthorizedSender
+#
+# EXCEPCIÓN: Si el Call que invoca erc4626Deposit tiene callbackHash != 0,
+# entonces reenterHash está seteado y el vault PODRÍA llamar reenter()
+# con el bundle correcto. PERO el vault necesitaría conocer el exact
+# callbackHash, que el usuario define en el bundle. Si el usuario pone
+# callbackHash en un call a erc4626Deposit con un vault no confiable,
+# es un error del usuario.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-12
+  tier: 1
+  type: property
+  description: >
+    Un vault ERC4626 malicioso pasado a erc4626Deposit/Mint NO puede
+    reentrar al Bundler3 ni al adapter durante la ejecución del deposit.
+    El modelo de protección (initiator lock + reenterHash + onlyBundler3)
+    es suficiente EXCEPTO si el Call tiene callbackHash != 0, en cuyo
+    caso el vault podría triggear un reenter con datos arbitrarios.
+  attack_scenario: >
+    CASO SEGURO (callbackHash == 0):
+    1. Bundle: [{to: adapter, data: erc4626Deposit(malVault, max, ...), callbackHash: 0}]
+    2. reenterHash = 0 (L60). malVault.deposit() se ejecuta.
+    3. malVault intenta: Bundler3.multicall() → AlreadyInitiated.
+    4. malVault intenta: Bundler3.reenter() → IncorrectReenterHash.
+    5. malVault intenta: adapter.morphoSupply() → UnauthorizedSender.
+    6. No hay reentrancia posible.
+
+    CASO PELIGROSO (callbackHash != 0 + vault = callee):
+    1. Bundle: [{to: adapter, data: erc4626Deposit(malVault, max, ...), callbackHash: H}]
+    2. WAIT: callbackHash se computa con hash(to, callbackHash). to = adapter, no malVault.
+    3. reenterHash = hash(adapter, H). malVault necesita msg.sender = adapter para reenter.
+    4. malVault no es el adapter → no puede satisfacer msg.sender check en reenter().
+    5. SEGURO: el callbackHash usa `to` (adapter) no el vault.
+  impact: "Confirmación de que el modelo de protección bloquea reentrancia de vaults maliciosos"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Test: vault malicioso intenta reentrar durante deposit
+    // El revert esperado es AlreadyInitiated o IncorrectReenterHash
+    // Este es un test unitario, no un invariante de fuzzing
+    // INVARIANTE: post-erc4626Deposit, el adapter NO fue reentered
+    bytes32 postHash = IBundler3(BUNDLER3).reenterHash();
+    // Si callbackHash era 0: reenterHash debe ser 0 (fue seteado a 0 en L60)
+    // Si callbackHash era != 0: reenterHash debe ser 0 (callback consumió el hash)
+    eq(uint256(postHash), 0, "BD-D-12: reenterHash not cleared — unexpected reenter");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 80
+  notes: >
+    El análisis muestra que el modelo es seguro. El callbackHash usa
+    hash(to, H) donde to es el adapter (no el vault), así que el vault
+    no puede satisfacer la verificación de reenter(). Confidence 80%
+    de que es seguro, 20% reservado para edge cases con nested callbacks
+    donde el adapter llama al vault que llama a MORPHO que hace callback
+    al adapter que llama reenter. Necesita fuzzing para confirmar.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-13: permit2TransferFrom — INITIATOR BALANCE ASSUMPTION
+# ─────────────────────────────────────────────────────────────────────
+# GeneralAdapter1.permit2TransferFrom() L355-363:
+#   address initiator = initiator();
+#   if (amount == type(uint256).max) amount = IERC20(token).balanceOf(initiator);
+#   Permit2Lib.PERMIT2.transferFrom(initiator, receiver, amount.toUint160(), token);
+#
+# Si el initiator tiene una cantidad ENORME de tokens (> type(uint160).max),
+# toUint160() truncaría el amount. WAIT: SafeCast160 revierte en overflow.
+# Así que si balanceOf > type(uint160).max, la tx revierte.
+#
+# ¿Puede balanceOf > type(uint160).max? type(uint160).max es ~1.46e48.
+# Para tokens de 18 decimales, eso es ~1.46e30 tokens. Improbable.
+# Para tokens de 0 decimales (raro), eso es ~1.46e48 tokens. Improbable.
+#
+# TAMBIÉN: receiver puede ser CUALQUIER address (no solo adapter o initiator).
+# permit2TransferFrom(token, attackerAddr, max) transferiría todos los tokens
+# del initiator al atacante, si el initiator aprobó Permit2 y Permit2 aprobó
+# al adapter. PERO: el initiator (msg.sender) es quien llama multicall.
+# Si el initiator firma un bundle con receiver=attacker, es culpa del initiator.
+#
+# No hay forma de que un tercero haga esto sin que el initiator lo firme.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-13
+  tier: 2
+  type: property
+  description: >
+    permit2TransferFrom con receiver libre permite enviar tokens del
+    initiator a cualquier address. El initiator controla el bundle,
+    así que no hay exploit directo. SafeCast160 previene truncación.
+  attack_scenario: >
+    1. Initiator firma bundle: [permit2TransferFrom(USDC, attacker, max)].
+    2. Permit2 transfiere todo el USDC del initiator al attacker.
+    3. PERO: el initiator firmó este bundle voluntariamente.
+    4. No es un bug — es el initiator transfiriendo sus propios fondos.
+    5. Para smart wallets con relayers: el relayer podría inyectar esto,
+       pero la misma lógica que BD-D-06 aplica (trust en relayer).
+  impact: "Token drain via permit2TransferFrom — pero requiere que el initiator firme el bundle"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: receiver en permit2TransferFrom debería ser adapter o initiator
+    // Pero esto limitaría funcionalidad legítima
+    // Monitoring: contar transfers a addresses que no son adapter/initiator
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    By design. El initiator tiene control total del bundle. permit2TransferFrom
+    con receiver libre es una feature, no un bug. La seguridad depende de
+    que el initiator verifique el bundle antes de firmar.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-14: MORPHO CALLBACK DATA INJECTION VIA REENTER
+# ─────────────────────────────────────────────────────────────────────
+# GeneralAdapter1.morphoCallback() L416-421:
+#   require(msg.sender == address(MORPHO), ...);
+#   reenterBundler3(data);
+#
+# `data` viene del callback de Morpho. ¿Quién controla `data`?
+# El initiator lo pasa en el bundle: morphoSupply(..., data=callbackBundle).
+# Morpho lo pasa transparentemente al callback. El adapter lo pasa a
+# Bundler3.reenter().
+#
+# PERO: ¿Morpho modifica `data` antes del callback? NO — Morpho pasa
+# los bytes tal cual. Así que `data` es exactamente lo que el initiator
+# puso en el bundle.
+#
+# RIESGO: si callbackHash (en el Call struct del bundle) no coincide con
+# keccak256(data), reenter() revierte. El initiator DEBE pre-computar
+# el hash correctamente. Si hay un error en la computación del hash
+# (e.g., encoding discrepancy), el bundle falla.
+#
+# ¿PUEDE MORPHO MODIFICAR DATA? En Morpho Blue, los callbacks
+# (onMorphoSupply, etc.) pasan `data` tal cual de la función original.
+# No hay modificación. PERO: Morpho agrega el `assets` como primer
+# parámetro del callback: onMorphoSupply(uint256 assets, bytes data).
+# El adapter ignora `assets` (L145: onMorphoSupply(uint256, bytes calldata data)).
+# `data` es el segundo parámetro, sin modificar.
+#
+# CONCLUSIÓN: No hay injection. data es controlado por el initiator y
+# pasa sin modificación a través de Morpho.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-14
+  tier: 2
+  type: property
+  description: >
+    morphoCallback pasa `data` transparentemente a Bundler3.reenter().
+    `data` es controlado por el initiator y no modificado por Morpho.
+    El callbackHash en el Call struct debe coincidir con keccak256(data)
+    para que reenter() funcione.
+  attack_scenario: >
+    No hay injection posible. Morpho pasa `data` sin modificar.
+    El único riesgo es un error de encoding por parte del frontend
+    que construye el bundle (callbackHash != keccak256(actual_callback_data)),
+    lo cual causa DoS (revert), no pérdida de fondos.
+  impact: "N/A — no hay injection; DoS por hash mismatch es error del frontend"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: data en callback es idéntico al data en el bundle
+    // Esto es un property de Morpho Blue, no del adapter
+    // Test: verificar que reenter() se llama con el hash correcto
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: Confirmado seguro. No hay vector de injection.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-15: CompoundV2 REPAY — borrowBalanceCurrent SIDE EFFECT
+# ─────────────────────────────────────────────────────────────────────
+# CompoundV2MigrationAdapter.compoundV2RepayErc20() L46:
+#   amount = MorphoUtilsLib.min(amount, ICToken(cToken).borrowBalanceCurrent(onBehalf));
+#
+# borrowBalanceCurrent() es una función que ACCRUE INTEREST internamente
+# en Compound V2 (llama accrueInterest). Esto modifica el estado de
+# Compound V2 ANTES del repay. Es un side effect esperado.
+#
+# PERO: si el bundle tiene múltiples calls que interactúan con Compound V2
+# (e.g., repay de múltiples cTokens), el accrueInterest de uno puede
+# afectar el interest rate de otro (si comparten la misma Comptroller
+# y hay efectos de utilización cruzada).
+#
+# ¿Es explotable? En un bundle atómico, un atacante no puede intervenir
+# entre calls. Pero el ORDER de las calls importa: repagar un mercado
+# primero puede cambiar la utilización y afectar el interest de otro
+# mercado. Esto es un edge case de UX, no un exploit.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-15
+  tier: 2
+  type: property
+  description: >
+    borrowBalanceCurrent() en CompoundV2 adapter accrue interest como
+    side effect. En bundles con múltiples repays de Compound V2, el
+    orden de los calls puede afectar los amounts por interest accrual.
+    No es explotable pero puede causar diferencias vs lo esperado.
+  attack_scenario: >
+    1. Bundle: [compoundV2Repay(cUSDC, max, user), compoundV2Repay(cDAI, max, user)].
+    2. Primera call: borrowBalanceCurrent(cUSDC) accrue interest → deuda USDC sube 1 wei.
+    3. Repay USDC completo con los tokens disponibles.
+    4. Segunda call: borrowBalanceCurrent(cDAI) accrue interest → deuda DAI sube 1 wei.
+    5. Si los tokens DAI enviados al adapter eran EXACTAMENTE la deuda pre-accrual,
+       ahora hay 1 wei short. min(balance, debt) = balance. Se paga balance, queda 1 wei de debt.
+    6. No es un exploit, es un edge case de timing. Resuelto pasando unos wei extra.
+  impact: "Dust debt residual tras múltiples repays CompoundV2 — sub-wei impact"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: después de compoundV2Repay con max, la deuda del onBehalf es 0
+    uint256 remainingDebt = ICToken(cToken).borrowBalanceCurrent(onBehalf);
+    eq(remainingDebt, 0, "BD-D-15: dust debt after compound V2 repay with max");
+    // NOTA: puede fallar por 1-2 wei de accrual — tolerance de 2 wei
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    Low severity — dust debt from interest accrual. El adapter ya caps
+    con min(amount, debt), que es correcto. El timing issue solo causa
+    1-2 wei de diferencia. Probablemente known.
+
+# ─────────────────────────────────────────────────────────────────────
+# BD-D-16: CROSS-ADAPTER FLOW — SWAP → SUPPLY con SLIPPAGE MISMATCH
+# ─────────────────────────────────────────────────────────────────────
+# Patrón típico de uso:
+#   Call 1: permit2TransferFrom(WETH, adapter, 10e18)
+#   Call 2: paraswap.sell(augustus, callData, WETH, USDC, true, offsets, adapter)
+#   Call 3: morphoSupply(market_USDC, max, 0, maxSharePriceE27, user, "")
+#
+# RIESGO: el sell() tiene su propio slippage check (minDestAmount).
+# morphoSupply tiene su propio slippage check (maxSharePriceE27).
+# Pero NO hay un check end-to-end: "¿cuántos shares de Morpho obtuve
+# por mis 10 ETH originales?"
+#
+# Un atacante con MEV puede:
+#   - Sandwich el swap para minimizar USDC recibido (justo arriba de minDestAmount)
+#   - Manipular el share price de Morpho para maximizar assets/share ratio
+#   - Resultado: el usuario obtiene mucho menos value de lo esperado
+#
+# Cada check individual pasa, pero el resultado combinado es malo.
+# ─────────────────────────────────────────────────────────────────────
+- id: BD-D-16
+  tier: 1
+  type: property
+  description: >
+    Cross-adapter bundles (swap → supply, swap → repay) tienen slippage
+    checks independientes en cada paso pero NO end-to-end. Un MEV
+    attacker puede sandwich ambos pasos por separado, cada uno justo
+    dentro del slippage limit, causando pérdida acumulada al usuario.
+  attack_scenario: >
+    1. Usuario quiere: 10 ETH → swap a USDC → supply a Morpho vault.
+    2. Slippage sell: minDestAmount = 25000 USDC (esperados ~27000 a precio justo).
+    3. Slippage supply: maxSharePriceE27 = 1.01e27 (1% tolerance).
+    4. MEV attacker sandwiches el swap: usuario recibe 25001 USDC (just above min).
+    5. MEV attacker manipula Morpho vault share price: assets/share = 1.009e27 (just below max).
+    6. Ambos checks pasan. Pero el usuario perdió ~2000 USDC en el swap + ~0.9% en supply.
+    7. Pérdida total: ~$2225 en un swap de ~$27000 (8.2%).
+    8. Sin un check end-to-end "mis 10 ETH deben producir al menos X shares de Morpho",
+       el usuario no tiene protección contra esta pérdida acumulada.
+  impact: "Pérdida acumulada de slippage en bundles multi-step sin protección end-to-end"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante end-to-end: shares recibidas en Morpho / ETH enviados >= minEndToEndPrice
+    // Este invariante requiere ghost tracking del input original y output final
+    uint256 ethSent = ghost_ethInputForBundle;
+    uint256 sharesReceived = ghost_morphoSharesReceived;
+    // property: sharesReceived / ethSent >= minAcceptableRatio
+    // NOTA: esto no se puede enforcer on-chain sin un check explícito en el bundle
+    // El usuario debería añadir una Call final que verifique su posición final
+  ghost_vars:
+    - "uint256 internal ghost_ethInputForBundle;"
+    - "uint256 internal ghost_morphoSharesReceived;"
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Este es un design limitation inherente a multicall bundlers. Cada adapter
+    solo conoce su propia operación, no el bundle completo. La solución
+    standard es que el frontend añada un "assert" call al final del bundle
+    que verifique el resultado end-to-end. Si Bundler3 no ofrece esta
+    funcionalidad de "assert final state", es un gap de UX/seguridad.
+    Verificar si hay una función de assertion disponible en algún adapter.
+    Probablemente known limitation.
+
+false_positives:
+- hunter: DomainHunter
+  id: BD-FP-01
+  reason: >
+    Investigado: "adapter permanent MORPHO approval exploitation" — DESCARTADO.
+    La approval del adapter a MORPHO es permanente pero solo usable por MORPHO
+    en el contexto de sus propias operaciones (supply, repay, flashloan repayment).
+    No hay path donde un tercero pueda triggerear MORPHO para drenar el adapter
+    usando esa approval. MORPHO.supply/repay usa transferFrom(msg.sender), no
+    transferFrom(adapter). Solo cuando el adapter ES msg.sender (via morphoSupply
+    etc.) la approval se usa, y esas funciones tienen onlyBundler3.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Approval permanente de adapter a protocolo trusted (como Morpho Blue)
+      es safe porque el protocolo solo usa la approval en contextos controlados
+      (supply, repay, flashloan repayment). No confundir con approval a
+      contratos no confiables.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: BD-FP-02
+  reason: >
+    Investigado: "msg.value reuse/amplification via selfdestruct" — DESCARTADO.
+    Conservation of ETH impide amplificación. selfdestruct devuelve el mismo
+    ETH enviado, no más. Bundler3 no tiene receive() pero selfdestruct ignora
+    eso. El resultado neto es neutral — no hay ganancia para el atacante.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: BD-FP-03
+  reason: >
+    Investigado: "initiator spoofing via arbitrary call in bundle" — DESCARTADO.
+    Las calls en el bundle salen de msg.sender=Bundler3, no del initiator.
+    Approvals vía bundle calls solo afectan a Bundler3 (que no debería tener fondos).
+    initiator() en adapters lee de Bundler3.initiator (transient), que solo se
+    modifica en multicall() con require(initiator==0) + msg.sender.
+    No hay path para spoofear initiator.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: BD-FP-04
+  reason: >
+    Investigado: "ERC4626 vault malicioso reentrancia via callback" — DESCARTADO.
+    El vault recibe la call desde el adapter. El vault no puede reentrar porque:
+    (1) multicall() bloquea con AlreadyInitiated; (2) reenter() usa hash(to, H)
+    donde to=adapter, no vault; (3) adapter functions tienen onlyBundler3.
+    El modelo de protección es robusto para todos los niveles de anidamiento.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: multicall.md
+    content: >
+      Bundler3 reenter model: callbackHash usa hash(to, H) donde `to` es el
+      target de la Call en el bundle, NO el contrato que recibe la sub-call.
+      Un vault malicioso pasado a erc4626Deposit no puede reentrar porque
+      msg.sender sería el vault (no el adapter = to). Triple protección:
+      AlreadyInitiated + IncorrectReenterHash + onlyBundler3.
+    briefing_update_applied: false

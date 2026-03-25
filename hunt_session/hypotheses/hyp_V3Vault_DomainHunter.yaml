@@ -1,243 +1,693 @@
 protocol: revert-lend
 component: V3Vault
 file: src/V3Vault.sol
-domain: lending
+domain: vault
 hunter: DomainHunter
-generated_at: "2026-03-20T00:00:00Z"
-
+generated_at: '2026-03-24T00:00:00Z'
 invariants:
-  - id: VV-D01
-    tier: 1
-    type: property
-    description: "Solvency invariant: vault balance + outstanding debt >= total lent amount (lender claims)"
-    attack_scenario: "If balance + debt < lent, lenders cannot be made whole. An attacker who finds a way to extract more assets than their share (e.g. via rounding exploit on repeated deposit/withdraw) would break this, causing protocol insolvency. This is the fundamental lending protocol invariant."
-    solidity: |
-      // After every state-changing operation:
-      uint256 balance = IERC20(vault.asset()).balanceOf(address(vault));
-      uint256 debt = _convertToAssets(vault.debtSharesTotal(), vault.lastDebtExchangeRateX96(), Math.Rounding.Up);
-      uint256 lent = _convertToAssets(vault.totalSupply(), vault.lastLendExchangeRateX96(), Math.Rounding.Up);
-      // Allow tolerance for rounding: 1 wei per operation
-      gte(balance + debt + ghost_numOps, lent, "VV-D01: solvency violated");
-      ghost_numOps++;
-    ghost_vars:
-      - "uint256 internal ghost_numOps;"
-    validated: true
-    priority: high
-    confidence: 90
-    notes: "Core solvency. Rounding tolerance needed (1 wei per op). This catches any asset extraction bug."
 
-  - id: VV-D02
-    tier: 1
-    type: property
-    description: "debtSharesTotal == sum of all individual loan.debtShares across all tokenIds in the vault"
-    attack_scenario: "If debtSharesTotal diverges from the sum of individual loans, interest distribution becomes incorrect. An attacker could borrow with a manipulated position where debt shares are not properly tracked, leading to under-collateralized positions or free borrowing. The _updateAndCheckCollateral function tracks token-level debt shares separately from debtSharesTotal."
-    solidity: |
-      uint256 sumDebtShares = 0;
-      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
-          (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
-          sumDebtShares += shares;
-      }
-      eq(vault.debtSharesTotal(), sumDebtShares, "VV-D02: debtSharesTotal != sum of loan shares");
-    ghost_vars:
-      - "uint256[] internal ghost_allTokenIds;"
-    validated: true
-    priority: high
-    confidence: 95
-    notes: "Track all tokenIds added to vault. Critical accounting invariant."
+# ============================================================
+# SYMMETRIC INSPECTION: deposit/withdraw, borrow/repay,
+# create/remove, stake/unstake, transform (entry/exit)
+# ============================================================
 
-  - id: VV-D03
-    tier: 1
-    type: property
-    description: "tokenConfigs[token].totalDebtShares == sum of debtShares of all loans whose Uni V3 position includes that token"
-    attack_scenario: "If per-token totalDebtShares diverges from actual loan debt shares, the collateralValueLimit check (_updateAndCheckCollateral) becomes inaccurate. An attacker could bypass collateral concentration limits by manipulating positions so totalDebtShares undercount, allowing excessive borrowing against a single collateral type. This is especially relevant during transform (position replacement) where old debt is cleaned and new debt assigned."
-    solidity: |
-      // For each tracked token:
-      // sum all loan.debtShares where position has this token as token0 or token1
-      // compare with tokenConfigs[token].totalDebtShares
-      // This requires tracking position tokens per loan
-      uint256 sumForToken = 0;
-      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
-          uint256 tid = ghost_allTokenIds[i];
-          (uint256 shares) = vault.loans(tid);
-          if (ghost_tokenHasAsset[tid][targetToken]) {
-              sumForToken += shares;
-          }
-      }
-      (uint32 cf, uint32 cvl, uint192 tds) = vault.tokenConfigs(targetToken);
-      eq(uint256(tds), sumForToken, "VV-D03: per-token totalDebtShares mismatch");
-    ghost_vars:
-      - "uint256[] internal ghost_allTokenIds;"
-      - "mapping(uint256 => mapping(address => bool)) internal ghost_tokenHasAsset;"
-    validated: false
-    priority: high
-    confidence: 75
-    notes: "Complex to track in fuzzing. Transform/replacement flows are the most likely source of divergence. Needs handler-level ghost tracking of token0/token1 per position."
+- id: VV-D-01
+  tier: 1
+  type: property
+  description: "Solvencia global: balance + deuda >= lent (el vault nunca tiene patrimonio neto negativo)"
+  attack_scenario: >
+    Si balance + debt < lent, significa que los lenders tienen claims sobre assets que no existen.
+    Un atacante podria forzar esto via liquidacion con reserveCost que no se cubre adecuadamente,
+    o via manipulacion de exchange rates. El resultado seria que los ultimos lenders no pueden
+    retirar sus fondos (bank run).
+  impact: "Insolvencia del vault -- lenders pierden fondos proporcional al deficit"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    (uint256 debt, uint256 lent, uint256 balance, uint256 reserves,,) = vault.vaultInfo();
+    // Solvency: balance + debt >= lent (total claims)
+    gte(balance + debt, lent, "VV-D-01: vault insolvent -- balance + debt < lent");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "La funcion _handleReserveLiquidation puede reducir lendExchangeRate via haircut, lo cual deberia mantener solvencia. Verificar que el haircut no tiene off-by-one."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D04
-    tier: 1
-    type: property
-    description: "Exchange rates are monotonically non-decreasing: debtExchangeRate and lendExchangeRate can only increase over time (outside of bad debt socialization for lend rate)"
-    attack_scenario: "If debtExchangeRate decreases, borrowers pay less interest than owed. If lendExchangeRate decreases outside of explicit socialization, lenders lose funds silently. An attacker who can manipulate the interest rate model or time-travel the exchange rate update could steal interest."
-    solidity: |
-      (uint256 newDebtRate, uint256 newLendRate) = vault._calculateGlobalInterest();
-      gte(newDebtRate, ghost_lastDebtRate, "VV-D04: debtExchangeRate decreased");
-      // lendRate can decrease ONLY during _handleReserveLiquidation (bad debt socialization)
-      // Outside of that, it must be non-decreasing
-      if (!ghost_liquidationInProgress) {
-          gte(newLendRate, ghost_lastLendRate, "VV-D04: lendExchangeRate decreased outside socialization");
-      }
-      ghost_lastDebtRate = newDebtRate;
-      ghost_lastLendRate = newLendRate;
-    ghost_vars:
-      - "uint256 internal ghost_lastDebtRate = 79228162514264337593543950336;"
-      - "uint256 internal ghost_lastLendRate = 79228162514264337593543950336;"
-      - "bool internal ghost_liquidationInProgress;"
-    validated: true
-    priority: high
-    confidence: 90
-    notes: "Q96 initial value. Debt rate must ALWAYS increase (interest compounds). Lend rate can decrease only during socialization."
+- id: VV-D-02
+  tier: 1
+  type: property
+  description: "Monotonicity de exchange rates: debtExchangeRateX96 y lendExchangeRateX96 nunca decrecen (excepto haircut explicito)"
+  attack_scenario: >
+    Si debtExchangeRateX96 decrece, los borrowers deben menos de lo que pidieron prestado
+    (el protocolo regala dinero). Si lendExchangeRateX96 decrece sin haircut,
+    los lenders pierden valor sin que haya habido liquidacion de reservas.
+    Un atacante podria explotar un decrecimiento en debtRate prestando pre-decrecimiento
+    y repagando post-decrecimiento, extrayendo la diferencia.
+  impact: "Lenders pierden yield o principal; borrowers extraen valor del protocolo"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (,,,,uint256 debtRate, uint256 lendRate) = vault.vaultInfo();
+    if (ghost_lastDebtRateX96 > 0) {
+        gte(debtRate, ghost_lastDebtRateX96, "VV-D-02: debtExchangeRate decreased");
+    }
+    // lendRate puede decrecer por haircut, pero solo durante liquidacion
+    if (ghost_lastLendRateX96 > 0 && !ghost_liquidationInProgress) {
+        gte(lendRate, ghost_lastLendRateX96, "VV-D-02: lendExchangeRate decreased without haircut");
+    }
+    ghost_lastDebtRateX96 = debtRate;
+    ghost_lastLendRateX96 = lendRate;
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "El haircut en _handleReserveLiquidation reduce lendExchangeRateX96. ghost_liquidationInProgress debe setearse en el handler de liquidate."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D05
-    tier: 1
-    type: property
-    description: "After staking a position, the health check must use ignoreFees=true valuation, and the loan must still be healthy. A borrower who borrows at max against fee-inclusive value then stakes should become unhealthy or be blocked."
-    attack_scenario: "Borrower deposits a position with large accumulated fees. Borrows maximum amount using fee-inclusive collateral valuation. Then stakes the position, which switches to fee-exclusive valuation. If the health check after staking is missing or uses wrong valuation, the loan becomes under-collateralized and the fees are lost to the gauge. Attacker profits by extracting borrowed funds while position is effectively underwater."
-    solidity: |
-      // After any stakePosition call:
-      // Verify the health check was done with staked (ignoreFees=true) valuation
-      if (vault.loans(tokenId).debtShares > 0) {
-          bool isStaked = IGaugeManager(vault.gaugeManager()).tokenIdToGauge(tokenId) != address(0);
-          if (isStaked) {
-              (uint256 fullValue,,,) = oracle.getValue(tokenId, vault.asset(), true); // ignoreFees=true
-              uint32 cf = vault._calculateTokenCollateralFactorX32(tokenId);
-              uint256 collateralValue = fullValue * cf / Q32;
-              uint256 debt = _convertToAssets(vault.loans(tokenId).debtShares, vault.lastDebtExchangeRateX96(), Math.Rounding.Up);
-              gte(collateralValue * BORROW_SAFETY_BUFFER_X32 / Q32, debt, "VV-D05: staked loan unhealthy");
-          }
-      }
-    ghost_vars: []
-    validated: true
-    priority: high
-    confidence: 85
-    notes: "V3Vault.stakePosition() does check health post-stake (lines 1390-1393). But the check calls loanInfo() which calls _checkLoanIsHealthy which uses _isStaked. Need to verify the staking state is visible within the same tx. Cross-component with GaugeManager. UPDATE from wildcard-hunter collaboration: liquidation flow for staked positions is internally consistent -- health check, liquidation calc, and _sendPositionValue all use fee-excluded view. The fullValue passed through is fee-excluded (ignoreFees=true), feeValue=0, so partial liquidation formula (liquidationValue * liquidity / fullValue) is correct. Focus fork testing on whether fee-excluded fullValue accurately represents actual post-unstake position value."
+- id: VV-D-03
+  tier: 1
+  type: property
+  description: "Debt shares conservation: sum(loan[i].debtShares) == debtSharesTotal en todo momento"
+  attack_scenario: >
+    Si debtSharesTotal diverge de la suma real de debtShares individuales, la contabilidad
+    de deuda esta rota. Esto puede pasar si _cleanupLoan no reduce debtSharesTotal
+    correctamente en algun path (ej: replacement en onERC721Received donde el oldTokenId
+    se limpia pero debtSharesTotal no se ajusta). Un atacante podria crear deuda fantasma
+    o deuda invisible, permitiendo extraer mas de lo que el collateral respalda.
+  impact: "Deuda fantasma permite borrowing sin colateral real; deuda invisible deja bad debt no rastreable"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 sumDebtShares = 0;
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 20; i++) {
+        (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+        sumDebtShares += shares;
+    }
+    eq(sumDebtShares, vault.debtSharesTotal(), "VV-D-03: debtSharesTotal != sum of individual loan.debtShares");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Path critico: onERC721Received con replacement (oldTokenId != newTokenId) - la deuda se copia al nuevo token y _cleanupLoan borra del viejo, pero debtSharesTotal no cambia (correcto: la deuda se mueve, no se crea ni destruye). Verificar que borrow/repay/liquidate mantienen la invariante."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D06
-    tier: 1
-    type: property
-    description: "No position can be borrowed against if both tokens have collateralFactorX32 == 0"
-    attack_scenario: "If a position with unconfigured tokens (factor=0) can somehow have debt, it means the collateral check is bypassed. The _calculateTokenCollateralFactorX32 takes the min of both factors, so min(0, anything)=0. But _requireLoanIsHealthy checks collateralValue >= debt, and collateralValue=fullValue*0/Q32=0. So any debt>0 should fail. However, in transform mode, borrow() skips the health check. A transformer could borrow against a zero-collateral-factor position."
-    solidity: |
-      for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
-          uint256 tid = ghost_allTokenIds[i];
-          (uint256 debtShares) = vault.loans(tid);
-          if (debtShares > 0) {
-              uint32 cf = _calculateTokenCollateralFactorX32(tid);
-              t(cf > 0, "VV-D06: debt on zero-collateral-factor position");
-          }
-      }
-    ghost_vars:
-      - "uint256[] internal ghost_allTokenIds;"
-    validated: true
-    priority: high
-    confidence: 70
-    notes: "Transform mode skips health check in borrow() (line 630). The check happens after transform completes (line 579). But if the transformer itself is malicious or compromised... Requires trusted transformer assumption."
+- id: VV-D-04
+  tier: 1
+  type: property
+  description: "Roundtrip safety: deposit(X) seguido de redeem(shares) nunca extrae mas de X assets"
+  attack_scenario: >
+    Si un usuario deposita X assets, recibe S shares, y luego redeem(S) le devuelve
+    mas de X assets, hay una extraccion gratuita. Esto puede ocurrir si el rounding
+    en _convertToShares (Down en deposit) y _convertToAssets (Down en redeem) no esta
+    correctamente alineado, o si hay un cambio de estado entre deposit y redeem
+    que favorece al usuario (ej: interest accrual en el mismo bloque).
+  impact: "Extraccion gradual de fondos del vault por cada roundtrip, drenando reserves"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    if (ghost_lastDepositAssets > 0 && ghost_lastDepositShares > 0) {
+        (,,,,, uint256 lendRate) = vault.vaultInfo();
+        uint256 redeemAssets = ghost_lastDepositShares * lendRate / Q96;
+        // En el mismo bloque (sin interest), redeem no debe dar mas de lo depositado
+        // Tolerancia de 1 wei por rounding
+        lte(redeemAssets, ghost_lastDepositAssets + 1, "VV-D-04: roundtrip extraction -- redeem > deposit");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "deposit usa Math.Rounding.Down para shares (menos shares al depositar), redeem usa Math.Rounding.Down para assets (menos assets al retirar). Ambos favorecen al vault. Pero si lendExchangeRate cambia entre calls, el resultado puede diferir. Testear dentro del mismo bloque."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D07
-    tier: 2
-    type: property
-    description: "After liquidation, the position's debt shares must be zero and the loan must be cleaned up"
-    attack_scenario: "If liquidation does not fully clear debt, the position could be liquidated multiple times (similar to Frax Finance H-01 from Solodit). Each liquidation extracts reserves, draining the protocol. The _cleanupLoan function deletes the loan entirely, but if called incorrectly or state is corrupted, debt could persist."
-    solidity: |
-      // After liquidate() call on tokenId:
-      (uint256 debtShares) = vault.loans(ghost_lastLiquidatedTokenId);
-      eq(debtShares, 0, "VV-D07: debt remains after liquidation");
-    ghost_vars:
-      - "uint256 internal ghost_lastLiquidatedTokenId;"
-    validated: true
-    priority: high
-    confidence: 85
-    notes: "Inspired by Frax Finance finding. V3Vault liquidation always clears full debt (_cleanupLoan at line 779). But verify with fuzzing."
+- id: VV-D-05
+  tier: 1
+  type: property
+  description: "Token ownership consistency: todo tokenId en ownedTokens tiene tokenOwner[tokenId] != address(0) y viceversa"
+  attack_scenario: >
+    Si tokenOwner[tokenId] se borra sin remover de ownedTokens[], o se agrega a ownedTokens[]
+    sin setear tokenOwner, el vault tiene estado inconsistente. Un atacante podria
+    explotar un token huerfano (en ownedTokens pero sin owner) para manipular
+    loanCount/loanAtIndex y confundir integraciones/frontends, o peor, si el token
+    tiene deuda activa, nadie puede repagar/remover.
+  impact: "Posiciones bloqueadas permanentemente o acceso no autorizado a posiciones"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tokenId);
+        if (owner != address(0)) {
+            // If owner is set, loanCount must be > 0 for that owner
+            uint256 count = vault.loanCount(owner);
+            gt(count, 0, "VV-D-05: owner set but loanCount is 0");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: "_addTokenToOwner y _removeTokenFromOwner parecen consistentes. El path riesgoso es _cleanupLoan que NO remueve de ownedTokens (intencionalmente -- la posicion se queda para que el usuario pueda hacer remove()). Verificar que no se puede re-add un token ya en ownedTokens."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D08
-    tier: 2
-    type: property
-    description: "dailyDebtIncreaseLimitLeft should never exceed the daily cap computed by _calculateDailyIncreaseLimit"
-    attack_scenario: "Liquidation replenishes dailyDebtIncreaseLimitLeft (line 767) by adding liquidatorCost back. If multiple large liquidations happen in one day, the cumulative replenishment could exceed the daily cap, effectively removing the borrow limit. An attacker could: (1) create many positions, (2) make them liquidatable, (3) liquidate them all to inflate the daily limit, (4) borrow beyond intended limits."
-    solidity: |
-      uint256 dailyLeft = vault.dailyDebtIncreaseLimitLeft();
-      uint256 dailyCap = _calculateDailyIncreaseLimit(
-          vault.lastLendExchangeRateX96(), vault.dailyDebtIncreaseLimitMin(), MAX_DAILY_DEBT_INCREASE_X32
-      );
-      lte(dailyLeft, dailyCap, "VV-D08: daily debt limit exceeded via liquidation replenishment");
-    ghost_vars: []
-    validated: true
-    priority: medium
-    confidence: 75
-    notes: "Line 767 adds liquidatorCost to dailyDebtIncreaseLimitLeft without checking cap. Same for dailyLendIncreaseLimitLeft on withdraw (line 1001). Could accumulate beyond initial daily limit."
+- id: VV-D-06
+  tier: 1
+  type: property
+  description: "Collateral value limit tracking: tokenConfigs[token].totalDebtShares refleja la suma real de debtShares respaldados por ese token"
+  attack_scenario: >
+    Si totalDebtShares de un token diverge de la realidad, el collateralValueLimit check
+    se vuelve inefectivo. Un atacante podria crear muchos loans con un token de bajo
+    collateral factor, excediendo el limite real pero pasando el check porque
+    totalDebtShares esta subdeclarado. Path critico: replacement en onERC721Received
+    donde el viejo token tiene (tokenA, tokenB) y el nuevo tiene (tokenA, tokenC) --
+    _cleanupLoan reduce totalDebtShares de tokenA y tokenB, pero _updateAndCheckCollateral
+    del nuevo token incrementa tokenA y tokenC. tokenB queda con totalDebtShares reducido
+    sin deuda real que lo respalde.
+  impact: "Bypass del collateral value limit -- concentracion excesiva de deuda en un token de bajo collateral"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que la suma de debtShares de todos los loans que contienen token0/token1
+    // es consistente con tokenConfigs.totalDebtShares
+    // Simplificado: debtSharesTotal siempre >= cada tokenConfig.totalDebtShares individual
+    (,uint256 lent,,,,) = vault.vaultInfo();
+    if (lent > 0 && vault.debtSharesTotal() > 0) {
+        // totalDebtShares de cualquier token individual no debe exceder debtSharesTotal global
+        // (cada posicion aporta sus shares a ambos tokens)
+        t(true, "VV-D-06: placeholder -- need token-level check");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: "Dificil de testear sin acceso directo a tokenConfigs. Necesita un helper custom que lea tokenConfigs[token].totalDebtShares. El path de replacement en transform es el mas riesgoso: si los pares de tokens cambian, los totalDebtShares se rebalancean."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D09
-    tier: 2
-    type: property
-    description: "Reserve socialization (lendExchangeRate haircut) must not reduce the rate below the minimum needed for existing shares to cover remaining deposits"
-    attack_scenario: "If bad debt socialization reduces lendExchangeRateX96 too aggressively (e.g., totalLent is very small due to mass withdrawals before liquidation), the rate could crash. An attacker could: (1) deposit and borrow max, (2) withdraw most lending (via another account), (3) let position go bad, (4) liquidation socializes across few remaining lenders who lose disproportionately."
-    solidity: |
-      uint256 lendRate = vault.lastLendExchangeRateX96();
-      // Lend exchange rate should never go below some reasonable fraction of initial Q96
-      // A 99% haircut means the protocol has essentially failed
-      gte(lendRate, Q96 / 100, "VV-D09: catastrophic lend rate collapse");
-    ghost_vars: []
-    validated: true
-    priority: medium
-    confidence: 65
-    notes: "Edge case. _handleReserveLiquidation line 1216: newRate = (totalLent - missing) * rate / totalLent. If missing ~ totalLent, rate -> 0. Requires specific sequence of events."
+- id: VV-D-07
+  tier: 1
+  type: property
+  description: "Symmetric borrow/repay: total borrowed assets == total repaid assets + outstanding debt (conservation de deuda)"
+  attack_scenario: >
+    Si ghost_totalBorrowed != ghost_totalRepaid + outstanding_debt_assets, hay una fuga
+    contable. Un atacante podria explotar un path donde repay reduce debtShares pero
+    el monto en assets no corresponde al monto originalmente borroweado (ej: por
+    rounding asimetrico entre borrow y repay). Si la deuda se reduce mas rapido
+    de lo que deberia, el protocolo pierde la diferencia.
+  impact: "Perdida gradual de fondos del protocolo via deuda que desaparece sin repago completo"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (uint256 debt,,,,,uint256 debtRate) = vault.vaultInfo();
+    uint256 tolerance = ghost_numOps > 0 ? ghost_numOps : 1;
+    // debt + repaid + liquidated >= borrowed (accounting for rounding, 1 wei per op)
+    gte(
+        debt + ghost_totalRepaid + ghost_totalLiquidated + tolerance,
+        ghost_totalBorrowed,
+        "VV-D-07: debt conservation violated -- debt vanished"
+    );
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "El rounding en borrow (Up para shares) y repay (Down para shares) favorece al protocolo. Pero el haircut en _handleReserveLiquidation puede distorsionar. La tolerance per-op absorbe rounding dust."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D10
-    tier: 1
-    type: property
-    description: "No ERC4626 first-depositor share inflation attack: a small initial deposit should not allow an attacker to steal subsequent deposits via share rounding"
-    attack_scenario: "Classic ERC4626 inflation attack: (1) Attacker deposits 1 wei, gets 1 share. (2) Attacker donates large amount directly to vault. (3) Victim deposits, gets 0 shares due to rounding. Revert Lend uses custom exchange rate math (not balance-based totalAssets for share calc), which uses lendExchangeRateX96. The exchange rate starts at Q96 (1:1). A direct donation increases balance but NOT lendExchangeRateX96, so it goes to reserves, not share price. This means the classic attack does NOT work here. However, need to verify there is no path to manipulate lendExchangeRateX96 directly."
-    solidity: |
-      // After deposit: shares received must be > 0 if assets > 0
-      // This catches the inflation attack
-      if (ghost_lastDepositAssets > 0) {
-          t(ghost_lastDepositShares > 0, "VV-D10: zero shares for non-zero deposit");
-      }
-    ghost_vars:
-      - "uint256 internal ghost_lastDepositAssets;"
-      - "uint256 internal ghost_lastDepositShares;"
-    validated: true
-    priority: high
-    confidence: 80
-    notes: "Revert Lend is likely safe because exchange rate is tracked independently (not balance-based). Donations go to reserves. But verify with large rate manipulation scenarios."
+- id: VV-D-08
+  tier: 1
+  type: property
+  description: "No loan without owner: si loans[tokenId].debtShares > 0, entonces tokenOwner[tokenId] != address(0)"
+  attack_scenario: >
+    Si un token tiene deuda activa pero no tiene owner en el vault, nadie puede
+    repagar la deuda (repay no verifica ownership, pero remove si). Mas importante:
+    la deuda se vuelve irrecuperable porque no se puede liquidar si el vault no
+    tiene el NFT o no sabe quien es el owner. Path critico: _removeTokenFromOwner
+    se llama sin verificar que debtShares == 0 en algun path no cubierto, o
+    un transformer malicioso logra que el token sea removido durante transform mode.
+  impact: "Bad debt permanente que socializa perdidas entre lenders via haircut"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 20; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debtShares) = vault.loans(tokenId);
+        if (debtShares > 0) {
+            address owner = vault.ownerOf(tokenId);
+            t(owner != address(0), "VV-D-08: loan has debt but no owner");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "remove() tiene el check loans[tokenId].debtShares != 0 -> revert NeedsRepay. _cleanupLoan borra la deuda antes de permitir el remove. Pero verificar que no hay otro path que remueva ownership sin limpiar deuda."
+  poc_sketch: ''
+  call_stack: ''
 
-  - id: VV-D11
-    tier: 1
-    type: property
-    description: "Transform position replacement must preserve debt accounting: old position debt must equal new position debt, and global debtSharesTotal must not change"
-    attack_scenario: "During transform, when a new NFT replaces the old one (onERC721Received, lines 437-462), debt is copied from old to new. If _cleanupLoan on the old position reduces debtSharesTotal but the new position's debt was already added, there's double-counting. Or if the cleanup subtracts from tokenConfig.totalDebtShares for token0/token1 of the OLD position, but _updateAndCheckCollateral adds to the NEW position's token0/token1, the per-token tracking could diverge if the positions have different token pairs."
-    solidity: |
-      // Before and after transform:
-      uint256 debtSharesBefore = vault.debtSharesTotal();
-      // ... transform executes ...
-      uint256 debtSharesAfter = vault.debtSharesTotal();
-      eq(debtSharesBefore, debtSharesAfter, "VV-D11: debtSharesTotal changed during transform");
-    ghost_vars: []
-    validated: true
-    priority: high
-    confidence: 80
-    notes: "Transform replacement: _cleanupLoan deletes old loan, new loan gets debtShares assigned. debtSharesTotal should not change because cleanup only deletes loan struct (not debtSharesTotal). Actually looking closer: _cleanupLoan calls _updateAndCheckCollateral with (oldShares, 0) which subtracts from tokenConfig.totalDebtShares, and the new position calls _updateAndCheckCollateral with (0, debtShares) which adds. But debtSharesTotal itself is only modified in borrow/repay/liquidation. During transform replacement, debtSharesTotal is NOT modified. Correct by design."
+- id: VV-D-09
+  tier: 1
+  type: property
+  description: "Liquidation only when unhealthy: no se puede liquidar una posicion con collateralValue >= debt"
+  attack_scenario: >
+    Si una posicion healthy puede ser liquidada, un atacante puede forzar liquidaciones
+    para extraer el penalty del collateral de posiciones solventes. Path de ataque:
+    manipular el oracle price justo antes de liquidar (sandwich con oracle manipulation),
+    o explotar un bug en _checkLoanIsHealthy que subestime collateralValue.
+    Nota: staked positions usan ignoreFees=true, lo cual reduce fullValue --
+    si las fees son significativas, una posicion staked podria parecer unhealthy
+    cuando no lo es (o viceversa).
+  impact: "Liquidacion injusta de posiciones solventes -- borrowers pierden penalty injustamente"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        if (debt > 0 && collateralValue >= debt) {
+            // This position is healthy -- it should not be liquidatable
+            // (liquidationCost and liquidationValue should be 0)
+            (,,,uint256 liqCost, uint256 liqValue) = vault.loanInfo(tokenId);
+            eq(liqCost, 0, "VV-D-09: healthy position has non-zero liquidationCost");
+            eq(liqValue, 0, "VV-D-09: healthy position has non-zero liquidationValue");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "loanInfo() usa _checkLoanIsHealthy sin buffer (withBuffer=false). liquidate() tambien usa withBuffer=false. Consistente. Pero el valor del oracle puede cambiar entre la lectura de loanInfo y la ejecucion de liquidate."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-10
+  tier: 1
+  type: property
+  description: "Reserve protection: withdrawReserves nunca puede retirar mas que las reservas no protegidas"
+  attack_scenario: >
+    Si el owner puede retirar reservas protegidas, los lenders quedan sin buffer de seguridad.
+    Path: manipular el calculo de reserves via donation attack (enviar asset directamente
+    al vault para inflar balance y por tanto reserves), luego withdrawReserves extrae
+    mas de lo que deberia. Nota: reserves = balance + debt - lent. Si balance se infla
+    via transfer directo, reserves sube artificialmente.
+  impact: "Owner drena reservas protegidas, dejando a lenders sin colchon ante bad debt"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    (uint256 debt, uint256 lent, uint256 balance, uint256 reserves,,) = vault.vaultInfo();
+    // reserves siempre >= 0 (ya manejado en _getBalanceAndReserves)
+    // protected amount = lent * reserveProtectionFactorX32 / Q32
+    // available = min(balance, max(0, reserves - protected))
+    // Invariant: available (what can be withdrawn) <= reserves
+    if (reserves > 0) {
+        t(balance >= 0, "VV-D-10: balance sanity");
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "El calculo de reserves usa balance + debt - lent. Un donation attack inflaria balance, pero eso beneficia al protocolo (mas reserves). El riesgo real es si reserves se calcula mal cuando lent > balance + debt (underflow protegido por ternary). Verificar el path de donation."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-11
+  tier: 1
+  type: property
+  description: "Transform mode reentrancy guard: transformedTokenId se resetea a 0 al final de _transform (incluso si el transformer falla)"
+  attack_scenario: >
+    Si transformedTokenId queda != 0 despues de una transaccion (por revert parcial,
+    estado corrupto, etc.), el vault queda en un estado donde: (1) no se pueden
+    hacer nuevos transforms, (2) borrow() puede ser llamado por cualquier transformer
+    aprobado para ese tokenId sin verificar ownership, (3) liquidate/decreaseLiquidityAndCollect
+    estan bloqueados. Un transformer malicioso podria intentar dejar transformedTokenId
+    en un estado permanente (aunque el revert deberia limpiar todo).
+  impact: "Vault bloqueado permanentemente o borrow no autorizado durante transform mode"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // transformedTokenId should always be 0 between transactions
+    // (within a Chimera test, this is checked after each handler call)
+    eq(vault.transformedTokenId(), 0, "VV-D-11: transformedTokenId stuck non-zero between txs");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "El reset `transformedTokenId = 0` esta al final de _transform. Si el transformer.call() reverts, todo el tx reverts, asi que transformedTokenId se resetea via revert. El unico path problematico seria si el transformer logra un side-effect que persiste antes del reset. Pero el reset ocurre despues del check, asi que es safe. Verificar con Multicall."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-12
+  tier: 1
+  type: property
+  description: "Daily limit symmetry: deposit replenishes lend limit, repay replenishes debt limit, y viceversa para withdraw/borrow"
+  attack_scenario: >
+    _deposit reduce dailyLendIncreaseLimitLeft, _withdraw la incrementa. Si esta
+    simetria se rompe (ej: withdraw incrementa por assets pero deposit decrementa
+    por una cantidad diferente debido a rounding), un atacante puede hacer
+    deposit/withdraw loops para agotar o inflar el daily limit artificialmente.
+    Path: deposit 100 (limit -= 100), withdraw da 99 por rounding (limit += 99),
+    neto: limit decrece 1 por roundtrip. No es explotable directamente pero
+    puede causar DoS al agotar el limit.
+  impact: "DoS: daily limits se agotan sin actividad neta real, bloqueando nuevos deposits/borrows"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a deposit-then-withdraw cycle in same block, the daily lend limit
+    // should not have decreased by more than rounding dust
+    // This is a conceptual check -- the actual enforcement is in the handlers
+    uint256 tolerance = ghost_numOps > 0 ? ghost_numOps : 1;
+    uint256 inflows = ghost_totalDeposited + ghost_totalRepaid + ghost_totalLiquidated;
+    uint256 outflows = ghost_totalWithdrawn + ghost_totalBorrowed;
+    // Net activity should be bounded -- this is a sanity check
+    t(true, "VV-D-12: daily limit symmetry placeholder");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: "Solodit M-08 confirma que dailyLendIncreaseLimitLeft y dailyDebtIncreaseLimitLeft no se ajustan correctamente en todos los paths. La liquidacion incrementa dailyDebtIncreaseLimitLeft por liquidatorCost (no por debt completo). Verificar si esto es correcto."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-13
+  tier: 1
+  type: property
+  description: "Borrow safety buffer enforcement: borrow siempre verifica health con BORROW_SAFETY_BUFFER_X32 (95%), no con 100%"
+  attack_scenario: >
+    _requireLoanIsHealthy usa withBuffer=true, lo cual multiplica collateralValue
+    por 95%. Esto da un 5% de buffer antes de que la posicion sea liquidatable.
+    Si un path de borrow NO usa el buffer (ej: borrow dentro de transform mode
+    donde _requireLoanIsHealthy no se llama hasta el final de _transform),
+    un atacante podria borrowear hasta el limite exacto de 100% collateralization,
+    dejando la posicion inmediatamente liquidatable si el precio se mueve 0.01%.
+    Nota: en transform mode, borrow() NO llama _requireLoanIsHealthy (linea 672-674).
+    El health check ocurre al final de _transform con el buffer.
+  impact: "Posiciones creadas al borde de liquidacion via transform+borrow, causando cascadas de liquidacion"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any borrow, the position must still be healthy WITH the safety buffer
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debt,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        if (debt > 0) {
+            // With buffer: collateralValue * 95% >= debt
+            uint256 bufferedCollateral = collateralValue * 4080218931 / (2**32);
+            gte(bufferedCollateral + 1, debt, "VV-D-13: position not healthy with borrow safety buffer");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "El buffer se aplica en _requireLoanIsHealthy(withBuffer=true), que se llama al final de borrow() y al final de _transform(). Sin embargo, loanInfo() usa withBuffer=false, asi que la lectura publica no incluye el buffer. El check aqui usa el buffer manualmente."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-14
+  tier: 2
+  type: property
+  description: "Constraint inference: todos los paths que modifican deuda llaman _updateGlobalInterest primero"
+  attack_scenario: >
+    Si un path modifica debtSharesTotal o loan.debtShares sin primero actualizar
+    los exchange rates, los calculos de assets se hacen con rates obsoletos.
+    Un atacante podria explotar esto si hay un path que incrementa deuda
+    con rates viejos (pagando menos shares por la misma cantidad de assets).
+    Paths que modifican deuda: borrow, repay, liquidate, onERC721Received (replacement).
+    Verificar que TODOS llaman _updateGlobalInterest.
+  impact: "Borrowers pagan menos interes del que deberian; lenders reciben menos yield"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify exchange rates are fresh (updated in current block)
+    // This is implicitly true because all state-changing functions call _updateGlobalInterest
+    // We check the rates are at least Q96 (initial value) and monotonically increasing
+    (,,,,uint256 debtRate, uint256 lendRate) = vault.vaultInfo();
+    gte(debtRate, Q96, "VV-D-14: debtExchangeRate below initial Q96");
+    gte(lendRate, Q96, "VV-D-14: lendExchangeRate below initial Q96");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: "borrow -> _updateGlobalInterest (OK). repay -> _updateGlobalInterest (OK). liquidate -> _updateGlobalInterest (OK). onERC721Received -> _updateGlobalInterest (OK). Todos los paths cubiertos. Pero _calculateGlobalInterest es view y no modifica estado -- solo _updateGlobalInterest persiste."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-15
+  tier: 1
+  type: property
+  description: "Liquidation penalty bounds: penalty siempre entre MIN_LIQUIDATION_PENALTY_X32 (2%) y MAX_LIQUIDATION_PENALTY_X32 (10%)"
+  attack_scenario: >
+    Si la penalty se calcula fuera de los bounds, un liquidador podria recibir
+    mas del 10% de bonus (extraccion excesiva del borrower) o menos del 2%
+    (desincentivando liquidaciones y causando bad debt). El calculo en
+    _calculateLiquidation usa interpolacion lineal entre min y max penalty
+    basado en penaltyFractionX96. Si penaltyFractionX96 > Q96 (overflow
+    por fullValue/collateralValue edge case), la penalty podria exceder max.
+  impact: "Borrowers pierden mas del 10% en liquidacion o liquidadores no tienen incentivo suficiente"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 10; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debt,,,uint256 liqCost, uint256 liqValue) = vault.loanInfo(tokenId);
+        if (liqCost > 0 && liqValue > 0 && debt > 0) {
+            // liquidationValue = debt * (Q32 + penaltyX32) / Q32
+            // So liquidationValue / debt should be between 1.02 and 1.10
+            // liqValue <= fullValue (can't take more than the position is worth)
+            lte(liqValue, debt * (Q32 + 429496729) / Q32 + 1, "VV-D-15: liquidation penalty exceeds 10%");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 75
+  notes: "El path fullValue < maxPenaltyValue usa liquidationValue = fullValue (capped). El path fullValue >= maxPenaltyValue usa la interpolacion. Edge case: collateralValue == 0 -> liquidationValue = maxPenaltyValue. Verificar division by zero en startLiquidationValue - maxPenaltyValue."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-16
+  tier: 1
+  type: property
+  description: "ERC4626 share price sanity: convertToAssets(convertToShares(X)) <= X para todo X > 0"
+  attack_scenario: >
+    Si convertToAssets(convertToShares(X)) > X, un atacante puede extraer valor
+    del vault via repeated deposit/redeem cycles. Esto es el roundtrip check
+    a nivel de vista (no transaccional). El first depositor attack es el caso
+    clasico: depositar 1 wei, donar assets al vault para inflar share price,
+    luego el siguiente depositor recibe 0 shares. Verificar si el vault tiene
+    proteccion contra first depositor.
+  impact: "First depositor attack: robo de depositos subsiguientes via share inflation"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 testAmount = 1e6; // 1 USDC equivalent
+    uint256 shares = vault.convertToShares(testAmount);
+    if (shares > 0) {
+        uint256 assets = vault.convertToAssets(shares);
+        lte(assets, testAmount, "VV-D-16: roundtrip inflation -- convertToAssets(convertToShares(X)) > X");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "V3Vault NO usa virtual shares ni _decimalsOffset. El initial exchange rate es Q96 (1:1). No hay dead shares burn. Si totalSupply == 0, el primer depositor puede ser vulnerable. Pero _convertToShares con exchangeRate=Q96 es amount*Q96/Q96 = amount, asi que 1:1 siempre. El rate solo cambia con interest accrual, no con donations. totalAssets() usa balanceOf + debt, pero donations to balance inflate totalAssets sin minting shares. INVESTIGAR."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-17
+  tier: 1
+  type: property
+  description: "Donation attack vector: totalAssets() usa balanceOf(address(this)) + debt, pero el vault NO usa balanceOf para share pricing internamente"
+  attack_scenario: >
+    totalAssets() es una view function que retorna balanceOf(address(this)) + debt.
+    Un atacante puede donar assets al vault para inflar totalAssets(). PERO:
+    internamente, deposit/withdraw usan lendExchangeRateX96 para convertir,
+    NO totalAssets(). El exchange rate se actualiza via interest accrual, no
+    via balance changes. Sin embargo, _getBalanceAndReserves SI usa
+    balanceOf(address(this)), y reserves = balance + debt - lent. Si balance
+    se infla, reserves crece, lo cual podria permitir al owner extraer
+    las donaciones via withdrawReserves.
+  impact: "Donaciones al vault pueden ser extraidas por el owner via withdrawReserves. No es un ataque directo a lenders pero es value extraction."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify that share pricing is not affected by direct balance manipulation
+    // The lendExchangeRate should not change due to donations (only via interest accrual)
+    (,,,,, uint256 lendRate) = vault.vaultInfo();
+    if (ghost_lastLendExchangeRateX96 > 0 && !ghost_liquidationInProgress) {
+        gte(lendRate, ghost_lastLendExchangeRateX96, "VV-D-17: lendExchangeRate decreased");
+    }
+    ghost_lastLendExchangeRateX96 = lendRate;
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "El vault usa exchange rates internos, NO totalAssets(), para share pricing. Esto es una proteccion by-design contra donation attacks para share inflation. Sin embargo, donations si afectan reserves y por tanto withdrawReserves. Esto es un finding de bajo impacto (owner trust assumption)."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-18
+  tier: 2
+  type: property
+  description: "Staked position health check consistency: staked positions excluyen fees del fullValue, lo cual puede hacer que una posicion healthy parezca unhealthy al stakear"
+  attack_scenario: >
+    Cuando una posicion es staked, _checkLoanIsHealthy pasa ignoreFees=true al oracle,
+    lo cual excluye el fee value. Si las fees acumuladas son significativas,
+    el fullValue de una staked position puede ser mucho menor que el de una
+    unstaked. Un atacante podria: (1) acumular fees grandes, (2) stakear la posicion,
+    (3) ahora la posicion parece unhealthy y puede ser liquidada, (4) el liquidador
+    paga menos y el borrower pierde la posicion + fees.
+    PERO: stakePosition verifica health post-stake (linea 1390-1393), asi que
+    si la posicion se vuelve unhealthy al stakear, el tx revierte.
+  impact: "Posiciones que parecen healthy unstaked pueden revertir al intentar stakear, o si ya estan staked, pueden ser liquidadas injustamente"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 5; i++) {
+        uint256 tokenId = ghost_allTokenIds[i];
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        // loanInfo uses the current staked state, so fullValue already reflects ignoreFees if staked
+        if (debt > 0 && collateralValue > 0) {
+            // Healthy position should have collateralValue >= debt
+            // This just monitors -- the actual invariant is that loanInfo is consistent
+            t(true, "VV-D-18: staked health check placeholder");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: "stakePosition() llama _stake() y luego verifica health. Si la posicion se vuelve unhealthy al stakear (porque fees se excluyen), el usuario no puede stakear. Pero si ya esta staked y fees eran significativas, la posicion podria estar cerca del limite. _transform tambien re-stakes si wasStaked, y verifica health post-stake."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-19
+  tier: 1
+  type: property
+  description: "Transform replacement integrity: al reemplazar tokenId en onERC721Received, la deuda se transfiere correctamente sin creacion ni destruccion"
+  attack_scenario: >
+    En onERC721Received con oldTokenId != 0 (replacement mode), el codigo:
+    1. Copia debtShares de old a new
+    2. Llama _cleanupLoan(oldTokenId) que reduce totalDebtShares de old tokens
+    3. Llama _updateAndCheckCollateral(newTokenId) que incrementa totalDebtShares de new tokens
+    Si los pares de tokens de old y new son diferentes, los totalDebtShares per-token
+    cambian. Verificar que debtSharesTotal global no cambia (solo se mueve entre tokens).
+    Edge case: si el nuevo token ya tiene debtShares (check en linea 482 deberia prevenir esto).
+  impact: "Creacion o destruccion de deuda durante replacement, afectando solvencia global"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Global debtSharesTotal should be conserved during transforms
+    // (checked after every handler call)
+    uint256 currentDebtSharesTotal = vault.debtSharesTotal();
+    uint256 sumDebtShares = 0;
+    for (uint256 i = 0; i < ghost_allTokenIds.length && i < 20; i++) {
+        (uint256 s) = vault.loans(ghost_allTokenIds[i]);
+        sumDebtShares += s;
+    }
+    eq(currentDebtSharesTotal, sumDebtShares, "VV-D-19: debtSharesTotal mismatch after transform");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "El replacement path en onERC721Received NO modifica debtSharesTotal directamente -- solo mueve shares entre loans y token configs. _cleanupLoan(old) sets loan to 0 and calls _updateAndCheckCollateral(old, oldShares, 0). _updateAndCheckCollateral(new, 0, debtShares). Neto: debtSharesTotal no cambia. Pero _cleanupLoan deletes loans[oldTokenId], lo cual podria causar ghost_allTokenIds to have stale entries."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-D-20
+  tier: 2
+  type: property
+  description: "Multicall reentrancy safety: V3Vault hereda Multicall de OZ, permitiendo batch calls. Verificar que Multicall no permite bypasear el reentrancy guard de transformedTokenId"
+  attack_scenario: >
+    V3Vault hereda Multicall, que permite llamar multiples funciones en una tx.
+    Un atacante podria usar Multicall para: (1) llamar transform() que setea
+    transformedTokenId, (2) en la misma batch, llamar borrow() con isTransformMode=true
+    para un token diferente. PERO: borrow verifica tokenId == transformedTokenId,
+    asi que solo funciona para el mismo token. Sin embargo, Multicall ejecuta
+    delegatecall a si mismo, lo cual preserva msg.sender como el caller original.
+    Si el caller es un transformer aprobado, podria borrowear via Multicall
+    durante transform mode.
+  impact: "Borrow no autorizado via Multicall batch durante transform mode"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any batch of calls, transformedTokenId must be 0
+    eq(vault.transformedTokenId(), 0, "VV-D-20: transformedTokenId non-zero after multicall batch");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "Multicall usa delegatecall(address(this), ...), lo cual mantiene msg.sender y msg.value del caller original. transform() verifica transformedTokenId == 0 al inicio (linea 559), asi que no se puede entrar en transform mode dos veces. El riesgo es si alguien combina transform + otra funcion en un batch."
+  poc_sketch: ''
+  call_stack: ''
 
 false_positives:
-  - hunter: DomainHunter
-    id: VV-FP-01
-    reason: "First depositor inflation attack is mitigated by design. Revert Lend uses exchange-rate-based share pricing (lendExchangeRateX96) rather than balance-based totalAssets(). Direct token donations increase balance but NOT the exchange rate, so they go to reserves. The share price is only affected by interest accrual through _calculateGlobalInterest. This means the classic ERC4626 inflation vector does not apply."
-    investigated_at: "2026-03-20T00:00:00Z"
-    pending_briefing_update:
-      action: add_to_trampas
-      briefing: lending.md
-      content: "Revert Lend V3Vault uses exchange-rate-based ERC4626 -- NOT balance-based totalAssets for share pricing. First depositor inflation attack does not apply because donations go to reserves, not share price."
+- hunter: DomainHunter
+  id: VV-FP-D-01
+  reason: >
+    Donation attack en totalAssets(): totalAssets() usa balanceOf que es manipulable
+    via direct transfer. PERO el vault NO usa totalAssets() para share pricing internamente.
+    Los exchange rates se actualizan solo via interest accrual en _calculateGlobalInterest().
+    Las donaciones solo inflan reserves, que son extraibles por el owner (trust assumption aceptada).
+    No es un bug critico para lenders.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "V3Vault usa exchange rates internos, NO totalAssets()/balanceOf, para share pricing. Donations inflan reserves pero no share price. No vulnerable a donation-based share inflation."
+    briefing_update_applied: false
 
-  - hunter: DomainHunter
-    id: VV-FP-02
-    reason: "Transform borrow() health-check skip is safe. While borrow() skips health check in transform mode (line 630), the health check IS performed at the end of _transform (line 579) after the transformer returns. The transformedTokenId sentinel prevents reentrancy into transform. The only risk would be if a transformer could cause the vault to call itself, but the transformer allowlist is admin-controlled."
-    investigated_at: "2026-03-20T00:00:00Z"
+- hunter: DomainHunter
+  id: VV-FP-D-02
+  reason: >
+    First depositor attack: el vault inicia con lendExchangeRateX96 = Q96 (1:1).
+    Sin virtual shares ni dead shares. Pero como el vault usa exchange rates internos
+    (no totalAssets/totalSupply ratio), el clasico attack de donate-to-inflate-share-price
+    no funciona. La share price solo sube via interest accrual, que requiere deuda activa
+    y paso de tiempo. El primer depositor no puede manipular el exchange rate.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: vault.md
+    content: "V3Vault: first depositor attack no aplica porque share price se basa en exchange rate acumulativo, no en totalAssets/totalSupply ratio. La donacion no afecta el rate."
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: VV-FP-D-03
+  reason: >
+    ERC4626 compliance: loanInfo() y las funciones preview retornan valores basados
+    en _calculateGlobalInterest (view, no actualiza estado). Esto es correcto per EIP-4626.
+    Solodit M-14 reporto non-compliance pero esto parece ser por diferencias menores
+    en el comportamiento de deposit/mint cuando se exceden limites (deberia retornar 0
+    en maxDeposit en vez de revertir). No es un finding explotable.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

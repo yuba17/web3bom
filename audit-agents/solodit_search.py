@@ -113,12 +113,20 @@ def _build_fts5_match(keywords: list) -> str:
     """
     Construye expresión FTS5 MATCH desde lista de keywords.
     ["gauge reward", "epoch"] → gauge OR reward OR epoch
+    Términos con guión (STK-1) se pasan como "STK-1" (quoted) para evitar
+    que FTS5 interprete '-' como NOT operator.
     """
     terms = []
     for kw in keywords:
         for part in kw.strip().split():
+            # Quitar caracteres peligrosos para FTS5 excepto letras/números/guión/guión_bajo
             clean = re.sub(r'[^a-zA-Z0-9_\-]', '', part)
-            if clean and len(clean) >= 2:
+            if not clean or len(clean) < 2:
+                continue
+            # Si contiene guión → quoted string para evitar NOT operator en FTS5
+            if '-' in clean:
+                terms.append(f'"{clean}"')
+            else:
                 terms.append(clean)
 
     if not terms:
@@ -128,7 +136,7 @@ def _build_fts5_match(keywords: list) -> str:
     seen = set()
     unique = []
     for t in terms:
-        tl = t.lower()
+        tl = t.lower().strip('"')
         if tl not in seen:
             seen.add(tl)
             unique.append(t)

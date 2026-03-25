@@ -1,0 +1,255 @@
+protocol: hyperlane
+component: Mailbox
+file: /home/kali/Documents/Web3/hyperlane-monorepo/solidity/contracts/Mailbox.sol
+domain: access
+hunter: OracleHunter
+generated_at: '2026-03-24T18:30:00Z'
+invariants:
+- id: M-O-01
+  tier: 1
+  type: property
+  description: "quoteDispatch y dispatch deben usar la misma logica de fee splitting -- si quoteDispatch retorna X, enviar X en msg.value a dispatch debe cubrir ambos hooks sin revert"
+  attack_scenario: "requiredHook.quoteDispatch() puede retornar un valor diferente entre la llamada a quoteDispatch() y dispatch() si el hook tiene estado mutable (ej: protocol fee cambia entre bloques, front-running de owner). Un usuario que llama quoteDispatch, luego dispatch con ese valor exacto, puede: (1) overpay si el quote sube, (2) underpay y tener el requiredHook revert si el quote baja y luego sube, (3) el hook custom recibe menos ETH del esperado. El atacante front-runs el cambio de fee para causar DoS o extraer valor."
+  impact: "Usuarios pierden ETH por overpayment o sufren DoS por underpayment. El hook custom puede recibir 0 ETH si requiredHook.quoteDispatch sube entre quote y dispatch."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Quote primero, luego verifica que dispatch con ese quote no revierte
+    // y que la distribucion de fondos es consistente
+    bytes memory msgBody = hex"deadbeef";
+    bytes32 recipient = bytes32(uint256(uint160(address(this))));
+    uint256 quoted = originMailbox.quoteDispatch(DESTINATION, recipient, msgBody);
+    uint256 balBefore = address(originMailbox).balance;
+    // Si el quote es consistente, dispatch con ese valor no debe revertir
+    // y el mailbox no debe retener fondos
+    try originMailbox.dispatch{value: quoted}(DESTINATION, recipient, msgBody) {
+      uint256 balAfter = address(originMailbox).balance;
+      eq(balAfter, balBefore, "M-O-01: Mailbox retained ETH after dispatch");
+    } catch {
+      // Si revierte con el quote exacto, hay inconsistencia
+      t(false, "M-O-01: dispatch reverted with exact quoted amount");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "El vector depende de que requiredHook tenga estado mutable entre quoteDispatch y postDispatch. ProtocolFee tipicamente es estable pero el owner puede cambiarlo."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-02
+  tier: 1
+  type: property
+  description: "recipientIsm() no valida que el ISM retornado sea un contrato -- un recipient malicioso puede retornar una EOA como ISM, causando que ism.verify() retorne datos arbitrarios"
+  attack_scenario: "Un recipient malicioso implementa interchainSecurityModule() retornando una EOA (no contrato). Cuando process() llama ism.verify(), la llamada a una EOA retorna true (success con empty returndata, que Solidity NO detecta como error en high-level calls si el compilador no chequea returndata size). Esto bypassea la verificacion de seguridad completamente, permitiendo procesar mensajes fraudulentos."
+  impact: "Bypass total del ISM -- mensajes no verificados se entregan al recipient. El recipient malicioso puede auto-enviar mensajes cross-chain falsos para explotar cualquier logica downstream."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que recipientIsm siempre retorna un contrato o el defaultIsm
+    address testRecipient = address(uint160(uint256(keccak256("test_recipient"))));
+    IInterchainSecurityModule ism = originMailbox.recipientIsm(testRecipient);
+    address ismAddr = address(ism);
+    // El ISM debe ser un contrato (no EOA) o ser el defaultIsm
+    bool isContract = ismAddr.code.length > 0;
+    bool isDefault = ismAddr == address(originMailbox.defaultIsm());
+    t(isContract || isDefault, "M-O-02: recipientIsm returned non-contract, non-default ISM");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: "En Solidity >=0.8, high-level calls a EOAs con returndata esperada revierten si no hay code. Esto probablemente es seguro por defecto, pero si el compilador version es >=0.8 la llamada revertira. Verificar version exacta del compilador. Si usa <0.8 o si hay un edge case con returndata, es explotable. ACTUALIZADO: ism.verify() es una high-level call, y en >=0.8 la EVM chequea que el target tenga code. Confianza baja porque probablemente es safe."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-03
+  tier: 1
+  type: property
+  description: "process() marca el mensaje como delivered ANTES de verificar con el ISM (CEI violation) -- si ISM.verify revierte, el delivery queda marcado pero la transaccion revierte, asi que el storage se deshace. PERO si ISM.verify tiene side effects y retorna false, el delivery ya esta escrito"
+  attack_scenario: "El CEI pattern esta invertido: deliveries[_id] se escribe en L247-249, luego ism.verify() se llama en L257-259. Si una ISM maliciosa o comprometida observa que el delivery ya esta marcado (via delivered(id) que lee deliveries), podria tomar decisiones basadas en estado inconsistente. Ademas, si verify() tiene side-effects (emite eventos, actualiza estado) y luego falla el handle(), esos side-effects persisten pero el delivery se revierte, creando inconsistencia cross-contract."
+  impact: "Inconsistencia de estado entre Mailbox y ISM/recipient. En el caso de ISM con estado mutable, puede causar double-processing o skip de verificacion en ISMs que trackean mensajes verificados."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que un mensaje no puede estar en estado "delivered" sin haber pasado ISM verification
+    // Esto testea la invariante post-condicion: delivered(id) == true implica ISM.verify retorno true
+    bytes32 testId = keccak256("test_message_id");
+    bool isDelivered = originMailbox.delivered(testId);
+    if (isDelivered) {
+      // Si esta delivered, el processor no puede ser address(0)
+      address proc = originMailbox.processor(testId);
+      t(proc != address(0), "M-O-03: delivered message has zero processor");
+      // Y el blockNumber debe ser > 0
+      uint48 processedBlock = originMailbox.processedAt(testId);
+      gt(uint256(processedBlock), 0, "M-O-03: delivered message has zero block");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: "La transaccion completa revierte si verify() revierte o handle() revierte, asi que el storage se deshace. El riesgo real es si verify() tiene side-effects ANTES de retornar false y no revierte. Confianza baja por la naturaleza del EVM rollback."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-04
+  tier: 1
+  type: property
+  description: "dispatch() permite hook=address(0) que se reemplaza por defaultHook, pero un caller puede pasar un hook arbitrario (cualquier contrato) -- no hay whitelist. Un hook malicioso puede robar los fondos enviados via postDispatch{value: ...}"
+  attack_scenario: "Un usuario llama dispatch(domain, recipient, body, metadata, maliciousHook). El Mailbox envia msg.value - requiredValue al hook malicioso via hook.postDispatch{value: ...}. El hook malicioso simplemente recibe el ETH y no hace nada util. El usuario pierde sus fondos voluntariamente (auto-ataque). PERO: si un protocolo upstream construye la llamada a dispatch y permite al usuario especificar el hook, el usuario puede desviar fondos del protocolo."
+  impact: "Protocolos que integran Hyperlane y permiten al usuario controlar el parametro hook pueden perder fondos. El Mailbox en si no pierde fondos propios."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que el Mailbox no retiene fondos despues de dispatch
+    // independientemente del hook usado
+    uint256 mailboxBalBefore = address(originMailbox).balance;
+    bytes memory msgBody = hex"cafe";
+    bytes32 recipient = bytes32(uint256(uint160(address(this))));
+    try originMailbox.dispatch{value: 1 ether}(DESTINATION, recipient, msgBody) {
+      uint256 mailboxBalAfter = address(originMailbox).balance;
+      eq(mailboxBalAfter, mailboxBalBefore, "M-O-04: Mailbox retained funds after dispatch");
+    } catch {}
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: "El dispatch es permissionless y acepta cualquier hook. Esto es by design segun Hyperlane -- el caller elige su hook. El riesgo es para integradores que no sanitizan el hook parameter."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-05
+  tier: 2
+  type: property
+  description: "requiredHook.quoteDispatch() puede retornar un valor mayor que msg.value, pero dispatch() clampea requiredValue = msg.value en ese caso (L308-310). Esto significa que requiredHook recibe todo el ETH y el hook custom recibe 0"
+  attack_scenario: "Si requiredHook.quoteDispatch es manipulable (ej: depende de gas price, estado externo, o un oracle de precio de gas interchain), un atacante puede inflarlo para que siempre sea >= msg.value. Resultado: el hook custom (que puede ser un InterchainGasPaymaster) recibe 0 ETH, el mensaje no se paga en destino, y el relayer no lo procesa. DoS selectivo de mensajes."
+  impact: "DoS de mensajes cross-chain. El hook custom de gas payment recibe 0 ETH, el relayer no tiene incentivo para relayear, el mensaje queda pendiente indefinidamente."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que requiredHook no consume todo el msg.value
+    // dejando al hook custom sin fondos
+    bytes memory msgBody = hex"beef";
+    bytes32 recipient = bytes32(uint256(uint160(address(this))));
+    bytes memory metadata = hex"";
+    uint256 requiredQuote = originMailbox.quoteDispatch(DESTINATION, recipient, msgBody);
+    // El quote total debe ser razonable (no mayor que un umbral)
+    // Si requiredQuote > 0, el hook custom debe recibir algo tambien
+    lte(requiredQuote, 1 ether, "M-O-05: quoted fee exceeds 1 ETH -- suspicious");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "El clamping en L308-310 es intencional -- el comentario dice 'defer to required hook reverting behavior'. Pero el hecho de que NO revierte y silenciosamente da 0 al custom hook es el vector. La requiredHook deberia revertir si underpaid, pero si no lo hace, el custom hook se queda sin fondos silenciosamente."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-06
+  tier: 2
+  type: property
+  description: "nonce overflow: nonce es uint32 (max 4,294,967,295). Si se envian suficientes mensajes, nonce wraps a 0, causando colision de message IDs y potencial replay"
+  attack_scenario: "Despues de ~4.3 mil millones de dispatches, nonce wraps a 0. Los message IDs se calculan usando nonce, asi que los nuevos mensajes tendrian IDs identicos a mensajes antiguos. En destination, delivered[id] ya seria true, bloqueando el procesamiento de mensajes legitimos nuevos. Alternativamente, si el mensaje original no fue procesado, un mensaje nuevo con el mismo ID podria ser procesado con datos diferentes."
+  impact: "Colision de message IDs causa DoS permanente para ciertos recipients o replay de mensajes viejos."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que nonce es monotonicamente creciente y no ha wrapped
+    uint32 currentNonce = originMailbox.nonce();
+    // Nonce debe ser razonable (no cerca del max)
+    lt(uint256(currentNonce), uint256(type(uint32).max - 1000), "M-O-06: nonce approaching uint32 max -- wrap risk");
+  ghost_vars:
+  - uint32 internal ghost_lastNonce;
+  validated: false
+  priority: low
+  confidence: 30
+  notes: "4.3 mil millones de transacciones es practicamente imposible en la mayoria de chains por costo de gas. Este es un riesgo teorico, no practico. Lo documento para completitud."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-07
+  tier: 1
+  type: property
+  description: "quoteDispatch() y dispatch() construyen el mensaje con _buildMessage() que usa el nonce ACTUAL. Pero en dispatch(), nonce se incrementa DESPUES de construir el mensaje (L301). Si quoteDispatch se llama en la misma tx antes de dispatch, ambos usan el mismo nonce y producen el mismo message -- el quote es correcto. PERO si otra dispatch ocurre entre quote y dispatch (front-running), el nonce cambia y el message es diferente, potencialmente cambiando el quote de los hooks"
+  attack_scenario: "Hook.quoteDispatch(metadata, message) puede retornar fees diferentes segun el contenido del mensaje (ej: routing hooks que cobran diferente por destination). Si un front-runner inserta un dispatch entre el quoteDispatch y el dispatch del victima, el nonce cambia, el message ID cambia, y el hook puede cobrar diferente. El usuario puede overpay o underpay."
+  impact: "Inconsistencia de fees pagados. En el peor caso, el usuario paga mas de lo esperado o la transaccion revierte por underpayment."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que el nonce se incrementa exactamente en 1 por cada dispatch
+    uint32 nonceBefore = originMailbox.nonce();
+    bytes memory msgBody = hex"aa";
+    bytes32 recipient = bytes32(uint256(uint160(address(this))));
+    try originMailbox.dispatch{value: 0}(DESTINATION, recipient, msgBody) {
+      uint32 nonceAfter = originMailbox.nonce();
+      eq(uint256(nonceAfter), uint256(nonceBefore) + 1, "M-O-07: nonce did not increment by exactly 1");
+    } catch {}
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: "Los hooks tipicamente no varian fee por message content/nonce, pero hooks custom podrian hacerlo. El riesgo depende de la implementacion del hook."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-O-08
+  tier: 2
+  type: property
+  description: "latestDispatchedId se sobreescribe en cada dispatch (L300) y se usa para auth en post-dispatch hooks. En un contexto de multicall o batch, solo el ultimo dispatch ID es visible, los anteriores se pierden"
+  attack_scenario: "Si un protocolo hace 2+ dispatches en una transaccion (batch), latestDispatchedId solo refleja el ultimo. Si un hook usa latestDispatchedId para validar que el caller realmente dispatcho un mensaje, solo el ultimo mensaje es verificable. Un atacante podria explotar esto en hooks que confian en latestDispatchedId para auth -- front-running con su propio dispatch para sobrescribir el ID antes de que el hook lo lea."
+  impact: "Hooks que dependen de latestDispatchedId para auth pueden ser bypasseados. Un atacante puede sobrescribir el ID con su propio mensaje y luego explotar el hook."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que latestDispatchedId corresponde al ultimo mensaje dispatched
+    bytes memory msgBody1 = hex"01";
+    bytes memory msgBody2 = hex"02";
+    bytes32 recipient = bytes32(uint256(uint160(address(this))));
+    try originMailbox.dispatch{value: 0}(DESTINATION, recipient, msgBody1) returns (bytes32 id1) {
+      bytes32 latestAfter1 = originMailbox.latestDispatchedId();
+      eq(uint256(latestAfter1), uint256(id1), "M-O-08: latestDispatchedId mismatch after first dispatch");
+    } catch {}
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: "latestDispatchedId es un patron de auth fragil. Si hooks dependen de el, es vulnerable a race conditions en batch/multicall. El impacto depende de que hooks lo usen y como."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: OracleHunter
+  id: M-O-FP-01
+  reason: "El contrato Mailbox no usa oracles de precio tradicionales (Chainlink, TWAP, Uniswap). Los 'oracles' en este contexto son los ISMs que verifican mensajes cross-chain y los hooks que calculan fees. El analisis se adapto a estas external dependencies como fuentes de datos de confianza analogas a oracles."
+  investigated_at: '2026-03-24T18:30:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Mailbox de Hyperlane no usa oracles de precio -- los ISMs y hooks son las dependencias externas de confianza. No buscar latestRoundData/TWAP en contratos de messaging."
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: M-O-FP-02
+  reason: "recipientIsm() retorna un ISM no validado como contrato, pero en Solidity >=0.8, la high-level call a ism.verify() en process() revertira automaticamente si el target no tiene code (EXTCODESIZE check). Asi que un recipient que retorna una EOA como ISM causara revert, no bypass. Esto NO es un bug explotable en la practica."
+  investigated_at: '2026-03-24T18:30:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "High-level calls en Solidity >=0.8 incluyen EXTCODESIZE check -- una EOA como ISM target causa revert, no bypass de verificacion."
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: M-O-FP-03
+  reason: "El CEI violation en process() (delivery marcado antes de ISM verify) NO es explotable porque: (1) si verify() revierte, toda la tx revierte y el storage se deshace, (2) si verify() retorna false, el require en L257-259 revierte y deshace, (3) la unica forma de explotar seria si verify() tiene side-effects Y retorna true pero el handle() revierte -- en ese caso, todo se deshace tambien. El delivery solo persiste si TODA la funcion completa exitosamente."
+  investigated_at: '2026-03-24T18:30:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "CEI violation en Mailbox.process() no es explotable -- EVM atomic transactions deshacen todo el storage si cualquier sub-llamada revierte."
+    briefing_update_applied: false

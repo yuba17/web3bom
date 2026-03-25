@@ -1,0 +1,487 @@
+hunter: MathHunter
+component: VaultV2
+contract: /home/kali/Documents/Web3/vault-v2/src/VaultV2.sol
+domain: vault
+generated: 2026-03-25
+
+hypotheses:
+
+  - id: VV2-MATH-01
+    title: "Donation attack inflates share price via balanceOf read in accrueInterestView"
+    description: |
+      accrueInterestView() at L655 reads IERC20(asset).balanceOf(address(this)) to compute realAssets.
+      A direct token transfer (donation) before accrueInterest() inflates realAssets, but is capped by
+      maxRate. However, if maxRate is set high (up to 200% APR) and elapsed time is large, the cap may
+      not be effective. An attacker can donate tokens, then deposit to get shares at a price that hasn't
+      fully reflected the donation (since it's rate-limited), then later redeem when the donation is
+      fully accrued. The key math: newTotalAssets = min(realAssets, _totalAssets + _totalAssets*elapsed*maxRate/WAD).
+      If realAssets >> maxTotalAssets the donation is partially absorbed, but the attacker who deposits
+      RIGHT AFTER the donation gets shares priced at maxTotalAssets, not realAssets. The excess sits as
+      unaccounted idle balance until future accruals.
+    severity: high
+    confidence: 65
+    solidity: |
+      function crytic_donation_does_not_inflate_share_price() public returns (bool) {
+        uint256 totalAssetsBefore = vault.totalAssets();
+        uint256 supplyBefore = vault.totalSupply();
+        if (supplyBefore == 0 || totalAssetsBefore == 0) return true;
+        uint256 sharePriceBefore = (totalAssetsBefore * 1e18) / supplyBefore;
+        uint256 totalAssetsAfter = vault.totalAssets();
+        uint256 supplyAfter = vault.totalSupply();
+        if (supplyAfter == 0) return true;
+        uint256 sharePriceAfter = (totalAssetsAfter * 1e18) / supplyAfter;
+        uint256 elapsed = block.timestamp - vault.lastUpdate();
+        uint256 maxIncrease = (sharePriceBefore * elapsed * vault.maxRate()) / 1e18;
+        return t(sharePriceAfter <= sharePriceBefore + maxIncrease + 1, "MATH-01: donation inflated share price beyond maxRate");
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+      - deposit
+      - previewDeposit
+    attack_scenario: |
+      1. Attacker observes vault with 1M assets, 1M shares (1:1 ratio)
+      2. Attacker donates 100K tokens directly via transfer
+      3. accrueInterestView sees realAssets=1.1M but caps at maxTotalAssets based on maxRate
+      4. Attacker deposits immediately — gets shares priced at capped rate
+      5. Over time, the donated 100K gradually accrues, increasing share price
+      6. Attacker redeems later at higher share price, extracting value from existing depositors
+
+  - id: VV2-MATH-02
+    title: "Fee shares computation underflow when fees exceed newTotalAssets after long inactivity"
+    description: |
+      In accrueInterestView() L674: newTotalAssetsWithoutFees = newTotalAssets - performanceFeeAssets - managementFeeAssets.
+      If fees are large enough (long elapsed time with managementFee), this subtraction underflows.
+      The comment at L673 says "Interest should be accrued at least every 10 years to avoid fees exceeding total assets."
+      But there's no enforcement. managementFeeAssets = (newTotalAssets * elapsed * managementFee / WAD).
+      MAX_MANAGEMENT_FEE = 0.05e18/365days ~ 1.585e9/sec. Underflow when elapsed * managementFee > WAD,
+      i.e., elapsed > WAD / 1.585e9 ~ 6.31e8 sec ~ 20 years. Unlikely but unguarded.
+    severity: medium
+    confidence: 45
+    solidity: |
+      function crytic_fee_assets_never_exceed_total_assets() public returns (bool) {
+        (uint256 newTotalAssets, uint256 perfFeeShares, uint256 mgmtFeeShares) = vault.accrueInterestView();
+        uint256 currentSupply = vault.totalSupply();
+        if (currentSupply == 0) return true;
+        uint256 totalFeeShares = perfFeeShares + mgmtFeeShares;
+        return t(totalFeeShares <= currentSupply, "MATH-02: fee shares exceed total supply in single accrual");
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+    attack_scenario: |
+      1. Vault created with managementFee = MAX_MANAGEMENT_FEE (5% APR)
+      2. Nobody interacts with the vault for ~20 years
+      3. accrueInterest() called — managementFeeAssets ~ newTotalAssets
+      4. L674 underflows, tx reverts — vault bricked
+      5. All deposits/withdrawals revert because they call accrueInterest first
+
+  - id: VV2-MATH-03
+    title: "Zero shares minted for non-zero deposit due to rounding in previewDeposit"
+    description: |
+      previewDeposit at L687: assets.mulDivDown(newTotalSupply + virtualShares, newTotalAssets + 1).
+      If the vault has accumulated significant totalAssets relative to totalSupply (high share price),
+      a small deposit rounds down to 0 shares. For 18-decimal tokens, virtualShares = 1.
+      With virtualShares=1, depositing 1 wei when share price > 1 yields 0 shares.
+      The vault doesn't check shares > 0 in enter(), so user loses their deposit.
+      Solodit finding #5 confirms: "Zero shares could be minted for a non-zero provided asset".
+    severity: medium
+    confidence: 75
+    solidity: |
+      function crytic_nonzero_deposit_mints_nonzero_shares() public returns (bool) {
+        uint256 supply = vault.totalSupply();
+        uint256 ta = vault.totalAssets();
+        if (supply == 0 || ta == 0) return true;
+        uint256 meaningfulAmount = 10 ** (vault.decimals() / 2);
+        uint256 shares = vault.previewDeposit(meaningfulAmount);
+        return t(shares > 0, "MATH-03: meaningful deposit gives zero shares");
+      }
+    affected_functions:
+      - previewDeposit
+      - deposit
+      - enter
+    attack_scenario: |
+      1. Vault has totalAssets = 1e30, totalSupply = 1e12 (share price = 1e18)
+      2. User deposits 1e17 (0.1 token) — previewDeposit rounds to 0 shares
+      3. enter() transfers 0.1 token, mints 0 shares — user loses funds
+      4. The 0.1 token increases _totalAssets, benefiting existing shareholders
+
+  - id: VV2-MATH-04
+    title: "Deposit-then-redeem roundtrip should never profit the user"
+    description: |
+      previewDeposit uses mulDivDown (L687) — fewer shares for depositor.
+      previewRedeem uses mulDivDown (L708) — fewer assets for redeemer.
+      Both round in favor of the vault, which is correct per EIP-4626.
+      A deposit-then-redeem roundtrip: user deposits X assets, gets Y shares (rounded down),
+      redeems Y shares, gets Z assets (rounded down). Z should always be <= X.
+      The +1 in totalAssets denominators provides asymmetric protection.
+      This invariant must hold across all vault states — if broken, attacker drains vault.
+    severity: high
+    confidence: 70
+    solidity: |
+      function crytic_roundtrip_deposit_redeem_no_profit() public returns (bool) {
+        uint256 ta = vault.totalAssets();
+        if (ta == 0) return true;
+        uint256 depositAmount = 1e18;
+        uint256 sharesGot = vault.previewDeposit(depositAmount);
+        if (sharesGot == 0) return true;
+        uint256 assetsBack = vault.previewRedeem(sharesGot);
+        return t(assetsBack <= depositAmount, "MATH-04: deposit-redeem roundtrip profits user");
+      }
+    affected_functions:
+      - previewDeposit
+      - previewRedeem
+      - deposit
+      - redeem
+    attack_scenario: |
+      1. Attacker finds vault state where rounding creates favorable conditions
+      2. Deposits X assets via deposit(), receives Y shares
+      3. Immediately redeems Y shares via redeem()
+      4. If assetsBack > X, attacker profits — extracting from vault reserves
+      5. Repeat in loop to drain vault
+
+  - id: VV2-MATH-05
+    title: "maxTotalAssets overflow in accrueInterestView when _totalAssets * elapsed is large"
+    description: |
+      L659: maxTotalAssets = _totalAssets + (_totalAssets * elapsed).mulDivDown(maxRate, WAD).
+      The intermediate (_totalAssets * elapsed) is computed before mulDivDown.
+      mulDivDown does (x * y) / d, so the full computation is: (_totalAssets * elapsed * maxRate) / WAD.
+      _totalAssets is uint128 (max ~3.4e38). elapsed could be large if lastUpdate is stale.
+      MAX_MAX_RATE = 200%/year ~ 6.34e9/sec.
+      Worst case: 3.4e38 * 3.15e8 * 6.34e9 = ~6.8e56, which exceeds uint256.max (~1.15e77).
+      Wait — this fits. But if _totalAssets is near max AND elapsed is very large (billions of seconds),
+      the multiplication inside mulDivDown (x*y where x = _totalAssets*elapsed, y = maxRate) could overflow.
+    severity: low
+    confidence: 40
+    solidity: |
+      function crytic_accrue_interest_view_no_revert() public returns (bool) {
+        try vault.accrueInterestView() returns (uint256 newTA, uint256, uint256) {
+          return t(newTA >= vault._totalAssets() || newTA == vault._totalAssets(), "MATH-05: newTotalAssets inconsistent");
+        } catch {
+          return t(false, "MATH-05: accrueInterestView reverted — potential overflow");
+        }
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+    attack_scenario: |
+      1. Vault accumulates large _totalAssets (close to uint128 max)
+      2. Nobody calls accrueInterest for extended period
+      3. (_totalAssets * elapsed) * maxRate in mulDivDown overflows uint256
+      4. Transaction reverts — vault DoS'd, nobody can deposit/withdraw/redeem
+
+  - id: VV2-MATH-06
+    title: "Fee share denominator near-zero creates massive dilution"
+    description: |
+      At L676: performanceFeeShares = performanceFeeAssets.mulDivDown(totalSupply + virtualShares, newTotalAssetsWithoutFees + 1).
+      The +1 prevents division by zero. But when newTotalAssetsWithoutFees = 0 (fees consumed everything),
+      denominator = 1. Fee shares = performanceFeeAssets * (totalSupply + virtualShares).
+      This would mint astronomical fee shares, diluting all depositors to near-zero.
+      Can newTotalAssetsWithoutFees reach 0? If both fees are at max and elapsed is large enough
+      that fees >= newTotalAssets, yes. Or if newTotalAssets itself is very small.
+    severity: high
+    confidence: 35
+    solidity: |
+      function crytic_fee_shares_bounded_by_total_supply() public returns (bool) {
+        (uint256 newTA, uint256 perfShares, uint256 mgmtShares) = vault.accrueInterestView();
+        uint256 currentSupply = vault.totalSupply();
+        if (currentSupply == 0) return true;
+        uint256 totalFeeShares = perfShares + mgmtShares;
+        return t(totalFeeShares <= currentSupply * 2, "MATH-06: fee shares exceed 2x current supply — massive dilution");
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+    attack_scenario: |
+      1. Vault has small totalAssets (e.g., 100 wei) and both fees at max
+      2. Extended period causes fees to consume most of totalAssets
+      3. newTotalAssetsWithoutFees ~ 0, denominator = 1
+      4. Fee shares = feeAssets * (supply + vShares) — massive dilution
+      5. Fee recipients own almost all shares, depositors diluted to near-zero
+
+  - id: VV2-MATH-07
+    title: "firstTotalAssets transient storage enables stale share price within multicall"
+    description: |
+      firstTotalAssets is `transient` (L218), resets to 0 at tx end.
+      accrueInterest() L640: if (firstTotalAssets == 0) firstTotalAssets = newTotalAssets.
+      accrueInterestView() L653: if (firstTotalAssets != 0) return (_totalAssets, 0, 0).
+      Interest accrues only ONCE per tx. But deposit at L770 does _totalAssets += assets.toUint128().
+      In a multicall: deposit changes _totalAssets, but subsequent previewDeposit/previewWithdraw
+      calls accrueInterestView which returns STALE _totalAssets (from before the deposit).
+      Wait — it returns current _totalAssets (which WAS updated by the deposit). The key is that
+      accrueInterestView returns (_totalAssets, 0, 0) when firstTotalAssets != 0, so it returns
+      the CURRENT _totalAssets (which includes deposit changes). So this is actually correct.
+      BUT: the share price for the second operation reflects the first operation's _totalAssets change.
+      This means depositing twice in one tx: first deposit inflates _totalAssets, second deposit
+      gets fewer shares because _totalAssets is higher. This is expected behavior.
+    severity: low
+    confidence: 50
+    solidity: |
+      function crytic_interest_accrual_idempotent_within_tx() public returns (bool) {
+        vault.accrueInterest();
+        uint256 taAfter1 = vault._totalAssets();
+        vault.accrueInterest();
+        uint256 taAfter2 = vault._totalAssets();
+        return t(taAfter1 == taAfter2, "MATH-07: second accrueInterest changed _totalAssets within same tx");
+      }
+    affected_functions:
+      - accrueInterest
+      - accrueInterestView
+      - multicall
+    attack_scenario: |
+      1. Attacker uses multicall: deposit(huge) + withdraw(huge) in same tx
+      2. First deposit accrues interest and sets firstTotalAssets
+      3. Deposit increases _totalAssets
+      4. Second withdraw sees higher _totalAssets → different share price
+      5. Net effect: attacker's withdraw uses a share price computed with inflated _totalAssets
+      6. Potential extraction if the share-to-asset conversion is more favorable
+
+  - id: VV2-MATH-08
+    title: "Allocation tracking via int256 change can DoS deallocate if adapter returns bad change"
+    description: |
+      allocateInternal L579: _caps.allocation = (int256(_caps.allocation) + change).toUint256().
+      deallocateInternal L607: same pattern.
+      The `change` from adapter is int256. If adapter returns change that makes allocation negative,
+      toUint256 reverts. A buggy or malicious adapter can return change = -int256(allocation) - 1,
+      permanently DoS'ing deallocate for that id. Funds locked in adapter.
+    severity: medium
+    confidence: 55
+    solidity: |
+      function crytic_allocation_never_negative() public returns (bool) {
+        // After any allocate/deallocate, all allocations must be >= 0
+        // We can't iterate caps directly, but we verify _totalAssets >= idle
+        uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+        uint256 ta = vault._totalAssets();
+        return t(ta >= idle || ta == 0, "MATH-08: _totalAssets < idle — allocation accounting broken");
+      }
+    affected_functions:
+      - allocateInternal
+      - deallocateInternal
+    attack_scenario: |
+      1. Malicious adapter returns change = -(allocation + 1) on deallocate
+      2. toUint256 reverts on negative value
+      3. Deallocate permanently bricked for that id
+      4. Funds locked in adapter, users cannot withdraw
+
+  - id: VV2-MATH-09
+    title: "forceDeallocate double rounding up compounds penalty against user"
+    description: |
+      forceDeallocate L827: penaltyAssets = assets.mulDivUp(forceDeallocatePenalty[adapter], WAD).
+      L828: penaltyShares = withdraw(penaltyAssets, address(this), onBehalf).
+      withdraw calls previewWithdraw which uses mulDivUp (rounds up shares).
+      Double round-up: first on penalty assets, then on shares-to-burn.
+      For small amounts, compound rounding error could be 2 wei of shares.
+      The shares go to address(this), increasing share price for others but burning user's shares.
+    severity: low
+    confidence: 70
+    solidity: |
+      function crytic_force_deallocate_penalty_bounded() public returns (bool) {
+        uint256 assets = 1e18;
+        address adapter = vault.liquidityAdapter();
+        if (adapter == address(0)) return true;
+        uint256 penaltyRate = vault.forceDeallocatePenalty(adapter);
+        if (penaltyRate == 0) return true;
+        uint256 expectedPenalty = (assets * penaltyRate) / 1e18;
+        uint256 actualPenalty = (assets * penaltyRate + 1e18 - 1) / 1e18;
+        return t(actualPenalty <= expectedPenalty + 1, "MATH-09: penalty rounding exceeds 1 wei tolerance");
+      }
+    affected_functions:
+      - forceDeallocate
+      - withdraw
+      - previewWithdraw
+    attack_scenario: |
+      1. User calls forceDeallocate with 1 wei assets
+      2. penaltyAssets = mulDivUp(1, penalty, WAD) rounds up to 1 even for tiny rates
+      3. withdraw(1) calls previewWithdraw(1) — rounds up to 1 share
+      4. User loses 1 share (could be worth significant assets if share price is high)
+      5. Repeated 1-wei forceDeallocates drain shares from another user
+
+  - id: VV2-MATH-10
+    title: "Management fee double-taxes interest — fee on total including already-taxed interest"
+    description: |
+      accrueInterestView L665: performanceFeeAssets = interest * performanceFee / WAD.
+      L670: managementFeeAssets = (newTotalAssets * elapsed * managementFee) / WAD.
+      newTotalAssets includes the interest. So management fee taxes the interest that performance
+      fee already taxed. Combined extraction from interest:
+      performanceFee * interest + managementFee * elapsed * interest (approximately).
+      Also: management fee is on newTotalAssets (post-interest), not on _totalAssets (pre-interest).
+      If interest is small but elapsed is large, managementFee alone can exceed interest,
+      making depositors lose principal even when the underlying position is profitable.
+    severity: medium
+    confidence: 60
+    solidity: |
+      function crytic_management_fee_does_not_exceed_total_assets() public returns (bool) {
+        uint256 ta = vault._totalAssets();
+        if (ta == 0) return true;
+        (uint256 newTA, uint256 perfShares, uint256 mgmtShares) = vault.accrueInterestView();
+        return t(newTA >= 1 || ta == 0, "MATH-10: total assets collapsed to near-zero from fees");
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+    attack_scenario: |
+      1. Vault: 100 ETH, managementFee = MAX (5% APR), performanceFee = 50%
+      2. After 1 year with 10% yield: interest = 10 ETH
+      3. performanceFeeAssets = 10 * 0.5 = 5 ETH
+      4. managementFeeAssets = 110 * 365d * rate ≈ 5.5 ETH (on post-interest total)
+      5. Total fees = 10.5 ETH > interest of 10 ETH — depositors lose 0.5 ETH of principal
+      6. Double-taxation: management fee includes fee on the 10 ETH interest already taxed
+
+  - id: VV2-MATH-11
+    title: "virtualShares = 1 for 18-decimal tokens gives minimal inflation attack protection"
+    description: |
+      Constructor L298-300: decimalOffset = max(0, 18 - assetDecimals), virtualShares = 10^offset.
+      For 18-decimal tokens (DAI, WETH): offset = 0, virtualShares = 1.
+      previewDeposit: assets * (totalSupply + 1) / (totalAssets + 1).
+      With virtualShares=1, first depositor attack requires only ~1e18 donation to steal significant
+      value from second depositor. The +1 in denominator provides negligible protection.
+      The contract docs acknowledge this at L39-41 but don't enforce seeding.
+      Solodit HIGH finding #2 confirms: "Side effects of underlying directly donated to VaultV2."
+    severity: high
+    confidence: 55
+    solidity: |
+      function crytic_first_depositor_protected() public returns (bool) {
+        uint256 supply = vault.totalSupply();
+        uint256 ta = vault.totalAssets();
+        if (supply == 0 || ta == 0) return true;
+        uint256 vShares = vault.virtualShares();
+        if (vShares <= 1 && supply <= 10) {
+          // Share price should not be wildly inflated with so few shares
+          return t(ta <= supply * 1e18, "MATH-11: share price inflated with minimal shares — first depositor attack");
+        }
+        return true;
+      }
+    affected_functions:
+      - previewDeposit
+      - deposit
+      - enter
+    attack_scenario: |
+      1. Fresh vault for DAI (18 decimals, virtualShares = 1)
+      2. Attacker deposits 1 wei DAI — gets 1 share
+      3. Attacker donates 10000e18 DAI directly to vault
+      4. accrueInterest processes donation (capped by maxRate per elapsed time)
+      5. After sufficient time, share price = ~10000e18 per share
+      6. Next depositor deposits 9999e18 DAI — gets 0 or 1 share due to rounding
+      7. Attacker redeems 1 share — gets ~half the vault
+
+  - id: VV2-MATH-12
+    title: "Relative cap uses firstTotalAssets (transient) allowing allocation manipulation"
+    description: |
+      allocateInternal L584: _caps.allocation <= firstTotalAssets.mulDivDown(_caps.relativeCap, WAD).
+      firstTotalAssets is transient, set once per tx at the value of _totalAssets at first accrual.
+      Within a tx, deposits increase _totalAssets but firstTotalAssets stays fixed.
+      If allocator withdraws 90% in a multicall before allocating, _totalAssets drops but
+      firstTotalAssets still reflects the old value. The relative cap check uses the old (higher)
+      value, allowing over-allocation relative to actual assets.
+    severity: medium
+    confidence: 65
+    solidity: |
+      function crytic_relative_cap_uses_reasonable_base() public returns (bool) {
+        uint256 fta = vault.firstTotalAssets();
+        uint256 ta = vault._totalAssets();
+        if (fta == 0 || ta == 0) return true;
+        // firstTotalAssets should not diverge more than 2x from _totalAssets
+        if (ta > 0) {
+          uint256 ratio = (fta * 1e18) / ta;
+          return t(ratio <= 3e18, "MATH-12: firstTotalAssets > 3x _totalAssets — cap check on stale value");
+        }
+        return true;
+      }
+    affected_functions:
+      - allocateInternal
+      - accrueInterest
+    attack_scenario: |
+      1. Vault: _totalAssets = 10M, firstTotalAssets = 10M, relativeCap = 50%
+      2. Allocator withdraws 9M in a multicall — _totalAssets = 1M
+      3. firstTotalAssets still = 10M (transient, set at tx start)
+      4. Allocator calls allocate for 5M (= 50% of firstTotalAssets = 10M)
+      5. Cap check passes: 5M <= 10M * 50% = 5M
+      6. But actual allocation = 5M / 1M = 500% of real _totalAssets
+
+  - id: VV2-MATH-13
+    title: "previewMint(previewDeposit(X)) >= X always — verify vault rounding consistency"
+    description: |
+      previewDeposit uses mulDivDown, previewMint uses mulDivUp.
+      For EIP-4626 compliance: previewMint(previewDeposit(X)) >= X must hold.
+      If violated, deposit() costs less than mint() for the same shares — arbitrage.
+    severity: low
+    confidence: 80
+    solidity: |
+      function crytic_preview_deposit_mint_consistent() public returns (bool) {
+        uint256 ta = vault.totalAssets();
+        if (ta == 0) return true;
+        uint256 assets = 1e18;
+        uint256 shares = vault.previewDeposit(assets);
+        if (shares == 0) return true;
+        uint256 assetsForMint = vault.previewMint(shares);
+        return t(assetsForMint >= assets, "MATH-13: previewMint(previewDeposit(X)) < X — vault leaks value");
+      }
+    affected_functions:
+      - previewDeposit
+      - previewMint
+    attack_scenario: |
+      1. User queries previewDeposit(1e18) = Y shares
+      2. User calls mint(Y) — previewMint(Y) should cost >= 1e18
+      3. If previewMint(Y) < 1e18, mint is cheaper than deposit for same shares
+      4. Attacker uses mint path repeatedly to extract 1 wei per operation
+
+  - id: VV2-MATH-14
+    title: "uint128 truncation in _totalAssets creates deposit cap DoS for high-supply tokens"
+    description: |
+      _totalAssets is uint128 (max ~3.4e38). enter() L770: _totalAssets += assets.toUint128().
+      For 18-decimal tokens, max total is ~3.4e20 tokens (~340 billion).
+      For tokens with huge supply or low decimals (6), this is fine (3.4e32 tokens).
+      But for 18-decimal meme tokens with trillions in supply, deposits revert.
+      Also: accrueInterest L639 casts newTotalAssets to uint128. If adapter realAssets
+      pushes newTotalAssets above uint128.max, accrueInterest reverts — full DoS.
+    severity: low
+    confidence: 50
+    solidity: |
+      function crytic_total_assets_fits_uint128() public returns (bool) {
+        uint256 ta = vault._totalAssets();
+        return t(ta <= type(uint128).max, "MATH-14: _totalAssets exceeds uint128 max");
+      }
+    affected_functions:
+      - accrueInterest
+      - enter
+      - exit
+    attack_scenario: |
+      1. Token with 1e40 total supply at 18 decimals
+      2. Deposits push _totalAssets above uint128.max
+      3. toUint128 reverts — all deposits bricked
+      4. If adapter position grows past uint128, accrueInterest reverts — full DoS
+      5. No one can interact with the vault
+
+  - id: VV2-MATH-15
+    title: "exit() deallocate may return fewer assets than requested causing withdrawal revert"
+    description: |
+      exit() L797: idleAssets = balanceOf(vault). L799: if assets > idle, deallocate (assets - idle).
+      deallocateInternal L610: safeTransferFrom(adapter, vault, assets).
+      But the adapter might return fewer tokens than the requested `assets` due to rounding or fees.
+      The vault then has idle + (returned < requested) < assets needed.
+      L809: safeTransfer(receiver, assets) reverts — user cannot withdraw.
+      The contract docs at L83-85 acknowledge this: "adapters might lose some assets due to roundings."
+    severity: medium
+    confidence: 55
+    solidity: |
+      function crytic_exit_sufficient_balance_post_deallocate() public returns (bool) {
+        // This is a structural invariant: after exit, vault balance >= 0
+        // We verify indirectly: idle + allocated should be consistent
+        uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+        uint256 ta = vault._totalAssets();
+        // idle should be <= _totalAssets (rest is in adapters)
+        // If idle > _totalAssets it means untracked tokens exist (donation)
+        return t(idle <= ta + 1e18 || ta == 0, "MATH-15: idle exceeds _totalAssets significantly — untracked assets");
+      }
+    affected_functions:
+      - exit
+      - deallocateInternal
+      - withdraw
+      - redeem
+    attack_scenario: |
+      1. Vault: 100 idle, 900 in adapter, _totalAssets = 1000
+      2. User redeems shares worth 500 assets
+      3. exit() sees idle=100, requests 400 from adapter
+      4. Adapter returns 399 due to rounding in underlying protocol
+      5. Vault has 100 + 399 = 499 < 500 needed
+      6. safeTransfer(500) reverts — user blocked from withdrawing

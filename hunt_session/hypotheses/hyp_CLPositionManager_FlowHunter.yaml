@@ -1,0 +1,472 @@
+protocol: pancakeswap-infinity
+component: CLPositionManager
+file: src/pool-cl/CLPositionManager.sol
+domain: dex
+hunter: FlowHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: CLPM-01
+  tier: 1
+  type: property
+  description: "modifyLiquiditiesWithoutLock has NO deadline check — transactions can be held and executed at an unfavorable price"
+  attack_scenario: >
+    modifyLiquidities() enforces checkDeadline(deadline), but modifyLiquiditiesWithoutLock()
+    has NO deadline parameter or check. If a user (or integrator contract) calls
+    modifyLiquiditiesWithoutLock to mint/increase liquidity, a validator can hold the
+    transaction in the mempool indefinitely and execute it when the pool price has moved
+    significantly against the user. The user deposits tokens at a stale price ratio,
+    receiving far less liquidity value than expected. While slippage checks (amount0Max/
+    amount1Max) exist, they protect against the token amounts but NOT against the time
+    dimension — the user may accept the amounts but not realize the price has moved
+    unfavorably since submission. This is especially dangerous for _mintFromDeltas and
+    _increaseFromDeltas which compute liquidity from current sqrtPriceX96 (spot price).
+  impact: "User provides liquidity at unfavorable price ratios. Loss depends on price movement during delay."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // This is an architectural observation — modifyLiquiditiesWithoutLock lacks deadline.
+    // Invariant: all liquidity modifications should have deadline protection.
+    // Verification: check that modifyLiquiditiesWithoutLock is only callable
+    // from contexts that already enforce their own deadline.
+    // If called directly by EOA or contract without deadline, it is vulnerable.
+    bool hasDeadline = false; // modifyLiquiditiesWithoutLock has no deadline param
+    t(!hasDeadline, "CLPM-01: modifyLiquiditiesWithoutLock missing deadline");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This mirrors a known pattern from Uniswap V4 PositionManager. The question is whether
+    modifyLiquiditiesWithoutLock is intended to be called only by other contracts that
+    enforce their own deadlines (the vault lock pattern). If it's externally callable by
+    EOAs, this is a real issue. The function IS public and callable by anyone (isNotLocked
+    modifier only checks reentrancy, not access). Need to verify if there's an upstream
+    contract that wraps this with deadline checks.
+
+- id: CLPM-02
+  tier: 1
+  type: property
+  description: "Subscriber callback in _modifyLiquidity executes external code AFTER pool state change but BEFORE settlement — read-only reentrancy vector"
+  attack_scenario: >
+    When a position has a subscriber, _modifyLiquidity calls _notifyModifyLiquidity which
+    does an external call to the subscriber contract. This happens AFTER clPoolManager.modifyLiquidity
+    has already modified pool state (ticks, liquidity, fee growth) but BEFORE the caller
+    settles the delta (pays tokens or takes tokens). A malicious subscriber contract could:
+    1. Observe the modified pool state (new sqrtPrice, new liquidity)
+    2. Read vault.currencyDelta which shows unsettled amounts
+    3. Use this inconsistent state in another protocol that reads PancakeSwap pool state
+       (e.g., an oracle, a lending protocol using pool price)
+    The ReentrancyLock prevents re-entering CLPositionManager, but does NOT prevent the
+    subscriber from calling OTHER contracts that read the pool's now-modified state.
+    Classic read-only reentrancy pattern (ChainSecurity/Curve style).
+  impact: "External protocols reading pool state during callback see manipulated values. Could cause oracle manipulation, incorrect liquidations."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track whether subscriber callback was called with unsettled deltas
+    // In a test setup, a malicious subscriber would:
+    // 1. Record pool state during notifyModifyLiquidity callback
+    // 2. Compare with final settled state
+    // If they differ, read-only reentrancy is possible
+    //
+    // Pseudo-invariant (needs custom test harness):
+    // After full settlement, pool state seen during callback == pool state after settlement
+    // This is expected to FAIL for sqrtPrice/liquidity during active modification
+    int256 deltaInCallback = vault.currencyDelta(address(positionManager), currency0);
+    t(deltaInCallback == 0, "CLPM-02: unsettled delta visible during subscriber callback");
+  ghost_vars:
+  - "int256 internal ghost_deltaInCallback;"
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The subscriber callback pattern is identical to Uniswap V4. The risk depends on
+    whether any external protocols use PancakeSwap Infinity pool state as a price feed
+    or collateral valuation. The ReentrancyLock on CLPositionManager does NOT protect
+    external contracts. However, the Vault lock mechanism may provide some protection
+    since the vault is locked during the entire operation. Need to verify if external
+    reads of pool state are possible while vault is locked.
+
+- id: CLPM-03
+  tier: 1
+  type: property
+  description: "_burn clears positionInfo BEFORE calling clPoolManager.modifyLiquidity — state inconsistency during external call"
+  attack_scenario: >
+    In the _burn function (line 372): positionInfo[tokenId] is set to EMPTY_POSITION_INFO
+    and the ERC721 token is burned BEFORE calling clPoolManager.modifyLiquidity (line 380).
+    During the clPoolManager.modifyLiquidity call (which can trigger hook callbacks via
+    hookData), the CLPositionManager's state shows the position as non-existent (burned)
+    while the pool manager still has active liquidity for it. If a hook contract queries
+    CLPositionManager.getPoolAndPositionInfo(tokenId) or getPositionLiquidity(tokenId)
+    during this window, it will see empty/zero data despite the position still having
+    active liquidity in the pool. This CEI violation could confuse hook logic that
+    cross-references position state.
+  impact: "Hook contracts see inconsistent state during burn. Could lead to incorrect accounting in hooks that track positions."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After _burn is called, check that positionInfo is cleared ONLY after
+    // liquidity is actually removed from the pool
+    // This tests the ordering: if positionInfo is empty but pool liquidity > 0,
+    // we have a CEI violation window
+    CLPositionInfo info = positionManager.positionInfo(tokenId);
+    uint128 poolLiquidity = positionManager.getPositionLiquidity(tokenId);
+    // If info is empty but pool still has liquidity, state is inconsistent
+    bool infoEmpty = (CLPositionInfo.unwrap(info) == 0);
+    bool liquidityExists = (poolLiquidity > 0);
+    t(!(infoEmpty && liquidityExists), "CLPM-03: positionInfo cleared before liquidity removal");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    The _burn function clears state at line 372-374, then modifies liquidity at line 380.
+    This is technically a CEI violation. However, the practical exploitability depends on
+    whether hook contracts can query CLPositionManager during the modifyLiquidity call
+    AND whether the inconsistent state leads to a concrete loss. The Vault lock prevents
+    re-entry to CLPositionManager but hooks execute within the pool manager context.
+    The burn also skips modifyLiquidity entirely if liquidity==0 (line 378), so for
+    already-empty positions this path is safe. The risk is specifically for positions
+    with remaining liquidity.
+
+- id: CLPM-04
+  tier: 1
+  type: property
+  description: "_pay truncates amount to uint160 via permit2.transferFrom — amounts > type(uint160).max silently lose funds"
+  attack_scenario: >
+    In _pay (line 472): permit2.transferFrom(payer, address(vault), uint160(amount), ...).
+    The amount parameter is uint256 but is cast to uint160 for the permit2 call. If
+    amount > type(uint160).max (which is ~1.46e48), the cast silently truncates the value.
+    The vault would receive fewer tokens than expected, creating a delta discrepancy.
+    While this amount is astronomically large for most tokens (far exceeding total supply),
+    for tokens with very high decimal counts (e.g., 36 decimals) or rebase tokens with
+    inflated supplies, this truncation could be triggered with realistic USD values.
+    More practically: if a future pool uses a token where type(uint160).max is reachable,
+    the position manager would silently underpay the vault.
+  impact: "Silent token amount truncation. Vault receives less than expected. Delta accounting breaks."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: amount passed to _pay should always fit in uint160
+    // If it doesn't, the transfer will silently truncate
+    uint256 settleAmount = _getFullDebt(currency);
+    t(settleAmount <= type(uint160).max, "CLPM-04: settle amount exceeds uint160 max");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    This is a known pattern in Permit2-based systems. The practical likelihood is very
+    low because no real ERC20 token has supply > 2^160. However, the code has no explicit
+    check or SafeCast, and the truncation is silent. This could be classified as Low/QA
+    unless a realistic scenario with high-decimal tokens is found. Note that Uniswap V4
+    has the same pattern — this may be "accepted by design" for the Permit2 ecosystem.
+
+- id: CLPM-05
+  tier: 1
+  type: property
+  description: "_sweep sends entire contract balance to caller-specified recipient — leftover tokens from failed/partial settlements can be stolen"
+  attack_scenario: >
+    The _sweep function sends the ENTIRE contract balance of a given currency to a
+    recipient chosen by the caller. In a multicall/batched action scenario:
+    1. User A calls modifyLiquidities with a batch that includes SETTLE (sending tokens
+       to the contract) but the subsequent action fails, leaving tokens in the contract
+    2. User B (or even User A in a separate tx) calls modifyLiquidities with a batch that
+       includes SWEEP, taking all leftover tokens
+
+    More concretely: if anyone sends tokens directly to the CLPositionManager contract
+    (either by mistake or as part of a failed operation), those tokens can be swept by
+    anyone. The _sweep is protected by the action router (only callable within a batch),
+    but the batch can be crafted by any user.
+
+    Key question: does _settle via vault.sync() + _pay ever leave residual tokens in the
+    contract? If vault.sync records the pre-transfer balance and _pay transfers tokens
+    directly to the vault, the contract itself shouldn't hold tokens. But wrap/unwrap
+    operations DO hold WETH/ETH temporarily in the contract.
+  impact: "Theft of stranded tokens in the contract. Especially dangerous for ETH/WETH wrap/unwrap residuals."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track contract balance before and after each user's batch
+    // If balance increases without corresponding settlement, tokens are at risk
+    uint256 balanceBefore = currency.balanceOfSelf();
+    // ... execute user batch ...
+    uint256 balanceAfter = currency.balanceOfSelf();
+    // Contract should not accumulate tokens between batches
+    t(balanceAfter <= balanceBefore, "CLPM-05: contract accumulated tokens during batch");
+  ghost_vars:
+  - "mapping(Currency => uint256) internal ghost_contractBalancePre;"
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    The sweep pattern is intentional — it's a cleanup mechanism. But the risk is in the
+    timing: between wrap/unwrap and settle, WETH/ETH sits in the contract. If a multicall
+    includes wrap() but then the subsequent settle fails, WETH is stranded. The next caller
+    can sweep it. This is similar to known issues in Uniswap V4 periphery. The question
+    is whether the atomic nature of the transaction (all-or-nothing revert) makes this
+    moot. If the ENTIRE batch reverts on failure, no tokens are stranded. But if only
+    SOME actions in the batch fail silently (they don't — each action reverts), then it's
+    exploitable.
+
+- id: CLPM-06
+  tier: 1
+  type: property
+  description: "_increaseFromDeltas and _mintFromDeltas read spot sqrtPriceX96 from getSlot0 — liquidity computation is sandwich-attackable"
+  attack_scenario: >
+    Both _increaseFromDeltas (line 264) and _mintFromDeltas (line 346) read sqrtPriceX96
+    from clPoolManager.getSlot0(). This spot price is used to compute how much liquidity
+    can be created from the available credit (token amounts). An attacker can:
+    1. Front-run: swap to move sqrtPriceX96 significantly
+    2. Victim's _mintFromDeltas executes: with skewed price, LiquidityAmounts.getLiquidityForAmounts
+       computes LESS liquidity than the user expected (because one token is "worth more"
+       at the manipulated price, the min(liquidityFromAmount0, liquidityFromAmount1) is lower)
+    3. Back-run: swap back, restoring price
+    Result: user gets less liquidity than they should for their token amounts. The excess
+    tokens remain as credit on the vault and might be lost (if not explicitly taken back)
+    or could be claimed by the attacker if they can influence the settlement.
+
+    The slippage check (amount0Max/amount1Max) protects the TOKEN AMOUNTS spent but NOT
+    the LIQUIDITY received. The user has no minLiquidity parameter.
+  impact: "User receives less liquidity than expected. Excess tokens may be stranded or lost. MEV extraction from LPs."
+  impact_rating: Medium
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Invariant: liquidity received from _mintFromDeltas should be close to
+    // what would be computed at a "fair" TWAP price, not just spot
+    // This is hard to express as a pure invariant — better as a comparative test:
+    // Compute liquidity at current spot vs TWAP, ensure difference < threshold
+    (uint160 sqrtPriceX96,,,) = clPoolManager.getSlot0(poolKey.toId());
+    uint256 liquidityFromSpot = LiquidityAmounts.getLiquidityForAmounts(
+        sqrtPriceX96, sqrtRatioATickLower, sqrtRatioATickUpper, amount0, amount1
+    );
+    // If sqrtPriceX96 was manipulated, liquidityFromSpot < expected
+    // No minLiquidity check exists in the code
+    gte(liquidityFromSpot, ghost_expectedMinLiquidity, "CLPM-06: liquidity less than expected minimum");
+  ghost_vars:
+  - "uint256 internal ghost_expectedMinLiquidity;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    The FromDeltas variants are specifically designed for convenience (compute liquidity
+    from available credits). But using spot price for this computation is inherently
+    manipulable. Standard mint/increase functions let the user specify exact liquidity
+    amount, bypassing this issue. The severity depends on whether users/integrators are
+    expected to use FromDeltas directly or only through higher-level contracts that add
+    protection. If DEX aggregators or wallets use FromDeltas, the sandwich risk is real.
+
+- id: CLPM-07
+  tier: 2
+  type: property
+  description: "transferFrom forces unsubscribe — subscriber can lose accrued rewards/state without owner consent"
+  attack_scenario: >
+    When an NFT position is transferred via transferFrom (line 488-491), the function
+    automatically calls _unsubscribe(id) if the position has a subscriber. The unsubscribe
+    uses a gas-limited try/catch for notifyUnsubscribe, meaning:
+    1. A position is subscribed to a reward/staking contract (subscriber)
+    2. The owner (or an approved spender) transfers the NFT
+    3. The subscriber is automatically unsubscribed with gas-limited notification
+    4. If the subscriber needs to do complex cleanup (claim rewards, update accounting),
+       it may not have enough gas within unsubscribeGasLimit
+    5. Rewards accrued in the subscriber contract are not claimed before unsubscription
+
+    An approved operator (not the owner) could maliciously transfer the position to
+    themselves, causing the unsubscribe and potentially stranding rewards in the
+    subscriber contract.
+  impact: "Accrued rewards in subscriber contracts may be lost on transfer. Approved operators can force-unsubscribe positions."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Before transfer, subscriber should have opportunity to claim rewards
+    // After transfer, subscriber should be properly cleaned up
+    // Track: does the subscriber's notifyUnsubscribe succeed within gas limit?
+    ICLSubscriber sub = positionManager.subscriber(tokenId);
+    bool hasSubscriber = (address(sub) != address(0));
+    // If the transfer succeeds but notification failed (try/catch swallowed error),
+    // subscriber state is inconsistent
+    if (hasSubscriber) {
+        // After transfer, subscriber should be cleared
+        ICLSubscriber subAfter = positionManager.subscriber(tokenId);
+        t(address(subAfter) == address(0), "CLPM-07: subscriber not cleared after transfer");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    This is a design trade-off: preventing transfer from being DoS'd by a malicious
+    subscriber vs ensuring subscribers get proper cleanup. The gas limit on
+    notifyUnsubscribe is the mitigation. But if the subscriber is a legitimate
+    reward contract and the gas limit is too low, rewards are stranded. The
+    onlyIfVaultUnlocked modifier prevents this during active vault operations.
+    Note: safeTransferFrom is NOT overridden — only transferFrom. This means
+    safeTransferFrom (inherited from ERC721) does NOT trigger unsubscribe.
+
+- id: CLPM-08
+  tier: 2
+  type: property
+  description: "_clearOrTake allows users to voluntarily forfeit tokens to the vault with insufficient guardrails"
+  attack_scenario: >
+    The _clearOrTake function (line 427-436) lets users forfeit positive deltas (tokens
+    owed to them) if the amount is <= amountMax. This is designed for dust cleanup, but:
+    1. If a user passes amountMax = type(uint256).max, ALL credits are forfeited regardless
+       of amount — this could be a significant sum if the user made a mistake
+    2. In a multicall scenario, if an earlier action generates an unexpected large credit
+       (e.g., from fees or hook returns), CLEAR_OR_TAKE with a generous amountMax will
+       silently forfeit those tokens
+    3. The forfeited tokens go to the vault (vault.clear), effectively donating them to
+       the pool — other LPs benefit at the expense of the user
+
+    While this is "by design" (user explicitly passes amountMax), the UX concern is that
+    amountMax is set at transaction construction time, before the exact credit amount is
+    known. If pool state changes between construction and execution, the credit could be
+    much larger than expected.
+  impact: "Users may unintentionally forfeit significant token credits. Donated to vault, benefiting other LPs."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track: how much is being cleared vs a reasonable dust threshold
+    uint256 delta = _getFullCredit(currency);
+    // If clearing more than dust (e.g., > 1e6 for USDC = $1), flag it
+    uint256 dustThreshold = 1e6; // configurable per token
+    if (delta > dustThreshold) {
+        t(delta > amountMax, "CLPM-08: non-dust amount being cleared");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    This is more of a UX/design concern than a vulnerability. The user explicitly chooses
+    amountMax. However, in composable/multicall contexts, the user may not anticipate the
+    exact credit amount. Frontends should set amountMax to a small dust value, not
+    type(uint256).max.
+
+- id: CLPM-09
+  tier: 1
+  type: property
+  description: "_burn notifies subscriber via _removeSubscriberAndNotifyBurn which reverts on failure — malicious subscriber can DoS position burns"
+  attack_scenario: >
+    In _burn (line 396), if the position has a subscriber, _removeSubscriberAndNotifyBurn
+    is called. Unlike _unsubscribe (which uses try/catch with gas limit for
+    notifyUnsubscribe), _removeSubscriberAndNotifyBurn calls the subscriber's notifyBurn
+    and REVERTS on failure (line 102-104 in CLNotifier: bubbleUpAndRevertWith).
+
+    A malicious subscriber contract can:
+    1. Subscribe to a user's position (if approved)
+    2. Implement notifyBurn to always revert
+    3. The position owner can NEVER burn the position
+
+    The owner can still unsubscribe first (via unsubscribe(), which uses try/catch and
+    won't revert), then burn. But this requires an extra transaction and the owner must
+    know about this attack vector. If the subscriber's notifyUnsubscribe also consumes
+    all gas, the unsubscribeGasLimit should cap it, but the subscriber is deleted anyway.
+
+    Key distinction: notifyBurn MUST succeed (reverts on failure), but notifyUnsubscribe
+    is best-effort (try/catch). So the defense is: unsubscribe first, then burn.
+  impact: "Temporary DoS on position burning. Mitigated by unsubscribing first, but UX friction and gas cost."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariant: burn should always succeed if the caller is the owner
+    // Test: subscribe a reverting contract, attempt burn, verify it reverts
+    // Then: unsubscribe, attempt burn again, verify it succeeds
+    // The invariant is that the 2-step (unsubscribe + burn) always works
+    bool burnSucceeded = false;
+    try positionManager.modifyLiquidities(burnPayload, deadline) {
+        burnSucceeded = true;
+    } catch {}
+    // If burn failed due to subscriber, unsubscribe should fix it
+    if (!burnSucceeded) {
+        positionManager.unsubscribe(tokenId);
+        positionManager.modifyLiquidities(burnPayload, deadline);
+        burnSucceeded = true;
+    }
+    t(burnSucceeded, "CLPM-09: position permanently stuck, cannot burn even after unsubscribe");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: >
+    This is a known design pattern in Uniswap V4. The mitigation (unsubscribe first) is
+    available. However, users may not know they need to do this. The severity is Low
+    because it's a temporary DoS with a clear workaround, not a fund loss. The subscriber
+    was authorized by the owner in the first place.
+
+false_positives:
+- hunter: FlowHunter
+  id: CLPM-FP-01
+  reason: >
+    ReentrancyLock uses transient storage (tstore/tload) which correctly resets after each
+    transaction. Initially investigated whether tstore reentrancy guard could be bypassed
+    via delegatecall in Multicall. However, delegatecall preserves the caller's storage
+    context (including transient storage), so the lock IS effective even through multicall.
+    The isNotLocked modifier on both entry points (modifyLiquidities and
+    modifyLiquiditiesWithoutLock) correctly prevents re-entry.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Transient storage reentrancy locks (EIP-1153 tstore/tload) work correctly through
+      delegatecall paths (e.g., Multicall). The lock is in the context of the original
+      contract, not the delegatecall target. Do not flag as bypass.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: CLPM-FP-02
+  reason: >
+    Investigated whether _close function could be exploited to steal deltas from other
+    users. The vault.currencyDelta(address(this), currency) returns the delta for the
+    CLPositionManager contract, not per-user. However, the vault lock mechanism ensures
+    only one batch executes at a time (isNotLocked modifier + vault.lock), so deltas
+    from different users cannot overlap. Each batch starts with zero delta and must
+    settle to zero before the lock is released (vault enforces this).
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Vault lock pattern in PancakeSwap Infinity / Uniswap V4 style systems ensures delta
+      isolation between batches. Even though deltas are tracked per-contract (not per-user),
+      the lock ensures only one batch at a time. Do not flag _close as a cross-user delta leak.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: CLPM-FP-03
+  reason: >
+    Investigated whether safeTransferFrom bypasses the transferFrom override that triggers
+    _unsubscribe. Verified Solmate ERC721 source: safeTransferFrom calls
+    transferFrom(from, to, id) which is the PUBLIC VIRTUAL function. Since CLPositionManager
+    overrides this public function with the unsubscribe logic, safeTransferFrom DOES trigger
+    unsubscription correctly. Both transfer paths are safe. NOT a bug.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: >
+      Solmate ERC721 safeTransferFrom calls the public virtual transferFrom, so overriding
+      transferFrom is sufficient to hook into all transfer paths. Do not flag missing
+      safeTransferFrom override when using Solmate.
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: CLPM-FP-04
+  reason: >
+    Investigated nextTokenId overflow with unchecked increment (line 313-315). uint256 max
+    is 2^256 - 1, which is astronomically large. Even minting 1 billion positions per
+    second for the lifetime of the universe wouldn't approach overflow. The unchecked
+    keyword is a gas optimization, not a vulnerability.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update: null

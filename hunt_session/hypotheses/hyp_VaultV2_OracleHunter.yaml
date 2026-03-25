@@ -1,0 +1,605 @@
+protocol: morpho-vault-v2
+component: VaultV2
+file: src/VaultV2.sol
+domain: vault
+hunter: OracleHunter
+generated_at: '2026-03-25T00:00:00Z'
+invariants:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-01: Donation inflates share price bounded only by maxRate * elapsed
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-01
+  tier: 1
+  type: property
+  title: Donation attack exploits maxRate window to inflate share price
+  description: >
+    accrueInterestView() at L655 reads IERC20(asset).balanceOf(address(this)) and
+    sums adapter.realAssets() to compute realAssets. Growth is capped by maxRate:
+    newTotalAssets = min(realAssets, _totalAssets + _totalAssets * elapsed * maxRate / WAD).
+    With MAX_MAX_RATE (~6.34e-8/s) and 7 days elapsed (604800s), that allows ~4.4%
+    growth. An attacker holding shares can donate tokens, wait for elapsed time to
+    accumulate, then the donation gets absorbed. The NatSpec at L42-44 explicitly
+    acknowledges: "donations...can be in part stolen by opportunistic depositors.
+    Setting a low maxRate prevents that." The risk: if maxRate is high AND the vault
+    is not interacted with frequently, donation becomes profitable.
+  attack_scenario: >
+    1. Vault: _totalAssets = 1M, maxRate = MAX_MAX_RATE, last interaction 7 days ago.
+    2. Attacker deposits 100K (gets shares at current price).
+    3. Attacker donates 44K directly to vault address.
+    4. Attacker (or anyone) calls accrueInterest().
+    5. newTotalAssets = min(1M + 44K, 1M * (1 + 604800 * 6.34e-8)) = min(1.044M, 1.044M).
+    6. Share price jumps 4.4%. Attacker's 100K deposit is now worth ~104.4K.
+    7. Attacker redeems. Net profit = 4.4K - 44K donation = LOSS unless attacker held
+       a larger proportion of shares before the donation.
+    8. Real scenario: attacker holds 90% of shares, donates to inflate price, new
+       depositor enters at inflated price, attacker redeems capturing donated + new funds.
+  impact: >
+    Depositors after the donation get fewer shares than fair value. Known Solodit HIGH:
+    "Side effects of underlying directly donated to the VaultV2 or adapters positions."
+    maxRate limits speed but doesn't prevent eventual capture over multiple blocks.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_or_01() public {
+      uint256 currentTotalAssets = vault._totalAssets();
+      uint256 currentTotalSupply = vault.totalSupply();
+      uint256 currentVirtualShares = vault.virtualShares();
+      if (ghost_lastTotalAssets > 0 && ghost_lastTotalSupply > 0) {
+        uint256 elapsed = block.timestamp - ghost_lastTimestamp;
+        uint256 maxGrowth = ghost_lastTotalAssets
+          + (ghost_lastTotalAssets * elapsed * vault.maxRate()) / 1e18;
+        lte(currentTotalAssets, maxGrowth + 1,
+          "OR-01: totalAssets grew faster than maxRate allows");
+      }
+      ghost_lastTotalAssets = currentTotalAssets;
+      ghost_lastTotalSupply = currentTotalSupply;
+      ghost_lastTimestamp = block.timestamp;
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - deposit
+    - enter
+  ghost_vars:
+    - uint256 internal ghost_lastTotalAssets;
+    - uint256 internal ghost_lastTotalSupply;
+    - uint256 internal ghost_lastTimestamp;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: >
+    NatSpec acknowledges this. maxRate at MAX_MAX_RATE = 200% APR. The cap IS the
+    mitigation. Worth fuzzing with various elapsed times and donation sizes to see
+    if profitable extraction is possible for a majority shareholder.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-02: Adapter realAssets() lies bypass vault accounting
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-02
+  tier: 1
+  type: property
+  title: Malicious adapter inflates realAssets() to manipulate share price
+  description: >
+    accrueInterestView() at L656-658 iterates all adapters and sums
+    IAdapter(adapters[i]).realAssets(). The vault trusts adapter return values
+    unconditionally (bounded only by maxRate). A compromised or malicious adapter
+    can report inflated realAssets() at zero capital cost. Unlike direct token
+    donation (which requires actual tokens), a rogue adapter can inflate share
+    price just by lying. Over time, sustained inflation extracts real funds.
+  attack_scenario: >
+    1. Curator adds adapter A that wraps an external lending protocol.
+    2. Adapter A's realAssets() reads from an oracle the attacker can manipulate.
+    3. Attacker inflates oracle price, adapter reports 2x actual position value.
+    4. accrueInterest() computes newTotalAssets up to maxRate cap.
+    5. Over many blocks, inflated realAssets() keeps maxTotalAssets fully utilized.
+    6. Attacker deposits before inflation, redeems after share price rises.
+    7. The real tokens backing the shares are unchanged — attacker extracts other
+       depositors' funds.
+  impact: >
+    Full fund drain over time if adapter reports inflated values persistently.
+    maxRate caps per-second growth but over days/weeks, extraction is total.
+    Trust model places full reliance on adapter honesty + curator diligence.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_or_02() public {
+      uint256 storedTA = vault._totalAssets();
+      uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 adapterAssets = 0;
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        adapterAssets += IAdapter(vault.adapters(i)).realAssets();
+      }
+      uint256 realTotal = idle + adapterAssets;
+      // _totalAssets should never exceed real assets (it's min(real, max))
+      lte(storedTA, realTotal + 1,
+        "OR-02: _totalAssets exceeds real assets — possible adapter manipulation");
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This is a trust boundary issue. The vault inherently trusts adapters. Solodit
+    HIGH "H-11: Differences between actual and cached total assets can be arbitraged"
+    (Tokemak) is the same pattern. The invariant _totalAssets <= realTotal should
+    always hold after accrueInterest() by construction of min().
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-03: firstTotalAssets > _totalAssets after withdrawal enables cap bypass
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-03
+  tier: 1
+  type: property
+  title: Relative cap bypass when firstTotalAssets exceeds _totalAssets after withdrawal
+  description: >
+    firstTotalAssets (transient, L218) is set once per tx in accrueInterest() at L640.
+    After that, _totalAssets changes via enter() (+= assets at L770) and exit()
+    (-= assets at L808). If a withdrawal reduces _totalAssets below firstTotalAssets,
+    the relative cap check at L584 uses the STALE higher firstTotalAssets:
+    allocation <= firstTotalAssets * relativeCap / WAD. This means the cap is looser
+    than intended relative to actual vault assets. An allocator could over-allocate
+    relative to current _totalAssets.
+  attack_scenario: >
+    1. Tx starts: accrueInterest() sets firstTotalAssets = 1M, _totalAssets = 1M.
+    2. User withdraws 800K. _totalAssets = 200K. firstTotalAssets still = 1M.
+    3. Allocator calls allocate() with relativeCap = 50%.
+    4. Cap check: allocation <= 1M * 0.5 = 500K. But _totalAssets = 200K.
+    5. Allocation of 200K passes (limited by actual balance), but represents 100% of
+       actual assets, not the intended 50%.
+    6. Risk concentration: one adapter holds 100% instead of max 50%.
+  impact: >
+    Relative cap system can be bypassed within a single tx after large withdrawal.
+    Allocator (trusted role) could concentrate risk beyond intended cap bounds.
+    NatSpec at L62 acknowledges allocator-driven manipulation but not this specific
+    withdrawal-induced scenario.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    function property_or_03() public {
+      uint256 fta = vault.firstTotalAssets();
+      uint256 ta = vault._totalAssets();
+      // After withdrawal in same tx, firstTotalAssets can exceed _totalAssets
+      // This means relative caps are evaluated against a stale (higher) base
+      if (fta > 0 && ta > 0) {
+        // firstTotalAssets should not exceed 2x _totalAssets — would indicate
+        // cap bypass risk of >2x intended allocation
+        lte(fta, ta * 2 + 1,
+          "OR-03: firstTotalAssets > 2x _totalAssets — relative cap bypass risk");
+      }
+    }
+  affected_functions:
+    - allocateInternal
+    - enter
+    - exit
+    - accrueInterest
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    The real cap bypass is limited by actual vault token balance (can't transfer
+    more than vault holds). But if the vault has idle tokens from a recent deposit
+    by another user who hasn't withdrawn yet, the allocator can deploy those tokens
+    past the relative cap. Requires allocator role (trusted) but the cap system is
+    supposed to bound even allocators.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-04: Stale pricing within single tx via multicall
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-04
+  tier: 1
+  type: property
+  title: Multicall creates stale share pricing after first accrueInterest
+  description: >
+    accrueInterestView() at L653: `if (firstTotalAssets != 0) return (_totalAssets, 0, 0)`.
+    After the first accrueInterest() call in a tx, all subsequent calls return stale
+    values — they don't re-read adapter realAssets(). Preview functions (previewDeposit,
+    previewRedeem, etc.) use accrueInterestView() which returns early. If adapter state
+    changes mid-tx (via allocate/deallocate which call adapter contracts), the new
+    adapter state is NOT reflected in preview calculations. In a multicall batch:
+    [deposit, allocate(adapter loses value), redeem] — the redeem uses pre-loss pricing.
+  attack_scenario: >
+    1. Attacker uses multicall: [deposit(1M, self), allocate(...), redeem(allShares, self, self)].
+    2. deposit: triggers accrueInterest(), sets firstTotalAssets. Shares minted at fair price.
+    3. allocate: moves assets to adapter. Adapter's allocate() function may incur entry fee,
+       reducing real value. But _totalAssets is not reduced (it was updated before allocate).
+    4. redeem: accrueInterest returns early. previewRedeem uses current _totalAssets
+       (which includes the full amount, ignoring adapter entry fee).
+    5. User redeems at a price that doesn't reflect the adapter loss from step 3.
+    6. The loss from adapter entry fee is socialized to remaining shareholders.
+  impact: >
+    Within a single tx, adapter state changes from allocate/deallocate are invisible
+    to the share pricing mechanism. The loss/gain is only recognized in the next tx's
+    accrueInterest. Can be used to extract adapter losses from the vault.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    function property_or_04() public {
+      // After accrueInterest, subsequent calls should be no-ops
+      uint256 ta_before = vault._totalAssets();
+      vault.accrueInterest();
+      uint256 ta_after = vault._totalAssets();
+      // If firstTotalAssets was already set, _totalAssets should not change from accrual
+      if (ghost_accrueCalledThisTx) {
+        eq(ta_before, ta_after,
+          "OR-04: accrueInterest modified state on second call in same tx");
+      }
+      ghost_accrueCalledThisTx = true;
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - previewDeposit
+    - previewRedeem
+    - multicall
+  ghost_vars:
+    - bool internal ghost_accrueCalledThisTx;
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Design is intentional (prevent double-counting). But consequence is frozen
+    pricing within a tx. Combined with allocate/deallocate that change adapter state,
+    this creates arbitrage. NatSpec says adapters "must not re-enter the vault" but
+    the vault itself calls adapter.allocate() which can change adapter state.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-05: maxRate = 0 suppresses yield, enabling front-run capture
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-05
+  tier: 1
+  type: property
+  title: Allocator suppresses yield via maxRate=0 then captures on toggle
+  description: >
+    An allocator can call setMaxRate(0). With maxRate=0, accrueInterestView computes
+    maxTotalAssets = _totalAssets + 0 = _totalAssets. So newTotalAssets = min(realAssets,
+    _totalAssets) = _totalAssets regardless of actual yield. Yield accumulates in
+    adapters invisibly. When the allocator sets maxRate back to a high value, the
+    next accrueInterest() recognizes the accumulated yield (capped by the new maxRate
+    * elapsed). The allocator can front-run by depositing before the toggle.
+  attack_scenario: >
+    1. Allocator sets maxRate = 0. Share price freezes.
+    2. Adapters earn 5% yield over 1 month. realAssets = 1.05M, _totalAssets still = 1M.
+    3. Allocator deposits 500K at the frozen (low) share price. Gets proportionally
+       more shares than deserved given actual underlying value.
+    4. Allocator sets maxRate = MAX_MAX_RATE in same or next tx.
+    5. accrueInterest() recognizes yield: newTotalAssets = min(1.55M, 1M * (1 + elapsed * maxRate / WAD)).
+    6. Share price jumps. Allocator redeems at the new price. Profit from captured yield.
+    7. Existing depositors get diluted — they earned yield but allocator captured a share.
+  impact: >
+    Allocator captures yield that accrued while maxRate was suppressed. Existing
+    depositors are diluted. Requires allocator role — trusted but cap system should
+    limit even allocators.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_or_05() public {
+      uint256 currentMaxRate = vault.maxRate();
+      uint256 totalAssets = vault._totalAssets();
+      uint256 supply = vault.totalSupply();
+      if (supply == 0) return;
+      uint256 currentSharePrice = (totalAssets * 1e18) / supply;
+
+      // Detect maxRate toggle: was zero, now non-zero
+      if (ghost_maxRateWasZero && currentMaxRate > 0) {
+        uint256 priceDiff = currentSharePrice > ghost_sharePriceAtZeroRate
+          ? currentSharePrice - ghost_sharePriceAtZeroRate
+          : 0;
+        // Share price should not jump more than 5% after maxRate toggle
+        lte(priceDiff, ghost_sharePriceAtZeroRate / 20,
+          "OR-05: share price jumped >5% after maxRate toggle — yield suppression attack");
+        ghost_maxRateWasZero = false;
+      }
+      if (currentMaxRate == 0 && !ghost_maxRateWasZero) {
+        ghost_maxRateWasZero = true;
+        ghost_sharePriceAtZeroRate = currentSharePrice;
+      }
+    }
+  affected_functions:
+    - setMaxRate
+    - accrueInterest
+    - accrueInterestView
+    - deposit
+    - redeem
+  ghost_vars:
+    - bool internal ghost_maxRateWasZero;
+    - uint256 internal ghost_sharePriceAtZeroRate;
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Requires allocator privilege. NatSpec says allocators set maxRate. This is within
+    the trust model. However, the yield suppression + front-run pattern is a concrete
+    attack that the cap system does not prevent. Severity depends on whether allocator
+    is EOA vs multisig.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-06: Fee underflow bricks vault after extended inactivity
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-06
+  tier: 1
+  type: property
+  title: Management fee underflow causes permanent vault DoS after years of inactivity
+  description: >
+    In accrueInterestView() at L669-670: managementFeeAssets = (newTotalAssets * elapsed)
+    .mulDivDown(managementFee, WAD). At L674: newTotalAssetsWithoutFees = newTotalAssets
+    - performanceFeeAssets - managementFeeAssets. If elapsed is large enough (>10 years
+    with MAX_MANAGEMENT_FEE), managementFeeAssets > newTotalAssets, causing L674 to
+    underflow and revert. Since every user-facing function calls accrueInterest() which
+    calls accrueInterestView(), the entire vault becomes inoperable. NatSpec at L673
+    says "Interest should be accrued at least every 10 years" — but no on-chain
+    enforcement exists.
+  attack_scenario: >
+    1. Vault deployed with managementFee = MAX_MANAGEMENT_FEE (5% annual).
+    2. Vault has _totalAssets = 1M, totalSupply = 1M shares.
+    3. No one interacts for 20+ years. elapsed = 630,720,000s.
+    4. managementFeeAssets = 1M * 630720000 * (0.05e18/31536000) / 1e18 = 1M (100%).
+    5. performanceFeeAssets is also non-zero. Total fees > newTotalAssets.
+    6. L674 underflows. Every function reverts. Funds permanently locked.
+    7. Even calling accrueInterest() directly reverts — no recovery path.
+  impact: >
+    Permanent vault DoS and fund loss after extended inactivity. Anyone can call
+    accrueInterest() to prevent this, so practically low risk. But a griefing
+    attack that blocks all vault interactions for 20+ years is unrealistic.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_or_06() public {
+      uint256 storedTA = vault._totalAssets();
+      uint256 elapsed = block.timestamp - vault.lastUpdate();
+      uint256 mgmtFee = vault.managementFee();
+      // Management fee assets should not exceed total assets
+      if (elapsed > 0 && storedTA > 0 && mgmtFee > 0) {
+        uint256 mgmtFeeAssets = (storedTA * elapsed * mgmtFee) / 1e18;
+        lte(mgmtFeeAssets, storedTA,
+          "OR-06: management fee exceeds total assets — vault would be bricked");
+      }
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    NatSpec explicitly acknowledges the 10-year limit. accrueInterest() is public.
+    In practice, any interaction (deposit, withdraw, accrueInterest) resets the
+    timer. The risk is near-zero for active vaults. Worth noting as Info/QA.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-07: Loss realization is unbounded — instant share price crash
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-07
+  tier: 1
+  type: property
+  title: Asymmetric rate limiting — losses are instant while gains are capped
+  description: >
+    At L660: newTotalAssets = min(realAssets, maxTotalAssets). When realAssets <
+    _totalAssets (loss), newTotalAssets = realAssets (since realAssets < _totalAssets
+    <= maxTotalAssets). The loss is fully realized in one tx — no rate limiting.
+    This is asymmetric: gains capped by maxRate, losses instant. A malicious adapter
+    or oracle manipulation can crash share price instantly. NatSpec at L31-32:
+    "Vault shares should not be loanable to prevent shares shorting on loss
+    realization." This implies the protocol KNOWS this is exploitable if shares
+    are loanable.
+  attack_scenario: >
+    1. Attacker borrows vault shares from external lending market.
+    2. Attacker manipulates adapter's underlying to cause temporary value drop
+       (e.g., sandwich attack on underlying pool, oracle manipulation).
+    3. Someone calls accrueInterest(). Loss fully realized: _totalAssets drops.
+    4. Share price crashes instantly.
+    5. Attacker redeems borrowed shares at the crashed price.
+    6. Underlying recovers, but shares already redeemed at low price.
+    7. Attacker profits from the difference.
+  impact: >
+    If vault shares are listed on lending markets (against the NatSpec warning),
+    short selling becomes profitable via triggered loss realization. The entire
+    vault value can be at risk if adapter loss is large.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    function property_or_07() public {
+      uint256 currentTotal = vault._totalAssets();
+      if (ghost_prevTotalAssets > 0 && currentTotal < ghost_prevTotalAssets) {
+        uint256 lossPct = ((ghost_prevTotalAssets - currentTotal) * 1e18)
+          / ghost_prevTotalAssets;
+        // Flag if loss exceeds 10% in one observation
+        lte(lossPct, 0.1e18,
+          "OR-07: totalAssets dropped >10% — unbounded loss realization");
+      }
+      ghost_prevTotalAssets = currentTotal;
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+    - redeem
+    - withdraw
+  ghost_vars:
+    - uint256 internal ghost_prevTotalAssets;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: >
+    NatSpec explicitly warns against share lending. The design is intentional —
+    immediate loss realization prevents users from exiting at stale prices. But
+    the asymmetry creates a strong incentive for short attacks if shares are
+    listed on lending markets. External dependency risk.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-08: Performance fee on capped interest — fee recipient gets less
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-08
+  tier: 2
+  type: property
+  title: Performance fee undercharges when real yield exceeds maxRate cap
+  description: >
+    At L660-666: interest = newTotalAssets.zeroFloorSub(_totalAssets), where
+    newTotalAssets = min(realAssets, maxTotalAssets). Performance fee is taken on
+    this CAPPED interest, not actual yield. If realAssets >> maxTotalAssets (large
+    yield spike or low maxRate), the fee only captures a fraction of actual yield.
+    The excess yield trickles in over subsequent accrueInterest calls, each time
+    paying partial fee. An attacker can front-run the trickle by depositing before
+    each accrual, diluting the fee recipient's share of the yield.
+  attack_scenario: >
+    1. Vault: _totalAssets = 1M, maxRate allows 1% per day.
+    2. Adapter suddenly earns 10% (realAssets = 1.1M).
+    3. accrueInterest(): newTotalAssets = min(1.1M, 1.01M) = 1.01M. Interest = 10K.
+    4. Performance fee (50%) = 5K on 10K recognized interest.
+    5. Remaining 90K real yield will trickle over subsequent days.
+    6. Attacker deposits large amount before each daily accrual.
+    7. Each day, ~10K interest is recognized. Fee = 5K. But attacker's shares
+       dilute the remaining shareholders — attacker captures yield without full fee.
+  impact: >
+    Performance fee recipient receives less than intended percentage of total yield.
+    Front-running depositors capture yield with reduced fee burden. Economic
+    misalignment between fee recipient and depositors.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    function property_or_08() public {
+      // After accrueInterest, verify fee shares represent correct % of interest
+      uint256 totalBefore = vault._totalAssets();
+      uint256 supplyBefore = vault.totalSupply();
+
+      (uint256 newTotal, uint256 perfShares, uint256 mgmtShares) = vault.accrueInterestView();
+
+      if (newTotal > totalBefore && vault.performanceFee() > 0 && supplyBefore > 0) {
+        uint256 interest = newTotal - totalBefore;
+        uint256 expectedFeeAssets = (interest * vault.performanceFee()) / 1e18;
+        uint256 vs = vault.virtualShares();
+        // Fee shares should represent expectedFeeAssets of value
+        uint256 feeShareValue = perfShares * (newTotal + 1) / (supplyBefore + perfShares + mgmtShares + vs);
+        // Allow 5% tolerance for rounding
+        gte(feeShareValue * 20, expectedFeeAssets * 19,
+          "OR-08: performance fee shares worth less than expected");
+      }
+    }
+  affected_functions:
+    - accrueInterestView
+    - accrueInterest
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 45
+  notes: >
+    By design — maxRate cap intentionally smooths yield recognition. But fee
+    recipient economic impact is real. Likely Info/QA severity.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OR-09: balanceOf read in exit() diverges from accrueInterest read
+# ═══════════════════════════════════════════════════════════════════════════
+- id: OR-09
+  tier: 2
+  type: property
+  title: Double balanceOf read in same tx creates inconsistent idle asset view
+  description: >
+    accrueInterestView() at L655 reads balanceOf(vault) to compute realAssets.
+    Then exit() at L797 reads balanceOf(vault) again for idleAssets. Between these
+    two reads, enter() at L768 may have transferred tokens IN and allocateInternal
+    at L574 may have transferred tokens OUT (to liquidityAdapter). So the idle
+    balance seen by exit() can be very different from what accrueInterestView() saw.
+    If idleAssets < withdrawal amount, exit() triggers deallocateInternal from
+    liquidityAdapter. This adapter churn (allocate then immediately deallocate in
+    same tx) can incur adapter entry/exit fees (rounding losses per NatSpec L83-85).
+  attack_scenario: >
+    1. multicall: [deposit(1000, self), withdraw(1000, self, self)].
+    2. deposit: accrueInterest reads balanceOf = B. enter() transfers 1000 in
+       (balance = B+1000), then allocateInternal sends 1000 to adapter (balance = B).
+    3. withdraw: accrueInterest returns early. exit() reads balanceOf = B.
+       If withdraw amount > B, deallocateInternal pulls from adapter.
+    4. Each allocate/deallocate cycle incurs adapter rounding loss.
+    5. Over many roundtrips, cumulative rounding loss erodes vault value.
+  impact: >
+    Systematic rounding loss from adapter churn. Each deposit+withdraw cycle through
+    liquidityAdapter can lose 1-2 wei per adapter operation. Small per-tx but
+    accumulates over thousands of operations. Value leak to depositors' detriment.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    function property_or_09() public {
+      // Track total value conservation across operations
+      uint256 idle = IERC20(vault.asset()).balanceOf(address(vault));
+      uint256 adapterVal = 0;
+      for (uint256 i = 0; i < vault.adaptersLength(); i++) {
+        adapterVal += IAdapter(vault.adapters(i)).realAssets();
+      }
+      uint256 systemValue = idle + adapterVal;
+      uint256 storedTA = vault._totalAssets();
+
+      // System value should be >= stored totalAssets (can exceed due to unrecognized yield)
+      // If system value < storedTA, value leaked
+      if (ghost_prevSystemValue > 0) {
+        uint256 maxLoss = ghost_operationCount * 2; // 2 wei tolerance per operation
+        gte(systemValue + maxLoss, ghost_prevSystemValue,
+          "OR-09: system value leaked beyond tolerance from adapter churn");
+      }
+      ghost_prevSystemValue = systemValue;
+      ghost_operationCount++;
+    }
+  affected_functions:
+    - exit
+    - enter
+    - allocateInternal
+    - deallocateInternal
+  ghost_vars:
+    - uint256 internal ghost_prevSystemValue;
+    - uint256 internal ghost_operationCount;
+  validated: false
+  priority: low
+  confidence: 50
+  notes: >
+    NatSpec at L83-85 acknowledges adapter rounding losses: "This loss should stay
+    negligible compared to gas." Likely QA/Info. The invariant checks cumulative
+    leak over many operations.
+
+false_positives:
+- hunter: OracleHunter
+  id: OR-FP-01
+  reason: >
+    Classic ERC4626 inflation attack (deposit 1 wei, donate large amount) is
+    mitigated by maxRate cap. When _totalAssets is tiny (1 wei), maxRate limits
+    growth to ~0/second (1 * maxRate / WAD ≈ 0). Attacker must wait years for
+    donation to absorb. virtualShares for 18-decimal tokens is just 1 (weak) but
+    maxRate is the real defense. NatSpec recommends seeding. NOT exploitable in
+    practice due to maxRate when _totalAssets is near-zero.
+  investigated_at: '2026-03-25T00:00:00Z'
+
+- hunter: OracleHunter
+  id: OR-FP-02
+  reason: >
+    accrueInterest() called multiple times per tx — transient storage pattern
+    (firstTotalAssets != 0 at L653) correctly prevents double-accrual. Early return
+    means no fee shares minted and no adapter re-reads. Deposits/withdrawals that
+    modify _totalAssets directly (L770, L808) are separate from interest accrual
+    and are correct. This is clean design, not a bug.
+  investigated_at: '2026-03-25T00:00:00Z'
+
+- hunter: OracleHunter
+  id: OR-FP-03
+  reason: >
+    Management fee underflow within 10 years is impossible. MAX_MANAGEMENT_FEE =
+    5%/year. After 10y: fee = 50% of TA. MAX_PERFORMANCE_FEE = 50% of interest.
+    Even max interest = maxRate * 10y ≈ 2000% of TA → perf fee = 1000% of TA.
+    Wait — performance fee is on INTEREST not TA. Max interest after 10y with
+    MAX_MAX_RATE = TA * 20 (2000%). Perf fee = 10 * TA. This WOULD underflow.
+    Revisiting: the actual calculation is bounded because newTotalAssets itself
+    can't grow beyond maxTotalAssets = _totalAssets * (1 + elapsed * maxRate / WAD).
+    After 10y: maxTotalAssets = TA * 21. Interest = 20 * TA. PerfFee = 10 * TA.
+    MgmtFee = 0.5 * TA (on the maxTotalAssets 21*TA basis... actually mgmt fee
+    is on newTotalAssets). So mgmtFeeAssets = 21*TA * 10y * 5%/y / WAD... this
+    needs careful numerical analysis. Keeping as potential real issue in OR-06.
+  investigated_at: '2026-03-25T00:00:00Z'

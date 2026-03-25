@@ -1,0 +1,479 @@
+protocol: morpho-bundler3
+component: GeneralAdapter1
+file: src/adapters/GeneralAdapter1.sol
+domain: trust
+hunter: DomainHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+
+- id: GA-D01
+  tier: 1
+  type: property
+  description: >
+    Malicious ERC4626 vault can steal tokens from adapter during erc4626Deposit/erc4626Mint.
+    The vault parameter is user-supplied with zero validation. forceApprove(underlyingToken, vault, max)
+    is called BEFORE vault.deposit()/vault.mint(). A malicious vault's asset() returns a real token
+    (e.g., USDC), the adapter approves the vault for max USDC, then the vault's deposit() function
+    calls transferFrom(adapter, attacker, adapter_balance) before returning. The approval is revoked
+    AFTER the external call returns, but by then the vault already drained the tokens.
+  attack_scenario: |
+    1. Víctima envía un bundle: [transferFrom(USDC, adapter, 1000), erc4626Deposit(legitimateVault, max, ...)]
+    2. Atacante front-runs con un bundle propio usando misma tx atomicity via flashbots:
+       No — el ataque real es más sutil. El atacante construye SU PROPIO bundle:
+    1. Atacante deploys MaliciousVault donde asset() retorna USDC y deposit() drena el approval
+    2. Atacante envía bundle: [permit2TransferFrom(USDC, adapter, 100), erc4626Deposit(MaliciousVault, max, 0, attacker)]
+    3. El adapter aprueba MaliciousVault para max USDC, llama MaliciousVault.deposit(100, attacker)
+    4. Dentro de deposit(), MaliciousVault llama USDC.transferFrom(adapter, attacker, 100) aprovechando el approval
+    5. MaliciousVault retorna shares=100 (o lo que sea), slippage check pasa porque el vault controla el return value
+    PERO: esto solo drena tokens del propio atacante (los 100 USDC que él mismo envió).
+    El ataque real sería si hay tokens RESIDUALES de otro usuario en el adapter.
+    El adapter no debería tener tokens residuales entre bundles (transient by design).
+    CONCLUSIÓN: El vault malicioso solo puede drenar tokens que estén en el adapter en ese momento,
+    que serían los que el propio caller puso ahí. No hay cross-user theft posible UNLESS
+    hay tokens stuck en el adapter de una transacción anterior (por un revert parcial con skipRevert=true).
+  impact: "Potencial robo de tokens residuales en el adapter si skipRevert deja tokens stuck"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: después de cada bundle completo, el adapter no debe tener balance > 0
+    // de ningún token ERC20 previamente manejado
+    // Este es un invariante de estado post-bundle, no intra-bundle
+    uint256 adapterBalance = IERC20(token).balanceOf(address(adapter));
+    eq(adapterBalance, 0, "GA-D01: adapter has residual tokens after bundle");
+  ghost_vars:
+  - "address[] internal ghost_tokensUsed;"
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    El diseño del Bundler3 asume que el adapter es stateless entre bundles.
+    Si skipRevert=true permite que tokens queden stuck, un bundle posterior
+    con un vault malicioso podría drenarlos. Necesita verificación de si
+    skipRevert puede causar tokens residuales.
+
+- id: GA-D02
+  tier: 1
+  type: property
+  description: >
+    skipRevert=true en un Call previo puede dejar tokens en el adapter que un
+    Call posterior (del mismo bundle, mismo initiator) consume vía type(uint256).max.
+    Esto NO es cross-user theft (mismo bundle = mismo initiator), pero puede crear
+    un escenario donde el usuario pierde tokens si una operación falla silently
+    y la siguiente consume el balance entero para otra operación.
+  attack_scenario: |
+    1. Usuario construye bundle: [
+         Call(transferFrom(USDC, adapter, 1000), skipRevert=false),
+         Call(morphoSupply(market1, max, ...), skipRevert=true),  // FALLA silently
+         Call(morphoSupply(market2, max, ...), skipRevert=false)   // Consume los 1000 USDC
+       ]
+    2. Si market1 supply falla (e.g., market pausado), los 1000 USDC quedan en adapter
+    3. El tercer Call los consume todos para market2 — posiblemente no era la intención
+    4. El usuario quería 1000 en market1 y 0 en market2, pero termina con 0 en market1 y 1000 en market2
+    Impacto: fondos del usuario se despliegan en market incorrecto. No es theft pero sí fund misallocation.
+  impact: "Misallocación de fondos del usuario por skipRevert + max pattern"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Después de un call con skipRevert=true que falló, verificar que el siguiente
+    // call no consume balance residual inesperado
+    // Esto es un invariante de comportamiento del bundle, no del adapter solo
+    uint256 balBefore = IERC20(token).balanceOf(address(adapter));
+    // execute skipRevert call (should fail)
+    uint256 balAfter = IERC20(token).balanceOf(address(adapter));
+    // Si el call falló, balAfter == balBefore (tokens no se consumieron)
+    // El SIGUIENTE call con amount=max consumirá estos tokens
+    // Invariante: si un call skipRevert falla, los tokens restantes deben devolverse al user
+    // No hay mecanismo para esto en el protocolo actual
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    Este es un design pattern issue más que un bug. El usuario que usa skipRevert
+    acepta el riesgo. Pero la combinación skipRevert + type(uint256).max es peligrosa
+    porque el max pattern consume TODO lo que hay en el adapter sin discriminar origen.
+    Verificar si el frontend/SDK protege contra esto.
+
+- id: GA-D03
+  tier: 1
+  type: property
+  description: >
+    morphoCallback permite reentrancia controlada. Un atacante que controla un mercado
+    Morpho falso NO puede explotar esto porque morphoCallback verifica msg.sender == MORPHO
+    (L464). PERO: si el callback data contiene calls que manipulan estado del adapter
+    (e.g., otro morphoSupply dentro del callback de un morphoFlashLoan), el nesting podría
+    crear inconsistencias. El reenterHash de Bundler3 debería prevenir reentrancia no
+    autorizada, pero verificar que el hash chain es correcto en nested callbacks.
+  attack_scenario: |
+    1. Atacante construye: morphoFlashLoan(USDC, 1M, callback_data)
+    2. callback_data contiene: [
+         morphoSupply(market, max, ..., onBehalf=attacker),  // Usa el 1M flashloaned
+         permit2TransferFrom(USDC, adapter, 1M),              // Trae 1M del attacker para repay
+       ]
+    3. Dentro del callback: adapter tiene 1M de flashloan, lo suplica todo a morpho market on behalf del attacker
+    4. Luego trae 1M del attacker para repagar el flashloan
+    5. Resultado: el atacante tiene 1M supplied en morpho. No hay exploit aquí — es uso legítimo.
+    PERO: ¿qué pasa si el callback_data tiene un segundo morphoFlashLoan nested?
+    6. Nested flashloan: morphoFlashLoan(USDC, 2M, inner_callback)
+    7. inner_callback: [morphoSupply(...)]
+    8. Esto requiere que reenterHash se maneje correctamente para 2 niveles de nesting
+    9. Bundler3._multicall sets reenterHash para cada Call. Después del callback (reenter),
+       reenterHash se resetea a bytes32(0). El require(reenterHash == 0) al final de cada
+       Call iteration verifica que el callback ocurrió si se esperaba.
+    10. En nesting de 2 niveles: outer callback → reenter → inner call → inner callback → reenter
+        Cada reenter consume su reenterHash. Parece correcto.
+  impact: "Potencial bypass de reenterHash en callbacks anidados profundos"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: reenterHash SIEMPRE debe ser bytes32(0) al final de _multicall
+    bytes32 finalHash = IBundler3(bundler3).reenterHash();
+    eq(uint256(finalHash), 0, "GA-D03: reenterHash not cleared after multicall");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    Tras analizar el código de Bundler3._multicall con detalle, el manejo de reenterHash
+    parece correcto: se setea antes de cada call con callbackHash, y se verifica == 0
+    después. Si el callback no llama reenter cuando se esperaba, revierte con
+    MissingExpectedReenter. No veo un vector de ataque concreto pero la complejidad
+    del nesting merece fuzzing exhaustivo.
+
+- id: GA-D04
+  tier: 1
+  type: property
+  description: >
+    morphoRepay con shares == type(uint256).max Y assets == type(uint256).max simultáneamente
+    puede crear un escenario donde se repaga más de lo debido. El código procesa primero
+    assets = balanceOf(adapter), luego shares = borrowShares(onBehalf). Morpho.repay()
+    requiere que "either assets or shares should be zero" pero no enforcea esto — el
+    adapter tampoco. Si ambos son non-zero, Morpho usará uno de los dos (probablemente
+    el mínimo para proteger al borrower), pero el adapter puede haber cargado más tokens
+    de los necesarios, dejando residuales o causando un repay incorrecto.
+  attack_scenario: |
+    1. Usuario tiene deuda de 500 USDC (equivalente a X shares)
+    2. Envía 1000 USDC al adapter y llama morphoRepay(market, max, max, ...)
+    3. assets se resuelve a 1000, shares se resuelve a X (equivalente a 500 USDC)
+    4. Morpho.repay(market, 1000, X, ...) — ambos non-zero
+    5. Morpho Blue internamente: si ambos son non-zero, ¿qué pasa?
+       Según Morpho Blue: require(iff(assets > 0, shares == 0)) — REVERTS
+    6. CONCLUSIÓN: Si ambos son max y se resuelven a non-zero, Morpho Blue revierte.
+       Esto es un DoS para el usuario que pasa ambos como max, pero no es una
+       vulnerabilidad de pérdida de fondos. Los tokens se quedan en el adapter
+       si el call tiene skipRevert=true, lo que conecta con GA-D02.
+  impact: "DoS de repay cuando usuario pasa ambos assets y shares como type(uint256).max"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: morphoRepay no debe llamarse con ambos assets y shares non-zero
+    // porque Morpho Blue revertirá
+    // Pre-condición: si assets==max y shares==max, al menos uno debe resolver a 0
+    // para que la transacción no reverta
+    // Esto es un invariante de UI/SDK, no del contrato
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 70
+  notes: >
+    Morpho Blue enforce iff(assets > 0, shares == 0) internamente.
+    Si el usuario pasa ambos como max y tiene balance > 0 y deuda > 0,
+    la tx revierte. No es un bug del adapter per se, es un edge case
+    de UX. Documéntese como known limitation.
+
+- id: GA-D05
+  tier: 1
+  type: property
+  description: >
+    ERC4626 slippage check es post-hoc y puede ser sandwiched. El flujo es:
+    1) forceApprove vault max, 2) vault.deposit(assets), 3) forceApprove vault 0,
+    4) check slippage. Entre paso 2 (operación real) y paso 4 (check), la operación
+    ya ocurrió. Si el vault es legítimo pero el share price fue manipulado ANTES
+    del deposit (via sandwich), el slippage check revierte la TX completa.
+    Esto es el comportamiento correcto — el slippage check PROTEGE al usuario.
+    No es un bypass de slippage sino su implementación estándar.
+  attack_scenario: |
+    Escenario de NO-vulnerability (by design):
+    1. Atacante front-runs para manipular share price del vault ERC4626
+    2. Usuario ejecuta erc4626Deposit con maxSharePriceE27 = 1.01e27
+    3. Share price real ahora es 1.05 (manipulado)
+    4. assets.rDivUp(shares) = 1.05e27 > 1.01e27 → SlippageExceeded → REVERT
+    5. La protección funciona. El usuario no pierde fondos.
+
+    El ÚNICO riesgo es si maxSharePriceE27 es demasiado permisivo (e.g., type(uint256).max),
+    pero eso es error del usuario/frontend, no del contrato.
+  impact: "N/A — slippage protection funciona correctamente"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: para erc4626Deposit, assets/shares ratio nunca excede maxSharePriceE27
+    uint256 sharePrice = assets.rDivUp(shares);
+    lte(sharePrice, maxSharePriceE27, "GA-D05: share price exceeds max");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Confirmado: slippage check es correcto y post-hoc revert protege al usuario.
+    La dirección del rounding (rDivUp para max checks, rDivDown para min checks)
+    es consistente y correcta en todas las funciones ERC4626 y Morpho.
+
+- id: GA-D06
+  tier: 1
+  type: property
+  description: >
+    Cross-adapter interaction: ParaswapAdapter.swap() aprueba augustus para max, ejecuta
+    swap, revoca approval. Si el swap result deja tokens en el adapter, y el siguiente
+    Call en el bundle es a GeneralAdapter1 con amount=max, esos tokens se consumen.
+    Esto es BY DESIGN (el adapter es un transit point), pero verificar que el receiver
+    en la segunda operación es controlado por el initiator y no por un tercero.
+  attack_scenario: |
+    Bundle legítimo: [
+      permit2TransferFrom(WETH, adapter, 10),
+      paraswap.sell(augustus, calldata, WETH, USDC, true, ..., adapter),  // swap WETH→USDC, result stays in adapter
+      morphoSupply(market, max, ..., onBehalf=initiator)  // supply all USDC to Morpho
+    ]
+    Esto funciona correctamente. El punto clave es que TODOS los calls en un bundle
+    comparten el mismo initiator (set en Bundler3.multicall). No hay forma de que un
+    tercero inyecte calls en el bundle de otro usuario.
+
+    Riesgo: Si ParaswapAdapter.swap() revierte con skipRevert=true y los tokens source
+    quedan en el adapter, el morphoSupply posterior intentaría supplyar un token diferente
+    (WETH en vez de USDC del market). Morpho rechazaría si el loanToken no coincide,
+    o si WETH no es el loanToken. PERO si por coincidencia el mercado acepta WETH,
+    el usuario termina supplying WETH en un market USDC — pérdida por precio incorrecto.
+  impact: "Fund misallocation si swap falla con skipRevert y market acepta el token source"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante cross-adapter: después de swap, el adapter debe tener destToken y no srcToken
+    uint256 srcBalance = IERC20(srcToken).balanceOf(address(adapter));
+    uint256 destBalance = IERC20(destToken).balanceOf(address(adapter));
+    eq(srcBalance, 0, "GA-D06: srcToken still in adapter after swap");
+    gte(destBalance, minDestAmount, "GA-D06: not enough destToken after swap");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    Conecta con GA-D02. El patrón skipRevert + max es el vector más peligroso
+    en toda la arquitectura del Bundler3. No es un bug individual sino un design
+    pattern que puede causar fund misallocation en combinaciones específicas.
+
+- id: GA-D07
+  tier: 1
+  type: property
+  description: >
+    morphoFlashLoan deja approval permanente de MORPHO sobre el token flashloaned.
+    El comentario dice "Morpho's allowance is not reset as it is trusted." Esto es
+    by design porque MORPHO es immutable. PERO: si el token tiene un comportamiento
+    no estándar donde approval de max permite algo más que transferFrom (e.g., algunos
+    tokens raros), esto podría ser un vector. Para tokens estándar ERC20, esto es seguro.
+    Morpho Blue solo usa el approval para pullback del flashloan repayment.
+  attack_scenario: |
+    No hay ataque concreto. MORPHO es immutable, trusted, y solo usa el approval para
+    transferFrom durante el repay del flashloan. Marcar como by design.
+  impact: "N/A — by design, MORPHO es trusted"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: la approval a MORPHO es permanente y eso está bien
+    // Solo verificar que MORPHO address es el verdadero Morpho Blue
+    address morpho = address(adapter.MORPHO());
+    // morpho should be the canonical Morpho Blue deployment
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: By design. MORPHO es immutable en constructor. No hay vector.
+
+- id: GA-D08
+  tier: 1
+  type: property
+  description: >
+    erc4626Withdraw y erc4626Redeem permiten owner == initiator(). Esto significa que
+    el adapter llama vault.withdraw(assets, receiver, initiator) o vault.redeem(shares,
+    receiver, initiator). Para que esto funcione, el initiator debe haber aprobado el
+    adapter para gastar sus vault shares. Si un vault malicioso es pasado como parámetro,
+    el adapter NO aprueba nada (a diferencia de deposit/mint) — solo llama withdraw/redeem.
+    El vault malicioso podría intentar manipular el return value (shares/assets) para
+    hacer pasar el slippage check, pero no puede drenar tokens del adapter porque no
+    hay approval en withdraw/redeem direction.
+  attack_scenario: |
+    1. Atacante deploys MaliciousVault
+    2. Llama erc4626Redeem(MaliciousVault, 100, 0, attacker, initiator)
+    3. MaliciousVault.redeem() is called — no hay approval del adapter hacia el vault
+    4. MaliciousVault solo puede intentar manipular su propio state
+    5. Si initiator aprobó el adapter, el adapter puede gastar shares del initiator
+       en un vault legítimo. Pero con MaliciousVault, las shares no existen.
+    6. No hay vector porque el adapter no da approvals en las funciones withdraw/redeem.
+  impact: "N/A — no hay approval en withdraw/redeem, vault malicioso no tiene vector"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: erc4626Withdraw/Redeem no crean approvals
+    // Solo verificar que el owner check es correcto
+    address owner = /* from function args */;
+    bool validOwner = (owner == address(adapter)) || (owner == initiator);
+    t(validOwner, "GA-D08: invalid owner for erc4626 withdraw/redeem");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Confirmado seguro. Las funciones withdraw/redeem no crean approvals.
+    El owner check previene que un tercero redima las shares de otro usuario.
+
+- id: GA-D09
+  tier: 2
+  type: property
+  description: >
+    morphoSupply con onBehalf != initiator permite que el usuario supply tokens a la
+    posición de CUALQUIER dirección (excepto address(this)). Esto es by design en Morpho
+    Blue — cualquiera puede supply on behalf of anyone. No es un bug, pero verificar
+    que el adapter no permite que un callback dentro de morphoSupply redirija fondos.
+    El callback (onMorphoSupply) llama reenterBundler3(data) donde data es arbitrario
+    pero controlado por el initiator (viene del bundle original).
+  attack_scenario: |
+    No hay ataque. El initiator controla el onBehalf address y el callback data.
+    El initiator es msg.sender del multicall original, verificado por Bundler3.
+    Marcar como by design.
+  impact: "N/A — by design, supply onBehalf es feature de Morpho Blue"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: onBehalf nunca es address(adapter)
+    address onBehalf = /* from function args */;
+    t(onBehalf != address(adapter), "GA-D09: onBehalf is adapter address");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    By design. El check require(onBehalf != address(this)) previene self-supply
+    que dejaría fondos atrapados. Cualquier otro address es válido.
+
+- id: GA-D10
+  tier: 1
+  type: property
+  description: >
+    HIPÓTESIS PRINCIPAL: En erc4626Mint/erc4626Deposit, el vault address es user-supplied
+    y recibe forceApprove(underlyingToken, vault, max) donde underlyingToken = vault.asset().
+    Un vault malicioso puede retornar CUALQUIER token como asset(). Si retorna un token que
+    el adapter tiene en balance (de un paso previo del bundle), el vault recibe approval
+    para drainarlo. Dentro de vault.deposit()/mint(), el vault puede llamar
+    underlyingToken.transferFrom(adapter, attacker, adapter.balanceOf(underlyingToken)).
+    Esto FUNCIONA porque el approval se da ANTES del external call al vault.
+
+    PERO: esto solo drena tokens del PROPIO initiator (mismo bundle). No hay cross-user
+    theft porque el adapter es stateless entre bundles y initiator controla todos los calls.
+
+    EXCEPCIÓN CRÍTICA: Si tokens quedaron stuck en el adapter de un bundle anterior
+    (skipRevert edge case, o tokens enviados directamente al adapter por error),
+    CUALQUIER usuario podría drenarlos con un vault malicioso.
+  attack_scenario: |
+    1. Víctima envía USDC directamente al adapter por error (no via bundle) — o tokens quedan
+       de un bundle anterior con skipRevert failure
+    2. Atacante ve tokens en el adapter (balanceOf público)
+    3. Atacante deploys MaliciousVault:
+       - asset() retorna USDC
+       - deposit(amount, receiver) llama USDC.transferFrom(adapter, attacker, amount), retorna 1 share
+    4. Atacante envía bundle: [erc4626Deposit(MaliciousVault, max, type(uint256).max, attacker)]
+    5. Adapter: underlyingToken = USDC (de MaliciousVault.asset())
+    6. Adapter: assets = USDC.balanceOf(adapter) = stuck tokens
+    7. Adapter: forceApprove(USDC, MaliciousVault, max)
+    8. Adapter: MaliciousVault.deposit(stuckAmount, attacker) → vault drena USDC
+    9. Adapter: forceApprove(USDC, MaliciousVault, 0) — too late, tokens gone
+    10. Slippage check: stuckAmount.rDivUp(1) vs type(uint256).max → passes
+    11. Resultado: atacante robó tokens stuck del adapter
+
+    VECTOR ALTERNATIVO con erc20Transfer de CoreAdapter:
+    erc20Transfer(USDC, attacker, max) también drenaría tokens stuck.
+    Pero el vault malicioso es más sofisticado y puede bypass logging.
+  impact: "Robo de tokens stuck/residuales en el adapter via vault malicioso + max pattern"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: erc4626Deposit/Mint con vault arbitrario no debe poder drenar
+    // tokens que no fueron enviados por el initiator actual
+    // Pre-bundle adapter balance de underlyingToken debe ser 0
+    uint256 preBundleBalance = IERC20(underlyingToken).balanceOf(address(adapter));
+    eq(preBundleBalance, 0, "GA-D10: adapter has pre-existing token balance — drain risk");
+  ghost_vars:
+  - "mapping(address => uint256) internal ghost_preBundleBalances;"
+  validated: false
+  priority: high
+  confidence: 50
+  notes: >
+    La probabilidad depende de si tokens pueden quedarse stuck en el adapter.
+    El diseño del Bundler3 asume que el adapter es un transit point y nunca
+    retiene tokens entre bundles. Si esto es cierto al 100%, el finding se cae.
+    Necesita verificación: ¿hay algún path donde tokens queden en el adapter
+    después de un multicall completo? skipRevert + revert parcial es el candidato.
+    TAMBIÉN: erc20Transfer de CoreAdapter ya permite que CUALQUIERA drene tokens
+    residuales (no necesita vault malicioso), así que este vector es redundante
+    con un design feature existente. Eso sí, erc20Transfer tiene el check
+    require(receiver != address(this)) que previene self-drain del adapter.
+    CONCLUSIÓN: Los tokens stuck son por diseño "de quien los tome primero"
+    (MEV/frontrun), pero NO es un bug del adapter — es consecuencia del modelo
+    stateless. La documentación de Bundler3 dice explícitamente que "it should
+    not be approved/authorized anywhere" — precisamente por esto.
+
+false_positives:
+- hunter: DomainHunter
+  id: GA-FP-01
+  reason: >
+    morphoRepay shares==max lee correctamente onBehalf (L281), no initiator.
+    El bug reportado en Solodit (finding #2) ya fue corregido en esta versión del código.
+    Verificado: L280-281 usa MorphoLib.borrowShares(MORPHO, marketParams.id(), onBehalf).
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: GA-FP-02
+  reason: >
+    Permanent max approval to MORPHO (in morphoSupply, morphoSupplyCollateral, morphoRepay,
+    morphoFlashLoan) es by design. MORPHO es immutable, trusted, y canonically deployed.
+    El comentario del código lo confirma: "Morpho's allowance is not reset as it is trusted."
+    No hay vector porque Morpho Blue solo usa el approval para transferFrom en operaciones
+    legítimas (supply, repay, flashloan repayment).
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: GA-FP-03
+  reason: >
+    ERC4626 slippage check post-hoc es el patrón estándar y correcto. No hay forma
+    de bypassear el check porque ocurre en la misma transacción. Si el share price fue
+    manipulado, el revert protege al usuario. La dirección del rounding (rDivUp para max
+    checks, rDivDown para min checks) es conservadora y correcta.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: GA-FP-04
+  reason: >
+    Los tokens stuck en el adapter no son un bug del adapter. El Bundler3 comment dice
+    "it should not be approved/authorized anywhere" — el adapter es un transit point by design.
+    Cualquier token residual es "fair game" para el siguiente usuario que llame erc20Transfer.
+    Esto es similar a cómo Uniswap V3 router maneja tokens residuales (sweep function).
+    No es un vulnerability report válido.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Bundler3/adapter pattern: tokens residuales en el adapter son by design "de quien
+      los tome primero". No es un bug. El adapter es stateless — cualquier balance residual
+      puede ser drenado por cualquier usuario via erc20Transfer. Esto es un feature, no un bug.
+    briefing_update_applied: false

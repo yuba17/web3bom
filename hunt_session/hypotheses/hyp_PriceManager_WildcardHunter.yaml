@@ -1,0 +1,802 @@
+protocol: chainlink-pa-v2
+component: PriceManager
+file: src/PriceManager.sol
+domain: oracle
+hunter: WildcardHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ============================================================
+# CONTEXTO DE ANÁLISIS
+# PriceManager es un contrato abstracto que gestiona precios via
+# Chainlink Data Streams (verificados por VerifierProxy) con
+# fallback a Chainlink Data Feeds on-chain. Usado por BaseAuction
+# para valorar assets en subastas.
+# Foco WildcardHunter: vectores no convencionales — decimals mismatch,
+# fallback logic quirks, feed rotation edge cases, DoS via verifierProxy,
+# stale data window manipulation, admin misconfiguration.
+# ============================================================
+
+invariants:
+
+# ============================================================
+# BLOQUE 1: FALLBACK ORACLE — NO VALIDA answeredInRound NI minAnswer
+# ============================================================
+
+- id: PM-W-01
+  tier: 1
+  type: property
+  title: "Chainlink fallback no valida answeredInRound >= roundId — precio stale aceptado"
+  description: |
+    En _getAssetPrice(), cuando el Data Streams price es stale, el fallback llama
+    feedInfo.usdDataFeed.latestRoundData(). Solo se usa el `answer` y `updatedAt`,
+    pero se IGNORA roundId y answeredInRound. En Chainlink V3, si
+    answeredInRound < roundId, el precio está stale a nivel del agregador
+    (la ronda no fue respondida todavía). Además, NO se valida que answer > 0
+    ANTES del SafeCast .toUint256() — si answer es negativo, SafeCast revierte.
+    Sin embargo, si answer == 0, se acepta y la validación posterior
+    (isZero) lo marca como inválido solo si withValidation=true.
+    El Chainlink aggregator tiene minAnswer/maxAnswer bounds. Si el precio real
+    cae por debajo de minAnswer, el feed retorna minAnswer en vez del precio real.
+    No hay circuit breaker para este caso — el protocolo acepta minAnswer como
+    precio válido, sobrevalorado respecto a la realidad.
+    Impacto concreto: en un crash de mercado, el asset se valora al minAnswer
+    del aggregator (no al precio real). Para subastas, el assetOutAmount se calcula
+    con un precio inflado, causando que el bidder pague MENOS assetOut del debido.
+  attack_scenario: |
+    1. Token X tiene Chainlink feed con minAnswer = $0.10. Precio real cae a $0.01.
+    2. Data Streams price es stale (DON no transmite durante el crash).
+    3. _getAssetPrice fallback al Data Feed: answer = $0.10 (minAnswer, no real).
+    4. Subasta valora 1000 tokenX a $100 en vez del real $10.
+    5. Bidder compra 1000 tokenX pagando ~$100 en assetOut cuando valen $10.
+    6. Protocolo pierde $90 en value: entrega tokens baratos por precio inflado del bidder.
+    NOTA: el bidder paga assetOut basado en el precio inflado, pero el assetIn que
+    recibe vale mucho menos. El protocolo pierde value en dirección contraria:
+    recibe assetOut insuficiente para cubrir el valor real del assetIn.
+  impact: |
+    Sobrevaloración de assets durante crashes de mercado. El protocolo puede
+    vender assets a precio inflado (beneficia al protocolo) O comprar assets
+    sobrevalorados (pierde el protocolo), dependiendo de la dirección de la subasta.
+    En este sistema, el assetIn es lo que el auction vende y assetOut es lo que recibe.
+    Precio inflado de assetIn → el auction pide más assetOut del debido → bidder paga
+    de más → el protocolo gana. PERO si assetOut tiene el minAnswer problem, el
+    protocolo recibe menos valor real del que espera.
+  where: "PriceManager._getAssetPrice() L386-402"
+  severity_hypothesis: medium
+  confidence: 60
+  solidity: |
+    // No hay forma de verificar minAnswer/maxAnswer en Chimera sin acceso al
+    // aggregator subyacente. Invariante alternativo: verificar que el precio
+    // devuelto por _getAssetPrice es razonable respecto a un rango histórico.
+    function property_pm_w_01_no_minmax_bound_check() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            (uint256 price, uint256 updatedAt, bool isValid) = priceManager.getAssetPrice(assets[i]);
+            if (!isValid) continue;
+            // Invariante básico: precio no debe ser sospechosamente bajo
+            // (e.g., un feed con 8 decimals devolviendo 1 = $0.00000001)
+            // Después de escalar a 18 decimals, un precio de 1e10 es $0.00000001
+            // Cualquier asset real debería valer más.
+            // NOTA: esto depende del asset — algunos tokens valen < $0.01
+            // pero nunca $0.00000001. Ajustar threshold por asset en producción.
+            gt(price, 1e10, "PM-W-01: precio sospechosamente bajo (posible minAnswer)");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  notes: |
+    El vector de minAnswer es un patrón conocido (Venus/BSC $100M+ loss).
+    En este protocolo, el impacto depende de si hay assets con Chainlink feeds
+    que tienen minAnswer muy alejado del precio real esperado. Verificar qué
+    feeds usan los assets configurados en el deployment.
+
+# ============================================================
+# BLOQUE 2: DECIMAL MISMATCH — dataStreamsFeedDecimals ADMIN-CONFIGURABLE
+# ============================================================
+
+- id: PM-W-02
+  tier: 1
+  type: property
+  title: "Admin puede configurar dataStreamsFeedDecimals incorrecto — precio escalado mal"
+  description: |
+    En transmit(), el precio del Data Streams report se escala usando
+    feedInfo.dataStreamsFeedDecimals configurado por el admin via applyFeedInfoUpdates().
+    El contrato NO VERIFICA que este valor coincide con los decimals reales del feed.
+    Si el admin configura dataStreamsFeedDecimals=8 pero el feed real reporta con 18
+    decimals, el precio se multiplica por 10^(18-8) = 10^10, inflando el precio por
+    un factor de 10 mil millones.
+    Inversamente, si configura 18 pero el feed real es 8, el precio no se escala
+    (ya es 18), y el precio queda en la escala original de 8 decimals (1e8 en vez de 1e18),
+    subvalorándolo por 10^10.
+    Para el Data Feed fallback, los decimals se obtienen dinámicamente vía
+    feedInfo.usdDataFeed.decimals() — correcto. PERO para Data Streams, los decimals
+    son estáticos y confiados al admin.
+    La discrepancia entre verificación estática (Data Streams) y dinámica (Data Feed)
+    es una fuente de inconsistencia.
+  attack_scenario: |
+    Escenario de misconfiguration por admin (griefing o error):
+    1. ASSET_ADMIN_ROLE configura assetX con dataStreamsFeedDecimals=8 (error: real es 18).
+    2. PRICE_ADMIN_ROLE transmite reporte de Data Streams: price = 2000e18 (ETH $2000).
+    3. transmit() escala: 2000e18 * 10^(18-8) = 2000e28 — valor astronómico.
+    4. toUint224() revierte si > type(uint224).max. Pero 2000e28 ≈ 2e31 < 2^224 ≈ 2.7e67.
+       El precio se almacena como 2000e28 — 10 mil millones de veces más alto.
+    5. BaseAuction._getAssetOutAmount() usa este precio para calcular cuánto assetOut
+       pedir al bidder. El bidder debe pagar 10^10 veces más assetOut del esperado.
+       La subasta se vuelve inejutable (nadie puede pagar tanto). DoS de la subasta.
+    Inverso: decimals=18 cuando real es 8 → precio subvalorado → bidder compra barato.
+  impact: |
+    Misconfiguration de decimals causa precios incorrectos por factores de 10^N,
+    donde N = |decimals_real - decimals_configurado|. Resulta en DoS de subastas
+    (precio inflado) o venta de assets por una fracción de su valor (precio deflado).
+    Requiere acción del ASSET_ADMIN_ROLE — es un trusted role, pero la falta de
+    verificación on-chain amplifica el impacto de un error humano.
+  where: "PriceManager.transmit() L167-172 + PriceManager._applyFeedInfoUpdates() L253"
+  severity_hypothesis: medium
+  confidence: 70
+  solidity: |
+    function property_pm_w_02_streams_vs_feed_price_consistency() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            IPriceManager.FeedInfo memory fi = priceManager.getFeedInfo(asset);
+            // Si tiene AMBOS feeds configurados, comparar precios
+            if (fi.dataStreamsFeedId != bytes32(0) && address(fi.usdDataFeed) != address(0)) {
+                (uint256 price,,) = priceManager.getAssetPrice(asset);
+                // Obtener el precio del Data Feed directamente
+                (, int256 feedAnswer,,,) = fi.usdDataFeed.latestRoundData();
+                if (feedAnswer <= 0) continue;
+                uint8 feedDecimals = fi.usdDataFeed.decimals();
+                uint256 feedPrice = uint256(feedAnswer);
+                if (feedDecimals < 18) {
+                    feedPrice = feedPrice * 10 ** (18 - feedDecimals);
+                } else if (feedDecimals > 18) {
+                    feedPrice = feedPrice / 10 ** (feedDecimals - 18);
+                }
+                // Los dos precios deben estar dentro del 50% uno del otro
+                // (tolerancia amplia por naturaleza diferente de los feeds,
+                //  pero un mismatch de decimals causaría divergencia de 10^N)
+                if (price > 0 && feedPrice > 0) {
+                    uint256 ratio = (price * 1e18) / feedPrice;
+                    // ratio debería estar entre 0.5e18 y 2e18 (50%-200%)
+                    gte(ratio, 5e17, "PM-W-02: streams price < 50% del feed price");
+                    lte(ratio, 2e18, "PM-W-02: streams price > 200% del feed price");
+                }
+            }
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  notes: |
+    Este invariante requiere fork con ambos feeds activos para ser útil.
+    En mocks, los decimals son controlados y el invariante siempre pasa.
+    La validación real debe hacerse contra feeds deployados.
+
+# ============================================================
+# BLOQUE 3: TRANSMIT — REPORT REPLAY / NO MONOTONICITY CHECK
+# ============================================================
+
+- id: PM-W-03
+  tier: 1
+  type: property
+  title: "transmit() no verifica que observationsTimestamp sea mayor que el almacenado — replay de precio viejo"
+  description: |
+    En transmit(), el reporte se valida contra stalenessThreshold (no puede ser
+    demasiado viejo respecto a block.timestamp), pero NO se verifica que
+    report.observationsTimestamp > s_dataStreamsPrice[asset].timestamp.
+    Esto permite que un PRICE_ADMIN_ROLE transmita un reporte con timestamp MENOR
+    que el actual, efectivamente haciendo un rollback del precio.
+    El VerifierProxy valida la firma del DON, así que el reporte debe ser legítimo
+    (firmado por los nodos). Sin embargo, un PRICE_ADMIN con acceso a reportes
+    históricos (dentro de la ventana de staleness) puede elegir cuál transmitir.
+    Escenario concreto: si ETH está a $2500 ahora y estuvo a $2000 hace 5 minutos
+    (dentro del stalenessThreshold), el PRICE_ADMIN puede transmitir el reporte
+    de $2000. Esto no viola ningún check del contrato.
+    El VerifierProxy podría tener su propio nonce/replay protection, pero la
+    especificación de Data Streams V3 no garantiza replay protection a nivel de
+    report — solo validez de firma.
+  attack_scenario: |
+    PRICE_ADMIN con acceso a reportes históricos (DON-signed):
+    1. ETH precio actual: $2500 (almacenado con timestamp T=now).
+    2. PRICE_ADMIN tiene un reporte DON-signed de hace 3 minutos: $2000, T=now-180.
+    3. stalenessThreshold = 300s (5 min). Report es válido (180 < 300).
+    4. PRICE_ADMIN llama transmit([old_report]).
+    5. s_dataStreamsPrice[ETH] = {usdPrice: $2000, timestamp: now-180}.
+    6. El precio se REDUCE de $2500 a $2000. La subasta de ETH ahora pide
+       menos assetOut por la misma cantidad de ETH.
+    7. El bidder (potencialmente coludido con PRICE_ADMIN) compra ETH barato.
+  impact: |
+    Manipulación temporal del precio por un PRICE_ADMIN malicioso o comprometido.
+    El alcance depende de cuán grande es el stalenessThreshold (ventana de replay).
+    Con threshold=300s y volatilidad normal (0.1% por minuto), la manipulación
+    es de ~0.5%. Pero en flash crashes o high vol, puede ser >5%.
+  where: "PriceManager.transmit() L155-182"
+  severity_hypothesis: medium
+  confidence: 55
+  solidity: |
+    // ghost: almacenar el timestamp previo de cada asset
+    mapping(address => uint32) internal ghost_lastPriceTimestamp;
+
+    function property_pm_w_03_price_timestamp_monotonic() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            (,uint256 updatedAt,) = priceManager.getAssetPrice(asset);
+            uint32 current = uint32(updatedAt);
+            if (ghost_lastPriceTimestamp[asset] != 0 && current != 0) {
+                gte(current, ghost_lastPriceTimestamp[asset],
+                    "PM-W-03: price timestamp went backwards — possible replay");
+            }
+            if (current != 0) {
+                ghost_lastPriceTimestamp[asset] = current;
+            }
+        }
+    }
+  ghost_vars:
+    - "mapping(address => uint32) internal ghost_lastPriceTimestamp;"
+  validated: false
+  priority: high
+  notes: |
+    Este es un trust boundary issue. El PRICE_ADMIN_ROLE es trusted, pero
+    el contrato no enforcea la propiedad de que los precios avanzan en el tiempo.
+    Si VerifierProxy tiene replay protection interna (lo cual NO está garantizado
+    por la interfaz IVerifierProxy), este finding se invalidaría. Verificar la
+    implementación real de VerifierProxy en el deployment.
+
+# ============================================================
+# BLOQUE 4: FEED ROTATION — PREVIOUS ASSET LEFT WITHOUT STREAMS PRICE
+# ============================================================
+
+- id: PM-W-04
+  tier: 2
+  type: property
+  title: "Feed rotation: asset previo pierde Data Streams feed pero retiene precio stale en s_dataStreamsPrice"
+  description: |
+    En _applyFeedInfoUpdates(), cuando un feedId se rota de assetA a assetB:
+    - previousAssetFeedInfo.dataStreamsFeedId = bytes32(0)
+    - previousAssetFeedInfo.dataStreamsFeedDecimals = 0
+    - delete s_dataStreamsPrice[previousAssetForFeedId]
+
+    Esto es correcto. PERO hay un edge case: si en la MISMA llamada a
+    applyFeedInfoUpdates, el assetA está en AMBOS `removes[]` y el feedId
+    se reasigna a assetB en `adds[]`, la secuencia es:
+    1. removes[] procesa assetA: delete feedId-to-asset, delete feedInfo, delete price.
+    2. adds[] procesa assetB con el mismo feedId: s_dataStreamsFeedIdToAsset[feedId] = assetB.
+       previousAssetForFeedId = address(0) (ya borrado en step 1). No entra en la rama
+       de rotación. Todo correcto.
+
+    Pero si removes[] y adds[] se procesan en el ORDEN INVERSO (adds primero):
+    El código procesa removes[] PRIMERO (línea 217) y adds[] DESPUÉS (línea 233).
+    Así que el orden está fijo: removes → adds. No hay race condition.
+
+    EDGE CASE REAL: si assetA no está en removes[] pero su feedId se reasigna a
+    assetB en adds[]. La rotación ocurre: previousAssetFeedInfo.dataStreamsFeedId = 0.
+    Ahora assetA tiene feedInfo.dataStreamsFeedId=0 y feedInfo.usdDataFeed=original.
+    Si usdDataFeed es address(0), el revert Errors.InvalidZeroValue() protege.
+    Si usdDataFeed NO es address(0), assetA queda solo con fallback Data Feed.
+    Esto es intencional — pero _getAssetPrice para assetA ahora siempre
+    usa el fallback (Data Feed), que puede tener mayor latencia que Data Streams.
+  attack_scenario: |
+    No es un ataque directo — es un riesgo operacional:
+    1. ASSET_ADMIN rota feedId de assetA a assetB (sin remover assetA).
+    2. assetA pierde Data Streams pricing, cae a fallback Data Feed.
+    3. Data Feed tiene heartbeat de 1h vs Data Streams ~1s.
+    4. Precio de assetA durante la ventana de 1h entre updates del Data Feed
+       puede ser significativamente stale. Subastas de assetA usan precio viejo.
+    Esto es by design (el check `address(previousAssetFeedInfo.usdDataFeed) == address(0)`
+    previene rotación sin fallback). Pero el impacto de latencia aumentada
+    puede ser significativo en mercados volátiles.
+  impact: |
+    Impacto operacional: asset pierde pricing de alta frecuencia, queda con
+    Data Feed de baja frecuencia. Puede causar precios stale en subastas
+    durante ventanas de alta volatilidad. No hay pérdida directa de fondos
+    si el stalenessThreshold está bien configurado.
+  where: "PriceManager._applyFeedInfoUpdates() L265-278"
+  severity_hypothesis: low
+  confidence: 75
+  solidity: |
+    function property_pm_w_04_rotated_asset_has_valid_feed() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            IPriceManager.FeedInfo memory fi = priceManager.getFeedInfo(asset);
+            // Todo asset en la allowlist debe tener al menos UN feed válido
+            bool hasStreams = fi.dataStreamsFeedId != bytes32(0);
+            bool hasDataFeed = address(fi.usdDataFeed) != address(0);
+            t(hasStreams || hasDataFeed,
+              "PM-W-04: asset allowlisted sin ningun feed valido");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: |
+    La protección en L271-272 (revert si no hay usdDataFeed de fallback) cubre
+    el caso de dejar un asset sin ningún feed. Pero no cubre el caso de dejar
+    un asset con solo un feed de baja frecuencia. Documenter como design concern.
+
+# ============================================================
+# BLOQUE 5: DATA FEED FALLBACK — NEGATIVE ANSWER + REVERT RISK
+# ============================================================
+
+- id: PM-W-05
+  tier: 1
+  type: property
+  title: "Data Feed fallback: answer negativo causa SafeCast revert — DoS de getAssetPrice"
+  description: |
+    En _getAssetPrice() L392: `price = answer.toUint256();`
+    Si el Chainlink Data Feed retorna un answer negativo (lo cual es posible para
+    ciertos feeds — e.g., ETH/BTC cambio de porcentaje, o un feed misconfigured),
+    SafeCast.toUint256() revierte con SafeCastOverflowedIntToUint.
+    Si el Data Streams price también es stale, _getAssetPrice SIEMPRE revierte.
+    Esto bloquea TODA la funcionalidad que depende de getAssetPrice para ese asset:
+    - checkUpkeep() no puede valorar el asset
+    - performUpkeep() revierte al intentar iniciar la subasta
+    - bid() revierte al intentar calcular el precio
+
+    El DoS persiste hasta que:
+    a) Un nuevo Data Streams report se transmite (no stale), o
+    b) El Data Feed retorna un valor positivo, o
+    c) El ASSET_ADMIN remove el asset de la allowlist.
+
+    El contrato no tiene un try/catch alrededor de latestRoundData(), así que
+    un feed que revierte (e.g., contrato destruido, agregador pausado) también
+    causa DoS. Chainlink feeds pueden pausarse y esto causaría una reverting
+    call que propaga hacia arriba.
+  attack_scenario: |
+    1. Asset X tiene Data Streams + Data Feed configurados.
+    2. DON deja de transmitir Data Streams reports (mantenimiento, network issues).
+    3. Data Feed subyacente es pausado por Chainlink (evento extremo de mercado).
+    4. latestRoundData() revierte → _getAssetPrice() revierte.
+    5. Todas las subastas de asset X quedan bloqueadas. checkUpkeep puede
+       revertir si itera sobre este asset, bloqueando el keeper para TODOS los assets.
+    6. DoS persiste hasta que Chainlink restaure el feed.
+    Variante: feed retorna answer < 0 → SafeCast revert, mismo efecto.
+  impact: |
+    DoS de todo el sistema de subastas si checkUpkeep revierte al iterar sobre
+    un asset con feed broken. Si checkUpkeep tiene un try/catch interno o skip
+    logic, el impacto se limita al asset individual. Verificar BaseAuction.checkUpkeep().
+  where: "PriceManager._getAssetPrice() L386-402"
+  severity_hypothesis: medium
+  confidence: 65
+  solidity: |
+    // Invariante: getAssetPrice no debe revertir para assets allowlisted
+    // (propiedad de liveness, no de correctness)
+    function property_pm_w_05_get_price_does_not_revert() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            // Si este call revierte, el invariante falla.
+            // En Chimera, un revert dentro de una property function
+            // se captura como un failure.
+            try priceManager.getAssetPrice(assets[i]) returns (
+                uint256 price, uint256 updatedAt, bool isValid
+            ) {
+                // OK — puede retornar isValid=false, pero no debe revertir
+                t(true, "PM-W-05: getAssetPrice succeeded");
+            } catch {
+                t(false, "PM-W-05: getAssetPrice reverted for allowlisted asset");
+            }
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  notes: |
+    La falta de try/catch alrededor de latestRoundData() es un patrón conocido
+    que causa DoS en DeFi. La severidad depende de si checkUpkeep propaga
+    el revert o lo maneja internamente. Verificar BaseAuction.checkUpkeep().
+
+# ============================================================
+# BLOQUE 6: VERIFIER PROXY — BULK VERIFY RETURNS DIFFERENT LENGTH
+# ============================================================
+
+- id: PM-W-06
+  tier: 1
+  type: property
+  title: "verifyBulk puede retornar array de longitud diferente a la input — loop mismatch"
+  description: |
+    En transmit(), primero se valida unverifiedReports[] con un loop (L140-150),
+    luego se llama verifyBulk(unverifiedReports) que retorna verifiedReports[].
+    El segundo loop (L155-182) itera sobre verifiedReports.length, que se ASUME
+    igual a unverifiedReports.length. La interfaz IVerifierProxy.verifyBulk()
+    no GARANTIZA que la longitud del output sea igual a la del input.
+
+    Si verifyBulk retorna MENOS elementos (e.g., filtra reportes inválidos
+    silenciosamente), el primer loop ya validó feedIds para reportes que luego
+    no se procesan. Esto no es un bug per se, pero es inconsistente.
+
+    Si verifyBulk retorna MÁS elementos (e.g., expande reportes compuestos),
+    el segundo loop procesará reportes no validados en el primer loop. El feedId
+    de estos reportes extra podría NO estar allowlisted, y
+    s_dataStreamsFeedIdToAsset[report.dataStreamsFeedId] retornaría address(0).
+    Entonces feedInfo = s_feedInfo[address(0)] — un struct vacío con
+    stalenessThreshold=0. La comprobación L162 se convertiría en:
+      report.observationsTimestamp < block.timestamp - 0
+    que es siempre true (timestamp < block.timestamp) → revert StaleFeedData.
+    El revert protege contra almacenar precio para un feed no allowlisted.
+
+    PERO si el revert del segundo loop (dentro de transmit) causa que NINGÚN
+    precio se actualice (porque todo está en una sola TX), un VerifierProxy
+    malicioso que inyecte un report extra puede bloquear toda la transmisión.
+  attack_scenario: |
+    Si el VerifierProxy es comprometido o tiene un bug:
+    1. PRICE_ADMIN transmite 3 reportes válidos: [reportA, reportB, reportC].
+    2. verifyBulk retorna [verifiedA, verifiedB, verifiedC, extraReport].
+    3. Loop procesa verifiedA, B, C correctamente. Al llegar a extraReport:
+       - dataStreamsFeedId no está en s_dataStreamsFeedIdToAsset → address(0)
+       - feedInfo para address(0): stalenessThreshold=0
+       - block.timestamp - 0 = block.timestamp. observationsTimestamp < block.timestamp
+       - Revert StaleFeedData. TX completa revierte.
+    4. Los 3 reportes legítimos no se almacenan. DoS de price update.
+  impact: |
+    DoS de la actualización de precios si el VerifierProxy retorna longitud
+    inesperada. Requiere VerifierProxy comprometido, lo cual es un trust
+    assumption del sistema (Chainlink-operated). Severity baja por trust model,
+    pero el vector es real si el proxy tiene bugs.
+  where: "PriceManager.transmit() L140-182"
+  severity_hypothesis: low
+  confidence: 40
+  solidity: |
+    // Este invariante no es testeable sin un mock de VerifierProxy malicioso.
+    // Documentar como architectural concern.
+    function property_pm_w_06_verify_bulk_length_consistency() public {
+        // En un test real, inyectar un VerifierProxy mock que retorne arrays
+        // de longitud diferente y verificar que transmit() no procesa
+        // reportes no validados.
+        t(true, "PM-W-06: requires mock verifierProxy for testing");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: |
+    El VerifierProxy es un contrato de Chainlink — trusted. Este finding es
+    de tipo "qué pasa si la trust assumption se rompe". La defensa sería
+    require(verifiedReports.length == unverifiedReports.length) después de
+    verifyBulk. Bajo costo, alta defensa.
+
+# ============================================================
+# BLOQUE 7: TIMESTAMP UNDERFLOW EN STALENESS CHECK
+# ============================================================
+
+- id: PM-W-07
+  tier: 1
+  type: property
+  title: "block.timestamp - stalenessThreshold puede underflow si stalenessThreshold > block.timestamp"
+  description: |
+    En _getAssetPrice() L378: `uint256 minTimestamp = block.timestamp - feedInfo.stalenessThreshold;`
+    stalenessThreshold es uint32 (max ~136 years). block.timestamp en Solidity 0.8.26
+    es uint256 y en mainnet es always > 1.7B (year 2024+).
+    Para underflow: stalenessThreshold > block.timestamp. En mainnet, impossible
+    (block.timestamp > 1.7e9 >> max uint32 4.2e9). Pero in a test environment or
+    a fresh chain with block.timestamp near 0, this would underflow and REVERT
+    (Solidity 0.8 checked arithmetic).
+
+    En transmit() L162, la misma resta se aplica: block.timestamp - feedInfo.stalenessThreshold.
+
+    Esto NO es explotable en producción, pero puede causar issues en tests.
+
+    Más interesante: si stalenessThreshold se configura a un valor muy grande
+    (e.g., type(uint32).max = ~136 years), entonces minTimestamp = block.timestamp - 4294967295.
+    En mainnet con block.timestamp ~1.7e9, esto da minTimestamp ≈ -2.5e9, pero en uint256
+    es un número muy grande (underflow) → REVERT en Solidity 0.8.
+
+    WAIT: block.timestamp = 1742688000 (March 2025), uint32 max = 4294967295.
+    1742688000 < 4294967295. Underflow! block.timestamp - stalenessThreshold REVERTS.
+
+    Un ASSET_ADMIN que configura stalenessThreshold = type(uint32).max causa
+    revert en TODA lectura de precio para ese asset. DoS permanente hasta
+    que el admin corrija el threshold.
+  attack_scenario: |
+    1. ASSET_ADMIN (malicioso o por error) configura stalenessThreshold = 4294967295 (max uint32).
+    2. block.timestamp en 2025 ≈ 1.74e9 < 4.29e9.
+    3. _getAssetPrice(): minTimestamp = 1.74e9 - 4.29e9 → underflow → REVERT.
+    4. Toda funcionalidad de pricing para ese asset queda bloqueada.
+    5. transmit() también revierte: block.timestamp - stalenessThreshold underflows.
+    6. El asset no puede ni recibir nuevos precios ni servir precios existentes.
+    Nota: requiere que block.timestamp < stalenessThreshold, lo cual es TRUE
+    para cualquier threshold > ~1.74e9 (>55 years) en 2025.
+  impact: |
+    DoS permanente del pricing para cualquier asset configurado con
+    stalenessThreshold > block.timestamp. Requiere ASSET_ADMIN_ROLE — trusted,
+    pero falta de validación en el setter amplifica errores humanos.
+    La condición persiste hasta ~año 2106 si threshold = max uint32.
+  where: "PriceManager._getAssetPrice() L378 + PriceManager.transmit() L162"
+  severity_hypothesis: medium
+  confidence: 85
+  solidity: |
+    function property_pm_w_07_staleness_no_underflow() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            IPriceManager.FeedInfo memory fi = priceManager.getFeedInfo(asset);
+            // stalenessThreshold MUST be <= block.timestamp to avoid underflow
+            lte(uint256(fi.stalenessThreshold), block.timestamp,
+                "PM-W-07: stalenessThreshold > block.timestamp — underflow risk");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  notes: |
+    Este es un bug real y verificable. En Solidity 0.8, la resta underflows
+    y revierte. block.timestamp actual ≈ 1.74e9, max uint32 ≈ 4.29e9.
+    Cualquier stalenessThreshold > 1.74e9 (~55 years) causa el underflow.
+    La pregunta es: ¿se validaría como bug reportable dado que requiere
+    admin action? Sí, porque la validación en el setter debería prevenir
+    valores irrazonables. El contrato acepta cualquier uint32 > 0.
+
+# ============================================================
+# BLOQUE 8: TRANSMIT — FEEDID PRE-CHECK VS POST-VERIFY MISMATCH
+# ============================================================
+
+- id: PM-W-08
+  tier: 1
+  type: property
+  title: "Pre-check de feedId usa decode de unverified data — post-verify usa verified data — possible mismatch"
+  description: |
+    En transmit(), hay DOS loops:
+    Loop 1 (L140-150): decodifica unverifiedReports[i] para extraer feedId.
+      El decode es: abi.decode(unverifiedReports[i], (bytes32[3], bytes, ...))
+      feedId = bytes32(reportData) — los primeros 32 bytes del reportData.
+
+    Loop 2 (L155-182): decodifica verifiedReports[i] como ReportV3.
+      feedId = report.dataStreamsFeedId — campo del struct.
+
+    El feedId en el pre-check se extrae de datos NO VERIFICADOS. El feedId
+    en el post-verify se extrae de datos VERIFICADOS por el VerifierProxy.
+    Si un atacante puede craftar un unverifiedReport donde el feedId en la
+    sección de report data NO coincide con el feedId real del report signed,
+    el pre-check pasa (feedId_fake está allowlisted) pero el post-verify
+    procesa el feedId_real (que puede no estar allowlisted).
+
+    Concretamente: el pre-check decodifica el payload como
+    (bytes32[3], bytes reportData, ...) y toma bytes32(reportData).
+    Pero reportData es la versión NO verificada — el VerifierProxy puede
+    rechazarla (revert) si la firma no cuadra, o puede retornar datos
+    diferentes si el report payload fue manipulado.
+
+    Si VerifierProxy.verifyBulk() retorna el mismo report data pero verified
+    (solo strip de firmas), entonces los feedIds coinciden. Pero si verifyBulk
+    MODIFICA el report data de alguna forma, los feedIds pueden divergir.
+
+    El riesgo real: el pre-check loop es REDUNDANTE si verifyBulk ya valida.
+    Su propósito es fail-fast con un error descriptivo (FeedNotAllowlisted)
+    antes de gastar gas en verify. Pero si los feedIds son diferentes,
+    el fail-fast no previene que un feedId no-allowlisted se procese.
+  attack_scenario: |
+    1. Atacante (con PRICE_ADMIN_ROLE) construye un unverifiedReport donde:
+       - reportData empieza con feedId_allowlisted (pasa pre-check L147)
+       - Pero la firma del DON cubre datos con feedId_NOT_allowlisted
+    2. verifyBulk() verifica la firma → retorna verifiedReport con feedId_NOT_allowlisted.
+    3. Loop 2: s_dataStreamsFeedIdToAsset[feedId_NOT_allowlisted] = address(0).
+    4. feedInfo = s_feedInfo[address(0)] → struct vacío, stalenessThreshold=0.
+    5. Underflow en L162 (block.timestamp - 0) si 0 < block.timestamp → NO, 0 is fine.
+       Actually: block.timestamp - 0 = block.timestamp. observationsTimestamp < block.timestamp
+       → always true. Revert StaleFeedData. Protegido.
+
+    PERO: si feedId_NOT_allowlisted SÍ tiene un asset mapeado (otro asset
+    legítimo que el pre-check no validó), el atacante podría sobrescribir
+    el precio de ese asset con datos arbitrarios (signed por el DON, pero
+    para un feed diferente del que pasó el pre-check).
+
+    Este escenario requiere que el VerifierProxy retorne datos diferentes
+    de los que recibió — que es poco probable en la implementación real.
+  impact: |
+    Si verifyBulk retorna feedIds diferentes a los del input, un atacante
+    con PRICE_ADMIN_ROLE podría sobrescribir precios de assets que no
+    pasaron el pre-check. Impacto: manipulación de precios.
+    Probabilidad muy baja por las trust assumptions del VerifierProxy.
+  where: "PriceManager.transmit() L140-150 vs L155-182"
+  severity_hypothesis: low
+  confidence: 35
+  solidity: |
+    // Este invariante requiere un mock de VerifierProxy que retorne
+    // feedIds diferentes. No testeable sin mock especializado.
+    // Invariante alternativo: verificar que el feedId almacenado post-transmit
+    // siempre corresponde a un asset allowlisted.
+    function property_pm_w_08_stored_price_only_for_allowlisted() public {
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            (uint256 price,,) = priceManager.getAssetPrice(asset);
+            // Si hay precio almacenado, el asset debe estar allowlisted
+            // (por definición, ya que iteramos sobre allowlisted assets)
+            // El invariante inverso es más interesante: ¿hay precios
+            // almacenados para assets NO allowlisted?
+            // No podemos iterar sobre "todos los assets" — solo los allowlisted.
+            t(true, "PM-W-08: placeholder — requires mock verifierProxy");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  notes: |
+    Este finding depende de la implementación interna de VerifierProxy.
+    Si verifyBulk simplemente valida firmas y retorna el mismo reportData,
+    los feedIds siempre coinciden y no hay mismatch. Verificar la implementación
+    concreta de IVerifierProxy en el deployment target.
+
+# ============================================================
+# BLOQUE 9: OPTIMIZE — MAXIMIZAR DIVERGENCIA STREAMS vs DATAFEED
+# ============================================================
+
+- id: PM-W-09
+  tier: 3
+  type: optimize
+  title: "Maximizar divergencia entre Data Streams price y Data Feed fallback price"
+  description: |
+    Función de optimización para Echidna que busca el máximo ratio entre el precio
+    de Data Streams almacenado y el precio del Data Feed fallback. Una divergencia
+    significativa indica que los decimals están mal configurados o que los feeds
+    apuntan a assets diferentes.
+  attack_scenario: |
+    Si la divergencia es > 2x, hay un misconfiguration o un oracle manipulation
+    vector. El precio más alto se usará para valorar subastas, causando pricing
+    incorrecto.
+  impact: |
+    Pricing incorrecto en subastas — el protocolo puede perder value si los
+    precios divergen significativamente de la realidad.
+  where: "PriceManager._getAssetPrice() L376-418"
+  severity_hypothesis: medium
+  confidence: 40
+  solidity: |
+    function optimize_pm_w_09_max_price_divergence() public returns (int256) {
+        int256 maxDivergence = 0;
+        address[] memory assets = priceManager.getAllowlistedAssets();
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            IPriceManager.FeedInfo memory fi = priceManager.getFeedInfo(asset);
+            if (fi.dataStreamsFeedId == bytes32(0) || address(fi.usdDataFeed) == address(0)) continue;
+
+            (uint256 price,,) = priceManager.getAssetPrice(asset);
+            if (price == 0) continue;
+
+            // Get feed price directly
+            try fi.usdDataFeed.latestRoundData() returns (
+                uint80, int256 answer, uint256, uint256, uint80
+            ) {
+                if (answer <= 0) continue;
+                uint256 feedPrice = uint256(answer);
+                uint8 dec = fi.usdDataFeed.decimals();
+                if (dec < 18) feedPrice = feedPrice * 10 ** (18 - dec);
+                else if (dec > 18) feedPrice = feedPrice / 10 ** (dec - 18);
+                if (feedPrice == 0) continue;
+
+                int256 divergence;
+                if (price > feedPrice) {
+                    divergence = int256((price * 1e18) / feedPrice) - 1e18;
+                } else {
+                    divergence = int256((feedPrice * 1e18) / price) - 1e18;
+                }
+                if (divergence > maxDivergence) maxDivergence = divergence;
+            } catch {}
+        }
+        return maxDivergence;
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: |
+    Si esta función retorna > 1e18 (100% divergencia), los feeds están
+    fundamentalmente desalineados — probablemente un error de decimals.
+
+# ============================================================
+# BLOQUE 10: ASSET REMOVAL DURING ACTIVE AUCTION — STALE PRICE
+# ============================================================
+
+- id: PM-W-10
+  tier: 1
+  type: property
+  title: "Asset removido de allowlist retiene precio stale si _onFeedInfoUpdate no limpia la subasta"
+  description: |
+    En _applyFeedInfoUpdates(), cuando un asset se remueve:
+    1. _onFeedInfoUpdate(asset, true) — hook para inheriting contract
+    2. s_allowlistedAssets.remove(asset)
+    3. delete s_dataStreamsFeedIdToAsset[...]
+    4. delete s_feedInfo[asset]
+    5. delete s_dataStreamsPrice[asset]
+
+    El precio almacenado se borra (step 5). Pero si hay una subasta activa
+    para este asset en BaseAuction, la subasta sigue referenciando al asset.
+    BaseAuction._getAssetOutAmount() llama _getAssetPrice(asset, false).
+    Con feedInfo borrado, stalenessThreshold=0.
+    minTimestamp = block.timestamp - 0 = block.timestamp.
+    priceInfo.timestamp (borrado) = 0.
+    0 < block.timestamp → stale. Fallback: usdDataFeed = address(0).
+    No entra en fallback branch. price=0, updatedAt=0, isValid=false.
+
+    Si _getAssetPrice se llama con withValidation=true, revierte con ZeroFeedData.
+    Si withValidation=false, retorna (0, 0, false).
+
+    En bid() de BaseAuction, _getAssetPrice(asset, true) revierte → DoS del bid.
+    En checkUpkeep, _getAssetPrice(asset, false) retorna 0 → isPriceValid=false,
+    el asset se marca como "ended" auction.
+
+    La pregunta es si _onFeedInfoUpdate() en BaseAuction (el inheriting contract)
+    cierra la subasta antes de borrar el feed. Si no lo hace, la subasta queda
+    en un estado inconsistente: activa pero sin pricing.
+  attack_scenario: |
+    1. Asset X tiene subasta activa en BaseAuction.
+    2. ASSET_ADMIN_ROLE remueve asset X via applyFeedInfoUpdates(removes=[X]).
+    3. _onFeedInfoUpdate(X, true) se ejecuta. Si BaseAuction NO cierra la subasta
+       aquí, la subasta queda activa pero sin pricing.
+    4. bid(X) revierte (ZeroFeedData). performUpkeep no puede procesar X.
+    5. Tokens de X quedan en el auction hasta que la subasta expire y performUpkeep
+       la cierre via el mecanismo de ended auctions.
+    6. Pero checkUpkeep para ended auctions: _getAssetPrice(X, false) → price=0 →
+       valuation=0 → la condición de "ended" puede no activarse correctamente.
+  impact: |
+    Tokens atrapados en el auction si el asset se remueve durante una subasta
+    activa y el hook _onFeedInfoUpdate no maneja este caso. Los tokens solo
+    serían recuperables via emergencyWithdraw.
+  where: "PriceManager._applyFeedInfoUpdates() L217-231 + BaseAuction hook"
+  severity_hypothesis: medium
+  confidence: 50
+  solidity: |
+    function property_pm_w_10_removed_asset_no_active_auction() public {
+        // Para verificar este invariante, necesitamos acceso tanto a PriceManager
+        // como a BaseAuction. El invariante es cross-component.
+        // Simplificación: si un asset NO está en la allowlist, no debe tener
+        // precio almacenado.
+        // NOTA: delete s_dataStreamsPrice[] se ejecuta en el remove, así que
+        // esta propiedad debería mantenerse. El invariante real es sobre la
+        // subasta, no sobre el precio.
+        t(true, "PM-W-10: requires BaseAuction access — cross-component invariant");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: |
+    Este es un finding cross-component (PriceManager × BaseAuction).
+    La verificación real requiere analizar _onFeedInfoUpdate() en BaseAuction
+    o en el contrato concreto que hereda de PriceManager. Si el hook cierra
+    subastas activas al remover, el invariante se mantiene. Si no, hay DoS.
+
+false_positives:
+- hunter: WildcardHunter
+  id: PM-W-FP-01
+  reason: |
+    "Data Feed fallback puede devolver precio 0 y no se valida" — FALSO POSITIVO.
+    SafeCast.toUint256() revierte si answer < 0. Si answer == 0, price=0 y
+    isValid=false. Si withValidation=true, se revierte con ZeroFeedData.
+    El contrato maneja correctamente el caso de answer=0.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: oracle.md
+    content: |
+      SafeCast.toUint256() en Solidity 0.8 revierte para int256 < 0.
+      No es necesario un check explícito de answer > 0 antes del cast si
+      la intención es revertir en caso de precio negativo. Pero si la intención
+      es un fallback graceful, se necesita try/catch o check previo.
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: PM-W-FP-02
+  reason: |
+    "Duplicate feedId en adds[] causa sobrescritura silenciosa" — ANALIZADO.
+    Si adds[] tiene dos entries con el mismo feedId pero diferentes assets,
+    el segundo sobrescribe al primero sin error. Esto es intencional — el
+    último write wins. No es un bug, es el comportamiento esperado de un
+    mapping overwrite. El primer asset pierde su Data Streams feed pero
+    mantiene el Data Feed fallback (si tiene uno). La lógica de rotación
+    en L265-278 maneja correctamente la limpieza del asset previo.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+# ============================================================
+# PRIORIDAD DE TESTING (orden de fuzzing recomendado):
+#
+# 1. PM-W-07 (underflow stalenessThreshold) — HIGH confidence, verificable
+# 2. PM-W-03 (timestamp monotonicity/replay) — HIGH priority, testeable con ghost vars
+# 3. PM-W-02 (decimal mismatch streams vs feed) — requiere fork con feeds reales
+# 4. PM-W-05 (DoS por negative answer / reverting feed) — requiere mock malicioso
+# 5. PM-W-01 (minAnswer hidden staleness) — requiere fork + feed con minAnswer
+# 6. PM-W-04 (feed rotation correctness) — medium priority, test de estado
+# 7. PM-W-10 (cross-component auction removal) — requiere BaseAuction context
+# 8. PM-W-06, PM-W-08 (VerifierProxy trust) — low priority, trust model
+# ============================================================

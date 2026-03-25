@@ -1,0 +1,645 @@
+protocol: variational
+component: Oracle+SettlementPool+SettlementPoolFactory
+file: src/Oracle.sol, src/SettlementPool.sol, src/SettlementPoolFactory.sol
+domain: settlement
+hunter: WildcardHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+# ============================================================================
+# H-01: grantRole PROVIDER_ROLE override always reverts — numProviders desync
+# ============================================================================
+- id: ORC-W-01
+  tier: 1
+  type: property
+  description: >
+    Oracle.grantRole() override for PROVIDER_ROLE always reverts due to ordering bug.
+    Line 439 calls super.grantRole() FIRST (which grants the role via _grantRole internally),
+    then line 442 checks require(!hasRole(PROVIDER_ROLE, account)) — but the role is ALREADY
+    granted, so hasRole returns true, !hasRole is false, and the require reverts.
+    This means grantRole(PROVIDER_ROLE, addr) is a dead code path. Only addProvider() works
+    (it calls _grantRole directly, bypassing the override). While the immediate impact is that
+    grantRole reverts (so no state change occurs), the real concern is that the developer
+    INTENDED this to keep numProviders in sync — the broken logic reveals the counter is fragile
+    and depends on all callers using addProvider/removeProvider exclusively. See ORC-W-02 for
+    the actual exploit.
+  attack_scenario: >
+    Admin calls grantRole(PROVIDER_ROLE, newProvider) expecting it to work (it's a standard
+    OZ pattern). Transaction reverts unexpectedly. Admin must use addProvider() instead.
+    The broken override is evidence of incomplete provider counter management — see ORC-W-02.
+  impact: "Low direct impact (revert = no state change), but reveals systemic counter desync risk"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // In test: call grantRole(PROVIDER_ROLE, addr) and expect revert
+    // This proves the override is broken
+    vm.prank(admin);
+    vm.expectRevert("Oracle: Provider already added.");
+    oracle.grantRole(PROVIDER_ROLE, newProvider);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 95
+  notes: >
+    Line 438-446 of Oracle.sol. The order is: super.grantRole (grants role) then
+    require(!hasRole) (checks AFTER grant). Should be: check FIRST, then grant.
+    This is a confirmed logic bug but with low direct impact since the tx just reverts.
+  poc_sketch: ''
+  call_stack: 'grantRole() -> super.grantRole() -> _grantRole() [role granted] -> hasRole() returns true -> require(!true) -> REVERT'
+  kill_signals:
+    - "If the protocol never intends anyone to call grantRole directly (only addProvider), this is informational"
+    - "Check if any off-chain system or multisig calls grantRole instead of addProvider"
+
+# ============================================================================
+# H-02: renounceRole bypasses numProviders counter — permanent system brick
+# ============================================================================
+- id: ORC-W-02
+  tier: 1
+  type: property
+  description: >
+    Oracle overrides grantRole and revokeRole to track numProviders, but does NOT override
+    renounceRole(). OpenZeppelin's AccessControl.renounceRole() calls _revokeRole() directly,
+    which bypasses the numProviders decrement in the revokeRole override.
+    A provider can call renounceRole(PROVIDER_ROLE, self) to remove their own provider role
+    WITHOUT decrementing numProviders. If the last provider does this:
+    1. numProviders remains 1 (stale)
+    2. Zero actual providers exist
+    3. All PROVIDER_ROLE functions (deposit, withdraw, createPool, etc.) are permanently
+       inaccessible — no one has the role to call them
+    4. Admin can addProvider(newAddr) — numProviders goes to 2 (should be 1)
+    5. Now removeProvider has numProviders=2, so it can remove this provider — numProviders
+       goes to 1, but there are again 0 real providers
+    6. The "Cannot remove the only provider" guard is permanently broken
+  attack_scenario: >
+    Step 1: Only one provider exists (numProviders=1).
+    Step 2: Provider calls renounceRole(PROVIDER_ROLE, self) — succeeds via OZ base.
+    Step 3: numProviders is still 1, but no address actually has PROVIDER_ROLE.
+    Step 4: All pool operations (deposits, withdrawals, settlements) are blocked.
+    Step 5: Funds in existing SettlementPools are trapped — withdrawUSDC requires PROVIDER_ROLE.
+    Step 6: Admin adds new provider — numProviders becomes 2 (wrong, should be 1).
+    Step 7: Counter is permanently desynced. The "minimum 1 provider" invariant is broken.
+
+    MALICIOUS SCENARIO: A compromised or rogue provider can brick the entire system by
+    renouncing, especially if they are the sole provider. Even with multiple providers,
+    each renounce desync the counter by -1, eventually allowing removal of the truly last provider.
+  impact: >
+    Critical: all USDC in all SettlementPools becomes permanently inaccessible if sole
+    provider renounces. The Oracle controls ALL pool operations. No provider = no withdrawals,
+    no deposits, no settlements. Funds are trapped until admin adds a new provider, but
+    the counter remains desynced permanently.
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Prove renounceRole bypasses numProviders
+    // Setup: admin deploys Oracle, adds 1 provider
+    oracle.addProvider(provider1); // numProviders = 1
+
+    // Provider renounces via OZ base function
+    vm.prank(provider1);
+    oracle.renounceRole(PROVIDER_ROLE, provider1);
+
+    // numProviders is STILL 1, but no one has the role
+    assertFalse(oracle.hasRole(PROVIDER_ROLE, provider1));
+    // numProviders getter not public, but the effect is:
+    // admin can now removeProvider on the NEXT provider added (guard passes with numProviders > 1)
+
+    // All pool operations revert — no one has PROVIDER_ROLE
+    vm.expectRevert(); // AccessControl revert
+    oracle.withdrawUSDC(user, 1000, poolUuid, transferUuid);
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 92
+  notes: >
+    Lines 448-457 override revokeRole. Lines 438-446 override grantRole. But renounceRole
+    in OZ AccessControl is: function renounceRole(bytes32 role, address account) public virtual override {
+    require(account == _msgSender()); _revokeRole(role, account); }
+    _revokeRole does NOT go through revokeRole override — it's internal.
+    This is a CLASSIC AccessControl override incompleteness bug.
+  poc_sketch: |
+    function test_renounceRole_bricks_system() public {
+        oracle.addProvider(provider1);
+        assertEq(oracle.hasRole(PROVIDER_ROLE, provider1), true);
+
+        vm.prank(provider1);
+        oracle.renounceRole(PROVIDER_ROLE, provider1);
+
+        // Provider role removed but numProviders not decremented
+        assertEq(oracle.hasRole(PROVIDER_ROLE, provider1), false);
+
+        // Try to use any provider function - should revert
+        vm.prank(provider1);
+        vm.expectRevert();
+        oracle.depositUSDC(user, 100e6, poolUuid, transferUuid);
+    }
+  call_stack: 'renounceRole() [OZ base] -> _revokeRole() [internal, bypasses revokeRole override] -> role removed, numProviders unchanged'
+  kill_signals:
+    - "If Immunefi considers provider a trusted role and renounce is self-sabotage, may be downgraded"
+    - "Check if renounceRole is disabled in the deployed version (not in current source)"
+    - "Counter desync is factual even if the DoS scenario requires malicious provider"
+
+# ============================================================================
+# H-03: transferFromOLPToPool sends USDC directly to pool without pool accounting
+# ============================================================================
+- id: ORC-W-03
+  tier: 1
+  type: property
+  description: >
+    Oracle.transferFromOLPToPool() (line 267-285) transfers USDC to a pool address via
+    direct ERC20 transfer (usdc.transfer(poolAddress, amount)) WITHOUT calling any pool
+    deposit function. The pool's internal accounting (transfers_processed mapping, events)
+    is not updated. The USDC just lands in the pool's balance but is untracked.
+    This means the pool's _totalBalance() (which reads balanceOf) includes these funds,
+    but no deposit event was emitted and no transferUuid was recorded. If the pool uses
+    internal balance tracking for anything, this creates an accounting discrepancy.
+    Furthermore: the poolAddress parameter is passed directly by the provider — it does NOT
+    validate that the address corresponds to the given poolUuid. A malicious provider could
+    route OLP funds to any address.
+  attack_scenario: >
+    1. Provider calls transferFromOLPToPool with a valid poolUuid but a DIFFERENT poolAddress
+       (the poolAddress param is not validated against factory.getPool(poolUuid)).
+    2. USDC is transferred from olpWallet to Oracle, then from Oracle to arbitrary poolAddress.
+    3. Funds meant for pool X end up at address Y.
+    Alternatively: even with correct routing, the pool receives USDC without accounting entries,
+    which can cause discrepancies between off-chain settlement system and on-chain balances.
+  impact: >
+    Medium-High: malicious provider can redirect OLP funds to arbitrary addresses.
+    If provider is trusted, the impact reduces to accounting discrepancy (untracked USDC in pool).
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // poolAddress is NOT validated against poolUuid
+    // Line 270: poolAddress parameter is passed directly
+    // No check: require(poolAddress == factory.getPool(poolUuid))
+    address realPool = factory.getPool(poolUuid);
+    // provider can pass poolAddress != realPool
+    // USDC goes to poolAddress, not necessarily the real pool
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 85
+  notes: >
+    Lines 267-285 of Oracle.sol. Compare with other functions like atomicDeposit which
+    calls getPool(poolUuid) to derive the address. transferFromOLPToPool takes poolAddress
+    as a separate parameter. The only validation is address(0) checks.
+    Kill signal: if provider is fully trusted and off-chain system guarantees correct params,
+    this is by design.
+  poc_sketch: ''
+  call_stack: 'transferFromOLPToPool(olp, ATTACKER_ADDR, amount, poolUuid, ...) -> transferFrom(olp, oracle) -> transfer(ATTACKER_ADDR, amount) -> funds misrouted'
+  kill_signals:
+    - "Provider is a trusted off-chain service — if trust model accepts this, it's by design"
+    - "The poolUuid in the event is just metadata; the actual transfer goes to poolAddress"
+    - "Immunefi may consider this trusted-role-only and exclude it"
+
+# ============================================================================
+# H-04: Factory.setOracleAddress can orphan existing pools
+# ============================================================================
+- id: ORC-W-04
+  tier: 2
+  type: property
+  description: >
+    Factory.setOracleAddress(newOracle) (line 103) updates the oracle reference. All existing
+    pools derive their oracle via factory.oracle(). So changing the oracle immediately changes
+    access control for ALL existing pools. The new oracle can call all onlyOracle functions
+    on existing pools (withdraw, deposit, addOtherParty). The old oracle loses access instantly.
+    Combined with Oracle.pools[] mapping: the OLD Oracle has pool addresses cached in its
+    pools[] mapping, but calling getPool then operating on those pools will fail because
+    the pools now check msg.sender against the NEW oracle.
+    If the new oracle is malicious or misconfigured, it can drain all pools.
+  attack_scenario: >
+    1. Factory owner sets new oracle to attacker-controlled address.
+    2. Attacker's oracle contract calls pool.withdrawUSDC() to drain all USDC.
+    3. Or: factory owner accidentally sets oracle to address(0) — no zero-address check in
+       setOracleAddress. All onlyOracle modifiers would compare msg.sender to address(0),
+       permanently locking all pool operations.
+    Wait — actually setOracleAddress has NO zero-address check (unlike the Oracle's
+    setSettlementPoolFactory which does check). This is a gap.
+  impact: >
+    Critical if factory owner is compromised: all pool funds can be drained via malicious oracle.
+    Medium if accidental: setting oracle to zero address bricks all pool operations permanently.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Factory.setOracleAddress has NO zero address check
+    // Line 103-106 of SettlementPoolFactory.sol
+    function setOracleAddress(address newAddress) external onlyOwner {
+        oracle = IOracle(newAddress);
+        emit OracleAddressChanged(newAddress);
+    }
+    // Compare with Oracle.setSettlementPoolFactory which DOES check:
+    // require(factoryAddress != address(0), "Factory address cannot be zero");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    The missing zero-address check is factual. The centralization risk (owner changes oracle)
+    may be considered acceptable by Immunefi. However, the lack of zero-check compared to
+    Oracle's own setFactory function suggests an oversight.
+  poc_sketch: ''
+  call_stack: 'owner -> setOracleAddress(address(0)) -> oracle = address(0) -> all pool onlyOracle checks fail -> funds locked'
+  kill_signals:
+    - "Centralization risk — Immunefi typically excludes owner-can-rug scenarios"
+    - "The zero-address check gap is more interesting as a concrete code quality issue"
+    - "Check if there's a timelock or multisig on the factory owner"
+
+# ============================================================================
+# H-05: renounceOwnership on Factory permanently bricks pool creation + oracle updates
+# ============================================================================
+- id: ORC-W-05
+  tier: 2
+  type: property
+  description: >
+    SettlementPoolFactory inherits Ownable but does NOT override renounceOwnership().
+    If the factory owner calls renounceOwnership(), the owner becomes address(0) permanently.
+    Effects: (1) createPool requires msg.sender == owner() || msg.sender == address(oracle) —
+    owner path dies, only oracle can create pools. (2) setOracleAddress is onlyOwner —
+    permanently impossible to change oracle. If the current oracle becomes compromised or
+    needs upgrade, there's no recovery path. (3) The SettlementPool.onlyFactoryOwner modifier
+    checks factory.getOwner() — this returns address(0), so no address passes that check.
+  attack_scenario: >
+    1. Factory owner accidentally or maliciously calls renounceOwnership().
+    2. setOracleAddress becomes permanently uncallable.
+    3. If oracle contract has a bug or is compromised, there's no way to point pools to a new oracle.
+    4. All USDC in pools is at the mercy of the current oracle with no recovery mechanism.
+  impact: "Medium: permanent loss of administrative control over oracle migration path"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Factory inherits Ownable which has:
+    // function renounceOwnership() public virtual onlyOwner {
+    //     _transferOwnership(address(0));
+    // }
+    // Factory does NOT override this function.
+    // After renounce: setOracleAddress is permanently dead (onlyOwner with owner=0)
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    Standard Ownable issue. Many protocols intentionally leave renounceOwnership available.
+    Immunefi may consider this a known/accepted risk. Worth mentioning but unlikely to be
+    accepted as a finding on its own.
+  poc_sketch: ''
+  call_stack: 'owner -> renounceOwnership() -> owner = address(0) -> setOracleAddress reverts forever'
+  kill_signals:
+    - "This is a standard Ownable pattern — most Immunefi programs won't accept this"
+    - "Only relevant if combined with oracle compromise scenario"
+
+# ============================================================================
+# H-06: console.sol import in production SettlementPool
+# ============================================================================
+- id: ORC-W-06
+  tier: 2
+  type: property
+  description: >
+    SettlementPool.sol line 11 imports forge-std console.sol:
+    import {console} from "../lib/forge-std/src/console.sol";
+    This is a development/testing dependency that should NOT be in production code.
+    While console.log calls are no-ops when deployed (they call a non-existent address),
+    the import itself increases deployment bytecode size and signals code quality issues.
+    The console.sol import may also cause compilation issues if forge-std is not present
+    in the production build environment.
+  attack_scenario: >
+    No direct exploit. The console functions call a hardcoded address (0x000...00636F6e736F6c652e6c6f67)
+    that doesn't exist on any chain. Calls to non-existent addresses succeed with empty
+    return data (no revert), so console.log is effectively a no-op that burns gas.
+    However: if any console.log calls are accidentally left in the code, they consume
+    gas needlessly on every call.
+  impact: "Informational: gas waste, code quality concern, no security impact"
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Line 11 of SettlementPool.sol
+    // import {console} from "../lib/forge-std/src/console.sol";
+    // Should be removed before deployment
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 99
+  notes: >
+    Pure informational finding. Grep for actual console.log usage in the contract to
+    determine if there's gas waste. The import alone without usage just increases bytecode slightly.
+  poc_sketch: ''
+  call_stack: ''
+  kill_signals:
+    - "Informational only — most programs won't pay for this"
+    - "Check if there are actual console.log calls in the contract code (not just import)"
+
+# ============================================================================
+# H-07: atomicDeposit parentQuoteUuid=0 bypasses replay protection
+# ============================================================================
+- id: ORC-W-07
+  tier: 1
+  type: property
+  description: >
+    In Oracle.atomicDeposit() lines 298-308: when partyOneAmountRequested > 0 and
+    partyTwoAmountRequested == 0, the function transfers USDC from partyOne to the pool.
+    It checks atomic_deposits_processed[parentQuoteUuid] == false for replay protection.
+    But line 305: if (parentQuoteUuid != 0) { atomic_deposits_processed[parentQuoteUuid] = true; }
+    This means if parentQuoteUuid IS 0, the replay protection flag is NEVER set.
+    A provider could call atomicDeposit with parentQuoteUuid=0 multiple times, each time
+    pulling USDC from partyOne (as long as they have allowance and balance).
+    Similarly in _depositUSDCOnBehalf (SettlementPool line 106-108): transfers_processed
+    is only set when transferUuid != 0. With transferUuid=0, the same deposit can be replayed.
+  attack_scenario: >
+    1. Provider calls atomicDeposit with parentQuoteUuid=0, partyOneAmount=1000 USDC, partyTwoAmount=0.
+    2. USDC transferred from partyOne to pool. atomic_deposits_processed[0] NOT set (if-check skips it).
+    3. Provider calls atomicDeposit again with same params and parentQuoteUuid=0.
+    4. No replay check fires (atomic_deposits_processed[0] was never set to true).
+    5. partyOne's USDC is drained up to their allowance to the pool.
+    Note: this requires a MALICIOUS PROVIDER (trusted role). The question is whether
+    the protocol considers this a valid trust boundary concern.
+  impact: >
+    High if provider trust boundary is in scope: unlimited replay of deposits drains party USDC.
+    Requires party to have approved USDC to the pool (which they must do for normal operations).
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Oracle.sol lines 298-308
+    // When parentQuoteUuid == 0:
+    // - atomic_deposits_processed[0] is checked (it's false by default)
+    // - USDC transfer executes
+    // - if (parentQuoteUuid != 0) is FALSE, so processed flag is NOT set
+    // - Next call: processed[0] is STILL false -> transfer executes again
+
+    // Same pattern in SettlementPool._depositUSDCOnBehalf lines 106-108:
+    // if (transferUuid != 0) { transfers_processed[transferUuid] = true; }
+    // transferUuid=0 -> flag never set -> replay possible
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 88
+  notes: >
+    The code comments suggest parentQuoteUuid=0 means "optional" — the developer intentionally
+    allows it. But the security implication is that replay protection is disabled when
+    parentQuoteUuid=0. The same pattern exists in _depositUSDCOnBehalf with transferUuid.
+    The question is: does the off-chain system ever send parentQuoteUuid=0? If yes, replay
+    protection is absent for those calls.
+  poc_sketch: |
+    function test_atomic_deposit_replay_with_zero_uuid() public {
+        // Setup: user approves 10000 USDC to pool
+        vm.prank(user);
+        usdc.approve(address(pool), 10000e6);
+
+        // Provider calls atomicDeposit with parentQuoteUuid=0 twice
+        vm.startPrank(provider);
+        oracle.atomicDeposit(user, otherUser, 1000e6, 0, poolUuid, 0, 0);
+        // Second call should also succeed — no replay protection
+        oracle.atomicDeposit(user, otherUser, 1000e6, 0, poolUuid, 0, 0);
+        vm.stopPrank();
+
+        // User lost 2000 USDC instead of 1000
+        assertEq(usdc.balanceOf(address(pool)), 2000e6);
+    }
+  call_stack: 'atomicDeposit(parentQuoteUuid=0) -> processed[0]==false -> transferFrom succeeds -> if(0!=0) skipped -> processed[0] still false -> callable again'
+  kill_signals:
+    - "Provider is trusted — Immunefi may exclude malicious provider actions"
+    - "Off-chain system may guarantee parentQuoteUuid is always non-zero"
+    - "The require on line 181 (depositUSDCAtomic) requires parentQuoteUuid != 0 for the two-party path, but the one-party path (lines 298-308) has no such requirement"
+
+# ============================================================================
+# H-08: batchDepositUSDCAtomic deposits creatorPartyAmount for EACH item (multiplication bug)
+# ============================================================================
+- id: ORC-W-08
+  tier: 1
+  type: property
+  description: >
+    In SettlementPool.batchDepositUSDCAtomic() (line 122-157), the function loops over items[]
+    and for EACH item, if creatorPartyAmountRequested > 0, it deposits that amount from
+    the creator. This means if there are N items, the creator deposits creatorPartyAmountRequested
+    * N total USDC (not creatorPartyAmountRequested once).
+
+    Looking at line 130-141: for each iteration, if creatorPartyAmountRequested > 0, it calls
+    _depositUSDCOnBehalf(creatorPartyAddress, creatorPartyAmountRequested, transferUuid, false).
+
+    BUT: transferUuid = items[i].parentQuoteUuid for each item. After the first deposit,
+    transferUuid is set to 0 (line 140). For the SECOND item, transferUuid = items[1].parentQuoteUuid
+    (NOT 0 — it's re-assigned on line 129). So each item gets its OWN parentQuoteUuid as
+    the transferUuid.
+
+    Actually re-reading: the transferUuid=0 reset on line 140 is LOCAL to each loop iteration.
+    Line 129 assigns transferUuid = items[i].parentQuoteUuid at the START of each iteration.
+    So the reset on line 140 only affects the SAME iteration's second deposit (the other party).
+
+    This means: for N items in the batch, the creator deposits creatorPartyAmountRequested
+    N times (once per item). The transfers_processed check uses each item's parentQuoteUuid,
+    so they're all unique. The creator loses N * creatorPartyAmountRequested USDC.
+
+    This may be INTENTIONAL (batch = multiple atomic deposits) or a bug (creator amount
+    should be deposited once for the whole batch, not per-item).
+  attack_scenario: >
+    Provider calls batchAtomicDeposit with creatorPartyAmountRequested=1000 USDC and 10 items.
+    Creator expects to deposit 1000 USDC total. Actually deposits 10,000 USDC (1000 per item).
+    The creator has approved enough USDC, so transfers succeed. Creator loses 9x more than expected.
+  impact: >
+    High if this is unintended: users deposit N times the expected amount. Depends on whether
+    the off-chain system correctly calculates creatorPartyAmountRequested as per-item or total.
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // SettlementPool.sol line 122-157
+    // For each item in items[]:
+    //   line 129: transferUuid = items[i].parentQuoteUuid
+    //   line 130: if (creatorPartyAmountRequested > 0)
+    //   line 131-136: _depositUSDCOnBehalf(creator, creatorPartyAmountRequested, transferUuid)
+    // Result: creator deposits creatorPartyAmountRequested for EACH item in the batch
+
+    // Expected by user: deposit once, settle with multiple counterparties
+    // Actual: deposit N times (once per counterparty)
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    This might be intentional design — each item represents a separate settlement, and the
+    creator's deposit is per-settlement. But the function name "batch" and the parameter name
+    "creatorPartyAmountRequested" (singular) suggest it should be deposited once.
+    CRITICAL: need to verify intent. If transfers_processed prevents re-processing the same
+    parentQuoteUuid, then each item MUST have a unique parentQuoteUuid — which is checked.
+    But the multiplication effect on the creator's total deposit is the concern.
+  poc_sketch: ''
+  call_stack: 'batchAtomicDeposit -> batchDepositUSDCAtomic -> loop(N items) -> N * _depositUSDCOnBehalf(creator, amount)'
+  kill_signals:
+    - "If this is by design (per-item deposit), it's not a bug"
+    - "Check Oracle.batchAtomicDeposit — does it transfer USDC separately before calling pool?"
+    - "Oracle.batchAtomicDeposit does NOT pre-transfer USDC (unlike atomicDeposit) — all transfers happen inside the pool"
+
+# ============================================================================
+# H-09: withdrawFees has no balance check — can drain pool beyond its balance
+# ============================================================================
+- id: ORC-W-09
+  tier: 1
+  type: property
+  description: >
+    SettlementPool.withdrawFees() (line 247-260) transfers USDC to requestor without checking
+    that the pool has sufficient balance. It calls usdc.transfer(requestor, amountRequested)
+    directly. If the pool's USDC balance is less than amountRequested, the ERC20 transfer
+    will revert (USDC reverts on insufficient balance). So no direct drain is possible.
+    However: the requestor address is controlled by the provider (msg.sender in collectFees).
+    The provider can withdraw fees to ANY address — there's no check that requestor is the
+    provider themselves or an authorized fee recipient.
+  attack_scenario: >
+    Provider calls collectFees with requestor=providerAddress. Fees are withdrawn to the
+    provider. This is the intended flow. But a malicious provider could set requestor to
+    any address. Since provider is trusted, this is likely by design.
+  impact: "Low: provider-controlled requestor is likely by design"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Line 255: usdc.transfer(requestor, amountRequested)
+    // requestor = msg.sender in _processFeeRequests (line 107)
+    // So requestor IS the provider — this is controlled by the trusted role
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    Actually re-reading: in Oracle._processFeeRequests line 107, msg.sender (the provider)
+    is passed as the requestor to withdrawFees. So the requestor IS always the provider.
+    This is safe. Killing this hypothesis — the requestor is msg.sender, not user-controlled.
+  poc_sketch: ''
+  call_stack: ''
+  kill_signals:
+    - "KILLED: requestor is msg.sender (provider), not arbitrary. See Oracle.sol line 107."
+
+# ============================================================================
+# H-10: EIP-1167 clone initialization frontrunning
+# ============================================================================
+- id: ORC-W-10
+  tier: 2
+  type: property
+  description: >
+    SettlementPoolFactory.createPool() deploys a clone via Clones.clone() (line 85) and then
+    calls initialize() on it (line 88). These are two separate transactions within the same
+    transaction. A frontrunner CANNOT insert a call between clone deployment and initialization
+    within the same transaction.
+
+    However, the initialize() check is: require(msg.sender == address(ISettlementPoolFactory(_factory))).
+    The _factory parameter is passed BY THE CALLER to initialize(). So if someone could call
+    initialize() before the factory does, they'd need to pass _factory=factoryAddress. But
+    the clone address is not known before the CREATE opcode executes, and both clone+initialize
+    happen in the same tx. So frontrunning is NOT possible.
+
+    KILLED: clone() + initialize() are in the same transaction. No frontrun vector.
+  attack_scenario: "None — clone deployment and initialization happen atomically in one tx."
+  impact: "None"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: ""
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    The factory == address(0) check on line 60 of SettlementPool.sol provides additional
+    protection. Even if somehow initialize were called twice, the second call would revert.
+    KILLED: no frontrun possible within single transaction.
+  poc_sketch: ''
+  call_stack: ''
+  kill_signals:
+    - "KILLED: atomic tx prevents frontrunning"
+
+# ============================================================================
+# H-11: Pause traps funds — no emergency withdrawal mechanism
+# ============================================================================
+- id: ORC-W-11
+  tier: 2
+  type: property
+  description: >
+    Oracle.pause() (line 460) pauses all provider operations. While paused: depositUSDC,
+    withdrawUSDC, createPool, atomicDeposit, collectFees ALL revert (whenNotPaused modifier).
+    However, SettlementPool functions only check onlyOracle (msg.sender == oracle address).
+    The pause is on the ORACLE, not on the pools. If the admin pauses the oracle, all funds
+    in pools are trapped — no one can withdraw. The parties themselves can still call
+    depositUSDC(amount, transferUuid) directly on the pool (onlyParties modifier), but there
+    is NO party-callable withdrawal function. ALL withdrawal paths go through the Oracle.
+
+    So: pause = all pool funds frozen. If admin key is lost while paused, funds are
+    permanently frozen.
+  attack_scenario: >
+    1. Admin pauses Oracle (legitimate emergency action).
+    2. While paused, no withdrawals from any pool are possible.
+    3. Admin loses key or is compromised → cannot unpause.
+    4. All USDC across all pools is permanently frozen.
+
+    Alternatively: malicious admin pauses to hold funds hostage.
+  impact: "Medium: pause creates a fund-trapping scenario with no emergency escape hatch"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // All withdrawal paths require whenNotPaused on Oracle:
+    // - withdrawUSDC: line 257 whenNotPaused
+    // - processTreasuryManagementWithdrawals: line 194 whenNotPaused
+    // - collectFees: line 30 whenNotPaused
+    //
+    // Parties can deposit directly (SettlementPool.depositUSDC, line 223, onlyParties)
+    // But NO party-callable withdrawal exists
+    // All withdrawals are onlyOracle -> Oracle is paused -> blocked
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    This is a centralization risk. Most Immunefi programs exclude admin-can-rug scenarios.
+    However, the LACK of an emergency withdrawal mechanism for parties is a design concern.
+    Parties deposited their USDC and have no self-service way to retrieve it.
+  poc_sketch: ''
+  call_stack: 'admin -> pause() -> all Oracle functions revert -> pool.withdrawUSDC only callable by oracle -> oracle is paused -> funds frozen'
+  kill_signals:
+    - "Centralization risk — likely excluded by Immunefi scope"
+    - "Pause is a standard safety mechanism; inability to withdraw while paused is often by design"
+    - "Check if there's a timelock on the admin role"
+
+false_positives:
+- hunter: WildcardHunter
+  id: ORC-W-FP-01
+  reason: >
+    EIP-1167 clone frontrunning (H-10) is NOT possible because clone() and initialize()
+    happen in the same transaction. The clone address is unknown before CREATE executes,
+    and the factory == address(0) check prevents re-initialization anyway.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: ORC-W-FP-02
+  reason: >
+    withdrawFees requestor drain (H-09) is NOT exploitable because the requestor parameter
+    in withdrawFees comes from msg.sender in Oracle._processFeeRequests (line 107). The
+    provider withdraws fees to themselves, which is the intended behavior.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+- hunter: WildcardHunter
+  id: ORC-W-FP-03
+  reason: >
+    Flash loan + approval attack (focus area #8) is NOT viable. The deposit flow requires
+    the user to have approved USDC to the pool AND the provider to call the Oracle function.
+    An attacker cannot control both timing and the provider call. Flash loans don't help
+    because the attacker's USDC would be flash-loaned and returned in the same tx, but
+    the provider call is a separate tx entirely.
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false

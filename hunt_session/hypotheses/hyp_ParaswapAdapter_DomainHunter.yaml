@@ -1,0 +1,319 @@
+protocol: morpho-bundler3
+component: ParaswapAdapter
+file: src/adapters/ParaswapAdapter.sol
+domain: trust
+hunter: DomainHunter
+generated_at: '2026-03-22T00:00:00Z'
+invariants:
+- id: PA-D01
+  tier: 1
+  type: property
+  description: >
+    Overlapping offsets: si exactAmount y limitAmount apuntan al mismo offset en callData,
+    el segundo set() sobrescribe el primero en updateAmounts(). En sell(), esto causa que
+    maxSrcAmount (leído de exactAmount offset) tenga el valor del limitAmount escalado,
+    NO el exactAmount original. El check srcAmount <= maxSrcAmount usa un valor corrupto.
+  attack_scenario: >
+    Atacante construye callData donde offsets.exactAmount == offsets.limitAmount (mismo byte position).
+    En sell() con sellEntireBalance=true, updateAmounts() primero escribe exactAmount = balanceOf(this),
+    luego calcula limitAmount = oldLimit * newExact / oldExact y lo escribe EN LA MISMA posición,
+    sobrescribiendo exactAmount. Ahora maxSrcAmount (leído del offset exactAmount) es el limitAmount
+    escalado, que puede ser mayor o menor que el balance real. Si mayor: el adapter aprueba max
+    a augustus, y augustus puede drenar más tokens de los que el usuario quería vender.
+    Si menor: la tx revierte por SellAmountTooHigh — DoS.
+  impact: "Pérdida de fondos del adapter si limitAmount escalado > balance real (augustus drena más tokens)"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // En un test: crear callData donde exactAmount offset == limitAmount offset
+    // Verificar que después de updateAmounts, el valor leído es inconsistente
+    // property: offsets.exactAmount != offsets.limitAmount (no enforced on-chain)
+    // Si se permite overlap, post-condition:
+    //   callData.get(offsets.exactAmount) == newExactAmount MUST hold after updateAmounts
+    bytes memory testCallData = augustusCallData;
+    uint256 preExact = BytesLib.get(testCallData, offsets.exactAmount);
+    // After updateAmounts:
+    // assert callData.get(offsets.exactAmount) == expectedExactAmount
+    // This WILL fail if offsets overlap
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    El riesgo real depende de si Bundler3 valida los offsets antes de pasar a ParaswapAdapter.
+    Si el usuario construye su propio bundle, los offsets maliciosos solo se auto-dañan.
+    PERO: si un frontend/relayer construye el bundle y un atacante manipula los offsets
+    en la calldata antes de que se firme, esto es explotable. También: si quotedAmount
+    overlap con exactAmount o limitAmount, mismo problema.
+
+- id: PA-D02
+  tier: 1
+  type: property
+  description: >
+    srcToken == destToken permite manipulación de balance accounting. swap() calcula
+    srcAmount = srcInitial - srcFinal y destAmount = destFinal - destInitial por separado,
+    pero si son el mismo token, ambos leen el mismo balanceOf(). Si augustus hace un swap
+    de token A por token A (con fee), srcFinal == destFinal y srcInitial == destInitial,
+    así que srcAmount + destAmount podría no reflejar la realidad. Peor: si augustus
+    simplemente retorna tokens sin hacer nada (no-op swap), destAmount = 0 pero srcAmount = 0
+    también, pasando los checks si minDestAmount era 0 (pero minDestAmount != 0 se requiere).
+  attack_scenario: >
+    Con srcToken == destToken, un augustus malicioso (registrado) podría transferir tokens
+    OUT del adapter y luego transferir una cantidad diferente BACK. El adapter solo verifica
+    que el balance no bajó más de maxSrcAmount y subió al menos minDestAmount. Si el token
+    es el mismo, el balance final refleja el NET, no gross. Ejemplo: adapter tiene 100 tokens.
+    Augustus toma 100, devuelve 50. srcInitial=100, srcFinal=50, destFinal=50, destInitial=100.
+    srcAmount = 100-50 = 50, destAmount = 50-100 = UNDERFLOW → revert.
+    Caso inverso: Augustus toma 0, devuelve 50 (de otra fuente). srcAmount=0 (ok, <= max),
+    destAmount=50 (ok, >= min). Pero el adapter transfiere 50 al receiver — estos 50 vinieron
+    de tokens que ya estaban en el adapter o fueron donados. No es un ataque directo, pero
+    rompe la asunción de que destAmount viene del swap.
+  impact: "Accounting inconsistente cuando srcToken == destToken; underflow reverts o destAmount inflado artificialmente"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: srcToken != destToken en toda llamada a swap()
+    // O si se permite: destAmount + srcAmount debe ser consistente con fees
+    // property: if srcToken == destToken, then destFinal >= srcInitial - maxSrcAmount + minDestAmount
+    // Este invariante captura la conservación neta
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    Es probable que Augustus rechace swaps de mismo token. Pero el contrato ParaswapAdapter
+    NO lo verifica. Si Augustus lo permite en alguna ruta (e.g., un wrapper que cobra fee),
+    la accounting del adapter se confunde. Realísticamente, este es un edge case poco probable.
+
+- id: PA-D03
+  tier: 1
+  type: property
+  description: >
+    buyMorphoDebt TOCTOU: expectedBorrowAssets() lee la deuda en el momento de la llamada,
+    pero entre la lectura y el uso efectivo del loanToken (e.g., para repay en un step
+    posterior del bundle), la deuda puede crecer por accrued interest. Si otro bundle action
+    llama a Morpho.accrueInterest() o si simplemente pasa tiempo (en el mismo bloque no,
+    pero en una tx posterior), la deuda comprada puede ser insuficiente.
+  attack_scenario: >
+    Bundle: [1] buyMorphoDebt lee deuda = 1000 USDC, compra exactamente 1000 USDC via swap.
+    [2] Antes del repay, otro action en el bundle triggerea accrueInterest en Morpho.
+    [3] La deuda ahora es 1001 USDC. El repay con 1000 USDC deja 1 USDC de deuda residual.
+    Esto no es una pérdida directa, pero rompe la expectativa de "compro exactamente mi deuda".
+    En un bundle de deleverage, esto puede dejar dust debt que impide cerrar la posición.
+  impact: "Dust debt residual tras buyMorphoDebt si accrueInterest ocurre entre la lectura y el repay"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Ghost: track debtAtRead vs debtAtRepay
+    // uint256 ghost_debtAtBuyMorphoDebt;
+    // property: after repay, borrowShares[onBehalf] == 0 IF intent was full repay
+    // Este invariante detecta dust debt residual
+    uint256 debtBefore = MorphoBalancesLib.expectedBorrowAssets(MORPHO, marketParams, onBehalf);
+    // ... swap happens ...
+    // ... repay happens ...
+    uint256 debtAfter = MorphoBalancesLib.expectedBorrowAssets(MORPHO, marketParams, onBehalf);
+    eq(debtAfter, 0, "PA-D03: dust debt remains after buyMorphoDebt + repay");
+  ghost_vars:
+  - uint256 internal ghost_debtAtBuyMorphoDebt;
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    expectedBorrowAssets ya incluye interés acumulado hasta el timestamp actual, así que
+    dentro del mismo bloque no debería cambiar SALVO que otro action llame a accrueInterest
+    explícitamente. En Morpho Blue, accrueInterest se llama al inicio de supply/borrow/repay/
+    withdraw/liquidate. Así que si el bundle hace buyMorphoDebt y luego repay, el repay
+    accrúa interés ANTES de procesar, haciendo que la deuda sea ligeramente mayor que la
+    leída. Esto es un bug real, aunque de impacto dust.
+
+- id: PA-D04
+  tier: 2
+  type: property
+  description: >
+    Offset inyección en function selector: BytesLib.set() puede escribir en cualquier
+    posición de callData incluyendo los primeros 4 bytes (selector). Si offsets.exactAmount = 0,
+    set() sobrescribe el selector de la función de Augustus con los bytes del newExactAmount.
+    Esto cambia qué función se llama en Augustus.
+  attack_scenario: >
+    Un relayer o frontend malicioso construye offsets con exactAmount = 0. Cuando
+    updateAmounts() se ejecuta, escribe el balance (en sellEntireBalance) sobre los primeros
+    32 bytes del callData, que incluyen el selector (bytes 0-3) y los primeros 28 bytes del
+    primer argumento. Ahora la call a Augustus ejecuta una función completamente diferente.
+    Si Augustus tiene una función que transfiere tokens a un address arbitrario sin swap,
+    el atacante podría drenar los fondos aprobados. El adapter da approval de type(uint256).max
+    antes de la call.
+  impact: "Cambio de función llamada en Augustus, potencial drain de tokens aprobados"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: offsets no deben apuntar a los primeros 4 bytes del callData (selector)
+    // property: offsets.exactAmount >= 4 && offsets.limitAmount >= 4 && offsets.quotedAmount >= 4
+    // (o quotedAmount == 0 que es el caso "no usar")
+    t(offsets.exactAmount >= 4, "PA-D04: exactAmount offset overlaps selector");
+    t(offsets.limitAmount >= 4, "PA-D04: limitAmount offset overlaps selector");
+    t(offsets.quotedAmount == 0 || offsets.quotedAmount >= 4, "PA-D04: quotedAmount offset overlaps selector");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    BytesLib.get/set solo requiere offset <= data.length - 32. offset=0 es perfectamente
+    válido. La pregunta es: ¿quién controla los offsets? El caller del bundle (usuario o
+    relayer). Si el usuario firma un bundle con offsets maliciosos, se auto-daña. Si un
+    relayer/frontend malicioso modifica los offsets después de que el usuario aprueba la tx,
+    es explotable. También relevante para meta-tx o gasless patterns donde el usuario firma
+    datos pero un third party los submite. NOTA: el post-swap check (srcAmount <= maxSrcAmount)
+    mitiga parcialmente, pero maxSrcAmount se lee del callData TAMBIÉN, que ya fue corrompido.
+
+- id: PA-D05
+  tier: 2
+  type: property
+  description: >
+    sell() sin sellEntireBalance: los valores maxSrcAmount y minDestAmount se leen
+    directamente del callData tal como viene del usuario. No hay validación de que estos
+    sean razonables (e.g., que maxSrcAmount <= balanceOf(this), o que minDestAmount sea
+    coherente con el precio de mercado). Un usuario puede pasar minDestAmount = 1 wei,
+    perdiendo la protección de slippage.
+  attack_scenario: >
+    Usuario (o frontend comprometido) envía sell() con minDestAmount = 1 en callData.
+    El swap se ejecuta con un precio terrible (MEV sandwich o pool manipulado), el adapter
+    recibe 1 wei de destToken y pasa el check destAmount >= 1. El usuario pierde el
+    99.99% del valor de su swap. Aunque esto es "culpa del usuario", un protocolo robusto
+    debería tener un precio mínimo de referencia o al menos un % de slippage máximo.
+  impact: "Pérdida total del valor del swap si minDestAmount es negligible"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Invariante: minDestAmount debe ser al menos X% del valor esperado
+    // Esto requiere un oracle como referencia — no se puede invariar puramente on-chain
+    // sin precio de referencia. Pero podemos verificar que minDestAmount > 0 (ya existe)
+    // y que minDestAmount sea al menos, say, 1% del exactAmount ajustado por decimales.
+    // property heuristic:
+    // minDestAmount >= exactAmount / 100  (asumiendo tokens ~1:1 para simplificar)
+    t(minDestAmount > 0, "PA-D05: minDestAmount is zero"); // ya enforced
+    // Esto es más un design review que un invariant fuzzeable
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Este es un patrón conocido (slippage protection insuficiente). Sin embargo, en el
+    contexto de Bundler3, el usuario construye su propio callData, así que la protección
+    de slippage es responsabilidad del frontend. El contrato no puede saber el precio justo
+    sin un oracle. Probablemente sea "by design" — marcado como confidence bajo.
+
+- id: PA-D06
+  tier: 1
+  type: property
+  description: >
+    updateAmounts con oldExactAmount = 0 causa division by zero en mulDiv.
+    Si el callData original tiene 0 en la posición de exactAmount, la llamada a
+    mulDiv(limitAmount, exactAmount=newValue, oldExactAmount=0) revierte.
+    En sell() con sellEntireBalance y balance > 0, esto es un DoS si el callData
+    mal-formado tiene exactAmount = 0.
+  attack_scenario: >
+    Un usuario construye callData con exactAmount = 0 en el offset indicado y llama sell()
+    con sellEntireBalance=true. updateAmounts lee oldExactAmount = 0, luego hace
+    limitAmount.mulDiv(newBalance, 0, Ceil) → reverts con division by zero.
+    No hay pérdida de fondos, pero es un DoS del bundle completo. En buyMorphoDebt(),
+    si el callData original tiene exactAmount = 0, el mismo DoS ocurre.
+  impact: "DoS: revert por division by zero en updateAmounts si callData mal-formado"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // property: updateAmounts solo se llama cuando oldExactAmount > 0
+    // Equivalente: callData.get(offsets.exactAmount) > 0 antes de updateAmounts
+    uint256 oldExact = callData.get(offsets.exactAmount);
+    t(oldExact > 0, "PA-D06: oldExactAmount is zero, will cause div-by-zero");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: >
+    Es un input validation issue. El usuario que envía callData con exactAmount=0
+    solo se DoSea a sí mismo. No es explotable por terceros. Severity: Low/Info.
+
+- id: PA-D07
+  tier: 1
+  type: property
+  description: >
+    sellEntireBalance balance inflation via same-bundle donation. Dentro de un bundle,
+    un action previo puede transferir tokens al adapter (e.g., via erc20Transfer en
+    CoreAdapter). Cuando sell() con sellEntireBalance=true lee balanceOf(this), incluye
+    estos tokens donados. El swap se ejecuta por un amount mayor al esperado por el usuario.
+    Si el slippage (limitAmount) se escala proporcionalmente via updateAmounts, la protección
+    de slippage también se relaja proporcionalmente.
+  attack_scenario: >
+    Bundle malicioso: [1] erc20Transfer envía 1000 USDC al adapter. [2] Un atacante de
+    alguna manera inyecta otra acción que envía 1000 USDC más al adapter. [3] sell() con
+    sellEntireBalance lee 2000 USDC, updateAmounts escala limitAmount (min buy) × 2.
+    El swap vende 2000 USDC pero el limitAmount escalado protege proporcionalmente.
+    Sin embargo, si el pool de destino tiene poco líquido, el price impact de vender 2000
+    en vez de 1000 es más que 2x, y el limitAmount escalado linealmente puede ser insuficiente.
+    El usuario recibe menos valor del esperado por los 1000 USDC que donó legítimamente.
+  impact: "Slippage protection insuficiente si balance inflado causa swap de amount mayor al esperado"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Ghost: track el balance esperado vs el balance real al momento de sell()
+    // Si la diferencia es > X%, flag como anomalía
+    // property: balanceOf(this) al momento de sellEntireBalance debe ser <= expectedDeposit * 1.01
+    // Esto requiere ghost tracking del expected deposit amount
+    uint256 actualBalance = IERC20(srcToken).balanceOf(address(adapter));
+    uint256 expectedFromBundle = ghost_expectedSrcAmount;
+    t(actualBalance <= expectedFromBundle * 101 / 100, "PA-D07: balance inflated beyond expected");
+  ghost_vars:
+  - uint256 internal ghost_expectedSrcAmount;
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    El vector principal es front-running o misconfiguración del bundle. En un bundle
+    atómico donde solo el usuario controla las actions, no hay tercer partido que pueda
+    inyectar tokens. Pero si hay un callback o un reenter en el bundle, sí es posible.
+    Depende de la arquitectura de Bundler3 y si permite callbacks que modifiquen el adapter
+    balance mid-bundle.
+
+false_positives:
+- hunter: DomainHunter
+  id: PA-FP-01
+  reason: >
+    forceApprove(max) → call → forceApprove(0) es un patrón seguro en este contexto.
+    Aunque hay un window de approval max durante el augustus.call(), el check post-swap
+    (srcAmount <= maxSrcAmount) limita cuánto puede gastar augustus realmente. Augustus está
+    validado por el registry. El patrón approve-call-revoke es estándar y aceptado.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: DomainHunter
+  id: PA-FP-02
+  reason: >
+    La falta de onlyBundler3 en sell(), buy(), y buyMorphoDebt() fue reportada como LOW
+    en Solodit (finding conocido). Sin embargo, swap() interno SÍ tiene onlyBundler3,
+    así que cualquier llamada externa a estas funciones eventualmente revierte si msg.sender
+    no es Bundler3. Las funciones externas sin modifier son un patrón deliberado para
+    permitir que el Bundler3 delegatecall o call directamente. No es un bug.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      ParaswapAdapter: sell/buy/buyMorphoDebt sin onlyBundler3 en la función externa es
+      by-design porque swap() interno sí lo tiene. No perder tiempo re-reportando esto.
+    briefing_update_applied: false
+
+- hunter: DomainHunter
+  id: PA-FP-03
+  reason: >
+    El receiver podría ser address(this) — en ese caso safeTransfer se omite y los tokens
+    quedan en el adapter. Esto es by-design para permitir encadenamiento de swaps dentro
+    del bundle (swap A→B, luego swap B→C, ambos en el adapter).
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

@@ -1,0 +1,373 @@
+component: Oracle
+hunter: AccessHunter
+target: Variational (Immunefi $100K)
+date: 2026-03-23
+files_analyzed:
+  - src/Oracle.sol (468 lines)
+  - src/SettlementPool.sol (332 lines)
+  - src/SettlementPoolFactory.sol (112 lines)
+
+invariants:
+  - id: "VAR-AC-01"
+    title: "grantRole() for PROVIDER_ROLE always reverts — dead code path"
+    description: |
+      Oracle.grantRole() (line 438) calls super.grantRole() BEFORE checking
+      require(!hasRole(PROVIDER_ROLE, account)). In OpenZeppelin AccessControl v4,
+      super.grantRole() internally calls _grantRole() which grants the role
+      immediately (sets _roles[role].members[account] = true). By the time
+      execution reaches line 442's require(!hasRole(PROVIDER_ROLE, account)),
+      the account ALREADY has the role, so hasRole() returns true and the
+      require ALWAYS reverts.
+
+      This means grantRole(PROVIDER_ROLE, ...) is permanently broken.
+      The admin MUST use addProvider() instead, which correctly calls
+      _grantRole() directly.
+
+      For non-PROVIDER roles (e.g., DEFAULT_ADMIN_ROLE), grantRole() works
+      fine since the if-block on line 441 is skipped.
+    confidence: 95
+    severity: "Medium"
+    location: "Oracle.sol:438-446"
+    solidity: |
+      // BUG: super.grantRole grants BEFORE the check
+      function grantRole(bytes32 role, address account) public override whenNotPaused onlyRole(getRoleAdmin(role)) {
+          super.grantRole(role, account);  // ← role is granted HERE
+          if (role == PROVIDER_ROLE) {
+              require(!hasRole(PROVIDER_ROLE, account), "Oracle: Provider already added.");
+              // ↑ ALWAYS reverts because account now HAS the role
+              numProviders++;  // ← never reached
+          }
+      }
+    attack_scenario: |
+      1. Admin tries to use the standard AccessControl interface grantRole(PROVIDER_ROLE, newProvider)
+      2. Transaction reverts with "Oracle: Provider already added." even though the provider was never added
+      3. Admin is confused — the role was actually granted by super.grantRole() but then reverted
+      4. Due to the revert, the state change is rolled back — the provider is NOT added
+      5. Impact: grantRole() is a broken interface. If any external system, multisig, or governance
+         contract calls grantRole() instead of addProvider(), it will always fail.
+      6. The provider IS correctly added via addProvider() — this is the workaround.
+
+      Escalation risk: If a governance module or timelock is configured to call the standard
+      grantRole() interface (since Oracle IS an AccessControl contract), provider management
+      breaks permanently.
+    kill_signals: |
+      - addProvider() works correctly as the alternative path — so this is "dead code" not "broken code"
+      - Admin likely knows to use addProvider() since it's in the IOracle interface
+      - No direct fund loss — just operational disruption
+      - Could be argued as "by design" if they intentionally want grantRole blocked
+      - BUT: if by design, they should revert BEFORE calling super, not after
+    verdict: "LIKELY VALID — Medium. Broken interface, not broken functionality. The fix is trivial: move the require BEFORE super.grantRole() or remove the override entirely and force addProvider()."
+
+  - id: "VAR-AC-02"
+    title: "renounceRole() not overridden — numProviders desync"
+    description: |
+      Oracle overrides grantRole() and revokeRole() to maintain numProviders counter,
+      but does NOT override renounceRole(). OpenZeppelin's renounceRole() calls
+      _revokeRole() directly, which removes the role without decrementing numProviders.
+
+      A PROVIDER can call renounceRole(PROVIDER_ROLE, self) and:
+      1. Their PROVIDER_ROLE is revoked (they lose access)
+      2. numProviders is NOT decremented
+      3. numProviders is now permanently inflated
+
+      Furthermore, removeProvider() has require(numProviders > 1) — if numProviders
+      is inflated, the admin can remove providers below the "real" count, potentially
+      removing the LAST actual provider while numProviders still shows > 1.
+    confidence: 92
+    severity: "Medium"
+    location: "Oracle.sol — renounceRole() NOT present (missing override)"
+    solidity: |
+      // MISSING: This override does not exist in Oracle.sol
+      // function renounceRole(bytes32 role, address account) public override {
+      //     if (role == PROVIDER_ROLE) {
+      //         require(numProviders > 1, "Cannot remove the only provider.");
+      //         numProviders--;
+      //     }
+      //     super.renounceRole(role, account);
+      // }
+    attack_scenario: |
+      1. System has 2 providers (numProviders = 2): Alice and Bob
+      2. Alice calls renounceRole(PROVIDER_ROLE, alice) — succeeds via OZ base
+      3. numProviders still = 2 (not decremented), but only Bob has the role
+      4. Admin calls removeProvider(bob) — passes require(numProviders > 1) since numProviders = 2
+      5. numProviders = 1, but ZERO addresses actually have PROVIDER_ROLE
+      6. All PROVIDER_ROLE functions (deposit, withdraw, settle, collectFees) are now permanently blocked
+      7. ALL FUNDS IN ALL SETTLEMENT POOLS ARE FROZEN — no withdrawals possible
+
+      Alternative scenario (griefing):
+      1. Malicious provider calls renounceRole() repeatedly via re-adding
+      2. numProviders inflates, making the > 1 guard meaningless
+    kill_signals: |
+      - Requires a provider to voluntarily renounce — providers are presumably trusted backend servers
+      - Admin can re-add providers via addProvider() to restore access
+      - The "freeze all funds" scenario requires admin to also make a mistake (removing last real provider)
+      - In practice, provider keys are likely controlled by the Variational team, not adversaries
+      - BUT: defense-in-depth failure — the counter is a security invariant and it's bypassable
+    verdict: "LIKELY VALID — Medium. numProviders desync can lead to operational failure. The freeze scenario requires two mistakes (renounce + admin removes last) but the invariant violation is real."
+
+  - id: "VAR-AC-03"
+    title: "SettlementPool implementation contract can be initialized by anyone"
+    description: |
+      SettlementPoolFactory deploys clones of an `implementation` contract.
+      The implementation contract itself is a bare SettlementPool with factory = address(0).
+      SettlementPool.initialize() does NOT use OpenZeppelin's Initializable pattern
+      (_disableInitializers in constructor). It only checks require(factory == address(0)).
+
+      Anyone can call initialize() on the implementation contract, passing _factory = msg.sender.
+      This passes the check on line 59: msg.sender == address(ISettlementPoolFactory(_factory))
+      becomes msg.sender == msg.sender (always true when _factory = msg.sender).
+    confidence: 90
+    severity: "Low"
+    location: "SettlementPool.sol:52-72, SettlementPoolFactory.sol:14"
+    solidity: |
+      // SettlementPool.sol line 52-60
+      function initialize(...) external nonReentrant {
+          require(msg.sender != address(0), "...");
+          require(msg.sender == address(ISettlementPoolFactory(_factory)), "Only factory can initialize");
+          require(factory == address(0), "can only initialize once");  // ← implementation has factory=0
+          // Attacker passes _factory = msg.sender → check passes
+      }
+    attack_scenario: |
+      1. Attacker finds the implementation contract address (it's stored as immutable in factory)
+      2. Attacker calls implementation.initialize(attacker, attacker, [attacker2], 1)
+         with _factory = attacker_address
+      3. The check msg.sender == address(ISettlementPoolFactory(_factory)) passes because
+         msg.sender == attacker == _factory (type cast doesn't change address)
+      4. Implementation is now initialized with attacker as creator and factory
+      5. Impact: The implementation contract itself can be "owned" by attacker, but since
+         EIP-1167 clones have their OWN storage, this doesn't affect any deployed pools.
+      6. If USDC is accidentally sent to the implementation address, the attacker could
+         call depositUSDC to claim it (but _oracle() would fail since attacker isn't a real factory).
+    kill_signals: |
+      - Implementation contract holds no state that clones use (EIP-1167 clones have independent storage)
+      - No USDC should ever be in the implementation contract
+      - _oracle() lookup would fail for most operations since attacker isn't a real factory
+      - This is a well-known pattern issue, many protocols have this — usually Info/Low
+      - No direct fund loss possible
+    verdict: "VALID but Low/Info. Classic uninitialized implementation. No fund impact but bad practice."
+
+  - id: "VAR-AC-04"
+    title: "onlyFactoryOwner modifier defined but never used — dead code"
+    description: |
+      SettlementPool defines modifier onlyFactoryOwner() on line 34-40 but it is
+      never applied to any function in the contract. This suggests either:
+      (a) a planned emergency/admin function was never implemented, or
+      (b) it was removed but the modifier was left behind.
+
+      If (a), there may be missing admin functionality (e.g., emergency fund recovery).
+    confidence: 95
+    severity: "Info"
+    location: "SettlementPool.sol:34-40"
+    solidity: |
+      modifier onlyFactoryOwner() {
+          require(
+              msg.sender == ISettlementPoolFactory(factory).getOwner(),
+              "SettlementPool: Unauthorized."
+          );
+          _;
+      }
+      // Never used on any function
+    attack_scenario: |
+      No direct attack. This is informational — dead code that may indicate
+      missing emergency functionality. If the factory owner was supposed to
+      have emergency withdrawal or pause capability on individual pools,
+      that capability doesn't exist.
+    kill_signals: |
+      - Pure dead code, no security impact
+      - May be intentional — pools are fully controlled by Oracle, no need for factory owner access
+      - Code cleanliness issue, not a vulnerability
+    verdict: "Info only. Dead code, no security impact."
+
+  - id: "VAR-AC-05"
+    title: "Factory owner vs Oracle admin divergence risk"
+    description: |
+      SettlementPoolFactory uses Ownable (owner()). Oracle uses AccessControl
+      (DEFAULT_ADMIN_ROLE). These are separate access control systems.
+
+      Factory.setOracleAddress() is onlyOwner — factory owner can change the oracle.
+      Oracle.setSettlementPoolFactory() is onlyRole(DEFAULT_ADMIN_ROLE) — oracle admin
+      can change the factory.
+
+      If these two admins are different entities (e.g., after ownership transfer),
+      one can rug the other:
+      - Factory owner calls setOracleAddress(malicious) → all pool operations now
+        controlled by malicious oracle → can drain all pools
+      - Oracle admin calls setSettlementPoolFactory(malicious) → pool lookups return
+        attacker-controlled addresses
+    confidence: 60
+    severity: "Medium"
+    location: "SettlementPoolFactory.sol:103-106, Oracle.sol:392-399"
+    solidity: |
+      // Factory — Ownable
+      function setOracleAddress(address newAddress) external onlyOwner {
+          oracle = IOracle(newAddress);  // No validation!
+      }
+
+      // Oracle — AccessControl
+      function setSettlementPoolFactory(address factoryAddress)
+          external onlyRole(DEFAULT_ADMIN_ROLE) {
+          factory = ISettlementPoolFactory(factoryAddress);
+      }
+    attack_scenario: |
+      1. Initially, deployer is both factory owner AND oracle admin
+      2. Factory ownership is transferred to a multisig, but oracle admin stays with EOA (or vice versa)
+      3. Compromised factory owner calls setOracleAddress(maliciousOracle)
+      4. maliciousOracle calls pool.withdrawUSDC() via onlyOracle modifier — drains all pools
+      5. Total fund loss across all settlement pools
+    kill_signals: |
+      - This is a trusted admin scenario — Immunefi typically excludes admin key compromise
+      - Both are likely controlled by the same team/multisig
+      - "Admin can rug" is generally not a valid bounty finding
+      - Factory.setOracleAddress has NO zero-address check (minor)
+      - The REAL question is: does Immunefi's scope explicitly exclude admin actions?
+    verdict: "LIKELY NOT REPORTABLE — admin trust assumption. But note that setOracleAddress has no validation (no zero-address check, no timelock). If Immunefi scope includes centralization risks, this could be valid."
+
+  - id: "VAR-AC-06"
+    title: "pause() and unpause() missing nonReentrant modifier — inconsistency"
+    description: |
+      All other admin/provider functions in Oracle.sol have both nonReentrant
+      and whenNotPaused modifiers. But pause() (line 460) and unpause() (line 465)
+      only have onlyRole(DEFAULT_ADMIN_ROLE) — missing nonReentrant.
+
+      While reentrancy on pause/unpause is extremely unlikely (they don't make
+      external calls), this is a modifier inconsistency.
+    confidence: 85
+    severity: "Info"
+    location: "Oracle.sol:460-467"
+    solidity: |
+      // Missing nonReentrant — inconsistent with all other functions
+      function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+          _pause();
+      }
+      function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+          _unpause();
+      }
+    attack_scenario: |
+      No realistic attack. _pause() and _unpause() are simple state changes
+      with no external calls. The inconsistency is cosmetic.
+    kill_signals: |
+      - No external calls in pause/unpause — reentrancy impossible
+      - Pure style inconsistency
+      - Pausable._pause() is safe against reentrancy by design
+    verdict: "Info only. Style inconsistency, no security impact."
+
+  - id: "VAR-AC-07"
+    title: "PROVIDER_ROLE can call createPool with arbitrary fee extraction"
+    description: |
+      Oracle.createPool() (line 359) is callable by PROVIDER_ROLE. It passes
+      feePaidBy and feeAmount to factory.createPool(), which does:
+      usdcAddress.transferFrom(feePaidBy, feeRequestor, feeAmount).
+
+      The feeRequestor is msg.sender (the provider, line 375).
+      The feePaidBy is an arbitrary address provided by the provider.
+
+      A malicious provider can set feePaidBy = victim_address (any address that
+      has approved USDC to the factory), feeAmount = their full allowance, and
+      extract USDC from any user who has approved the factory contract.
+    confidence: 75
+    severity: "High"
+    location: "Oracle.sol:359-380, SettlementPoolFactory.sol:77-82"
+    solidity: |
+      // Oracle.sol:359 — provider controls feePaidBy and feeAmount
+      function createPool(
+          address creatorAddress,
+          address[] calldata otherAddresses,
+          uint128 poolUuid,
+          ...
+          address feePaidBy,   // ← attacker controls this
+          uint256 feeAmount    // ← attacker controls this
+      ) external override nonReentrant whenNotPaused onlyRole(PROVIDER_ROLE) {
+          address poolAddress = factory.createPool(
+              ...,
+              msg.sender,      // feeRequestor = the provider = attacker
+              feePaidBy,       // victim address
+              feeAmount        // amount to steal
+          );
+      }
+
+      // SettlementPoolFactory.sol:77-82
+      if (feeAmount > 0) {
+          try usdcAddress.transferFrom(feePaidBy, feeRequestor, feeAmount) {
+          // ↑ transfers FROM victim TO attacker (the provider)
+      }
+    attack_scenario: |
+      1. User Alice approves USDC to the SettlementPoolFactory for pool creation fees
+      2. Malicious provider calls createPool(anyCreator, [anyOther], newUuid, ..., feePaidBy=Alice, feeAmount=Alice_balance)
+      3. Factory calls usdc.transferFrom(Alice, provider, Alice_balance)
+      4. Alice's USDC is stolen by the malicious provider
+
+      HOWEVER: Does anyone approve USDC to the factory directly? Looking at the flow:
+      - Users approve USDC to SettlementPool contracts (for deposits)
+      - Users might approve USDC to the Oracle contract (for atomicDeposit transferFrom on line 301)
+      - Factory approval is less clear — need to check if the frontend ever asks for factory approval
+
+      If users approve the FACTORY: this is Critical (direct fund theft by trusted role).
+      If users only approve pools/oracle: this is not exploitable.
+    kill_signals: |
+      - PROVIDER_ROLE is a trusted server-side role — Immunefi may exclude trusted role abuse
+      - Users may never approve USDC to the factory (need to check frontend/SDK)
+      - The transferFrom requires prior approval — no approval = no steal
+      - This is "trusted role can do bad things" territory
+      - BUT: if the scope includes "compromised provider key" scenarios, this is High
+    verdict: "CONDITIONAL — High IF provider key compromise is in scope AND users approve factory. Need to verify Immunefi scope and on-chain approvals."
+
+  - id: "VAR-AC-08"
+    title: "No PROVIDER_ROLE count on revokeRole bypass via renounceRole — can remove ALL providers"
+    description: |
+      This is the severe consequence of VAR-AC-02. The removeProvider() function
+      has require(numProviders > 1) to prevent removing the last provider.
+      revokeRole() override also has this check. But renounceRole() bypasses both.
+
+      Scenario: Single provider system (numProviders = 1). The provider calls
+      renounceRole(PROVIDER_ROLE, self). The role is removed but numProviders
+      stays at 1. Now there are ZERO providers but numProviders says 1.
+
+      Result: No one can call any PROVIDER_ROLE function. All fund movements
+      (deposits, withdrawals, settlements, fee collection) are permanently frozen
+      until admin manually calls addProvider().
+    confidence: 90
+    severity: "Medium"
+    location: "Oracle.sol — missing renounceRole override"
+    solidity: |
+      // OpenZeppelin AccessControl.sol (not overridden in Oracle):
+      function renounceRole(bytes32 role, address account) public virtual override {
+          require(account == _msgSender(), "can only renounce roles for self");
+          _revokeRole(role, account);  // ← bypasses numProviders-- and numProviders > 1 check
+      }
+    attack_scenario: |
+      1. Only 1 provider exists (numProviders = 1)
+      2. Provider's key is compromised, or provider goes rogue
+      3. Attacker calls renounceRole(PROVIDER_ROLE, self) — bypasses the > 1 guard
+      4. PROVIDER_ROLE is revoked, numProviders still = 1
+      5. No address has PROVIDER_ROLE anymore
+      6. withdrawUSDC, depositUSDC, collectFees, createPool — ALL revert
+      7. Funds in all SettlementPools are frozen until admin notices and calls addProvider()
+
+      Severity consideration: Admin CAN fix this by calling addProvider(newProvider).
+      But there's a window of operational disruption. If this is a high-frequency
+      trading settlement system, even minutes of downtime = significant loss.
+    kill_signals: |
+      - Admin can recover by calling addProvider() — not permanently frozen
+      - Provider is trusted (server-side key) — compromise is out of usual scope
+      - Self-grief by provider is irrational behavior
+      - The > 1 guard in removeProvider was clearly intended as safety — renounceRole bypasses it
+    verdict: "VALID — Medium (operational disruption, recoverable). Merges with VAR-AC-02 for the report."
+
+summary: |
+  6 findings identified across Oracle.sol, SettlementPool.sol, and SettlementPoolFactory.sol:
+
+  HIGH CONFIDENCE (report candidates):
+  - VAR-AC-01 (Medium, 95%): grantRole(PROVIDER_ROLE) always reverts — broken OZ override
+  - VAR-AC-02 (Medium, 92%): renounceRole not overridden — numProviders desync, fund freeze risk
+  - VAR-AC-03 (Low, 90%): Implementation contract initializable by anyone
+
+  CONDITIONAL:
+  - VAR-AC-07 (High, 75%): Provider can extract USDC via createPool fee param — needs scope check
+
+  INFORMATIONAL:
+  - VAR-AC-04 (Info, 95%): Dead onlyFactoryOwner modifier
+  - VAR-AC-05 (Medium, 60%): Factory owner vs Oracle admin divergence — likely excluded as admin trust
+  - VAR-AC-06 (Info, 85%): pause/unpause missing nonReentrant — no security impact
+
+  TOP PRIORITY FOR PIPELINE: VAR-AC-01 + VAR-AC-02 (can be combined into single report about
+  broken AccessControl overrides). These are real code bugs with concrete impact.

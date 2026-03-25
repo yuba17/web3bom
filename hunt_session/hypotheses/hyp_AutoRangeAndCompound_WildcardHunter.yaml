@@ -1,0 +1,214 @@
+component: AutoRangeAndCompound
+hunter: WildcardHunter
+date: "2026-03-21"
+
+invariants:
+  - id: ARC-W-01
+    title: "execute: transformedTokenId stuck if execute() reverts after vault unstakes position"
+    tier: 1
+    type: atomicity
+    confidence: 85
+    description: >
+      V3Vault._transform() sequence:
+      1. Sets transformedTokenId = tokenId (line 521)
+      2. Calls transformer.execute() (line 535)
+      3. Reads newTokenId = transformedTokenId (line 550) — could have been updated by onERC721Received
+      4. Runs _requireLoanIsHealthy(newTokenId) (line 579)
+      5. Resets transformedTokenId = 0 (line 581)
+
+      For GaugeManager integration with AutoRangeAndCompound:
+      - Before _transform(), GaugeManager._unstakePosition() unstakes from gauge
+      - execute() runs: mints newTokenId, but if health check (step 4) fails,
+        vault reverts at step 4 with transformedTokenId NOT reset to 0.
+
+      Wait — step 5 resets it, but if step 4 reverts, step 5 never executes.
+      So if _requireLoanIsHealthy fails, transformedTokenId remains set.
+
+      Consequence: tokenId is permanently in "transform mode". All vault operations
+      that check transformedTokenId != 0 will be blocked.
+      CRITICAL: liquidate(), borrow(), transform() all check or use transformedTokenId.
+      If this is stuck, the position cannot be liquidated → bad debt.
+    affected_line: "V3Vault.sol:521-581 _transform()"
+    attack_scenario: >
+      1. Position has debt near max collateral factor
+      2. Keeper calls vault.transform(tokenId, address(autoRangeAndCompound), params)
+      3. GaugeManager unstakes position (outside _transform scope)
+      4. V3Vault._transform() sets transformedTokenId = tokenId
+      5. autoRangeAndCompound.execute() runs: mints newTokenId, transfers to vault
+      6. V3Vault.onERC721Received sets transformedTokenId = newTokenId, migrates loan
+      7. Health check on newTokenId fails (price moved, position now undercollateralized)
+      8. _transform() reverts at step 4 (health check revert)
+      9. transformedTokenId is now STUCK at newTokenId
+
+      Wait — if the revert propagates up from step 4, all state changes in the current
+      call stack revert. But what about the onERC721Received at step 6?
+      That was a CALLBACK from npm.safeTransferFrom — also in the call stack → reverts.
+
+      So the revert should unwind everything including transformedTokenId.
+      NEED TO VERIFY: is there a case where GaugeManager state doesn't revert?
+    verification_needed: >
+      Check if GaugeManager._unstakePosition() is called BEFORE V3Vault._transform()
+      (outside the EVM call stack) or WITHIN it. If outside, the unstake persists on revert.
+    status: needs_verification
+    solidity: |
+      // INV-ARC-W-01: transformedTokenId always returns to 0 after transform attempt
+      function invariant_transformedTokenId_alwaysZeroAfterTransform() public view virtual {}
+
+  - id: ARC-W-02
+    title: "autoCompound: MEV keeper extracts value via amountOutMin=0 on every compound"
+    tier: 1
+    type: economic
+    confidence: 80
+    description: >
+      Confirmed independently from OracleHunter (ARC-O-01) perspective.
+      From WildcardHunter angle: this is a SYSTEMIC keeper-MEV pattern.
+      Any entity that becomes an approved keeper can:
+      1. Monitor positions with accumulated fees
+      2. Front-run their own autoCompound call with a pool manipulation
+      3. Call autoCompound (gets keeper reward + extracts MEV from zero-slippage swap)
+      4. Back-run to restore price
+
+      Double extraction: keeper reward (legitimate) + MEV extraction (illegitimate).
+      The compound fee goes to the protocol, but the MEV extraction goes to the attacker.
+
+      This is NOT a theoretical risk — it's the standard behavior for any keeper that is
+      also an MEV bot, which is the rational economic strategy.
+    affected_line: "AutoRangeAndCompound.sol:470 _poolSwap(..., 0)"
+    attack_scenario: >
+      Keeper bot strategy:
+      1. Monitor AutoRangeAndCompound events for pending compounds
+      2. Calculate: can I sandwich this swap and still pass TWAP check?
+         (TWAP check passes if |spot - twap| < 200 ticks)
+      3. If yes: front-run to move spot price ~1.9% (just under 200 ticks)
+      4. Submit autoCompound transaction (gets keeper reward)
+      5. Back-run to restore price
+      6. Net profit = MEV extraction - front-run cost - gas
+
+      For competitive keeper market: keepers undercut each other on speed,
+      but all have same MEV opportunity due to hardcoded amountOutMin=0.
+    severity: MEDIUM
+    status: confirmed_reportable
+    solidity: |
+      // INV-ARC-W-02: autoCompound must pass amountOutMin derived from TWAP
+      // Fix: compute amountOutMin = amountIn * twapPrice * (1 - maxSlippage)
+      // Same pattern as _validateSwap() in execute()
+
+  - id: ARC-W-03
+    title: "execute: config ordering — config set AFTER NFT transfer to vault"
+    tier: 2
+    type: ordering
+    confidence: 68
+    description: >
+      Independently confirms ARC-A-03. The window between NFT transfer and config setup
+      is a single transaction (atomic), so re-entry within that tx would need a malicious
+      vault. With the standard V3Vault, this window is not exploitable.
+      However: the config for newTokenId is copied from oldTokenId's config.
+      If the old config had different parameters than intended for the new range,
+      the new position starts with wrong configuration.
+      This is a UX concern: users expect the config to automatically adapt to the new range.
+      lowerTickDelta/upperTickDelta in the new config still relative to the new baseTick,
+      which is different from the old baseTick — so the deltas should still work correctly.
+    affected_line: "AutoRangeAndCompound.sol:~350 (config copy)"
+    status: low_priority
+    solidity: |
+      // INV-ARC-W-03: config migration is correct (deltas are relative, not absolute)
+
+  - id: ARC-W-04
+    title: "execute: position becomes permanently frozen if vault.transform() reverts on health check"
+    tier: 1
+    type: atomicity
+    confidence: 85
+    description: >
+      Deep analysis of the V3Vault._transform() + GaugeManager interaction.
+
+      Key question: Is GaugeManager._unstakePosition() called inside or outside _transform()?
+
+      Looking at V3Vault code path:
+      - vault.transform() → _transform() → calls transformer.execute()
+      - BUT: for staked positions, V3Vault._transform() calls GaugeManager._unstakePosition()
+        at line ~520 (before calling transformer)
+      - This unstake is WITHIN the _transform() call stack → reverts atomically on failure
+
+      ALTERNATIVE PATH (more dangerous):
+      - GaugeManager.beforeTransform() or similar hook called by V3Vault BEFORE _transform()
+      - If this is a separate transaction or OUTSIDE the revert scope, unstake persists
+
+      Need to check: does V3Vault call GaugeManager for unstake WITHIN _transform(), or
+      is there a separate preparatory call that precedes _transform()?
+    affected_line: "V3Vault.sol:_transform(), GaugeManager.sol:_unstakePosition()"
+    verification_needed: >
+      Read V3Vault lines 505-582 carefully and trace ALL GaugeManager calls.
+      Determine if _unstakePosition is called (a) inside _transform() or (b) as a prerequisite.
+      If (b): failing health check after rerange means unstaked position with no autoRange config.
+    status: needs_verification
+    solidity: |
+      // INV-ARC-W-04: staked position state is atomic with execute() outcome
+      function invariant_stake_atomicity() public view virtual {}
+
+  - id: ARC-W-05
+    title: "autoCompound: leftover sent to withdrawer, not position owner — wrong recipient"
+    tier: 2
+    type: accounting
+    confidence: 75
+    description: >
+      After autoCompound adds liquidity, any remaining tokens (leftover) are sent to
+      'withdrawer' or 'rewardConversion' address, not necessarily to the position owner.
+      The withdrawer is set by the operator configuration.
+      If the position owner expected leftovers to go back to them, they lose this value.
+      Attack: operator configures withdrawer to be their own address, extracts all leftovers.
+      This is operator privilege abuse (requires trusted operator), so severity is lower.
+    affected_line: "AutoRangeAndCompound.sol:~525 (leftover transfer)"
+    status: low_priority
+    solidity: |
+      // INV-ARC-W-05: leftover recipients are transparently configured
+
+  - id: ARC-W-06
+    title: "execute: max fee rewardX64 could be set to extract significant value from rerange"
+    tier: 3
+    type: economic
+    confidence: 50
+    description: >
+      The rewardX64 for execute() keepers is set in config. There's presumably a MAX_REWARD_X64.
+      If set to maximum (e.g., 5%), the keeper extracts 5% of all reranged value.
+      For a $100K position, each rerange pays $5000 to the keeper.
+      Keepers could call execute() frequently (churn) to maximize their fees.
+      Protection: position owner sets the reward in configToken() — self-inflicted.
+    affected_line: "AutoRangeAndCompound.sol:configToken(), MAX_REWARD_X64"
+    status: low_priority
+    solidity: |
+      // INV-ARC-W-06: rewardX64 bounded by MAX_REWARD_X64
+
+  - id: ARC-W-07
+    title: "autoCompound: reentrancy NOT possible — confirmed by nonReentrant modifier"
+    tier: 1
+    type: reentrancy
+    confidence: 95
+    description: >
+      autoCompound() has `nonReentrant` (Automator inherits ReentrancyGuard).
+      Any callback during autoCompound (e.g., from ERC777 token transfer, or
+      Slipstream pool callback) would be blocked by the reentrancy lock.
+      execute() does NOT have nonReentrant — potential issue but lower practical risk
+      since execute() is typically called by vault.transform() which doesn't re-enter.
+    affected_line: "AutoRangeAndCompound.sol:416 autoCompound() modifier"
+    status: confirmed_safe
+    solidity: |
+      // INV-ARC-W-07: autoCompound reentrancy blocked by ReentrancyGuard
+      // execute() missing nonReentrant is asymmetric but low practical risk
+
+  - id: ARC-W-08
+    title: "autoCompound with vault: tokenId health check after compound — position could be unhealthy"
+    tier: 2
+    type: economic
+    confidence: 65
+    description: >
+      autoCompoundWithVault() integrates with V3Vault.
+      After compound, should a health check be performed?
+      If the compound added liquidity and the position value increased,
+      health would only improve. But: if compound added value in wrong ratio
+      and the fee deduction (compound fees) reduced value, health could marginally decrease.
+      V3Vault doesn't require a health check after autoCompound — unlike execute().
+      This asymmetry means autoCompound could theoretically leave a position slightly less healthy.
+    affected_line: "AutoRangeAndCompound.sol:~390 autoCompoundWithVault()"
+    status: low_priority
+    solidity: |
+      // INV-ARC-W-08: position health maintained or improved after autoCompound

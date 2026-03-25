@@ -1,0 +1,588 @@
+protocol: chainlink-pa-v2
+component: WorkflowRouter
+file: src/WorkflowRouter.sol
+domain: access
+hunter: AccessHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODELO DEL PROTOCOLO
+# ═══════════════════════════════════════════════════════════════════════
+# WorkflowRouter es un receptor de informes Chainlink Keystone. Su función
+# es: recibir onReport(metadata, report) de un FORWARDER de confianza,
+# extraer workflowId del metadata (offset 0, confirmado por tests),
+# verificar que (workflowId, target, selector) esté en la allowlist tri-nivel,
+# y ejecutar _call(target, data) heredado de Caller.sol.
+#
+# Flujo de dinero: no hay assets propios en WorkflowRouter. El riesgo
+# es ejecución arbitraria de llamadas a contratos externos allowlisted.
+# Un bypass de la allowlist permitiría invocar funciones privilegiadas
+# en nombre del contrato.
+#
+# Trust boundaries:
+#   - DEFAULT_ADMIN_ROLE: controla la allowlist + puede grantar roles sin delay
+#   - FORWARDER_ROLE: puede invocar onReport (forwarder de Chainlink DON)
+#   - PAUSER_ROLE / UNPAUSER_ROLE: pausan/desbloquean el contrato
+#   - Chainlink DON: provee integridad del contenido del report (off-chain)
+#
+# Estructura de verificación en onReport():
+#   1. workflowId != 0 ✓
+#   2. workflowId in s_allowlistedWorkflowIds ✓
+#   3. selector in allowlistedSelectors[target] ← VERIFICA SELECTOR ANTES QUE TARGET
+#      3a. si NO: verifica si target in allowlistedTargets → error apropiado
+#   4. _call(target, data)
+#
+# NOTA: el happy path nunca verifica explícitamente target in allowlistedTargets.
+# ═══════════════════════════════════════════════════════════════════════
+invariants:
+- id: WR-A-01
+  tier: 2
+  type: property
+  description: "Selector extraction from sub-4-byte data reads memory garbage — could match an allowlisted selector by accident"
+  attack_scenario: >
+    FORWARDER calls onReport() with a report that abi.decodes to (target, data) where
+    data.length < 4 bytes (e.g., empty bytes or 1-3 bytes). At L106-108, the assembly
+    `mload(add(data, 32))` reads 32 bytes starting at the data content pointer. If
+    data.length is 0, it reads whatever sits in the adjacent memory slot (leftover from
+    abi.decode or other allocations). The high-order 4 bytes of this read become `selector`.
+    If this garbage value happens to match an allowlisted bytes4 for the given workflowId+target,
+    the call to target proceeds with < 4 bytes of calldata. The target's fallback/receive
+    function would execute. In practice, the probability of matching an allowlisted selector
+    from random memory is low (~1 in 2^32 per allowlisted selector), and the FORWARDER is
+    a trusted Chainlink node so crafting this deliberately requires a compromised forwarder.
+    Still, the contract lacks a `data.length >= 4` check which is a defensive gap.
+  impact: "Low — requires FORWARDER compromise AND memory coincidence. Worst case: target's fallback executes with msg.value=0"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: onReport should revert if report's data field has < 4 bytes
+    // This tests the defensive gap — can't be a Chimera invariant easily
+    // because it requires crafting specific calldata
+    bytes memory shortData = hex"aabb"; // 2 bytes
+    bytes memory report = abi.encode(allowlistedTarget, shortData);
+    bytes memory metadata = abi.encodePacked(allowlistedWorkflowId, bytes10(0), bytes20(0));
+    // Expect revert — but currently it does NOT revert, it reads garbage
+    // vm.expectRevert();
+    // workflowRouter.onReport(metadata, report);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 70
+  notes: >
+    The assembly reads past data boundaries. While Solidity guarantees the memory
+    after data content is zero-padded for the last word of the ABI encoding, this
+    applies to the encoding of `data` within the abi.decode output. For data.length=0,
+    mload reads the 32 bytes following the length field, which is zero-padded by
+    abi.decode. So for empty data, selector would be bytes4(0), which is explicitly
+    blocked by the add-selector function (L279: `if (selector == bytes4(0)) revert`).
+    For data.length 1-3, the non-provided bytes are zero-padded by ABI encoding.
+    So the actual selector extracted would be the provided bytes left-padded into
+    the high bits + zeros. Example: data=0xAA → selector=0xAA000000. This is
+    deterministic, not random garbage. DOWNGRADING confidence — the ABI encoding
+    guarantees make this less exploitable than initially thought. Still, no explicit
+    length check is a code quality issue.
+
+- id: WR-A-02
+  tier: 2
+  type: property
+  description: "Admin can add WorkflowRouter itself as allowlisted target — enables FORWARDER to trigger self-calls (grantRole, revokeRole, pause, etc.)"
+  attack_scenario: >
+    1. Admin calls applyAllowlistedWorkflowsUpdates() adding address(WorkflowRouter)
+       as a target with selector = grantRole.selector (0x2f2ff15d).
+    2. FORWARDER calls onReport() with report = abi.encode(address(WorkflowRouter),
+       abi.encodeWithSelector(grantRole.selector, FORWARDER_ROLE, attackerAddress)).
+    3. The _call() on L117 executes target.call(data) where target = address(this).
+       Inside this self-call, msg.sender = address(WorkflowRouter).
+    4. grantRole checks onlyRole(getRoleAdmin(role)). For FORWARDER_ROLE, the admin
+       role is DEFAULT_ADMIN_ROLE. WorkflowRouter would need DEFAULT_ADMIN_ROLE on
+       itself for this to succeed — it does NOT have it by default.
+    5. HOWEVER: if admin also grants DEFAULT_ADMIN_ROLE to address(WorkflowRouter)
+       (a misconfiguration), then the self-call succeeds and FORWARDER can grant
+       arbitrary roles to arbitrary addresses.
+    VERDICT: Requires TWO admin mistakes (allowlist self + grant admin role to self).
+    The contract does not prevent adding address(this) as a target, which is a missing
+    safety check. But exploitation requires admin misconfiguration, making this Low.
+  impact: "Medium impact IF exploited (full privilege escalation), but requires admin misconfiguration"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: WorkflowRouter should never be an allowlisted target
+    address[] memory targets = workflowRouter.getAllowlistedTargets(workflowId);
+    for (uint256 i = 0; i < targets.length; i++) {
+        t(targets[i] != address(workflowRouter), "WR-A-02: WorkflowRouter is self-allowlisted as target");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    This is a defense-in-depth finding. The contract lacks a check like
+    `require(target != address(this))` in _applyAllowlistedTargetsUpdates.
+    Exploitation requires the admin to make two specific mistakes. Most contest
+    judges would rate this QA/Low since it requires trusted admin misbehavior.
+    Worth documenting but unlikely to be a paid finding.
+
+- id: WR-A-03
+  tier: 2
+  type: property
+  description: "FORWARDER_ROLE is fully trusted — a compromised Chainlink forwarder can call any allowlisted target+selector with arbitrary arguments"
+  attack_scenario: >
+    The allowlist validates (workflowId, target, selector) but NOT the arguments
+    passed to the target function. A compromised FORWARDER can craft the report
+    to call any allowlisted function with arbitrary parameters. For example, if
+    target=PriceManager and selector=updatePrices is allowlisted, the FORWARDER
+    can submit any price values. The allowlist provides coarse-grained authorization
+    (which functions can be called) but zero validation of the call parameters.
+    This is BY DESIGN — the Chainlink DON consensus is supposed to ensure report
+    integrity. But if a forwarder is compromised (key leak, node takeover), the
+    allowlist provides no defense against parameter manipulation.
+  impact: "Depends on what targets+selectors are allowlisted. Could range from price manipulation to fund movement."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // This is a trust model observation, not a testable invariant.
+    // The allowlist checks (workflowId, target, selector) but never validates
+    // the actual calldata arguments beyond the 4-byte selector.
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 30
+  notes: >
+    This is explicitly by design — Chainlink DON consensus validates report content.
+    The FORWARDER_ROLE is meant to be assigned to trusted Chainlink infrastructure.
+    Not a vulnerability per se, but a trust assumption that should be documented.
+    Contest judges would reject this as "trusted role" unless the scope says otherwise.
+    DO NOT REPORT — this is architecture documentation, not a finding.
+
+- id: WR-A-04
+  tier: 2
+  type: property
+  description: "No reentrancy guard on onReport() — allowlisted target could reenter if it has FORWARDER_ROLE"
+  attack_scenario: >
+    1. onReport() calls _call(target, data) on L117.
+    2. The target contract executes and, if it also has FORWARDER_ROLE, calls back
+       into onReport() with a different (workflowId, target, selector) combination.
+    3. Since there is no reentrancy guard and no state is mutated before the external
+       call in onReport(), the reentrant call succeeds independently.
+    4. This allows a single tx to execute multiple allowlisted calls.
+    However: (a) target contracts don't normally have FORWARDER_ROLE, (b) even if
+    they did, each reentrant call is independently validated against the allowlist,
+    (c) no state is corrupted because onReport() is stateless (reads allowlist, calls
+    target, returns). The reentrancy doesn't give any advantage over simply calling
+    onReport() twice in separate txs.
+  impact: "None in practice — onReport is effectively stateless, reentrancy doesn't corrupt state"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Can't easily test in Chimera — would need a malicious target contract
+    // that has FORWARDER_ROLE and calls back into onReport.
+    // The key insight is that onReport has no state writes before _call,
+    // so reentrancy is a non-issue.
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: >
+    Verified: onReport() performs zero state writes. It only reads from
+    s_allowlistedWorkflowIds and s_workflowInfos (view operations), then calls
+    _call(). Reentrancy cannot corrupt any state because there is no state to
+    corrupt. The function is effectively a stateless router. This is NOT a finding.
+
+- id: WR-A-05
+  tier: 2
+  type: property
+  description: "Metadata comment says workflowId at offset 32 but code reads metadata[:32] (offset 0) — comment/code mismatch"
+  attack_scenario: >
+    The NatDoc comment on L91 says "Offset 32, size 32: workflow_id (bytes32)" implying
+    workflowId starts at byte 32. But L94 reads `bytes32(metadata[:32])` which takes
+    bytes 0-31. Verified against tests: test/unit/workflow-router/on-report/onReport.t.sol
+    uses `abi.encodePacked(WORKFLOW_ID, bytes10(0), bytes20(0))` placing workflowId at
+    offset 0. So the CODE is correct and the COMMENT is misleading. The comment describes
+    a structure where offset values represent cumulative positions, not starting offsets.
+    However, under the stated layout: offset 32 = workflowId(32 bytes), offset 64 =
+    workflow_name(10 bytes), offset 74 = workflow_owner(20 bytes). Total = 94 bytes, but
+    reading from offset 32 means bytes 0-31 are something undocumented. The comment is
+    simply wrong about offsets.
+  impact: "None — code is correct per tests. Comment is misleading but harmless."
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Documentation issue — not a code vulnerability
+    // The comment on L91 says "Offset 32" but code reads metadata[:32]
+    // Tests confirm workflowId is at offset 0
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Confirmed via unit tests. This is an informational/QA finding at best.
+    The comment should say "Offset 0, size 32" for workflowId, "Offset 32,
+    size 10" for workflow_name, "Offset 42, size 20" for workflow_owner.
+    Worth mentioning in a QA report but not worth a standalone finding.
+
+- id: WR-A-06
+  tier: 1
+  type: property
+  description: "allowlistedSelectors stores bytes4 as bytes32 — the contains() check on L110 compares bytes32(selector) which zero-extends to the RIGHT, matching the add() on L283 which also uses bytes32(selector)"
+  attack_scenario: >
+    When a selector is added via _applyAllowlistedSelectorsUpdates (L283):
+      s_workflowInfos[workflowId].allowlistedSelectors[target].add(bytes32(selector))
+    bytes4 → bytes32 conversion in Solidity left-aligns the 4 bytes and zero-pads the
+    right 28 bytes. Example: 0xAABBCCDD → 0xAABBCCDD000...000.
+
+    In onReport (L106-108), selector is extracted via assembly:
+      selector := mload(add(data, 32))
+    mload reads 32 bytes, and `selector` is bytes4, so Solidity takes the high 4 bytes.
+    Then L110 checks: contains(bytes32(selector)) — same left-aligned conversion.
+
+    The question is: could an attacker craft data where the first 4 bytes match an
+    allowlisted selector but the remaining 28 bytes of the mload are non-zero, causing
+    the bytes32 comparison to FAIL even though the selector matches? NO — because the
+    assignment `selector := mload(...)` into a bytes4 variable truncates to 4 bytes,
+    and `bytes32(selector)` re-extends with zeros. So the contains check is consistent.
+
+    VERIFIED: No bypass possible. The bytes4→bytes32 conversion is consistent between
+    add and contains paths.
+  impact: "None — the encoding is consistent"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify bytes4 → bytes32 conversion consistency
+    bytes4 sel = bytes4(0xAABBCCDD);
+    bytes32 stored = bytes32(sel);
+    // stored == 0xAABBCCDD000...000 (left-aligned)
+    // This matches what EnumerableSet.Bytes32Set stores
+    t(stored == bytes32(bytes4(0xAABBCCDD)), "WR-A-06: selector encoding mismatch");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Thoroughly verified. Solidity bytes4→bytes32 cast is always left-aligned with
+    zero-padding on the right. Both the add (L283) and contains (L110) paths use
+    bytes32(selector), ensuring consistency. The assembly extraction (L106-108)
+    produces a proper bytes4 because the assignment target is bytes4. NO FINDING.
+
+- id: WR-A-07
+  tier: 2
+  type: property
+  description: "No TOCTOU between allowlist check and _call — but allowlist removal during a batch via _multiCall (inherited from Caller) could affect other calls in the batch"
+  attack_scenario: >
+    WorkflowRouter inherits Caller which has _multiCall(). However, _multiCall is
+    internal and is NOT called from onReport() — onReport does a single _call().
+    WorkflowRouter does not expose _multiCall publicly, so there is no batch
+    execution path in this contract.
+
+    For the single _call path in onReport(): the allowlist check (L99-114) and
+    the call (L117) happen atomically in the same execution frame. The only way
+    to modify the allowlist between check and call is via reentrancy into
+    applyAllowlisted*() functions, which require DEFAULT_ADMIN_ROLE. If the target
+    contract has DEFAULT_ADMIN_ROLE (extremely unlikely), it could remove the
+    selector from the allowlist during execution — but this doesn't matter because
+    the call already passed the check.
+
+    VERDICT: No TOCTOU vulnerability exists.
+  impact: "None"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // No testable invariant — this is a verified non-issue
+    // The check-then-call pattern in onReport is atomic within EVM execution
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    Confirmed no TOCTOU. The check-call is atomic. _multiCall is internal and
+    not exposed by WorkflowRouter. Even if reentrancy occurred, the allowlist
+    check already passed so removing it mid-call has no effect. NOT A FINDING.
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# INVARIANTES ADICIONALES — AccessHunter (análisis específico de control de acceso)
+# Prefijo WR-AC-* para distinguir del análisis anterior (WR-A-*)
+# ═══════════════════════════════════════════════════════════════════════
+
+- id: WR-AC-01
+  tier: 1
+  type: property
+  description: >
+    La verificación de acceso en onReport tiene el orden invertido: verifica selector
+    ANTES que target. El happy path (líneas 126-131) nunca comprueba explícitamente
+    que target esté en allowlistedTargets — solo verifica selector en
+    allowlistedSelectors[target]. La verificación del target solo ocurre en el
+    error path (cuando el selector falla). Si el estado s_workflowInfos tiene
+    un selector registrado para un target que NO está en allowlistedTargets (estado
+    inconsistente), _call(target, data) se ejecuta sin que el contrato lo detecte.
+  attack_scenario: >
+    Prerequisito: estado inconsistente donde allowlistedSelectors[badTarget] contiene
+    un selector pero badTarget no está en allowlistedTargets. Este estado no es
+    alcanzable mediante las funciones públicas actuales (todas verifican target en
+    allowlistedTargets antes de añadir selectors). SIN EMBARGO:
+    (a) Un upgrade futuro del contrato que modifique el cleanup sin actualizar onReport
+        podría dejar este estado.
+    (b) En un contexto proxy/upgradeable, storage manipulation podría forzarlo.
+    (c) Es un design smell: la seguridad depende de un invariante de estado implícito
+        que nunca se verifica en el hot path.
+    Si el estado es alcanzable: FORWARDER llama onReport con (workflowId, badTarget,
+    allowlistedSelector) → el contrato NO revierte → ejecuta _call(badTarget, data).
+  impact: >
+    Ejecución de llamadas a targets no sancionados explícitamente como allowlisted
+    para ese workflowId. Dependiendo de badTarget, puede resultar en invocación de
+    funciones críticas (transferencia de fondos, modificación de precios, cambio de
+    parámetros). El impacto es contingente al estado inconsistente siendo alcanzable.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: para cualquier (workflowId, target) en s_workflowInfos,
+    // si allowlistedSelectors[target] no está vacío, target DEBE estar
+    // en allowlistedTargets del mismo workflowId.
+    // Verificar vía vm.store (Foundry) para forzar estado inconsistente.
+    //
+    // Test de verificación (pseudocódigo):
+    // 1. Crear setup normal con (wId, targetA, selectorA) allowlisted
+    // 2. Usar vm.store para añadir selectorA a allowlistedSelectors[badTarget]
+    //    sin añadir badTarget a allowlistedTargets
+    // 3. Llamar onReport(wId, badTarget, selectorA)
+    // 4. Si NO revierte → bug confirmado
+    bool hasSelectors = s_workflowInfos[workflowId].allowlistedSelectors[target].length() > 0;
+    bool targetInSet = s_workflowInfos[workflowId].allowlistedTargets.contains(target);
+    t(!hasSelectors || targetInSet, "WR-AC-01: selector registrado para target no allowlisted");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    La verificación de acceso debería ser: 1) workflowId en allowlist, 2) target en
+    allowlistedTargets, 3) selector en allowlistedSelectors[target]. El código actual
+    invierte 2 y 3. En el estado actual del protocolo no es explotable directamente,
+    pero es un invariante de seguridad implícito que el código no garantiza en el
+    hot path. Merece mención en un reporte como "missing explicit target validation
+    in execution path" (Low/QA).
+
+- id: WR-AC-02
+  tier: 1
+  type: property
+  description: >
+    applyAllowlistedWorkflowsUpdates permite en una sola llamada: remover workflowId X
+    (limpiando todos sus targets/selectors) Y re-añadir workflowId X con nuevos targets.
+    El orden de operaciones es crítico: primero se procesan todos los removes (incluyendo
+    cleanup completo de X), luego todos los adds. Sin embargo, si removes=[X] y adds
+    contiene X con targetSelectors=[], se re-añade X sin targets — la función
+    _applyAllowlistedTargetsUpdates con adds=[] lanza Errors.EmptyList(). Verificar
+    que la secuencia remove-then-readd con configuración vacía está correctamente manejada.
+  attack_scenario: >
+    Un admin llama applyAllowlistedWorkflowsUpdates(removes=[X], adds=[{workflowId:X, targetSelectors:[]}]).
+    Secuencia:
+    1. Remove X: _applyAllowlistedTargetsUpdates(X, allTargets, []) → limpia targets
+    2. s_allowlistedWorkflowIds.remove(X) → X ya no está en allowlist
+    3. Add X: s_allowlistedWorkflowIds.add(X) → X re-añadido
+    4. _applyAllowlistedTargetsUpdates(X, [], []) → removes=[] y adds=[] → REVIERTE con EmptyList
+    Resultado: X está en s_allowlistedWorkflowIds (añadido en paso 3) pero sin targets.
+    Ahora un FORWARDER puede llamar onReport con workflowId=X, y la llamada pasará los
+    checks de workflowId e irá al check de target — cualquier target+selector fallará
+    con TargetNotAllowlisted. No es explotable directamente, pero el estado es inconsistente:
+    workflowId en allowlist sin targets. Si el admin intenta corregirlo llamando
+    applyAllowlistedTargetsUpdates(X, [], [{target, [selector]}]) — ahora SÍ funciona
+    porque X está en allowlistedWorkflowIds.
+    ADVERTENCIA: el estado de "workflowId sin targets" puede ser intencional (señal futura),
+    pero no hay documentación de este caso y puede crear confusión operacional.
+  impact: >
+    DoS parcial: onReport con ese workflowId siempre falla con TargetNotAllowlisted.
+    No hay pérdida de fondos directa, pero interrumpe el flujo del protocolo hasta que
+    el admin corrija la configuración.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que si workflowId está en s_allowlistedWorkflowIds,
+    // tiene al menos un target allowlisted (invariante de completitud).
+    bytes32[] memory wids = s_workflowRouter.getAllowlistedWorkflowIds();
+    for (uint256 i = 0; i < wids.length; i++) {
+      address[] memory targets = s_workflowRouter.getAllowlistedTargets(wids[i]);
+      // Nota: esto puede ser false positive si workflowId-sin-targets es intencional.
+      // Para el invariante de seguridad, lo más importante es que onReport falle
+      // correctamente (TargetNotAllowlisted) en vez de ejecutar calls.
+      t(targets.length > 0, "WR-AC-02: workflowId en allowlist sin targets");
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 55
+  notes: >
+    Investigado el flujo: add con targetSelectors=[] revierte en _applyAllowlistedTargetsUpdates
+    (línea 208: removes.length == 0 && adds.length == 0 → EmptyList). Por tanto el
+    escenario de remove+readd con targetSelectors=[] sería un revert de la tx completa
+    — el estado no queda inconsistente por atomicidad EVM. Reducido a Tier 1 como
+    invariante de completitud pero con confianza baja.
+
+- id: WR-AC-03
+  tier: 2
+  type: property
+  description: >
+    WorkflowRouter hereda Caller.sol que expone _call() como función internal.
+    _call() hace target.call(data) sin ninguna validación de que target != address(0)
+    y sin enviar ETH (correcto). Sin embargo, _call() también puede llamar a precompiles
+    (address(1) a address(9) en EVM) si están allowlisted. El contrato no verifica
+    que target no sea una precompile. Si un admin por error allowlistea una precompile
+    como target, el FORWARDER puede enviar calldata arbitrario a esa precompile.
+  attack_scenario: >
+    Admin allowlistea address(0x1) (ecrecover precompile) con selector=bytes4(0xffffffff).
+    FORWARDER llama onReport con metadata válida y report=abi.encode(address(1), crafted_data).
+    _call(address(1), crafted_data) ejecuta ecrecover con datos controlados por el FORWARDER.
+    Para ecrecover, el resultado es determinista y no tiene efectos secundarios dañinos.
+    Para precompiles más peligrosas en otras redes (identity, sha256, ripemd160, etc.),
+    tampoco hay efectos secundarios. Sin embargo, en chains con precompiles custom
+    (Base/Optimism tienen precompiles en rangos superiores), podría haber impacto.
+    REQUIRES: admin misconfiguration + precompile con efectos secundarios = dos fallos.
+  impact: >
+    En práctica: bajo. Las precompiles EVM estándar no tienen efectos secundarios de estado.
+    En chains con precompiles custom (e.g., L2s con gas oracles o bridge precompiles),
+    podría haber efectos no deseados. Documentado como riesgo de configuración.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que ningún target allowlisted sea una precompile EVM (0x01 a 0x09)
+    // o una precompile de cadena específica (rango varía por chain).
+    bytes32[] memory wids = s_workflowRouter.getAllowlistedWorkflowIds();
+    for (uint256 i = 0; i < wids.length; i++) {
+      address[] memory targets = s_workflowRouter.getAllowlistedTargets(wids[i]);
+      for (uint256 j = 0; j < targets.length; j++) {
+        uint160 addr = uint160(targets[j]);
+        t(addr > 9, "WR-AC-03: target allowlisted es una precompile EVM");
+      }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 35
+  notes: >
+    Riesgo teórico bajo en chains estándar. Más relevante en L2s con precompiles
+    custom (Base Optimism tienen precompiles de sistema hasta 0x800). Documentado
+    como QA finding. Probabilidad de ser un hallazgo válido en bounty: muy baja
+    porque requiere admin misconfiguration.
+
+- id: WR-AC-04
+  tier: 2
+  type: property
+  description: >
+    AccessControlDefaultAdminRules de OZ aplica un delay (adminRoleTransferDelay)
+    únicamente para TRANSFERIR DEFAULT_ADMIN_ROLE, NO para grantRole/revokeRole de
+    otros roles. Por tanto, FORWARDER_ROLE puede ser asignado/revocado instantáneamente
+    por el admin actual. Un admin comprometido puede añadir un forwarder malicioso
+    sin ningún delay de timelock, ejecutar onReport con payloads arbitrarios
+    (dentro de la allowlist), y luego revocar el rol para ocultar el rastro.
+    En combinación con WR-A-02 (self-allowlist), si el admin también allowlistea
+    WorkflowRouter como target con grantRole.selector, el flujo podría escalar.
+  attack_scenario: >
+    1. Admin comprometido llama grantRole(FORWARDER_ROLE, attacker) → instantáneo
+    2. Attacker llama onReport con workflowId y target/selector allowlisted para
+       ejecutar acciones sensibles (actualizar precios, ejecutar subastas, etc.)
+    3. Admin revoca grantRole(FORWARDER_ROLE, attacker) → instantáneo
+    4. No hay delay que permita que governance detecte y bloquee el ataque.
+    NOTA: si hay un multisig como admin, el atacante necesita comprometer el multisig.
+    Esto generalmente está fuera de scope en bounties.
+  impact: >
+    Ejecución no autorizada de onReport con cualquier payload dentro de la allowlist.
+    El impacto depende de los targets/selectors allowlisted — puede incluir manipulación
+    de precios, ejecución forzada de subastas, o modificación de parámetros críticos.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // No hay invariante Chimera testeable — es análisis de diseño del sistema de roles.
+    // El punto crítico es: ¿hay algún delay al asignar FORWARDER_ROLE?
+    // AccessControlDefaultAdminRules solo aplica delay a beginDefaultAdminTransfer.
+    // grantRole(FORWARDER_ROLE, x) no tiene delay.
+    t(true, "WR-AC-04: placeholder — análisis estático confirmado");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 90
+  notes: >
+    Confirmado por lectura de PausableWithAccessControl.sol y OZ AccessControlDefaultAdminRules.
+    El delay solo aplica a la transferencia del DEFAULT_ADMIN_ROLE en sí, no a grantRole
+    para otros roles. Esto es documentación de diseño — generalmente out-of-scope para
+    bounties que consideran admin como trusted. Relevante si el programa cubre
+    "centralization risks" o si hay un escenario de admin key compromise.
+
+false_positives:
+- hunter: AccessHunter
+  id: WR-A-FP-01
+  reason: >
+    WR-A-03 (FORWARDER argument manipulation) es explícitamente by design.
+    El DON consensus de Chainlink valida el contenido del report antes de que el
+    forwarder lo envíe. FORWARDER_ROLE es infraestructura trusted. Los jueces
+    de bounty rechazarían esto como "trusted role" finding.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+- hunter: AccessHunter
+  id: WR-A-FP-02
+  reason: >
+    WR-A-04 (reentrancy) es un no-issue. onReport() no tiene state writes antes
+    de la llamada externa. La reentrancy no puede corromper estado en una función
+    de routing sin estado propio.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+- hunter: AccessHunter
+  id: WR-AC-FP-01
+  reason: >
+    Metadata offset comment mismatch (WR-A-05): los tests confirman que workflowId
+    está en offset 0 (metadata[:32]). El comentario en el código dice "Offset 32"
+    pero se refiere a la posición del siguiente campo, no al offset de workflowId.
+    El código es correcto. Es un error de documentación (QA/Info), no un bug de seguridad.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: access.md
+    content: >
+      En comentarios de estructura de metadata tipo "Offset X, size Y: campo",
+      verificar siempre contra los tests — el "offset" puede referirse a la
+      posición acumulada del siguiente campo, no al offset del campo actual.
+      Confirmar con tests antes de reportar como off-by-one.
+    briefing_update_applied: false
+
+# ═══════════════════════════════════════════════════════════════════════
+# RESUMEN EJECUTIVO — AccessHunter
+# ═══════════════════════════════════════════════════════════════════════
+# Hallazgos relevantes por prioridad:
+#
+# TIER 1 (bugs si el estado inconsistente es alcanzable):
+#   WR-AC-01: Verificación invertida selector vs target en onReport hot path.
+#             El contrato no verifica target en allowlistedTargets en el happy path.
+#             Estado inconsistente no alcanzable via API actual, pero frágil por diseño.
+#             → Candidato a QA/Low finding. PoC: vm.store para forzar estado.
+#
+#   WR-A-02:  WorkflowRouter sin check `target != address(this)`.
+#             Requiere dos errores de admin para ser explotable.
+#             → QA/Low, probablemente fuera de scope.
+#
+# TIER 2 (design/operational):
+#   WR-AC-02: workflowId en allowlist puede quedar sin targets si la tx
+#             de remove+readd tiene targetSelectors=[] (reverts por EmptyList
+#             pero vale la pena verificar el edge case exacto).
+#   WR-AC-04: FORWARDER_ROLE asignable sin delay. Centralization risk OOS.
+#   WR-AC-03: Precompiles como targets potenciales — QA.
+#
+# DESCARTADOS / FALSE POSITIVES:
+#   WR-A-03:  FORWARDER argument manipulation — by design
+#   WR-A-04:  Reentrancy — onReport es stateless, no issue
+#   WR-A-05:  Metadata offset comment — error de docs, código correcto
+#   WR-A-06:  bytes4→bytes32 encoding — consistente, no issue
+#   WR-A-07:  TOCTOU — no existe en EVM, check-call es atómico
+#
+# Próximos pasos:
+#   1. Test Foundry para WR-AC-01: vm.store para crear estado inconsistente
+#      y verificar si onReport pasa sin detectarlo.
+#   2. Confirmar WR-A-01 (data.length < 4): el padding de ABI encoding hace
+#      el selector determinista, no aleatorio — baja prioridad.
+# ═══════════════════════════════════════════════════════════════════════

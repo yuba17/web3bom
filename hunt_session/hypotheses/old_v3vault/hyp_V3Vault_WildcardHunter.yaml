@@ -1,0 +1,347 @@
+protocol: revert-lend
+component: V3Vault
+file: src/V3Vault.sol
+domain: vault
+hunter: WildcardHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: VV-W-01
+  tier: 1
+  type: property
+  description: "transformedTokenId must always be zero outside of a transform() call -- if it stays nonzero, the vault is in a broken reentrancy state that blocks liquidations and other operations"
+  attack_scenario: "If a transformer reverts in a way that doesnt propagate (try/catch around approval clear) or a token replacement leaves transformedTokenId nonzero, then liquidate(), decreaseLiquidityAndCollect(), and new transforms all revert with TransformNotAllowed/Reentrancy. Positions become unliquidatable -- attacker borrows max, lets position go underwater, protocol eats bad debt."
+  impact: "All liquidations blocked, bad debt accumulates, lenders lose funds"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Outside of any transform call, transformedTokenId must be 0
+    // This checks the persistent state -- if nonzero, vault is stuck
+    uint256 tid = vault.transformedTokenId();
+    eq(tid, 0, "VV-W-01: transformedTokenId stuck nonzero -- vault locked");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: "The transform function resets transformedTokenId=0 at the end (line 623). But if the transformer call at line 586 causes a state change that makes the approval-clear at line 609-612 revert AND the newTokenId custody check at 603-606 also reverts, the function reverts entirely and transformedTokenId is reset by EVM rollback. However, if onERC721Received during transform sets transformedTokenId to a new value (line 489), and the transform fails AFTER that point but BEFORE the reset... the EVM rolls back. So this is safe by EVM semantics. Keeping as a sanity check -- tier 2 downgrade if no path found."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-02
+  tier: 1
+  type: property
+  description: "A loan with zero debtShares must never have its tokenId tracked in tokenConfigs totalDebtShares -- cleanup must always decrement both token0 and token1 totalDebtShares to prevent phantom collateral accounting"
+  attack_scenario: "If _cleanupLoan skips _updateAndCheckCollateral or the position tokens change between borrow and cleanup, totalDebtShares for a token can be permanently inflated. This would cause CollateralValueLimit to trigger too early, blocking legitimate borrows against that collateral type."
+  impact: "Collateral type becomes unusable for borrowing, protocol functionality degraded"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For every tokenId in the vault, if debtShares==0 then it should not contribute
+    // to any tokenConfig totalDebtShares.
+    // We check sum of all active loan debtShares == debtSharesTotal
+    uint256 sumShares = 0;
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+        sumShares += shares;
+    }
+    eq(sumShares, vault.debtSharesTotal(), "VV-W-02: sum of loan debtShares != debtSharesTotal");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "Core accounting invariant. If any loan cleanup path fails to decrement debtSharesTotal, the ghost sum will diverge. This catches both over-counting (phantom debt) and under-counting (missing debt). The transform replacement path (onERC721Received lines 479-504) copies debt to new token and calls _cleanupLoan on old -- if the old token has different token0/token1 than the new token, the totalDebtShares accounting for the OLD tokens gets decremented but the NEW tokens get incremented. This is correct only if the new position has the same pair."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-03
+  tier: 1
+  type: property
+  description: "Transform token replacement must never allow a tokenId that already has an owner or debt in the vault -- reusing an existing vault tokenId would overwrite its loan state"
+  attack_scenario: "During transform, if a transformer sends a tokenId back to the vault that already exists as another users collateral, onERC721Received would overwrite that tokens loan data (line 494). The check at line 482-483 should prevent this, but if tokenOwner was cleared (e.g., after remove()) while loans still had residual data, the check could pass."
+  impact: "Loan data overwritten, victim loses collateral tracking, attacker inherits others debt position"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any operation, no two different owners should map to the same tokenId
+    // and no tokenId should have debtShares without an owner
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tid);
+        (uint256 shares) = vault.loans(tid);
+        // If token has debt, it must have an owner
+        if (shares > 0) {
+            t(owner != address(0), "VV-W-03: token has debt but no owner");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 80
+  notes: "Line 482-483 checks tokenOwner[tokenId] != address(0) || loans[tokenId].debtShares != 0 and reverts. But loans are deleted by delete loans[tokenId] in _cleanupLoan (line 1193) and tokenOwner is deleted in _removeTokenFromOwner. If a tokenId was fully removed (remove() called), both are zero, meaning a transformer could send that same tokenId back during transform and it would pass the check. However, the vault no longer holds that NFT after remove(), so the transformer cant send it. Safe by custody, not by the check alone."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-04
+  tier: 1
+  type: property
+  description: "Daily lend/debt increase limits must never allow more lending/borrowing than the configured percentage of total lent assets per day -- limits should reset correctly at day boundaries"
+  attack_scenario: "If dailyLendIncreaseLimitLeft or dailyDebtIncreaseLimitLeft is not properly reset, or if the replenishment on withdraw/repay allows gaming (deposit-withdraw-deposit cycle), an attacker could bypass the daily limits and flood the vault with deposits or drain it with borrows beyond what the protocol intended."
+  impact: "Rate limiting bypassed, protocol risk management undermined"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // The daily lend increase limit left should never exceed the calculated daily limit
+    // (it can be replenished by withdrawals but should not exceed the max)
+    (, uint256 lendExchangeRateX96) = vault.lastLendExchangeRateX96();
+    // We approximate: dailyLendIncreaseLimitLeft should be bounded
+    // by max(dailyLendIncreaseLimitMin, totalLent * MAX_DAILY_LEND_INCREASE_X32 / Q32)
+    uint256 totalLent = vault.totalSupply() * lendExchangeRateX96 / (1 << 96);
+    uint256 maxDailyLimit = totalLent * 429496729 / (1 << 32);  // MAX_DAILY_LEND_INCREASE_X32
+    uint256 dailyMin = vault.dailyLendIncreaseLimitMin();
+    uint256 expectedMax = dailyMin > maxDailyLimit ? dailyMin : maxDailyLimit;
+    lte(vault.dailyLendIncreaseLimitLeft(), expectedMax + 1e6, "VV-W-04: daily lend limit exceeded max");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "The withdraw function replenishes dailyLendIncreaseLimitLeft by the withdrawn amount (line 1043). If a user deposits at the start of a day (consuming limit), then withdraws (replenishing limit), then deposits again, they consume 2x the daily limit worth of deposits in net terms. However the NET effect is zero since the first deposit was undone. The real concern is if replenishment can exceed the originally calculated limit. Known M-08 from C4 audit flagged related issues."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-05
+  tier: 1
+  type: property
+  description: "Exchange rates must be monotonically non-decreasing -- debtExchangeRateX96 and lendExchangeRateX96 can only stay same or increase over time (except during reserve socialization haircut)"
+  attack_scenario: "If an attacker can cause exchange rates to decrease (outside of the legitimate haircut in _handleReserveLiquidation), they can steal value from lenders by making shares worth less, or from borrowers by making their debt worth less than expected."
+  impact: "Lender funds stolen if lend rate decreases; protocol insolvency if debt rate decreases"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 currentDebtRate = vault.lastDebtExchangeRateX96();
+    uint256 currentLendRate = vault.lastLendExchangeRateX96();
+    // Debt rate must never decrease
+    if (ghost_lastDebtExchangeRateX96 > 0) {
+        gte(currentDebtRate, ghost_lastDebtExchangeRateX96, "VV-W-05: debt exchange rate decreased");
+    }
+    // Lend rate can decrease ONLY during reserve socialization (liquidation)
+    if (ghost_lastLendExchangeRateX96 > 0 && !ghost_liquidationInProgress) {
+        gte(currentLendRate, ghost_lastLendExchangeRateX96, "VV-W-05: lend exchange rate decreased outside liquidation");
+    }
+    ghost_lastDebtExchangeRateX96 = currentDebtRate;
+    ghost_lastLendExchangeRateX96 = currentLendRate;
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "The debt rate is purely additive (line 1318: old + old*time*rate/Q64). The lend rate is additive too (line 1319) EXCEPT in _handleReserveLiquidation (line 1258) where it is explicitly reduced. The ghost_liquidationInProgress flag must be set by the handler that calls liquidate(). This invariant is critical -- any other path that decreases rates is a bug."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-06
+  tier: 1
+  type: property
+  description: "The vault must never hold an NFT that it does not track in tokenOwner -- orphaned NFTs would be permanently locked with no way to retrieve them"
+  attack_scenario: "If onERC721Received fails to register the token (e.g., during transform replacement the old token cleanup removes ownership but the NFT remains in the vault), the NFT becomes permanently stuck. No one can call remove() because tokenOwner is address(0), so the ownership check at line 841-843 would fail for everyone."
+  impact: "User NFT permanently locked in vault, irrecoverable collateral"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // For each tracked tokenId, verify the vault actually holds it or it is staked
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tid);
+        if (owner != address(0)) {
+            // Token is tracked -- vault should hold it or it should be staked via gaugeManager
+            address nftOwner = npm.ownerOf(tid);
+            bool vaultHolds = (nftOwner == address(vault));
+            bool isStaked = (nftOwner != address(vault) && nftOwner != address(0));
+            t(vaultHolds || isStaked, "VV-W-06: tracked token not held by vault or gauge");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 70
+  notes: "During transform, the NFT can be temporarily held by the transformer. But post-transform, the custody check at line 603-606 ensures it is back. During staking, the NFT moves to gaugeManager. The key risk is in the replacement path: old token is returned to transformer (via _cleanupLoan -> but cleanup doesnt transfer the NFT). Actually, the old token stays in the vault after replacement -- its just that its loan data is deleted and ownership removed. The NFT itself would need to be manually retrieved. This could be an issue."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-07
+  tier: 2
+  type: property
+  description: "Reserve socialization haircut in _handleReserveLiquidation must never reduce lendExchangeRate to zero or below a minimum threshold -- complete lender wipeout should be impossible"
+  attack_scenario: "If totalLent is very small and missing is close to totalLent, the calculation (totalLent - missing) * rate / totalLent could result in a near-zero or zero exchange rate. Subsequent depositors would get near-infinite shares. An attacker could engineer this by being the only lender, borrowing against worthless collateral, letting it get liquidated with missing > reserves."
+  impact: "Complete lender fund loss, vault exchange rate collapse"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 lendRate = vault.lastLendExchangeRateX96();
+    // Lend exchange rate must never be zero (would break all conversions)
+    t(lendRate > 0, "VV-W-07: lend exchange rate is zero -- vault broken");
+    // And should never drop below initial rate / 2 (50% haircut is extreme)
+    gte(lendRate, (1 << 96) / 2, "VV-W-07: lend exchange rate dropped below 50% of initial");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: "Line 1258: newLendExchangeRateX96 = (totalLent - missing) * rate / totalLent. If missing >= totalLent, this underflows (Solidity 0.8 reverts). So the liquidation itself would revert, preventing the wipeout. But if missing is just barely less than totalLent, the rate drops to near zero which is still catastrophic. The minLoanSize check and collateral limits should prevent scenarios where a single position can cause this level of damage."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-08
+  tier: 1
+  type: property
+  description: "The Multicall inherited by V3Vault must not allow batching of state-changing calls that bypass the transformedTokenId reentrancy guard -- multicall could let an attacker chain borrow() + liquidate() in a single tx"
+  attack_scenario: "V3Vault inherits Multicall from OpenZeppelin. If an attacker uses multicall to batch: (1) transform a position, (2) within the same multicall, call another function that checks transformedTokenId==0 -- the reentrancy guard would block this. BUT: if multicall is called from OUTSIDE transform context, it could batch borrow+liquidate on different tokens. The real risk is if multicall allows atomically depositing, borrowing, manipulating oracle, then liquidating in one tx."
+  impact: "Reentrancy guard bypass, atomic manipulation of vault state"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any multicall or regular call, transformedTokenId should be 0
+    // This is a post-condition check
+    uint256 tid = vault.transformedTokenId();
+    eq(tid, 0, "VV-W-08: transformedTokenId nonzero after operation completed");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 60
+  notes: "Multicall uses delegatecall to self, so msg.sender is preserved. The transformedTokenId guard at the start of liquidate (line 770), decreaseLiquidityAndCollect (line 690), and transform (line 559) should still work within multicall since they check the storage variable. The real question is whether multicall can be called DURING a transform callback -- the transformer could call vault.multicall([borrow(tokenId, x), ...]) which would work since borrow checks isTransformMode. This is by design. But if the multicall batches borrow + something else that shouldnt be callable during transform..."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-09
+  tier: 1
+  type: property
+  description: "Token replacement during transform must preserve debt accounting -- the sum of all loans debtShares plus the debtSharesTotal delta must remain consistent across the replacement"
+  attack_scenario: "In onERC721Received during transform (lines 479-504), debt is copied from old token to new token, then _cleanupLoan is called on the old token. If the cleanup decrements debtSharesTotal (via _updateAndCheckCollateral with oldShares=debtShares, newShares=0), but the new tokens _updateAndCheckCollateral increments it (oldShares=0, newShares=debtShares), the net effect should be zero change to debtSharesTotal. But if the tokens have different token0/token1 pairs, tokenConfigs totalDebtShares for the OLD pair gets decremented and the NEW pair gets incremented. If collateralValueLimit is tight on the new pair, this could revert unexpectedly."
+  impact: "Transform replacement blocked by CollateralValueLimit on the new token pair, user cannot rebalance position"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // debtSharesTotal must always equal the sum of all individual loan debtShares
+    uint256 sumDebt = 0;
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        (uint256 shares) = vault.loans(ghost_allTokenIds[i]);
+        sumDebt += shares;
+    }
+    eq(sumDebt, vault.debtSharesTotal(), "VV-W-09: debtSharesTotal mismatch after transform replacement");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: "This overlaps with VV-W-02 but specifically targets the transform replacement path. The sequence in onERC721Received is: (1) copy debtShares to new loan, (2) _addTokenToOwner for new token, (3) _cleanupLoan on old token (decrements debtSharesTotal via _updateAndCheckCollateral), (4) _updateAndCheckCollateral on new token (increments debtSharesTotal). Net effect on debtSharesTotal should be zero. But _cleanupLoan calls _updateAndCheckCollateral(oldTokenId, ..., loans[oldTokenId].debtShares, 0) -- and loans[oldTokenId].debtShares was already copied but NOT zeroed yet (delete happens inside _cleanupLoan at line 1193, AFTER _updateAndCheckCollateral at line 1192). So it correctly passes the old shares as oldShares parameter."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-10
+  tier: 1
+  type: property
+  description: "Staked position health check must use ignoreFees=true valuation consistently -- if a staked position is valued WITH fees for some operations and WITHOUT fees for others, there is a valuation gap exploitable for borrowing more than the true collateral value"
+  attack_scenario: "When a position is staked, _checkLoanIsHealthy passes ignoreFees=true to oracle.getValue (line 1429-1430). But if any code path computes collateral value without checking _isStaked and uses ignoreFees=false, the position appears more valuable (fees included). An attacker could: stake position (fees excluded from valuation), accumulate large fees, unstake (fees now included), borrow against inflated value, re-stake. The borrow health check during unstake/stake transition might use inconsistent valuations."
+  impact: "Borrower can extract more than their collateral is worth, protocol takes bad debt"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For each staked position with debt, verify that the loan is healthy
+    // even when excluding fees (consistent with staked valuation)
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        (uint256 shares) = vault.loans(tid);
+        if (shares > 0) {
+            (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tid);
+            // loanInfo uses _checkLoanIsHealthy which already handles ignoreFees
+            // So if the loan is healthy per loanInfo, it should be consistent
+            // The concern is if there is a path that DOESNT go through _checkLoanIsHealthy
+            if (debt > 0 && collateralValue > 0) {
+                t(collateralValue >= debt || fullValue > 0, "VV-W-10: staked loan has zero value but positive debt");
+            }
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 72
+  notes: "Key concern: stakePosition (line 1381-1394) calls _stake then checks health via loanInfo->_checkLoanIsHealthy. The transform path (line 617-621) re-stakes then checks _requireLoanIsHealthy. Both use _checkLoanIsHealthy which calls _isStaked. The transition window is: unstake (fees now visible) -> do something -> re-stake (fees hidden again). During the unstaked window in transform (line 581-619), the position is unstaked, transformer runs, then re-staked at 619. The health check at 621 is AFTER re-staking, so it uses ignoreFees=true. But the transformer could have borrowed during the unstaked window when fees were visible as collateral."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-11
+  tier: 2
+  type: property
+  description: "onERC721Received must reject any NFT that is not from the configured nonfungiblePositionManager -- accepting arbitrary ERC721 tokens would pollute vault state"
+  attack_scenario: "If a malicious ERC721 contract calls vault.onERC721Received directly, the msg.sender check at line 447 should reject it. But if someone deploys a fake NPM at the same address on a different chain (irrelevant for same-chain) or if the NPM proxy is upgraded maliciously (admin trust), the check could be bypassed."
+  impact: "Vault state corrupted with fake positions, phantom collateral"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Every tokenId tracked in the vault should be a valid NPM position
+    // We verify by checking that npm.positions(tokenId) doesnt revert
+    for (uint256 i = 0; i < ghost_allTokenIds.length; i++) {
+        uint256 tid = ghost_allTokenIds[i];
+        address owner = vault.ownerOf(tid);
+        if (owner != address(0)) {
+            // This should not revert for valid NPM positions
+            try npm.positions(tid) returns (uint96, address, address, address, uint24, int24, int24, uint128, uint256, uint256, uint128, uint128) {
+                // Valid position
+            } catch {
+                t(false, "VV-W-11: tracked tokenId is not a valid NPM position");
+            }
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 65
+  notes: "The msg.sender == address(nonfungiblePositionManager) check at line 447 and from != address(this) at same line provide strong protection. The only way to bypass is if NPM itself is compromised. This is more of a sanity/defense-in-depth invariant."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: VV-W-12
+  tier: 1
+  type: property
+  description: "After liquidation, the liquidated position must have zero debtShares -- partial liquidation is not supported, every liquidation clears the full debt"
+  attack_scenario: "If _cleanupLoan fails to delete the loan (line 1193) or if debtSharesTotal is decremented by less than the full debtShares, residual debt would remain on a position whose collateral was already seized. The owner would owe debt with no collateral backing, and could simply abandon the position, leaving the protocol with unbacked debt."
+  impact: "Unbacked debt in the system, lenders bear the loss"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After a liquidation, the liquidated token should have zero debt
+    if (ghost_liquidationInProgress && ghost_lastLiquidatedTokenId != 0) {
+        (uint256 shares) = vault.loans(ghost_lastLiquidatedTokenId);
+        eq(shares, 0, "VV-W-12: liquidated position still has debt shares");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: "Line 806 decrements debtSharesTotal by the full debtShares amount. Line 821 calls _cleanupLoan which deletes the loan. This should always result in zero debtShares for the liquidated token. The invariant acts as a safety net."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: WildcardHunter
+  id: VV-W-FP-01
+  reason: "Transform approval migration (lines 595-598): when tokenId changes during transform, approvals are copied from old to new token for the same msg.sender. Initially suspected this could allow unauthorized transform access, but the copy only happens for the CALLER (msg.sender) who already had approval. The old approval is deleted. This is correct behavior -- the caller who initiated the transform retains their approval on the replacement token."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null
+- hunter: WildcardHunter
+  id: VV-W-FP-02
+  reason: "onERC721Received owner override via data parameter (lines 459-464): initially flagged as potential ownership hijack. But the comment at line 460-463 explicitly states this is intentional -- whoever can trigger safeTransferFrom for the NFT can also choose the callback payload. This is an accepted trust assumption for integrator/operator flows. The caller must already control the NFT to transfer it."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null
+- hunter: WildcardHunter
+  id: VV-W-FP-03
+  reason: "Multicall + borrow reentrancy: considered whether multicall([borrow(token1, x), borrow(token2, y)]) could bypass per-token limits. But borrow checks are per-token (health, minLoanSize) and global (globalDebtLimit, dailyDebtIncreaseLimitLeft). Multicall batches are sequential within the same tx, so global limits correctly accumulate. No bypass found."
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update: null

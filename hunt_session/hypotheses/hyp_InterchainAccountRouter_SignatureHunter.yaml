@@ -1,0 +1,446 @@
+protocol: hyperlane
+component: InterchainAccountRouter
+file: solidity/contracts/middleware/InterchainAccountRouter.sol
+domain: trust
+hunter: SignatureHunter
+generated_at: '2026-03-24T00:00:00Z'
+invariants:
+- id: IAR-SIG-01
+  tier: 1
+  type: property
+  description: "revealAndExecute carece de control de acceso: cualquiera que conozca salt+calls puede front-runnear el reveal del CCIP read callback y ejecutar las calls directamente en el ICA"
+  attack_scenario: >
+    1. Usuario envia callRemoteCommitReveal con un swap secreto (commit).
+    2. El commitment llega al ICA via handle() y se almacena.
+    3. El CCIP read server devuelve (ica, salt, calls) al relayer para el reveal.
+    4. Un atacante observa la tx del relayer en el mempool con el metadata (salt, calls) visible en calldata.
+    5. El atacante front-runnea llamando ica.revealAndExecute(calls, salt) directamente.
+    6. Las calls se ejecutan con el front-runner como contexto de transaccion (puede sandwich el swap).
+    7. El reveal original del relayer falla porque el commitment ya fue borrado.
+    Impacto: El proposito del commit-reveal (secreto de calldata) se anula completamente.
+    El atacante puede sandwich swaps que el usuario intento proteger.
+  impact: "Perdida del secreto de calldata en commit-reveal. Swaps protegidos son sandwicheables. Valor en riesgo = valor de cada swap protegido por commit-reveal."
+  impact_rating: High
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Simular que cualquiera puede ejecutar un commitment pendiente
+    // Setup: commitment fue seteado por el owner (router)
+    bytes32 testSalt = bytes32(uint256(1));
+    CallLib.Call[] memory calls = new CallLib.Call[](1);
+    calls[0] = CallLib.Call({to: address(0xdead), data: "", value: 0});
+    bytes32 commitHash = keccak256(abi.encodePacked(testSalt, abi.encode(calls)));
+    // Pre-condition: commitment exists
+    t(ica.commitments(commitHash), "IAR-SIG-01: commitment should exist pre-reveal");
+    // Attack: non-owner calls revealAndExecute
+    vm.prank(attacker);
+    ica.revealAndExecute(calls, testSalt);
+    // Post-condition: commitment consumed by attacker
+    t(!ica.commitments(commitHash), "IAR-SIG-01: commitment consumed by non-owner");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 92
+  notes: >
+    revealAndExecute en OwnableMulticall.sol L52-71 no tiene modifier onlyOwner.
+    Cualquiera puede llamarla. El commit-reveal pattern depende de que las calls
+    sean secretas, pero el metadata del CCIP callback las expone en calldata on-chain.
+
+- id: IAR-SIG-02
+  tier: 1
+  type: property
+  description: "callRemoteCommitReveal drena todo el balance ETH del router al enviar el reveal message con address(this).balance"
+  attack_scenario: >
+    1. Router tiene 10 ETH de otros usuarios (fees pendientes, value de otros dispatches en vuelo).
+    2. Usuario A llama callRemoteCommitReveal con msg.value = 1 ETH.
+    3. El commitment message se despacha con msg.value (1 ETH).
+    4. El reveal message se despacha con address(this).balance, que es 10 ETH (el balance restante del router, NO del usuario A).
+    5. Usuario A pago 1 ETH pero se envian 10 ETH con su reveal, robando 9 ETH de fees/valores de otros usuarios.
+  impact: "Robo de ETH del router. Cualquier ETH residual en el contrato se adjunta al reveal del atacante. Si el router acumula fees de multiples usuarios, todos son drenados."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track balance before and after callRemoteCommitReveal
+    uint256 routerBalanceBefore = address(router).balance;
+    uint256 otherUserDeposit = 5 ether;
+    // Simulate other user's ETH sitting in router
+    vm.deal(address(router), otherUserDeposit);
+    uint256 attackerValue = 0.1 ether;
+    vm.deal(attacker, attackerValue);
+    vm.prank(attacker);
+    router.callRemoteCommitReveal{value: attackerValue}(destination, commitment, gasLimit);
+    // The reveal dispatch used address(this).balance which includes otherUserDeposit
+    uint256 routerBalanceAfter = address(router).balance;
+    t(routerBalanceAfter >= otherUserDeposit, "IAR-SIG-02: other users ETH should not be drained");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 88
+  notes: >
+    InterchainAccountRouter.sol L630: address(this).balance se usa como valor del reveal dispatch.
+    Esto incluye cualquier ETH que este en el router por cualquier razon (receive(), fees acumulados, etc).
+    El router tiene receive() payable en AbstractInterchainAccountRouter L107.
+
+- id: IAR-SIG-03
+  tier: 1
+  type: property
+  description: "route() permite que un atacante especifique un ISM arbitrario en el body del mensaje, incluyendo un ISM trivial que siempre retorna true"
+  attack_scenario: >
+    1. Atacante en chain A envia un mensaje al router en chain B con _ism = address(TrivialISM) en el body.
+    2. El router hereda AbstractRoutingIsm y usa route() para determinar el ISM.
+    3. route() lee el ISM del body del mensaje y lo usa directamente.
+    4. TrivialISM.verify() siempre retorna true.
+    5. El Mailbox acepta el mensaje como verificado y llama handle().
+    6. handle() crea/accede un ICA cuyo salt incluye el ISM trivial.
+    7. Pero: el ICA resultante es DIFERENTE del ICA del usuario legitimo (porque salt incluye ISM).
+    Conclusion: By design, el ISM es parte del salt de derivacion del ICA.
+    Un atacante solo obtiene acceso a un ICA vacio, no al ICA del victim.
+    PERO: si el atacante pre-carga fondos al ICA derivado con ISM trivial y luego
+    usa ese mismo ISM para ejecutar calls, tiene un ICA con fondos controlable
+    sin validadores reales. Esto es by design.
+  impact: "Bajo impacto directo - el atacante solo controla ICAs derivados con su ISM trivial. No puede acceder a ICAs de otros usuarios que usan ISMs legitimis."
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // Verificar que diferentes ISMs producen diferentes ICAs
+    address ism1 = address(0x1111);
+    address ism2 = address(0x2222);
+    address ica1 = address(router.getLocalInterchainAccount(origin, owner, routerAddr, ism1));
+    address ica2 = address(router.getLocalInterchainAccount(origin, owner, routerAddr, ism2));
+    t(ica1 != ica2, "IAR-SIG-03: different ISMs must produce different ICAs");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 95
+  notes: >
+    El diseno es intencional ("designed to receive messages from untrusted remote contracts").
+    El ISM en el salt previene cross-contamination entre ICAs de diferentes ISMs.
+    Pero vale documentar que no hay validacion del ISM en route() - se confia en que
+    el ISM especificado sea seguro. Un usuario que configura ISM=0 usara defaultIsm.
+
+- id: IAR-SIG-04
+  tier: 2
+  type: property
+  description: "CommitmentReadIsm.verify() ejecuta side effects (state changes + external calls) durante la verificacion del ISM, rompiendo la asuncion de que verify() es pure/view"
+  attack_scenario: >
+    1. El Mailbox llama ism.verify(metadata, message) esperando que sea una operacion de lectura.
+    2. CommitmentReadIsm.verify() es `external` (no view), y llama ica.revealAndExecute().
+    3. revealAndExecute() borra el commitment del storage Y ejecuta external calls arbitrarias.
+    4. Si alguna de esas calls revierte parcialmente o tiene reentrancy, el estado del ISM
+       verification queda inconsistente.
+    5. Mas grave: si el Mailbox tiene logica post-verify que asume estado limpio, las calls
+       ejecutadas dentro de verify() pueden manipular ese estado.
+  impact: "Side effects durante ISM verification. Potencial reentrancy si las calls en el reveal interactuan con el Mailbox o el router. Dificil de explotar pero rompe invariante fundamental de ISMs."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que verify() modifica state (no es view)
+    // Pre-condition: commitment exists in ICA
+    bytes32 commitHash = keccak256(abi.encodePacked(salt, abi.encode(calls)));
+    t(ica.commitments(commitHash), "IAR-SIG-04: commitment should exist before verify");
+    // Call verify via the ISM
+    commitmentReadIsm.verify(metadata, message);
+    // Post-condition: commitment was deleted DURING verify
+    t(!ica.commitments(commitHash), "IAR-SIG-04: verify() should have caused state change");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: >
+    CommitmentReadIsm.verify() en L52-79 es external (no view/pure).
+    Llama ica.revealAndExecute() que modifica storage y hace external calls.
+    Esto es by design para el commit-reveal pattern pero es anomalo para ISMs.
+
+- id: IAR-SIG-05
+  tier: 2
+  type: property
+  description: "approveFeeTokenForHook() no tiene control de acceso - cualquiera puede forzar approval infinita del router a cualquier address como 'hook'"
+  attack_scenario: >
+    1. El router tiene tokens ERC20 (fee tokens transferidos via safeTransferFrom en _dispatchMessageWithValue).
+    2. Atacante llama approveFeeTokenForHook(feeToken, attackerContract).
+    3. El router aprueba type(uint256).max de feeToken al attackerContract.
+    4. Atacante llama transferFrom(router, attacker, balance) desde su contrato.
+    5. Se roba todo el balance del fee token del router.
+  impact: "Robo de fee tokens residuales en el router. El router transfiere fees via safeTransferFrom y hace forceApprove, asi que puede tener residuos de allowance. El ataque drena cualquier balance de fee tokens."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verificar que cualquiera puede llamar approveFeeTokenForHook
+    address fakeHook = address(0xdead);
+    vm.prank(attacker);
+    router.approveFeeTokenForHook(address(feeToken), fakeHook);
+    uint256 allowance = feeToken.allowance(address(router), fakeHook);
+    t(allowance == 0, "IAR-SIG-05: non-owner should not be able to set approval");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 90
+  notes: >
+    AbstractInterchainAccountRouter.sol L109-111: approveFeeTokenForHook es external
+    sin modifier onlyOwner. Llama forceApprove(hook, type(uint256).max).
+    _dispatchMessageWithValue ya hace forceApprove en L242, asi que el router puede
+    acumular fee tokens que luego son drenables.
+    NOTA: _dispatchMessageWithValue hace safeTransferFrom(msg.sender, address(this), _fee)
+    en L241, asi que los tokens SI pasan por el router temporalmente.
+
+- id: IAR-SIG-06
+  tier: 2
+  type: property
+  description: "ECDSA.recover en AbstractMultisigIsm no valida explicitamente address(0) pero OpenZeppelin lo maneja internamente - verificar version de OZ"
+  attack_scenario: >
+    1. Atacante crafts metadata con una firma invalida que haria ecrecover retornar address(0).
+    2. Si validatorsAndThreshold retorna un array que incluye address(0) como validator
+       (por configuracion incorrecta), la firma invalida matchearia.
+    3. OpenZeppelin ECDSA.recover revierte en firma invalida (no retorna 0), asi que
+       esto requiere una version de OZ < 4.x o un bypass.
+    4. Verificar que la version de OZ usada es >= 4.7.3 donde esto esta hardened.
+  impact: "Si OZ version es vulnerable, un atacante podria bypassear multisig verification con firmas invalidas. Probabilidad baja con OZ moderno."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que ECDSA.recover revierte con firma invalida (no retorna address(0))
+    bytes32 testDigest = keccak256("test");
+    bytes memory invalidSig = new bytes(65); // all zeros
+    // This should revert, not return address(0)
+    try ECDSA.recover(testDigest, invalidSig) returns (address recovered) {
+        t(recovered != address(0), "IAR-SIG-06: ECDSA.recover must not return address(0)");
+    } catch {
+        // Expected: OZ ECDSA reverts on invalid signature
+        t(true, "IAR-SIG-06: ECDSA correctly reverts on invalid sig");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    AbstractMultisigIsm.sol L110 usa ECDSA.recover de OpenZeppelin.
+    OZ >= 4.7.3 revierte en firma invalida. Verificar version en package.json.
+    El two-pointer technique en verify() asume firmas ordenadas por validator index,
+    lo cual es correcto pero merece testing con firmas duplicadas.
+
+- id: IAR-SIG-07
+  tier: 2
+  type: property
+  description: "El commitment hash en encodeCommitment NO incluye el owner ni el origin domain - un commitment identico de dos owners diferentes colisiona"
+  attack_scenario: >
+    1. Usuario A en chain 1 envia commitment C = hash(salt, calls) para su ICA.
+    2. Usuario B en chain 2 envia el MISMO commitment C = hash(salt, calls) para su ICA.
+    3. El commitment se almacena en ICAs diferentes (por salt de derivacion distinto).
+    4. NO hay colision porque cada ICA tiene su propio storage de commitments.
+    5. PERO: si el mismo usuario usa el mismo salt y calls en dos commits diferentes
+       (retry), el segundo setCommitment revierte con "Previous commitment pending execution".
+    Analisis: El commitment hash es per-ICA, no global. No hay colision cross-ICA.
+    El check en setCommitment L43-45 previene double-commit en el mismo ICA.
+  impact: "Bajo. El diseno per-ICA previene colisiones cross-usuario. El unico riesgo es un DoS de re-submit del mismo commitment, que es by design."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que commitments son per-ICA (no globales)
+    bytes32 salt1 = bytes32(uint256(1));
+    bytes32 commitment1 = keccak256(abi.encodePacked(salt1, abi.encode(calls)));
+    // Two different ICAs should be able to have the same commitment
+    vm.prank(address(router));
+    ica1.setCommitment(commitment1);
+    vm.prank(address(router));
+    ica2.setCommitment(commitment1);
+    t(ica1.commitments(commitment1), "IAR-SIG-07: ICA1 commitment set");
+    t(ica2.commitments(commitment1), "IAR-SIG-07: ICA2 commitment set independently");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 85
+  notes: >
+    Commitments en OwnableMulticall son per-contrato. No hay riesgo de colision
+    cross-ICA. El hash keccak256(salt, abi.encode(calls)) es suficiente
+    dentro del scope de un unico ICA.
+
+- id: IAR-SIG-08
+  tier: 1
+  type: property
+  description: "CommitmentReadIsm.verify() confia en el metadata provider para el address del ICA sin validar que corresponde al mensaje - un relayer malicioso puede redirigir calls a otro ICA"
+  attack_scenario: >
+    1. Mensaje de reveal llega con commitment C y ISM = CommitmentReadIsm.
+    2. CommitmentReadIsm.verify() recibe metadata = (ica_address, salt, calls).
+    3. El ISM valida que hash(salt, calls) == commitment del mensaje.
+    4. PERO: el ica_address en metadata[0:20] NO se valida contra el mensaje.
+    5. Un CCIP server malicioso o un relayer que controla el metadata puede poner
+       ica_address = ICA_de_victima que tiene un commitment pendiente con el mismo hash.
+    6. Si dos ICAs tienen commitments con el mismo hash (posible si same salt+calls),
+       el atacante redirige la ejecucion al ICA equivocado.
+    7. El ICA de la victima ejecuta calls que fueron autorizadas por ella pero con timing
+       controlado por el atacante.
+  impact: "Ejecucion de calls en ICA equivocado si dos ICAs comparten el mismo commitment hash. El atacante controla el timing pero no las calls. Medium porque requiere colision de commitment hash."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that CommitmentReadIsm does NOT validate ICA address against message origin
+    // The metadata ICA address is taken at face value
+    address wrongIca = address(0xBEEF);
+    bytes memory maliciousMetadata = abi.encodePacked(
+        bytes20(wrongIca),  // wrong ICA address
+        salt,
+        abi.encode(calls)
+    );
+    bytes32 metadataHash = keccak256(maliciousMetadata[20:]);
+    // If commitment matches, verify will call wrongIca.revealAndExecute
+    // This should NOT be allowed
+    t(metadataHash == commitment, "IAR-SIG-08: hash matches but ICA is wrong");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 78
+  notes: >
+    CommitmentReadIsm.sol L57: revealedHash = keccak256(_metadata[20:]) valida salt+calls.
+    L65: ica = address(bytes20(_metadata[:20])) toma el ICA sin validacion.
+    El ica address NO es parte del commitment hash. Un metadata provider malicioso
+    puede redirigir a cualquier ICA que tenga un commitment pendiente con el mismo hash.
+
+- id: IAR-SIG-09
+  tier: 2
+  type: property
+  description: "CheckpointLib.digest usa abi.encodePacked con tipos mixtos (uint32, bytes32, bytes32, uint32, bytes32) - sin riesgo de colision porque los tipos son fixed-size, pero domainHash incluye string literal sin length prefix"
+  attack_scenario: >
+    1. domainHash = keccak256(abi.encodePacked(origin, merkleTreeHook, "HYPERLANE")).
+    2. abi.encodePacked con un string literal concatena los bytes directamente.
+    3. Si un atacante puede controlar merkleTreeHook tal que los ultimos bytes de
+       merkleTreeHook + primeros bytes de "HYPERLANE" forman un hash diferente...
+    4. Pero merkleTreeHook es bytes32 (32 bytes fijos) y "HYPERLANE" es constante.
+    5. No hay ambiguedad en el packing porque bytes32 siempre ocupa 32 bytes.
+    Conclusion: No hay colision posible. abi.encodePacked es seguro aqui porque
+    todos los tipos son fixed-size excepto el string literal que es constante.
+  impact: "Sin impacto. El uso de abi.encodePacked es seguro en este contexto."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify no collision in domainHash with different origins
+    bytes32 hash1 = CheckpointLib.domainHash(1, bytes32(uint256(0xABC)));
+    bytes32 hash2 = CheckpointLib.domainHash(2, bytes32(uint256(0xABC)));
+    t(hash1 != hash2, "IAR-SIG-09: different origins must produce different domain hashes");
+    bytes32 hash3 = CheckpointLib.domainHash(1, bytes32(uint256(0xDEF)));
+    t(hash1 != hash3, "IAR-SIG-09: different merkleTreeHooks must produce different hashes");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 95
+  notes: >
+    CheckpointLib.sol L39: abi.encodePacked(domainHash, root, index, messageId)
+    todos fixed-size. L90: abi.encodePacked(origin, merkleTreeHook, "HYPERLANE")
+    origin=uint32(4), merkleTreeHook=bytes32(32), "HYPERLANE"=9 bytes constante.
+    No hay ambiguedad.
+
+- id: IAR-SIG-10
+  tier: 2
+  type: property
+  description: "MultisigIsm verify() con threshold=0 revierte pero threshold=1 con un solo validador permite que un unico validador comprometido apruebe cualquier mensaje"
+  attack_scenario: >
+    1. validatorsAndThreshold configura threshold=1 con [validatorA].
+    2. validatorA es comprometido (clave privada robada).
+    3. Atacante firma un checkpoint fraudulento para un mensaje malicioso.
+    4. verify() acepta la firma unica y el mensaje se procesa.
+    5. Para ICA: el atacante ejecuta calls arbitrarias en el ICA de la victima
+       (si el ISM del ICA usa este multisig con threshold 1).
+  impact: "Control total del ICA si el unico validador es comprometido. Severity depende del threshold configurado - con threshold >= 2 requiere comprometer multiples validadores."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that threshold=0 is rejected
+    // This is enforced at AbstractMultisigIsm.sol L104
+    // require(_threshold > 0, "No MultisigISM threshold present for message");
+    (address[] memory validators, uint8 threshold) = multisigIsm.validatorsAndThreshold(message);
+    t(threshold > 0, "IAR-SIG-10: threshold must be > 0");
+    t(validators.length >= threshold, "IAR-SIG-10: enough validators for threshold");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 70
+  notes: >
+    AbstractMultisigIsm.sol L104: threshold > 0 check existe.
+    El riesgo es configuracion, no codigo. Pero vale verificar que no existe un path
+    donde threshold puede ser 0 tras deployment.
+
+- id: IAR-SIG-11
+  tier: 1
+  type: property
+  description: "MultisigIsm verify() no verifica que las firmas sean unicas - el mismo validador podria firmar con s-value malleability para producir dos firmas 'diferentes' que recoveran al mismo address"
+  attack_scenario: >
+    1. threshold = 2, validators = [A, B].
+    2. Atacante solo tiene la clave de A.
+    3. Atacante firma digest con s en lower half -> firma1, recover = A.
+    4. OZ ECDSA.recover normaliza s, asi que firmar con s en upper half tambien
+       recovera a A (OZ convierte a lower half internamente).
+    5. PERO: el two-pointer technique en verify() requiere que las firmas esten
+       ordenadas por validator index. Despues de matchear A en indice 0,
+       _validatorIndex se incrementa a 1. La segunda firma (tambien A) necesitaria
+       matchear un validator en indice >= 1. Solo B esta ahi, y A != B.
+    6. Conclusion: El two-pointer previene reuso del mismo validador.
+    PERO: si validators = [A, B, A] (A aparece dos veces por configuracion erronea),
+    el atacante con solo la clave de A puede satisfacer threshold=2.
+  impact: "En configuracion correcta (sin duplicados en validator set), no hay bypass. Con duplicados, un solo validador comprometido puede satisfacer threshold > 1."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that duplicate validators in the set would allow single-key bypass
+    // Pre-condition: validator set should not have duplicates
+    (address[] memory validators, ) = multisigIsm.validatorsAndThreshold(message);
+    for (uint i = 0; i < validators.length; i++) {
+        for (uint j = i + 1; j < validators.length; j++) {
+            t(validators[i] != validators[j], "IAR-SIG-11: duplicate validator in set");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: >
+    AbstractMultisigIsm.sol L109-121: two-pointer technique es correcto para
+    validadores unicos. No hay check on-chain de duplicados en el validator set.
+    OZ ECDSA.recover normaliza s-value, previniendo signature malleability.
+
+false_positives:
+- hunter: SignatureHunter
+  id: IAR-FP-01
+  reason: >
+    _getSalt usa abi.encodePacked(uint32, bytes32, bytes32, bytes32, bytes32) - todos tipos
+    fixed-size, no hay riesgo de colision de hash. Investigado y descartado.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "abi.encodePacked con todos tipos fixed-size NO tiene riesgo de colision - no reportar como finding"
+    briefing_update_applied: false
+
+- hunter: SignatureHunter
+  id: IAR-FP-02
+  reason: >
+    route() permite ISM arbitrario en el body del mensaje, pero el ISM es parte del salt
+    de derivacion del ICA. Diferente ISM = diferente ICA. By design para recibir mensajes
+    de contratos no confiables. No es un bypass de seguridad.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Hyperlane ICA: ISM arbitrario en mensaje no es vuln porque ISM es parte del salt de derivacion del ICA"
+    briefing_update_applied: false
+
+- hunter: SignatureHunter
+  id: IAR-FP-03
+  reason: >
+    ECDSA s-value malleability en MultisigIsm: OZ ECDSA.recover >= 4.x normaliza s
+    internamente (tryRecover convierte upper-half s a lower-half). Ademas, el two-pointer
+    technique previene que el mismo validador sea contado dos veces. No es explotable.
+  investigated_at: '2026-03-24T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "OZ ECDSA.recover normaliza s-value - no reportar malleability en ISMs que usan OZ"
+    briefing_update_applied: false

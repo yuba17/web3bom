@@ -1,0 +1,520 @@
+hunter: DomainHunter
+component: VaultV2
+protocol: morpho-vault-v2
+file: src/VaultV2.sol
+domain: vault
+generated_at: "2026-03-25"
+
+hypotheses:
+
+  - id: VV2-DOM-01
+    title: "Donation to vault inflates totalAssets beyond maxRate cap via balanceOf read"
+    description: |
+      accrueInterestView() reads IERC20(asset).balanceOf(address(this)) at L683 to compute realAssets.
+      A direct token donation increases realAssets, but newTotalAssets is capped by maxTotalAssets
+      (L688: min(realAssets, maxTotalAssets)). However, the donated amount sits as idle balance and is
+      used in exit() at L825 to determine idleAssets. If a user deposits right after donation (before
+      accrueInterest distributes the value), the deposited assets + donation inflate _totalAssets via
+      enter() L798 (_totalAssets += assets), while the share price hasn't yet reflected the donation.
+      The depositor gets shares at the old (lower) price, then after accrueInterest runs, the share
+      price increases and the depositor can withdraw at profit. maxRate limits the speed but does NOT
+      prevent the extraction if elapsed time * maxRate is sufficient.
+    severity: high
+    confidence: 65
+    solidity: |
+      function check_VV2_DOM_01_donation_front_run() public {
+        uint256 totalAssetsBefore = vault.totalAssets();
+        uint256 totalSupplyBefore = vault.totalSupply();
+        // Ghost: track if donation happened followed by deposit in same block
+        if (ghost_donationAmount > 0 && ghost_depositAfterDonation) {
+          uint256 sharesReceived = vault.balanceOf(ghost_depositor);
+          uint256 assetsRedeemable = vault.previewRedeem(sharesReceived);
+          // Depositor should NOT be able to redeem more than they deposited
+          t(assetsRedeemable <= ghost_depositAmount + 1, "VV2-DOM-01: donation front-run profit");
+        }
+      }
+    affected_functions:
+      - accrueInterestView
+      - enter
+      - deposit
+      - exit
+    attack_scenario: |
+      1. Attacker monitors mempool for large accrueInterest or deposit txs
+      2. Attacker donates tokens directly to vault (asset.transfer(vault, amount))
+      3. In same block, attacker calls deposit() — gets shares at pre-donation price
+         because accrueInterest() already ran and firstTotalAssets != 0 (transient)
+      4. Next block, accrueInterest() picks up the donated amount (capped by maxRate)
+      5. Attacker redeems shares at higher price
+      Key: maxRate limits the rate but over multiple blocks the donated value accrues
+
+  - id: VV2-DOM-02
+    title: "Management fee can exceed total assets if accrueInterest not called for extended period"
+    description: |
+      Management fee is computed as (newTotalAssets * elapsed).mulDivDown(managementFee, WAD) at L698.
+      The comment at L701 warns "Interest should be accrued at least every 10 years to avoid fees
+      exceeding total assets." If elapsed is very large, managementFeeAssets can exceed newTotalAssets,
+      causing L702 (newTotalAssets - performanceFeeAssets - managementFeeAssets) to underflow and revert.
+      This creates a permanent DoS: no one can interact with the vault because every function calls
+      accrueInterest() which reverts. The vault becomes bricked.
+    severity: high
+    confidence: 55
+    solidity: |
+      function check_VV2_DOM_02_management_fee_overflow() public {
+        uint256 lastUpd = vault.lastUpdate();
+        uint256 elapsed = block.timestamp - lastUpd;
+        uint256 ta = vault._totalAssets();
+        uint256 mFee = vault.managementFee();
+        if (mFee > 0 && ta > 0) {
+          uint256 feeAssets = (ta * elapsed * mFee) / 1e18;
+          // Fee should never exceed total assets
+          t(feeAssets <= ta, "VV2-DOM-02: management fee exceeds totalAssets");
+        }
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+    attack_scenario: |
+      1. Vault is deployed with managementFee set to MAX_MANAGEMENT_FEE (5% APR)
+      2. No one interacts with the vault for 10+ years (low-usage vault)
+      3. After ~20 years, managementFeeAssets > newTotalAssets
+      4. accrueInterestView() underflows at L702, reverts
+      5. ALL vault functions (deposit, withdraw, redeem, etc.) revert because they call accrueInterest()
+      6. Vault is permanently bricked — users cannot withdraw funds
+
+  - id: VV2-DOM-03
+    title: "Zero shares minted for non-zero deposit when totalAssets is very large relative to totalSupply"
+    description: |
+      previewDeposit() at L715 computes: assets.mulDivDown(totalSupply + virtualShares, totalAssets + 1).
+      If totalAssets is much larger than totalSupply (e.g., from donations or accumulated interest),
+      small deposits can result in 0 shares. The enter() function does NOT check that shares > 0.
+      The user loses their deposited assets and gets nothing back. This is a known Solodit finding
+      for this exact contract.
+    severity: medium
+    confidence: 80
+    solidity: |
+      function check_VV2_DOM_03_zero_shares_deposit() public {
+        uint256 totalAssetsBefore = vault.totalAssets();
+        uint256 totalSupplyBefore = vault.totalSupply();
+        if (totalSupplyBefore > 0 && totalAssetsBefore > 0) {
+          // For any deposit amount > 0, shares should be > 0
+          uint256 shares = vault.previewDeposit(1);
+          if (shares == 0) {
+            // Check if a larger deposit also gives 0
+            uint256 shares100 = vault.previewDeposit(100);
+            t(shares100 > 0, "VV2-DOM-03: 100 asset deposit yields zero shares");
+          }
+        }
+      }
+    affected_functions:
+      - previewDeposit
+      - deposit
+      - enter
+      - createShares
+    attack_scenario: |
+      1. Vault has high totalAssets relative to totalSupply (due to donations or interest accrual)
+      2. User calls deposit(smallAmount, user) — previewDeposit returns 0 shares
+      3. enter() proceeds: transfers assets from user, mints 0 shares, increments _totalAssets
+      4. User loses their assets with no shares to redeem
+      5. This inflates the share price further, compounding the problem
+
+  - id: VV2-DOM-04
+    title: "firstTotalAssets transient storage prevents interest accrual within same tx — stale pricing"
+    description: |
+      firstTotalAssets is declared as `transient` (L246). In accrueInterestView(), if firstTotalAssets != 0
+      (L681), it returns (_totalAssets, 0, 0) immediately — no interest calculation. This means within
+      a single transaction, after the first accrueInterest() call, ALL subsequent calls to deposit/withdraw
+      use stale _totalAssets. A user can exploit this: first trigger accrueInterest (which sets
+      firstTotalAssets), then perform multiple deposits/withdraws at the now-frozen exchange rate,
+      even if adapter.realAssets() has changed (e.g., from allocate/deallocate within the same tx).
+    severity: medium
+    confidence: 70
+    solidity: |
+      function check_VV2_DOM_04_stale_rate_within_tx() public {
+        // After accrueInterest, firstTotalAssets is set
+        uint256 fta = vault.firstTotalAssets();
+        uint256 ta = vault._totalAssets();
+        if (fta != 0) {
+          // Any subsequent deposit/withdraw uses _totalAssets not realAssets
+          // Check that _totalAssets still reflects reality
+          uint256 realTotal = IERC20(vault.asset()).balanceOf(address(vault));
+          // Add adapter balances...
+          // If realTotal significantly differs from ta, pricing is stale
+          t(realTotal >= ta * 95 / 100 && realTotal <= ta * 105 / 100,
+            "VV2-DOM-04: stale pricing within tx, >5% deviation");
+        }
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+      - deposit
+      - withdraw
+      - allocateInternal
+      - deallocateInternal
+    attack_scenario: |
+      1. Allocator calls multicall with: [accrueInterest, allocate(adapter, data, largeAmount)]
+      2. accrueInterest() sets firstTotalAssets = newTotalAssets, updates _totalAssets
+      3. allocateInternal transfers assets to adapter — idle balance drops
+      4. Within same tx, user deposit uses frozen _totalAssets (not reflecting allocation)
+      5. Share price calculation is based on stale data
+
+  - id: VV2-DOM-05
+    title: "forceDeallocate penalty bypass via zero-penalty adapter"
+    description: |
+      forceDeallocate() at L855 computes penaltyAssets = assets.mulDivUp(forceDeallocatePenalty[adapter], WAD).
+      If forceDeallocatePenalty[adapter] == 0 (default), penaltyAssets == 0 and penaltyShares == 0.
+      This means anyone can force-deallocate from any adapter with zero penalty if the curator forgot
+      to set the penalty. The function calls withdraw(0, address(this), onBehalf) which burns 0 shares
+      from onBehalf (no-op). An attacker could force-deallocate funds from adapters for free, disrupting
+      the vault's allocation strategy.
+    severity: medium
+    confidence: 75
+    solidity: |
+      function check_VV2_DOM_05_zero_penalty_force_deallocate() public {
+        uint256 adapterCount = vault.adaptersLength();
+        for (uint256 i = 0; i < adapterCount; i++) {
+          address adapter = vault.adapters(i);
+          uint256 penalty = vault.forceDeallocatePenalty(adapter);
+          // All adapters with non-zero allocation should have a penalty set
+          if (penalty == 0) {
+            t(false, "VV2-DOM-05: adapter with zero forceDeallocatePenalty");
+          }
+        }
+      }
+    affected_functions:
+      - forceDeallocate
+      - setForceDeallocatePenalty
+    attack_scenario: |
+      1. Curator adds adapter A but forgets to call setForceDeallocatePenalty(A, penalty)
+      2. Allocator allocates 1M USDC to adapter A
+      3. Anyone calls forceDeallocate(A, data, 1M, onBehalf) — penaltyAssets = 0
+      4. withdraw(0, address(this), onBehalf) is called — burns 0 shares (no-op)
+      5. 1M USDC is deallocated from adapter back to vault idle, disrupting strategy
+      6. No cost to attacker, vault allocation is broken
+
+  - id: VV2-DOM-06
+    title: "Relative cap bypass via flash deposit — firstTotalAssets inflated then allocation"
+    description: |
+      Relative caps are checked against firstTotalAssets (L612). firstTotalAssets is set once per tx
+      in accrueInterest (L668). An allocator could: (1) trigger a large deposit to inflate
+      _totalAssets (which becomes firstTotalAssets next block), (2) next block call allocate —
+      relative cap check uses the inflated firstTotalAssets, allowing larger allocation than intended.
+      The code comments acknowledge this: "Relative caps can still be manipulated by allocators
+      (with short-term deposits), but it requires capital."
+    severity: medium
+    confidence: 60
+    solidity: |
+      function check_VV2_DOM_06_relative_cap_bypass() public {
+        uint256 fta = vault.firstTotalAssets();
+        uint256 ta = vault._totalAssets();
+        if (fta > 0 && ta > 0) {
+          // firstTotalAssets should reasonably reflect actual total assets
+          // If firstTotalAssets >> current totalAssets, caps are too loose
+          t(fta <= ta * 2, "VV2-DOM-06: firstTotalAssets > 2x _totalAssets, cap bypass risk");
+        }
+      }
+    affected_functions:
+      - allocateInternal
+      - accrueInterest
+      - enter
+    attack_scenario: |
+      1. Allocator (or colluding party) flash-loans and deposits large amount into vault
+      2. This inflates _totalAssets (and next block's firstTotalAssets)
+      3. Next block: allocator calls allocate() — relative cap uses inflated firstTotalAssets
+      4. Allocator can push more assets into a target adapter than the cap intended
+      5. Depositor withdraws their initial deposit
+      6. Result: adapter has allocation exceeding the curator's intended relative cap
+
+  - id: VV2-DOM-07
+    title: "Multicall delegatecall allows arbitrary context reuse — msg.sig preservation attack"
+    description: |
+      multicall() at L308-317 uses delegatecall(data[i]) to address(this). This preserves msg.sender
+      across all calls. An owner/curator could batch calls that individually check msg.sender == owner
+      but in aggregate create unintended state transitions. More critically, if any function reads
+      msg.sig or msg.sender for authorization within delegatecall context, it gets the multicall
+      caller's context. The msg.sig in allocateInternal/deallocateInternal (L603, L630) is forwarded
+      to the adapter — under delegatecall, msg.sig would be multicall's selector, not allocate's.
+    severity: medium
+    confidence: 55
+    solidity: |
+      function check_VV2_DOM_07_multicall_msg_sig() public {
+        // After a multicall that includes allocate, verify adapter received correct msg.sig
+        // Ghost variable tracking: if multicall called allocate, what msg.sig did adapter see?
+        if (ghost_multicallUsed && ghost_allocateCalled) {
+          // msg.sig inside delegatecall should be the inner function selector
+          // NOT multicall's selector — delegatecall updates msg.data
+          t(ghost_adapterReceivedSig == bytes4(keccak256("allocate(address,bytes,uint256)")),
+            "VV2-DOM-07: adapter received wrong msg.sig via multicall");
+        }
+      }
+    affected_functions:
+      - multicall
+      - allocateInternal
+      - deallocateInternal
+    attack_scenario: |
+      1. Allocator calls multicall([allocate(adapter, data, amount)])
+      2. delegatecall preserves msg.sender but msg.sig becomes multicall's selector
+      3. allocateInternal at L603 passes msg.sig to adapter.allocate(data, assets, msg.sig, msg.sender)
+      4. Adapter receives multicall's selector instead of allocate's selector
+      5. If adapter uses msg.sig for access control or logic branching, it gets wrong selector
+      6. Could bypass adapter-side checks that expect specific caller function signatures
+
+  - id: VV2-DOM-08
+    title: "Performance fee computed on capped interest — fee recipient gets less when realAssets > maxTotalAssets"
+    description: |
+      In accrueInterestView(), newTotalAssets = min(realAssets, maxTotalAssets) (L688). The performance
+      fee is computed on (newTotalAssets - _totalAssets), not on (realAssets - _totalAssets). When
+      realAssets > maxTotalAssets (e.g., from adapter yield exceeding maxRate), the excess interest
+      is silently discounted. The fee recipient loses their share of the capped interest. Over time,
+      the capped amount eventually accrues, but the fee recipient is systematically underpaid because
+      each accrual takes a smaller fee on the rate-limited portion.
+    severity: low
+    confidence: 70
+    solidity: |
+      function check_VV2_DOM_08_fee_on_capped_interest() public {
+        uint256 ta = vault._totalAssets();
+        uint256 lastUpd = vault.lastUpdate();
+        uint256 elapsed = block.timestamp - lastUpd;
+        uint256 maxRateVal = vault.maxRate();
+        if (ta > 0 && elapsed > 0 && maxRateVal > 0) {
+          uint256 maxTotalAssets = ta + (ta * elapsed * maxRateVal) / 1e18;
+          uint256 realAssets = IERC20(vault.asset()).balanceOf(address(vault));
+          // Add adapter assets...
+          if (realAssets > maxTotalAssets) {
+            uint256 lostInterest = realAssets - maxTotalAssets;
+            // Fee recipient misses fee on lostInterest
+            t(lostInterest < ta / 100, "VV2-DOM-08: >1% interest capped, fee loss");
+          }
+        }
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+    attack_scenario: |
+      1. Vault has adapters generating high yield (e.g., leveraged positions)
+      2. maxRate is set conservatively (e.g., 50% APR)
+      3. Actual yield is 200% APR — realAssets >> maxTotalAssets each block
+      4. Performance fee is computed only on the capped portion
+      5. Fee recipient systematically receives less than their entitled share
+      6. Over time, the uncapped portion accrues but fee was already "skipped"
+
+  - id: VV2-DOM-09
+    title: "Adapter removal does not clear allocation tracking — ghost allocations persist"
+    description: |
+      removeAdapter() at L457-470 sets isAdapter[account] = false and removes from the adapters array,
+      but does NOT zero out caps[id].allocation for any ids associated with the removed adapter.
+      If the adapter is later re-added, the stale allocation data persists. Additionally, if another
+      adapter returns the same ids, the allocation is shared/conflated. The caps checks in
+      allocateInternal (L607) use this stale data, potentially allowing over-allocation or blocking
+      legitimate allocation.
+    severity: medium
+    confidence: 65
+    solidity: |
+      function check_VV2_DOM_09_ghost_allocation_after_removal() public {
+        // Track: after removeAdapter, check if any caps[id].allocation > 0
+        // where id was associated with the removed adapter
+        if (ghost_adapterRemoved && ghost_removedAdapterIds.length > 0) {
+          for (uint256 i = 0; i < ghost_removedAdapterIds.length; i++) {
+            uint256 alloc = vault.allocation(ghost_removedAdapterIds[i]);
+            t(alloc == 0, "VV2-DOM-09: ghost allocation after adapter removal");
+          }
+        }
+      }
+    affected_functions:
+      - removeAdapter
+      - allocateInternal
+      - deallocateInternal
+    attack_scenario: |
+      1. Adapter A is added, allocated 1M USDC, ids = [id1] with allocation = 1M
+      2. Adapter A is removed without full deallocate — caps[id1].allocation = 1M persists
+      3. Adapter B is added, it uses the same id1 (ids can be reused per spec)
+      4. Allocator tries to allocate to adapter B with id1 — allocation starts at 1M (stale)
+      5. If absoluteCap(id1) = 1.5M, only 500K more can be allocated (should be 1.5M)
+      6. OR: if adapter B was fully deallocated, allocation goes negative — revert
+
+  - id: VV2-DOM-10
+    title: "Exit function reads balanceOf for idle check — donation can bypass liquidity adapter deallocate"
+    description: |
+      exit() at L825 reads idleAssets = IERC20(asset).balanceOf(address(this)). If assets <= idleAssets,
+      the liquidity adapter is NOT called for deallocate. An attacker can donate tokens to the vault
+      to make idleAssets artificially high, causing exit() to skip the liquidityAdapter.deallocate()
+      call. This means the vault's allocation tracking (caps[id].allocation) is never decremented,
+      while _totalAssets is decremented at L836. Over time, sum of allocations diverges from
+      _totalAssets, breaking the accounting invariant.
+    severity: high
+    confidence: 60
+    solidity: |
+      function check_VV2_DOM_10_idle_donation_allocation_drift() public {
+        uint256 ta = vault._totalAssets();
+        uint256 idleBalance = IERC20(vault.asset()).balanceOf(address(vault));
+        if (ta > 0) {
+          // Idle balance should not significantly exceed _totalAssets minus adapter allocations
+          uint256 totalAllocated = ghost_sumAllocations;
+          if (idleBalance > 0 && totalAllocated > 0) {
+            uint256 expectedIdle = ta > totalAllocated ? ta - totalAllocated : 0;
+            t(idleBalance <= expectedIdle + ta / 100,
+              "VV2-DOM-10: idle balance exceeds expected by >1%");
+          }
+        }
+      }
+    affected_functions:
+      - exit
+      - withdraw
+      - redeem
+      - deallocateInternal
+    attack_scenario: |
+      1. Vault has 1M USDC total: 100K idle, 900K in liquidity adapter
+      2. User wants to withdraw 500K — normally exit() deallocates 400K from adapter
+      3. Attacker donates 500K tokens directly to vault before user's tx
+      4. exit() sees idleAssets = 600K >= 500K, skips liquidityAdapter.deallocate()
+      5. User gets 500K, _totalAssets decreases by 500K
+      6. But adapter still has 900K allocated — caps[id].allocation unchanged
+      7. Accounting: _totalAssets = 500K but adapter has 900K allocated — invariant broken
+
+  - id: VV2-DOM-11
+    title: "Rounding direction inconsistency in preview functions enables roundtrip extraction"
+    description: |
+      previewDeposit uses mulDivDown (L715), previewMint uses mulDivUp (L722), previewWithdraw uses
+      mulDivUp (L729), previewRedeem uses mulDivDown (L736). The +1 in denominator/numerator
+      (totalAssets + 1) is added consistently. However, the rounding means:
+      deposit(X) gives shares_down, then redeem(shares_down) gives assets_down. For the vault,
+      this is correct (user gets less). But mint(S) requires assets_up, and withdraw(X) burns
+      shares_up. The concern is whether there exists a sequence of operations where rounding
+      accumulation allows extracting value. With virtualShares, the rounding error is bounded
+      per-operation but may accumulate over many ops.
+    severity: low
+    confidence: 50
+    solidity: |
+      function check_VV2_DOM_11_roundtrip_no_profit() public {
+        uint256 ta = vault.totalAssets();
+        uint256 ts = vault.totalSupply();
+        if (ta > 0 && ts > 0) {
+          // deposit then redeem should not yield profit
+          uint256 depositAmount = 1e18;
+          uint256 sharesFromDeposit = vault.previewDeposit(depositAmount);
+          uint256 assetsFromRedeem = vault.previewRedeem(sharesFromDeposit);
+          t(assetsFromRedeem <= depositAmount, "VV2-DOM-11: roundtrip deposit->redeem profit");
+
+          // mint then withdraw should not yield profit
+          uint256 mintShares = 1e18;
+          uint256 assetsForMint = vault.previewMint(mintShares);
+          uint256 assetsFromWithdraw = vault.previewRedeem(mintShares);
+          t(assetsFromWithdraw <= assetsForMint, "VV2-DOM-11: roundtrip mint->redeem profit");
+        }
+      }
+    affected_functions:
+      - previewDeposit
+      - previewMint
+      - previewWithdraw
+      - previewRedeem
+    attack_scenario: |
+      1. Attacker finds a state where rounding favors them in one direction
+      2. Repeatedly deposit small amounts, accumulating rounding in their favor
+      3. Redeem accumulated shares for slightly more than deposited
+      4. With virtualShares offset, per-op error is ~1 wei, but with millions of ops
+         and specific totalAssets/totalSupply ratios, the extraction could be meaningful
+
+  - id: VV2-DOM-12
+    title: "Performance fee recipient gate check allows fee avoidance"
+    description: |
+      In accrueInterestView() L692, performance fee is only computed if
+      canReceiveShares(performanceFeeRecipient) returns true. If the receiveSharesGate is set
+      and blocks the fee recipient, performanceFeeAssets = 0. This means the fee recipient gets
+      zero shares AND the full interest goes to existing shareholders (inflating their share price).
+      A curator could set a restrictive receiveSharesGate that blocks the fee recipient, effectively
+      stealing the performance fee by giving it to existing shareholders (which could include the
+      curator's own deposits).
+    severity: medium
+    confidence: 70
+    solidity: |
+      function check_VV2_DOM_12_fee_recipient_gate_bypass() public {
+        address perfRecipient = vault.performanceFeeRecipient();
+        uint256 perfFee = vault.performanceFee();
+        address mgmtRecipient = vault.managementFeeRecipient();
+        uint256 mgmtFee = vault.managementFee();
+        if (perfFee > 0 && perfRecipient != address(0)) {
+          bool canReceive = vault.canReceiveShares(perfRecipient);
+          t(canReceive, "VV2-DOM-12: perf fee recipient blocked by gate, fee stolen");
+        }
+        if (mgmtFee > 0 && mgmtRecipient != address(0)) {
+          bool canReceive = vault.canReceiveShares(mgmtRecipient);
+          t(canReceive, "VV2-DOM-12: mgmt fee recipient blocked by gate, fee stolen");
+        }
+      }
+    affected_functions:
+      - accrueInterestView
+      - accrueInterest
+      - setReceiveSharesGate
+      - canReceiveShares
+    attack_scenario: |
+      1. Curator sets performanceFee = 50% and performanceFeeRecipient = feeAddr
+      2. Later, curator changes receiveSharesGate to a contract that blocks feeAddr
+      3. accrueInterestView: canReceiveShares(feeAddr) returns false — performanceFeeAssets = 0
+      4. Full interest accrues to existing shareholders (no fee deducted)
+      5. Curator (who is also a depositor) captures the fee via share price appreciation
+      6. Fee recipient is robbed of their entitled performance fee
+
+  - id: VV2-DOM-13
+    title: "Allocator can set liquidityAdapter to non-adapter address — deposit reverts permanently"
+    description: |
+      setLiquidityAdapterAndData() at L644-649 only requires isAllocator[msg.sender]. It does NOT
+      check isAdapter[newLiquidityAdapter]. The check happens inside allocateInternal/deallocateInternal
+      (L598: require(isAdapter[adapter])). This means if an allocator sets liquidityAdapter to a
+      non-adapter address, every deposit() call will revert at L801 (allocateInternal -> L598 revert).
+      Similarly, withdrawals that need liquidity from the adapter will revert. This is a DoS vector
+      controlled by allocators.
+    severity: medium
+    confidence: 75
+    solidity: |
+      function check_VV2_DOM_13_liquidity_adapter_is_valid() public {
+        address liqAdapter = vault.liquidityAdapter();
+        if (liqAdapter != address(0)) {
+          bool isAdap = vault.isAdapter(liqAdapter);
+          t(isAdap, "VV2-DOM-13: liquidityAdapter is not a registered adapter");
+        }
+      }
+    affected_functions:
+      - setLiquidityAdapterAndData
+      - enter
+      - exit
+      - allocateInternal
+    attack_scenario: |
+      1. Malicious or compromised allocator calls setLiquidityAdapterAndData(randomAddr, data)
+      2. randomAddr is not in isAdapter mapping
+      3. User calls deposit() -> enter() -> allocateInternal(randomAddr, ...) -> reverts at L598
+      4. All deposits permanently DoS'd until allocator fixes it
+      5. Withdrawals that need to deallocate from liquidityAdapter also DoS'd
+      6. Only forceDeallocate + direct transfer exit remain viable
+
+  - id: VV2-DOM-14
+    title: "totalSupply not updated until accrueInterest — share-based accounting uses stale supply"
+    description: |
+      The NatSpec at L47-48 states: "totalSupply is not updated to include shares minted to fee
+      recipients. One can call accrueInterestView to compute the updated totalSupply." This means
+      balanceOf[user] / totalSupply gives an incorrect ownership percentage between accrueInterest
+      calls. Any external protocol that reads totalSupply() on-chain for governance, collateral
+      valuation, or position sizing will get a stale (lower) number. This systematically overstates
+      each holder's ownership fraction.
+    severity: low
+    confidence: 65
+    solidity: |
+      function check_VV2_DOM_14_totalSupply_includes_pending_fees() public {
+        (uint256 newTA, uint256 perfShares, uint256 mgmtShares) = vault.accrueInterestView();
+        uint256 currentTS = vault.totalSupply();
+        uint256 realTS = currentTS + perfShares + mgmtShares;
+        if (realTS > 0 && currentTS > 0) {
+          uint256 drift = ((realTS - currentTS) * 1e18) / realTS;
+          // totalSupply drift should be bounded (< 1% between accruals)
+          t(drift < 0.01e18, "VV2-DOM-14: totalSupply stale by >1%");
+        }
+      }
+    affected_functions:
+      - totalSupply
+      - accrueInterest
+      - accrueInterestView
+    attack_scenario: |
+      1. External protocol uses vault.totalSupply() to compute user's share of the vault
+      2. Between accrueInterest calls, totalSupply is stale (doesn't include pending fee shares)
+      3. User's fraction = balanceOf[user] / totalSupply appears higher than reality
+      4. External protocol overvalues the user's position
+      5. User borrows against inflated collateral valuation
+      6. When accrueInterest runs, totalSupply increases, position becomes undercollateralized

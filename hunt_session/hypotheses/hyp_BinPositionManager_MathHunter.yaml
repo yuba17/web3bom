@@ -1,0 +1,280 @@
+protocol: pancakeswap-infinity
+component: BinPositionManager
+file: src/pool-bin/BinPositionManager.sol
+domain: dex
+hunter: MathHunter
+generated_at: '2026-03-23T00:00:00Z'
+invariants:
+
+- id: BPM-01
+  tier: 1
+  type: property
+  description: "_pay truncates amount to uint160 via permit2.transferFrom — any settlement amount > type(uint160).max silently loses upper 96 bits, paying far less than intended to the vault"
+  attack_scenario: "If a token has extremely high totalSupply (rebasing/high-decimal tokens) or if accumulated deltas across a batch exceed 2^160, the uint160 cast in _pay silently truncates. The vault receives less than expected, the delta is marked settled, and the difference is stolen. Attacker creates a pool with a custom ERC20 with supply > 2^160, deposits, then withdraws — the settlement pays truncated amount but credits full amount."
+  impact: "Direct fund theft from the vault — difference between actual amount and truncated amount is lost"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify _pay never truncates — amount must equal uint160(amount)
+    // This is a static property: for any settle call, amount <= type(uint160).max
+    // Test by creating a scenario where _getFullDebt returns > 2^160
+    uint256 debt = vault.currencyDelta(address(binPositionManager), currency);
+    if (debt > 0) {
+        uint256 absDebt = uint256(-int256(debt));
+        t(absDebt <= type(uint160).max, "BPM-01: settle amount exceeds uint160, truncation risk");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: "Same pattern as CLPositionManager. In practice, ERC20 supplies rarely exceed 2^160, but custom/rebasing tokens or accumulated batch deltas could. The cast is `uint160(amount)` on line 378 — NO revert on overflow in Solidity 0.8 for explicit downcasts to smaller types (this is unchecked by design in Solidity). CORRECTION: Solidity 0.8.26 explicit type conversions from uint256 to uint160 DO revert on truncation. This significantly reduces the risk — the tx would revert, not silently truncate. Confidence lowered."
+
+- id: BPM-02
+  tier: 1
+  type: property
+  description: "distributionX/Y are passed as uint256[] but silently truncated to uint64 in LiquidityConfigurations.encodeParams — values > 2^64 lose upper bits, causing incorrect liquidity distribution across bins"
+  attack_scenario: "User passes distributionX[i] = 1e18 + 2^64 (a value that looks correct but whose uint64 cast equals a much smaller number). The liquidity is distributed proportionally to the truncated value, not the intended one. In a multi-bin add, this causes most liquidity to concentrate in unintended bins, resulting in massive IL or allowing an attacker to front-run with a swap that exploits the mis-distribution."
+  impact: "User liquidity deposited into wrong bins proportionally — attacker can sandwich the misplaced liquidity for profit"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // For each distributionX[i] and distributionY[i], verify no truncation on uint64 cast
+    for (uint256 i = 0; i < distributionX.length; i++) {
+        t(distributionX[i] <= type(uint64).max, "BPM-02: distributionX truncated to uint64");
+        t(distributionY[i] <= type(uint64).max, "BPM-02: distributionY truncated to uint64");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "Line 269-271 in BinPositionManager: `uint64(distributionX[i])` — explicit downcast. In Solidity 0.8.26, explicit conversions from larger to smaller uint types DO revert on overflow. So this would revert, not silently truncate. However, the encodeParams function itself uses uint64 params — the truncation happens at the call site in _addLiquidity. Need to verify if Solidity 0.8.26 reverts on explicit uint256->uint64 narrowing. YES it does — this is safe. Downgrading confidence. The real question is whether decodeParams validates correctly — it checks distributionX > PRECISION (1e18) which fits in uint64. Self-inflicted DoS at worst."
+
+- id: BPM-03
+  tier: 1
+  type: property
+  description: "LiquidityConfigurations.getAmountsAndId uses assembly div(mul(x1, distributionX), PRECISION) — for large x1 values, mul can overflow 256-bit boundary in assembly (no overflow check), returning incorrect truncated amount"
+  attack_scenario: "If amount0 (x1) is close to type(uint128).max (~3.4e38) and distributionX is close to 1e18, the multiplication x1 * distributionX ≈ 3.4e56 which fits in 256 bits. However, for amounts approaching 2^128 * 1e18, the intermediate product exceeds 2^256. In assembly, mul wraps around. The attacker provides amount0 = type(uint128).max with a specific distribution that causes the wrapped result to be a small value after division, effectively depositing near-zero liquidity while being charged the full amount0."
+  impact: "User loses tokens — deposits large amount but receives near-zero liquidity shares due to assembly overflow wrap"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify: x1 * distributionX does not overflow uint256
+    // x1 is uint128 (max 2^128-1), distributionX is uint64 (max 1e18)
+    // Max product: (2^128-1) * 1e18 ≈ 3.4e56 < 2^256 ≈ 1.15e77
+    // This is safe — uint128 * uint64 always fits in uint256
+    // ACTUALLY: need to check if x1 could be larger than uint128 in the assembly context
+    uint256 maxProduct = uint256(type(uint128).max) * uint256(1e18);
+    t(maxProduct < type(uint256).max, "BPM-03: max product fits in uint256");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 30
+  notes: "After analysis: uint128 max * uint64 max = (2^128-1) * (2^64-1) ≈ 2^192, well within uint256. The assembly mul is safe for the actual types involved. This is likely a FALSE POSITIVE. Keeping for completeness but confidence is low. The real risk would be if distributionX could somehow exceed uint64 before reaching the assembly — but encodeParams takes uint64, and decodeParams validates <= 1e18."
+
+- id: BPM-04
+  tier: 1
+  type: property
+  description: "First depositor in a bin can manipulate the liquidity-to-token ratio by donating tokens to the bin before the first mint, inflating the share price so subsequent depositors receive zero or near-zero shares"
+  attack_scenario: "1) Attacker is first to add liquidity to a specific bin, depositing a tiny amount (1 wei of each token). 2) Attacker directly donates large amounts of tokens to the bin via swap or direct transfer. 3) When victim adds liquidity, the share calculation inside binPoolManager.mint divides victim's tokens by the inflated per-share price, rounding down to 0 or near-0 shares. 4) Attacker burns their shares and receives both their original deposit + victim's tokens. This is the classic ERC4626 inflation attack adapted to bin LP tokens."
+  impact: "Theft of depositor funds via share price inflation — victim deposits tokens, receives 0 shares, tokens go to attacker"
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After any mint, liquidityMinted[i] must be > 0 if amountIn > 0
+    // Track first depositor advantage
+    for (uint256 i = 0; i < mintArray.ids.length; i++) {
+        if (mintArray.liquidityMinted[i] == 0) {
+            // Zero liquidity minted despite nonzero input = potential inflation attack
+            t(false, "BPM-04: zero liquidity minted for nonzero deposit");
+        }
+    }
+  ghost_vars:
+    - "mapping(uint256 => bool) internal ghost_binHasDepositors;"
+  validated: false
+  priority: high
+  confidence: 65
+  notes: "This depends on how binPoolManager.mint() calculates shares internally. If it uses totalSupply-based share calculation (like ERC4626), this is vulnerable. Need to read BinPool.mint() in core to confirm. The BinPositionManager itself does NOT check for zero minted liquidity — it happily mints 0 BFT tokens. The _mint function in BinFungibleToken adds 0 to totalSupply and balance, which is a no-op but wastes gas and confuses accounting."
+
+- id: BPM-05
+  tier: 1
+  type: property
+  description: "idSlippage check has asymmetric underflow risk: `activeIdDesired - idSlippage` underflows when idSlippage > activeIdDesired, but both are validated <= type(uint24).max, so with uint256 arithmetic the subtraction wraps to a huge number that is always > activeId, reverting. However, `activeIdDesired + idSlippage` can exceed uint24.max without revert since they're uint256."
+  attack_scenario: "User sets activeIdDesired = 16777215 (max uint24) and idSlippage = 100. Then activeIdDesired + idSlippage = 16777315 which exceeds uint24 range. If activeId is at max uint24, the check `activeIdDesired + idSlippage < activeId` → 16777315 < 16777215 = false, so it passes. The second check `activeIdDesired - idSlippage > activeId` → 16777115 > 16777215 = false, also passes. This seems correct. But if activeIdDesired = 0 and idSlippage = 0, then activeIdDesired - idSlippage = 0 which is fine. Self-inflicted scenario only."
+  impact: "User transaction reverts unexpectedly (DoS) or passes when it shouldn't — incorrect slippage enforcement at uint24 boundaries"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify slippage check correctness at boundary values
+    // Test: activeIdDesired=0, idSlippage=0, activeId=0 → should pass
+    // Test: activeIdDesired=0, idSlippage=1 → subtraction underflows in uint256 → huge number > any activeId → reverts
+    // This is actually CORRECT behavior — if desired=0 and slippage=1, lower bound is "negative" which means only bin 0 is acceptable from below
+    uint256 lowerBound = activeIdDesired - idSlippage; // underflows if idSlippage > activeIdDesired
+    t(lowerBound <= activeId || idSlippage > activeIdDesired, "BPM-05: lower bound slippage check bypassed");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: "After analysis, the underflow in `activeIdDesired - idSlippage` when idSlippage > activeIdDesired wraps to a huge uint256, which is always > activeId (a uint24), so the tx reverts. This means the slippage check is STRICTER than intended at low activeId values — it's a self-inflicted DoS, not an exploit. Noted in context as known behavior. Likely LOW/QA at best."
+
+- id: BPM-06
+  tier: 1
+  type: property
+  description: "BinFungibleToken._mint does NOT check for amount == 0 — minting zero shares creates a position entry in _positions but gives no actual LP tokens, potentially enabling position map pollution and gas griefing"
+  attack_scenario: "Attacker calls addLiquidity with distributions crafted so that one bin receives 0 tokens (e.g., distributionX[i] = 0 and distributionY[i] = 0 for a specific deltaId). binPoolManager.mint returns liquidityMinted[i] = 0 for that bin. BinPositionManager._mint(to, tokenId, 0) succeeds — totalSupply[tokenId] += 0 is a no-op, but _positions[tokenId] gets written. Over many calls, this pollutes the _positions mapping. On its own this is low severity, but combined with the zero-supply tokenId existing in _positions, it could confuse off-chain indexers or enable griefing through gas-expensive batch operations."
+  impact: "Gas griefing and state pollution — position entries exist for zero-balance tokens"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After mint, verify no zero-amount mints occurred
+    for (uint256 i = 0; i < mintArray.ids.length; i++) {
+        if (mintArray.liquidityMinted[i] == 0) {
+            uint256 tokenId = poolId.toTokenId(mintArray.ids[i]);
+            // Position exists but balance is 0
+            t(balanceOf[to][tokenId] > 0, "BPM-06: position created with zero balance");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: "The _positions[tokenId].binId == 0 check on line 308 means binId 0 positions are overwritten every time. But for binId > 0 (most cases), the position is written once and stays forever even if all shares are burned later. This is state pollution but unlikely to cause fund loss directly."
+
+- id: BPM-07
+  tier: 1
+  type: property
+  description: "Round-trip add-then-remove liquidity in a single bin should not be profitable — user should receive <= what they deposited (rounding favors the pool/protocol)"
+  attack_scenario: "Attacker deposits into a single bin and immediately removes all shares. Due to rounding in the bin's internal math (liquidity calculation in mint, then token calculation in burn), if rounding goes in the user's favor on either side, the attacker extracts a small profit. Repeated across many bins or many iterations, this accumulates into material value extraction from the pool's other LPs."
+  impact: "Slow drain of pool reserves through repeated round-trip rounding profit — other LPs lose proportionally"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track tokens before add and after remove for round-trip analysis
+    // ghost_preAddBalance0 and ghost_preAddBalance1 set before addLiquidity
+    // After removeLiquidity of same shares:
+    int256 profit0 = int256(uint256(postBalance0)) - int256(uint256(ghost_preAddBalance0));
+    int256 profit1 = int256(uint256(postBalance1)) - int256(uint256(ghost_preAddBalance1));
+    // Neither token should be profitable
+    t(profit0 <= 0, "BPM-07: round-trip profit in token0");
+    t(profit1 <= 0, "BPM-07: round-trip profit in token1");
+  ghost_vars:
+    - "uint256 internal ghost_preAddBalance0;"
+    - "uint256 internal ghost_preAddBalance1;"
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "This is the fundamental bidirectional rounding check (Sec3/Josselin Feist methodology). The actual rounding logic is in binPoolManager.mint() and binPoolManager.burn() in core — BinPositionManager is just the periphery. But the periphery is where slippage is checked, so if the core rounds in user's favor AND slippage allows it, the extraction works. Need to fuzz with small amounts (1-100 wei) and large amounts to find the sweet spot."
+
+- id: BPM-08
+  tier: 2
+  type: property
+  description: "BinFungibleToken._burn uses unchecked block for both totalSupply and balanceOf decrements — if balanceOf check passes but totalSupply < amount (due to a separate bug), totalSupply underflows to near-max uint256"
+  attack_scenario: "If there is ANY path that increases balanceOf[from][id] without increasing totalSupply[id] (or decreases totalSupply without decreasing balanceOf), then the invariant totalSupply >= sum(balances) breaks. In _burn, the balanceOf check passes, but the unchecked totalSupply subtraction underflows. This inflates totalSupply to ~2^256, breaking all share-price calculations that divide by totalSupply. Subsequent mints would receive near-zero shares. Finding this path requires a separate bug in mint/transfer logic."
+  impact: "Total supply corruption leading to broken share price math — all subsequent deposits receive 0 shares"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariant: totalSupply[id] == sum of all balanceOf[user][id]
+    // Simplified: totalSupply[id] >= balanceOf[user][id] for all users we track
+    // After any operation:
+    for (uint256 i = 0; i < trackedTokenIds.length; i++) {
+        uint256 id = trackedTokenIds[i];
+        uint256 total = bft.totalSupply(id);
+        uint256 sumBalances = 0;
+        for (uint256 j = 0; j < actors.length; j++) {
+            sumBalances += bft.balanceOf(actors[j], id);
+        }
+        eq(total, sumBalances, "BPM-08: totalSupply != sum(balances)");
+    }
+  ghost_vars:
+    - "uint256[] internal trackedTokenIds;"
+    - "address[] internal actors;"
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "The unchecked block in _burn (line 124-127) is safe IF the only way to get balance is through _mint (which always increases totalSupply equally). But batchTransferFrom moves balance between users WITHOUT changing totalSupply — this is correct. The only risk is a reentrancy or logic bug that desynchs the two. In practice, _mint and _burn are internal and only called from BinPositionManager's add/remove liquidity. Low likelihood but catastrophic if it happens."
+
+- id: BPM-09
+  tier: 2
+  type: property
+  description: "BinFungibleToken.batchTransferFrom uses unchecked addition for balanceOf[to][id] — if to's balance is near max uint256 (from a bug elsewhere), the addition wraps to near-zero, destroying the receiver's shares"
+  attack_scenario: "If balanceOf[to][id] is somehow near type(uint256).max (requires separate bug or extremely many mints), adding `amount` in the unchecked block wraps around. The receiver's balance becomes near-zero instead of near-max + amount. However, reaching balanceOf near uint256.max requires totalSupply to also be near max, which requires ~2^256 worth of mints — practically impossible. This is a theoretical concern only."
+  impact: "Balance overflow destroys receiver's shares — theoretical only, requires totalSupply ≈ 2^256"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Before any transfer, verify no overflow
+    // balanceOf[to][id] + amount should not overflow
+    uint256 toBal = bft.balanceOf(to, id);
+    uint256 amount = transferAmount;
+    t(toBal + amount >= toBal, "BPM-09: balanceOf overflow on transfer");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 25
+  notes: "Practically impossible — requires totalSupply near 2^256. The unchecked is justified by the comment 'An array can't have a total length larger than the max uint256 value' but this refers to loop index, not the balance. The balance overflow is guarded by totalSupply being checked in _mint. Keeping as tier 2 for completeness."
+
+- id: BPM-10
+  tier: 1
+  type: optimize
+  description: "Maximize round-trip profit: deposit into a bin and immediately withdraw, measuring net token gain across various amount/bin combinations"
+  attack_scenario: "If the optimizer finds positive profit, there exists a combination of deposit amount and bin selection where rounding consistently favors the user, enabling repeated extraction"
+  impact: "Quantifies maximum extractable value per round-trip — if positive, confirms rounding bug in core"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Echidna optimization function
+    // Returns the maximum profit achievable from a single add-then-remove cycle
+    int256 profit0 = int256(uint256(postRemoveBalance0)) - int256(uint256(preAddBalance0));
+    int256 profit1 = int256(uint256(postRemoveBalance1)) - int256(uint256(preAddBalance1));
+    // Maximize total profit (in some common unit, simplified as sum)
+    return profit0 + profit1;
+  ghost_vars:
+    - "uint256 internal preAddBalance0;"
+    - "uint256 internal preAddBalance1;"
+    - "uint256 internal postRemoveBalance0;"
+    - "uint256 internal postRemoveBalance1;"
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "This is the optimization counterpart to BPM-07. Echidna's optimization mode will actively search for inputs that maximize the return value. Even 1 wei of consistent profit is reportable because it can be amplified with flash loans and repetition."
+
+false_positives:
+- hunter: MathHunter
+  id: BPM-FP-01
+  reason: "idSlippage underflow (activeIdDesired - idSlippage when idSlippage > activeIdDesired) is self-inflicted — user controls both values, and the underflow causes a revert (stricter than intended), not a bypass. No attacker benefit."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Bin pool idSlippage underflow at low activeIdDesired is by design — wraps to huge uint256, always reverts. Not exploitable."
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BPM-FP-02
+  reason: "Assembly mul overflow in LiquidityConfigurations.getAmountsAndId — after analysis, uint128 * uint64 max product is ~2^192, safely within uint256. No overflow possible with the actual types."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Bin pool getAmountsAndId assembly mul(uint128, uint64) max product is 2^192, no uint256 overflow possible."
+    briefing_update_applied: false
+
+- hunter: MathHunter
+  id: BPM-FP-03
+  reason: "uint256-to-uint160 truncation in _pay: Solidity 0.8.26 explicit narrowing conversions (uint256 to uint160) DO revert on overflow. The cast is not unchecked. So amounts > 2^160 would revert the transaction, not silently truncate. This is a DoS vector at most, not a fund loss vector."
+  investigated_at: '2026-03-23T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: dex.md
+    content: "Solidity 0.8+ explicit narrowing casts (uint256->uint160) revert on overflow — NOT silent truncation. DoS at most, not fund loss."
+    briefing_update_applied: false

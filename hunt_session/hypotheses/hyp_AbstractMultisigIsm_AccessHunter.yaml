@@ -1,0 +1,154 @@
+component: AbstractMultisigIsm
+hunter: AccessHunter
+date: '2026-03-24'
+scope_notes: |
+  Hyperlane Multisig ISM contracts (~330 LOC). Immunefi $2.5M critical.
+  Contracts: AbstractMultisigIsm, AbstractMerkleRootMultisigIsm, AbstractMessageIdMultisigIsm, StaticMultisigIsm.
+  Previously audited by Trail of Bits.
+
+invariants:
+- id: ISM-ACC-01
+  title: "Factory deploy() has no access control — anyone can deploy ISMs with arbitrary validator sets"
+  tier: 2
+  type: property
+  confidence: 30
+  severity: low
+  description: |
+    StaticThresholdAddressSetFactory.deploy() is public and permissionless. Anyone can deploy
+    an ISM with any validator set and threshold. However, this is BY DESIGN — the ISM is only
+    used if a recipient contract explicitly selects it as their ISM. The factory uses Create2
+    with deterministic addresses (salt = keccak256(metadata)), so deploying the same config
+    twice returns the existing address. No funds at risk from permissionless deployment alone.
+
+    VERDICT: This is safe. The trust model relies on recipients choosing their ISM, not on
+    who deployed it. The factory is a convenience, not a trust boundary.
+  solidity: |
+    // Chimera assertion — verify factory is deterministic and safe
+    function check_ISM_ACC_01() public {
+      // Factory deploy is permissionless but deterministic
+      // Same inputs always produce same address
+      address ism1 = factory.deploy(validators, threshold);
+      address ism2 = factory.deploy(validators, threshold);
+      t(ism1 == ism2, "Factory must be deterministic");
+    }
+  validated: true
+  status: not_a_bug
+
+- id: ISM-ACC-02
+  title: "verify() is public view — callable by anyone, but only matters when called by Mailbox.process()"
+  tier: 2
+  type: property
+  confidence: 95
+  severity: low
+  description: |
+    verify() is public view, meaning anyone can call it. This is correct behavior — it's a
+    pure verification function with no state changes. The security model relies on
+    Mailbox.process() calling verify() and acting on the result, not on restricting who can
+    call verify(). Adding access control would break composability (other ISMs that aggregate
+    multiple ISMs need to call verify() on sub-ISMs).
+
+    VERDICT: Not a bug. Public view is the correct visibility.
+  solidity: |
+    function check_ISM_ACC_02() public {
+      // verify() is view-only, no state changes
+      // Anyone can call it, but it only matters in context of Mailbox.process()
+      // This is by design — aggregation ISMs need to call sub-ISM verify()
+      bool result = ism.verify(metadata, message);
+      // Result is meaningless without Mailbox enforcing it
+      t(true, "verify() being public view is safe");
+    }
+  validated: true
+  status: not_a_bug
+
+- id: ISM-ACC-03
+  title: "MetaProxy.metadata() reads from calldata tail — garbage data if called outside proxy context"
+  tier: 1
+  type: property
+  confidence: 60
+  severity: medium
+  description: |
+    MetaProxy.metadata() uses assembly to read metadata appended to calldata by the proxy.
+    If AbstractMetaProxyMultisigIsm.validatorsAndThreshold() is called directly (not through
+    the MetaProxy), the function reads garbage from the end of calldata. However:
+
+    1. StaticMultisigIsm contracts are ONLY deployed as MetaProxy instances by the factory
+    2. The implementation contract deployed in the factory constructor is never used directly
+    3. Even if called on the bare implementation, abi.decode would likely revert on garbage
+
+    Potential attack vector: If someone could trick a system into using the raw implementation
+    address (not a proxy) as an ISM, validatorsAndThreshold() would return garbage validators,
+    potentially returning address(0) entries or an empty set. With threshold=0, verify() would
+    pass for ANY message. But require(_threshold > 0) blocks the threshold=0 case.
+
+    The real question: Can abi.decode of garbage calldata return a valid (validators, threshold)
+    tuple where threshold > 0 and validators contains attacker-controlled addresses? This depends
+    on what calldata is passed. In practice, the implementation address is not meant to be used
+    as an ISM, but there's no protection against it.
+
+    VERDICT: Theoretically possible but requires misconfiguration (using implementation as ISM).
+    Low practical exploitability. Worth noting but unlikely to be rewarded.
+  solidity: |
+    function check_ISM_ACC_03() public {
+      // If implementation is used directly (not as proxy), metadata() reads garbage
+      // This MUST revert or return empty/zero data
+      try StaticMessageIdMultisigIsm(implementation).validatorsAndThreshold(message)
+        returns (address[] memory vals, uint8 thresh) {
+        // If it doesn't revert, threshold must be 0 (which verify blocks)
+        // OR validators must be empty
+        t(thresh == 0 || vals.length == 0, "Implementation direct call must not return valid config");
+      } catch {
+        t(true, "Implementation direct call reverts as expected");
+      }
+    }
+  validated: false
+  status: hypothesis
+
+- id: ISM-ACC-04
+  title: "No duplicate validator check in factory allows threshold reduction attack"
+  tier: 1
+  type: property
+  confidence: 75
+  severity: high
+  description: |
+    StaticThresholdAddressSetFactory.deploy() validates 0 < threshold <= values.length but
+    does NOT check that all addresses in _values are unique. If a validator set is deployed
+    with duplicates, e.g., [A, A, B] with threshold=2, then a single signature from A can
+    match at BOTH positions 0 and 1 in the two-pointer walk, effectively satisfying the
+    threshold with only 1 unique signer instead of 2.
+
+    Attack scenario:
+    1. Attacker calls factory.deploy([A, A, B], 2)  -- A is duplicated
+    2. ISM is created with threshold=2 but only 2 unique validators
+    3. A single signature from A satisfies position 0, then _validatorIndex increments to 1
+    4. WAIT — the two-pointer algorithm increments _validatorIndex AFTER match, so for sig[0]
+       it matches validators[0]=A, increments to 1. For sig[1], it needs to match validators[1]=A.
+       But sig[1] recovers the SAME signer A from the SAME digest. So sig[0] and sig[1] would
+       both be identical signatures recovering to A.
+    5. sig[0] matches validators[0], _validatorIndex becomes 1
+    6. sig[1] recovers A, while loop checks validators[1]=A, matches! _validatorIndex becomes 2
+    7. Threshold of 2 satisfied with 1 unique key!
+
+    HOWEVER: Who deploys the ISM matters. If the protocol owner deploys it correctly (no dupes),
+    this is not exploitable. The risk is if deployment is automated/scripted without dedup.
+
+    This is a REAL bug in the factory, but the impact depends on who controls ISM deployment.
+    For Immunefi, this is likely Medium (requires misconfigured deployment) not Critical.
+  solidity: |
+    function check_ISM_ACC_04() public {
+      // Deploy ISM with duplicate validator
+      address[] memory vals = new address[](3);
+      vals[0] = address(0x1111);
+      vals[1] = address(0x1111); // DUPLICATE
+      vals[2] = address(0x2222);
+      address ism = factory.deploy(vals, 2);
+
+      // Now verify: can 1 unique signer satisfy threshold=2?
+      // If duplicate in sorted validator set, same sig matches twice
+      (address[] memory returnedVals, uint8 thresh) =
+        StaticMessageIdMultisigIsm(ism).validatorsAndThreshold(message);
+      t(thresh == 2, "Threshold is 2");
+      // Two identical signatures from 0x1111 would both match
+      // This effectively reduces threshold from 2-of-3 to 1-of-2
+    }
+  validated: false
+  status: hypothesis

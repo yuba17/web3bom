@@ -1,0 +1,154 @@
+component: AutoRangeAndCompound
+hunter: DomainHunter
+date: "2026-03-21"
+
+invariants:
+  - id: ARC-D-01
+    title: "autoCompound: OR condition in min threshold permanently blocks out-of-range positions"
+    tier: 1
+    type: business_logic
+    confidence: 90
+    description: >
+      autoCompound() line 440:
+        if (state.amount0 < config.autoCompoundMin0 || state.amount1 < config.autoCompoundMin1)
+            revert NotEnoughReward();
+      The OR condition means: if EITHER token is below its minimum, the whole compound reverts.
+
+      For out-of-range positions:
+      - Position below range: only token1 fees accumulate → amount0 = 0
+      - Position above range: only token0 fees accumulate → amount1 = 0
+
+      If config.autoCompoundMin0 > 0 AND position is below range (amount0 = 0):
+        → 0 < autoCompoundMin0 → condition TRUE → revert NotEnoughReward()
+
+      Result: out-of-range positions with one-sided fees NEVER compound.
+      This is a permanent DoS for a common and legitimate use case.
+      The correct condition should be AND: compound only if BOTH tokens below threshold
+      (i.e., not enough total value to be worth compounding).
+
+      Impact: position owner's fees sit idle, earning nothing while in-range positions compound.
+      Depending on position value, this could be thousands of dollars in lost compounding returns.
+    affected_line: "AutoRangeAndCompound.sol:440 if (amount0 < min0 || amount1 < min1)"
+    attack_scenario: >
+      1. LP has position in USDC/WETH pool, range [1800, 2200]
+      2. ETH price drops to $1500 → position goes out of range (above range)
+      3. Position only accumulates token1 (USDC) fees → amount1 = $500, amount0 = 0
+      4. Config has autoCompoundMin0 = 1e6 (1 USDC equivalent), autoCompoundMin1 = 1e6
+      5. Keeper calls autoCompound()
+      6. state.amount0 = 0 < config.autoCompoundMin0 = 1e6 → REVERT NotEnoughReward()
+      7. $500 in fees sit uncompounded indefinitely until position comes back in range
+
+      Compare to correct behavior (AND condition):
+      5. state.amount0 = 0 < min0 → true, BUT amount1 = $500 > min1 → false
+      6. 0 < min0 AND $500 > min1 → false AND true = false → NO revert (compound proceeds)
+      7. Fees compound correctly even though only one-sided
+    severity: HIGH
+    status: confirmed_reportable
+    solidity: |
+      // CORRECT: AND condition — compound if NEITHER token has enough
+      // if (state.amount0 < config.autoCompoundMin0 && state.amount1 < config.autoCompoundMin1)
+      //     revert NotEnoughReward();
+
+      // BUG: OR condition — compound blocked if ANY token below minimum
+      // if (state.amount0 < config.autoCompoundMin0 || state.amount1 < config.autoCompoundMin1)
+      //     revert NotEnoughReward();
+
+      function invariant_autoCompound_outOfRange_canCompound(
+          uint256 amount0, uint256 amount1, uint256 min0, uint256 min1
+      ) internal {
+          // Out-of-range positions with one-sided fees SHOULD be able to compound
+          // If amount0=0 and amount1 > min1, compound should proceed
+          bool outOfRangeAbove = (amount0 == 0 && amount1 > min1);
+          bool outOfRangeBelow = (amount1 == 0 && amount0 > min0);
+          if (outOfRangeAbove || outOfRangeBelow) {
+              // Current code would revert here — this is the bug
+              // t(canCompound, "ARC-D-01: out-of-range position cannot compound (OR bug)");
+          }
+      }
+
+  - id: ARC-D-02
+    title: "execute: VAULT strategy creates newTokenId in new range but may not match Slipstream CL pool"
+    tier: 2
+    type: business_logic
+    confidence: 65
+    description: >
+      AutoRangeAndCompound is designed for Aerodrome Slipstream CL positions.
+      Slipstream pools use discrete tickSpacing (typically 1, 10, 100, 200).
+      execute() uses npm.mint() with computed tick boundaries.
+      If the tick boundaries computed by execute() don't align with the pool's tickSpacing,
+      npm.mint() in Slipstream might behave differently than Uniswap V3.
+      Uniswap V3 rounds ticks down to tickSpacing — Slipstream might too.
+      The baseTick floor calculation at line 245 uses tickSpacing from the pool,
+      so ticks SHOULD be aligned. But lowerTickDelta and upperTickDelta are absolute
+      values that get added to baseTick, not relative to tickSpacing.
+      If lowerTickDelta is not a multiple of tickSpacing, the final tick might not align.
+    affected_line: "AutoRangeAndCompound.sol:260-265"
+    status: low_priority
+    solidity: |
+      // INV-ARC-D-02: new tick range must be tick-spacing aligned
+      function invariant_execute_tickAlignment(
+          int24 newLower, int24 newUpper, int24 tickSpacing
+      ) internal {
+          eq(newLower % tickSpacing, 0, "ARC-D-02: tickLower not aligned to tickSpacing");
+          eq(newUpper % tickSpacing, 0, "ARC-D-02: tickUpper not aligned to tickSpacing");
+      }
+
+  - id: ARC-D-03
+    title: "autoCompound: one-sided swap assumption — always swap to the underrepresented token"
+    tier: 2
+    type: business_logic
+    confidence: 70
+    description: >
+      autoCompound() swaps either token0→token1 or token1→token0 to balance amounts
+      for addLiquidity. The swap direction is determined by which token is in excess.
+      For out-of-range positions, one token is zero. After swap, the resulting split
+      must match the pool's current price ratio for addLiquidity to use both tokens.
+      If the position is far out of range, addLiquidity might only accept one token anyway
+      (since the price is outside the range), making the swap wasteful.
+      Wasted swap = swap fees paid unnecessarily + slippage exposure.
+    affected_line: "AutoRangeAndCompound.sol:460-475"
+    status: low_priority
+    solidity: |
+      // INV-ARC-D-03: no swap if position would only accept one token anyway
+
+  - id: ARC-D-04
+    title: "execute: reward charged on rerange even if position value decreased"
+    tier: 2
+    type: economic
+    confidence: 60
+    description: >
+      execute() with onlyFees=false reranges AND collects fees. The keeper reward is
+      calculated on the fee amounts OR the added amounts (depending on onlyFees flag).
+      After a rerange, if slippage caused the new position to be worth less than the old,
+      the position owner paid for a rerange that decreased their position value.
+      The keeper still earns a reward.
+      This creates a perverse incentive: keepers may call execute() frequently even when
+      the position isn't optimally positioned for a rerange.
+    affected_line: "AutoRangeAndCompound.sol:295-325 (reward calculation in execute)"
+    status: low_priority
+    solidity: |
+      // INV-ARC-D-04: keeper reward only if rerange improves position value
+
+  - id: ARC-D-05
+    title: "autoCompound: AERO rewards compound does not update gauge stake"
+    tier: 2
+    type: business_logic
+    confidence: 68
+    description: >
+      autoCompoundWithVaultAndRewardCompound() claims AERO rewards and compounds them
+      into the position. After addLiquidity, the position has more liquidity.
+      But: is the increased liquidity re-staked in the gauge to earn more AERO?
+      If the compound adds liquidity but doesn't update the gauge stake,
+      the incremental liquidity earns NO AERO rewards.
+      The existing stake in the gauge is for the pre-compound liquidity amount.
+      Slipstream gauges may automatically track the NFT's current liquidity,
+      or they may require explicit re-stake.
+    affected_line: "AutoRangeAndCompound.sol:~400 executeWithVaultAndRewardCompound()"
+    attack_scenario: >
+      Position has 1000 liquidity staked, earning 100 AERO/week.
+      autoCompound adds 100 more liquidity (10% increase) via compound.
+      If gauge doesn't auto-update, the 100 extra liquidity earns 0 AERO.
+      Position owner loses 10 AERO/week in missed rewards.
+    status: hypothesis
+    solidity: |
+      // INV-ARC-D-05: post-compound liquidity earns proportional AERO rewards

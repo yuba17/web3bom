@@ -1,0 +1,428 @@
+# DeepDiveHunter — LeverageTransformer
+# Reads convergence map from 6 parallel hunters, digs deeper into missed angles.
+# Focus: design assumptions, cross-function state, value exit traces, 0x raw call path.
+
+component: LeverageTransformer
+hunter: DeepDiveHunter
+timestamp: "2026-03-24"
+
+hypotheses:
+
+  - id: LT-DD-01
+    title: "leverageUp: _routerSwap amountInDelta can exceed tracked `amount` when UniversalRouter partial-fills or 0x over-pulls"
+    tier: 2
+    type: accounting
+    confidence: 62
+    description: |
+      In leverageUp, `amount` tracks remaining borrowed tokens. Line 68 does `amount -= amountIn`
+      where amountIn is the balance-based delta from _routerSwap. For the 0x path (Swapper.sol:108),
+      `safeIncreaseAllowance` is called with `params.amountIn`, but the raw call at line 109 could
+      theoretically consume tokens beyond that approval IF the contract already had a non-zero
+      allowance to zeroxAllowanceHolder from a previous failed/partial operation where
+      `safeApprove(..., 0)` at line 113 wasn't reached (e.g., if the call succeeded but a later
+      step reverted and the whole tx was replayed in a different context).
+
+      More concretely: `safeIncreaseAllowance` ADDS to existing allowance. If there's residual
+      allowance from a previous atomic operation in the same tx (e.g., via multicall or
+      composability), the 0x contract could pull more than `params.amountIn`. The balance-based
+      `amountInDelta` would then exceed what `amount` can support, causing underflow at line 68.
+
+      However, since each tx is atomic and the approve-to-zero at line 113 runs on success,
+      residual allowance requires: (a) a re-entrant call path that doesn't complete cleanup, or
+      (b) a multicall pattern where one call sets allowance and another leverageUp call inherits it.
+
+      Counter: The Vault's transform() blocks reentrancy via transformedTokenId != 0 check.
+      But direct calls (not via vault) skip this protection. A direct caller IS the NFT owner
+      acting on their own position — self-harm only.
+
+      Verdict: LOW/QA — the underflow is DoS (revert), not fund loss. And residual allowance
+      requires contrived setup. Documenting because 3 hunters flagged the underflow without
+      identifying this specific allowance accumulation vector.
+    affected_line: "LeverageTransformer.sol:68, Swapper.sol:108-113"
+    attack_scenario: |
+      1. Attacker contract owns NFT position directly (not via vault)
+      2. Calls leverageUp with amountIn0 that leaves residual 0x allowance (via reentrancy during 0x call)
+      3. Second leverageUp call in same tx inherits allowance, amountInDelta exceeds `amount`
+      4. Revert due to underflow — DoS only
+    status: debunked_low
+    solidity: |
+      // Invariant: amountInDelta from _routerSwap should never exceed remaining `amount`
+      function invariant_leverageUp_amountTracking() public view returns (bool) {
+        // Would need ghost variable tracking amount across _routerSwap calls
+        // amount_after_swap1 >= 0 && amount_after_swap2 >= 0
+        return true;
+      }
+    poc_sketch: |
+      // This is DoS-only, not exploitable for fund theft
+      // 1. Deploy attacker contract that owns Uni V3 NFT directly
+      // 2. Call leverageUp with crafted 0x swapData that reenters
+      // 3. Show underflow revert blocks legitimate deleverage
+      // Verdict: self-harm, user misconfiguration
+    call_stack: |
+      leverageUp() → _routerSwap() → zeroxAllowanceHolder.call() → [reentrant leverageUp?]
+      → safeIncreaseAllowance accumulates → amountInDelta > amount → underflow revert
+
+  - id: LT-DD-02
+    title: "leverageDown: collected amount used for repay can silently under-repay when collect returns less than decreaseLiquidity indicated"
+    tier: 2
+    type: accounting
+    confidence: 65
+    description: |
+      In leverageDown, lines 147 sets (amount0, amount1) from decreaseLiquidity. Then line 150-156
+      calls collect() with those amounts + feeAmount. The collect() return values OVERWRITE amount0
+      and amount1 (line 156). If the Uniswap NPM collect returns less than expected (e.g., due to
+      rounding in the pool contract, or because fees were already collected by another path), the
+      tracking variables are correct (they reflect actual collected amounts).
+
+      The deeper issue: at line 158, `amount = token == token0 ? amount0 : (token == token1 ? amount1 : 0)`.
+      If the debt token is token0, amount = amount0 (the actual collected). Then swaps happen to
+      convert token1 to debt token, adding to `amount`. Then `repay(tokenId, amount, false)` is called.
+
+      If `amount < total_debt`, the repay is partial. The vault's _repay caps shares to currentShares
+      (line 1027), so it won't over-repay. But the UNDER-repay is silent — no revert. The position
+      remains with residual debt. After transform() returns, _requireLoanIsHealthy runs. If the
+      residual debt makes the position unhealthy, the whole tx reverts.
+
+      But here's the gap: between the partial repay and the health check, the position has LESS
+      liquidity (removed in decreaseLiquidity) and STILL has debt. If the user expected full
+      repayment and set slippage params accordingly, the health check failure is a DoS.
+
+      This is not a fund loss issue — it's a UX/DoS issue already flagged as "silent partial repay."
+      Confirming as LOW.
+    affected_line: "LeverageTransformer.sol:156-180"
+    attack_scenario: |
+      1. User has position with debt = 1000 USDC, liquidity worth ~1050 USDC
+      2. Calls leverageDown to remove all liquidity and repay
+      3. Due to pool rounding or fee timing, collect returns 995 USDC equivalent
+      4. Repay is partial (995/1000), residual debt = 5 USDC
+      5. Health check fails because collateral was removed → revert
+      6. User must retry with different parameters
+    status: confirmed_low
+    solidity: |
+      function invariant_leverageDown_repayCoversDebt() public {
+        // After leverageDown, either debt is fully repaid OR position remains healthy
+        uint256 debtAfter = vault.loans(tokenId).debtShares;
+        if (debtAfter > 0) {
+          (bool healthy,,,) = vault._checkLoanIsHealthy(tokenId, debtAfter, false);
+          t(healthy, "LT-DD-02: partial repay left unhealthy position");
+        }
+      }
+    poc_sketch: |
+      // 1. Create position with tight collateral ratio
+      // 2. Call leverageDown removing most liquidity
+      // 3. Manipulate pool to cause collect() to return slightly less
+      // 4. Show health check reverts, blocking deleverage
+      // Verdict: DoS, user retries with adjusted params
+    call_stack: |
+      vault.transform() → leverageDown() → decreaseLiquidity() → collect()
+      → _routerSwap() → vault.repay() [partial] → _requireLoanIsHealthy() [may revert]
+
+  - id: LT-DD-03
+    title: "leverageUp: leftover borrowed tokens sent to recipient BEFORE vault health check — value extraction if health check is skipped"
+    tier: 1
+    type: flow
+    confidence: 68
+    description: |
+      Design assumption analysis reveals a critical ordering: in leverageUp, borrowed funds are
+      split into (1) liquidity added to position, and (2) leftovers sent to params.recipient
+      (lines 97-105). THEN control returns to vault's _transform which runs _requireLoanIsHealthy
+      (line 579).
+
+      The design ASSUMES that _requireLoanIsHealthy will catch any case where too much was sent
+      to recipient. This is correct — if the loan is unhealthy, the whole tx reverts, undoing
+      the leftover transfers.
+
+      HOWEVER: if the health check PASSES (because the position already had excess collateral),
+      the user has effectively:
+      1. Borrowed X tokens from the vault
+      2. Added Y tokens as liquidity (Y < X)
+      3. Sent (X - Y) tokens to recipient as "profit"
+      4. Health check passes because pre-existing collateral covers the new debt
+
+      This is BY DESIGN — it's how leveraged positions work. The owner borrows against their
+      collateral and uses the funds as they wish.
+
+      But there's a nuance: if `params.recipient` is NOT the loan owner, the loan owner effectively
+      donates borrowed funds to a third party while their position takes on the debt. This is the
+      "arbitrary recipient" issue flagged by 2 hunters.
+
+      The question is: can a transform-approved operator set recipient to themselves and extract value?
+      YES — if loanOwner grants transformApproval to an operator, that operator can call transform()
+      with leverageUp data that sends leftovers to operator's address. The loan owner bears the debt.
+
+      This is a trust model issue: transformApprovals are powerful. The owner CHOSE to approve the
+      operator. But the granularity is too coarse — approving transform doesn't mean "approve to
+      borrow and send to yourself."
+
+      Severity depends on whether transformApprovals are expected to be granted to semi-trusted
+      parties (like automation bots) vs fully-trusted parties only.
+    affected_line: "LeverageTransformer.sol:97-105, V3Vault.sol:528"
+    attack_scenario: |
+      1. Alice owns position tokenId=42, grants transformApproval to Bob (automation bot)
+      2. Bob calls vault.transform(42, leverageTransformer, leverageUpData) where:
+         - borrowAmount = 10000 USDC
+         - amountIn0 = 0, amountIn1 = 0 (no swaps)
+         - recipient = Bob's address
+      3. LeverageTransformer borrows 10000 USDC, adds 0 liquidity (amount0=0 if token!=token0/token1, or tries to add single-sided)
+      4. All borrowed USDC sent to Bob as leftover
+      5. If position had enough collateral, health check passes
+      6. Alice's position now has 10000 USDC extra debt, Bob has the USDC
+    status: needs_verification
+    solidity: |
+      function invariant_leverageUp_recipientMustBeOwner() public {
+        // After leverageUp via transform, verify recipient == loanOwner
+        // This would need tracking via ghost variables during transform calls
+        // Absence of this invariant is the root cause
+      }
+    poc_sketch: |
+      function test_transformApprovalExtraction() public {
+        // Setup: Alice deposits NFT as collateral, has excess collateral
+        // Alice grants transformApproval to Bob
+        vm.prank(alice);
+        vault.setTransformApproval(tokenId, bob, true);
+
+        // Bob calls transform with leverageUp, recipient = bob
+        LeverageTransformer.LeverageUpParams memory params = LeverageTransformer.LeverageUpParams({
+          tokenId: tokenId,
+          borrowAmount: 5000e6,
+          amountIn0: 0, amountOut0Min: 0, swapData0: "",
+          amountIn1: 0, amountOut1Min: 0, swapData1: "",
+          amountAddMin0: 0, amountAddMin1: 0,
+          recipient: bob,
+          deadline: block.timestamp
+        });
+
+        vm.prank(bob);
+        vault.transform(tokenId, address(leverageTransformer), abi.encodeCall(
+          LeverageTransformer.leverageUp, (params)
+        ));
+
+        // Bob now has 5000 USDC, Alice's position has 5000 USDC more debt
+        assertGt(IERC20(usdc).balanceOf(bob), 4900e6);
+      }
+    call_stack: |
+      Bob → vault.transform(42, LT, data) → LT.leverageUp()
+      → vault.borrow(42, 10000) [health skip in transform mode]
+      → no swaps, no liquidity added
+      → safeTransfer(token, Bob, 10000) [leftover = ALL borrowed]
+      → vault._requireLoanIsHealthy(42, debt) [passes if excess collateral]
+
+  - id: LT-DD-04
+    title: "leverageDown: fee-on-transfer tokens cause amount tracking mismatch — repay underflow or stuck funds"
+    tier: 2
+    type: accounting
+    confidence: 63
+    description: |
+      The contract uses SafeERC20 for transfers but tracks amounts via variables, not balances.
+      In leverageDown, collect() returns (amount0, amount1) which the NPM reports. Then swaps
+      use balance-before/after (_routerSwap). Then repay uses the tracked `amount` variable.
+
+      If token0 or token1 (or the debt token) is a fee-on-transfer token:
+      - collect() reports X tokens collected, but only X*(1-fee) arrive at LeverageTransformer
+      - _routerSwap would see the actual balance (X*(1-fee)) and operate correctly internally
+      - But amount0 is still set to X (the collect return value)
+      - When swapping token0 to debt token: amountIn0 could exceed actual balance → swap fails
+      - If debt token has fee: repay sends `amount` but vault receives less → partial repay
+
+      The Vault itself may or may not support fee-on-transfer tokens. If it does, this is a real
+      accounting bug in LeverageTransformer. If not, it's a non-issue.
+
+      Checking Vault: _pullAssetFromSender does safeTransferFrom for the exact `assets` amount.
+      If the token has transfer fee, the vault receives less than `assets`. This would break the
+      vault's own accounting. So the vault likely does NOT support fee-on-transfer tokens.
+
+      However, token0/token1 in the Uni V3 position COULD be fee-on-transfer tokens even if the
+      debt token (vault.asset()) is not. The mismatch between collect() return values and actual
+      balances would cause _routerSwap to attempt using more tokens than available.
+
+      Verdict: Medium IF the protocol supports fee-on-transfer collateral tokens, Low/QA otherwise.
+      Most lending protocols exclude these tokens, but it's not enforced in code — only by admin
+      setting collateralFactor > 0 for specific tokens.
+    affected_line: "LeverageTransformer.sol:156-177"
+    attack_scenario: |
+      1. Position has token0 = FEE_TOKEN (2% transfer fee), token1 = WETH
+      2. User calls leverageDown, collect returns (1000 FEE, 500 WETH)
+      3. Actual balance: 980 FEE (after 2% fee on collect transfer)
+      4. Swap: amountIn0 = 1000 (user's params), but only 980 available
+      5. _routerSwap transfers 1000 → only 980 arrives at router → swap gets less output
+      6. Or: _routerSwap tries to transfer 1000, but balance is 980 → revert (DoS)
+    status: needs_verification
+    solidity: |
+      function invariant_leverageDown_balanceMatchesTracking() public {
+        // After collect, actual balance of token0/token1 should match amount0/amount1
+        uint256 actualBalance0 = IERC20(token0).balanceOf(address(leverageTransformer));
+        uint256 actualBalance1 = IERC20(token1).balanceOf(address(leverageTransformer));
+        // If fee-on-transfer: actualBalance < tracked amount
+        eq(actualBalance0, amount0, "LT-DD-04: token0 balance mismatch");
+        eq(actualBalance1, amount1, "LT-DD-04: token1 balance mismatch");
+      }
+    poc_sketch: |
+      function test_feeOnTransferCollateral() public {
+        // 1. Create Uni V3 position with fee-on-transfer token0
+        // 2. Deposit into vault as collateral, borrow
+        // 3. Call leverageDown
+        // 4. Show that collect return value != actual balance
+        // 5. Show swap reverts or under-delivers
+        // Requires: fee-on-transfer token with collateralFactor > 0
+      }
+    call_stack: |
+      leverageDown() → npm.collect() [returns X] → actual balance = X*(1-fee)
+      → _routerSwap(amountIn=X) → safeTransfer(X) → REVERT (insufficient balance)
+
+  - id: LT-DD-05
+    title: "leverageUp: when token != token0 && token != token1, borrow proceeds bypass liquidity addition entirely"
+    tier: 2
+    type: flow
+    confidence: 70
+    description: |
+      Design assumption: the developer assumes the vault's asset is always one of token0 or token1
+      in the Uni V3 position. But the code explicitly handles the case where it's neither (line 103).
+
+      When token (vault asset) is neither token0 nor token1:
+      - amount0 = 0, amount1 = 0 (lines 56-57)
+      - If no swaps configured: amount0=0, amount1=0, amount=borrowAmount
+      - increaseLiquidity called with (0, 0) → adds nothing, returns (0, 0, 0)
+      - Leftover check: amount0(0) > added0(0) = false, amount1(0) > added1(0) = false
+      - Line 103: token != token0 && token != token1 && amount != 0 → TRUE
+      - ALL borrowed tokens sent to params.recipient
+
+      With swaps configured: some borrowed tokens get swapped to token0/token1 and added as
+      liquidity. The rest goes to recipient.
+
+      The interesting case: an attacker-approved operator borrows max, configures zero swaps,
+      and all funds go to recipient. The health check after must catch this.
+
+      But consider: the vault might have a position where the asset IS neither token. Example:
+      Vault asset = USDC. Position = WETH/WBTC pool. User borrows USDC, none of it can be
+      directly added as liquidity without swaps. If amountIn0=0 and amountIn1=0, ALL USDC
+      goes to recipient.
+
+      Combined with LT-DD-03 (transform approval extraction): a malicious operator with
+      transform approval can borrow the vault asset and redirect it entirely when the vault
+      asset doesn't match either position token. No swap needed, no slippage needed.
+
+      This amplifies LT-DD-03 because it requires zero swap configuration — the extraction
+      is trivially parameterized.
+    affected_line: "LeverageTransformer.sol:56-57,103-105"
+    attack_scenario: |
+      1. Alice has WETH/WBTC position in USDC-denominated vault
+      2. Alice grants transformApproval to automation bot (Bob)
+      3. Bob calls leverageUp with borrowAmount=MAX, no swaps, recipient=Bob
+      4. vault.borrow() sends USDC to LeverageTransformer
+      5. amount0=0, amount1=0 → no liquidity added
+      6. Line 103-104: all USDC sent to Bob
+      7. Health check: position lost no liquidity but gained debt
+      8. If position had excess collateral → health check passes → Bob extracts USDC
+    status: needs_verification
+    solidity: |
+      function invariant_leverageUp_mustAddLiquidity() public {
+        // After leverageUp, the added liquidity value should be >= some % of borrowed amount
+        // Absence of this check means borrowed funds can bypass the position entirely
+      }
+    poc_sketch: |
+      function test_borrowBypassViaThirdToken() public {
+        // Setup: WETH/WBTC position in USDC vault with excess collateral
+        // Bob has transform approval
+        LeverageTransformer.LeverageUpParams memory params = LeverageTransformer.LeverageUpParams({
+          tokenId: tokenId,
+          borrowAmount: 10000e6, // 10K USDC
+          amountIn0: 0, amountOut0Min: 0, swapData0: "",  // no swap to WETH
+          amountIn1: 0, amountOut1Min: 0, swapData1: "",  // no swap to WBTC
+          amountAddMin0: 0, amountAddMin1: 0,
+          recipient: bob,
+          deadline: block.timestamp
+        });
+        vm.prank(bob);
+        vault.transform(tokenId, address(lt), abi.encodeCall(LeverageTransformer.leverageUp, (params)));
+        // All 10K USDC goes to Bob, Alice's position gets the debt
+        assertEq(IERC20(usdc).balanceOf(bob), 10000e6);
+      }
+    call_stack: |
+      Bob → vault.transform() → LT.leverageUp()
+      → vault.borrow(tokenId, 10000e6) → USDC to LT
+      → amount0=0, amount1=0 (USDC != WETH, USDC != WBTC)
+      → increaseLiquidity(0, 0) → noop
+      → safeTransfer(USDC, Bob, 10000e6)
+      → vault._requireLoanIsHealthy() → passes if excess collateral
+
+  - id: LT-DD-06
+    title: "Swapper._routerSwap 0x path: raw call with user-controlled data to immutable address — no return data validation"
+    tier: 2
+    type: trust_boundary
+    confidence: 60
+    description: |
+      Section 4 deep-dive on the 0x raw call path (Swapper.sol:109):
+      `(bool success,) = zeroxAllowanceHolder.call(params.swapData);`
+
+      The call sends arbitrary calldata to zeroxAllowanceHolder. Only `success` is checked.
+      Return data is discarded. The actual amounts are measured via balance-before/after.
+
+      The balance measurement is robust against most attacks. However:
+
+      1. If zeroxAllowanceHolder has a fallback that succeeds without doing a swap, the call
+         returns success=true, but no tokens are swapped. amountInDelta=0, amountOutDelta=0.
+         The amountOutMin check catches this (line 119) IF amountOutMin > 0.
+
+      2. If the user sets amountOutMin=0 (zero slippage), the "swap" succeeds with no output.
+         In leverageUp: amount0/amount1 don't increase, less liquidity is added, more goes to
+         recipient. Combined with LT-DD-03/DD-05, this enables extraction.
+
+      3. The swapData could encode a call to a 0x function that has side effects beyond swapping.
+         For example, if 0x AllowanceHolder has admin functions callable via fallback. This is
+         speculative and depends on the 0x contract implementation.
+
+      The core issue: the combination of (a) arbitrary calldata, (b) zero slippage allowed,
+      and (c) leftover-to-recipient creates an extraction path. But the extraction requires
+      transform approval, making it a trust model issue (same as LT-DD-03).
+
+      Counter: The balance-based measurement means even if the 0x call does something weird,
+      the accounting reflects reality. The extraction only works if the caller intentionally
+      misconfigures parameters — which they can do even without the 0x path.
+    affected_line: "Swapper.sol:107-113"
+    attack_scenario: |
+      1. Attacker with transform approval calls leverageUp
+      2. swapData0 encodes a no-op call that succeeds on zeroxAllowanceHolder
+      3. amountOutMin0 = 0, so slippage check passes
+      4. No actual swap occurs, borrowed tokens remain unswapped
+      5. Leftover tokens sent to attacker's recipient address
+    status: confirmed_low
+    solidity: |
+      function invariant_routerSwap_nonzeroOutput() public {
+        // After _routerSwap with amountIn > 0, amountOut should be > 0
+        // Zero output with nonzero input indicates failed/no-op swap
+        // Enforced by amountOutMin — but only if caller sets it > 0
+      }
+    poc_sketch: |
+      // This is a parameterization issue, not a code bug
+      // The caller controls amountOutMin and swapData
+      // Setting amountOutMin=0 with no-op swapData = intentional misconfiguration
+      // Only exploitable by transform-approved operators (trust model)
+    call_stack: |
+      leverageUp() → _routerSwap(amountIn=X, amountOutMin=0, swapData=noop)
+      → zeroxAllowanceHolder.call(noop) → success=true
+      → amountInDelta=0, amountOutDelta=0 → passes amountOutMin=0 check
+      → borrowed tokens remain as leftover → sent to recipient
+
+summary: |
+  After thorough analysis of LeverageTransformer against the convergence map and debunked list:
+
+  **What the 6 hunters MISSED:**
+  - LT-DD-03/DD-05: The combination of transform approval + arbitrary recipient + no-swap
+    configuration creates a clean extraction path. Each individual issue was flagged in isolation
+    (arbitrary recipient by 2 hunters, leftover extraction by 2 hunters), but none connected it
+    to the transform approval trust model as a concrete attack. The "third token" case (DD-05)
+    makes this trivially exploitable without any swap configuration.
+
+  **What the hunters got RIGHT:**
+  - SafeCast overflow (convergence #1): Confirmed LOW/QA. Real tokens don't hit uint128 max.
+  - Dual-swap underflow (convergence #2): Confirmed DoS only, Solidity 0.8 catches it.
+  - Zero slippage (convergence #5): Confirmed as parameterization issue, not code bug.
+
+  **Key finding:** LT-DD-03 (transform approval extraction via recipient) is the most promising
+  at Tier 1. It depends on whether transform approvals are meant for fully-trusted vs semi-trusted
+  parties. If the protocol expects users to grant transform approval to automation bots or
+  third-party contracts, this is a MEDIUM. If only fully-trusted entities, it's by design.
+
+  The LeverageTransformer code itself is relatively clean — the real risk surface is in the
+  trust boundary between transform approvals and the power those approvals grant (borrow +
+  redirect to arbitrary recipient).

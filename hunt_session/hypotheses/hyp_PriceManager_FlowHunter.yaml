@@ -1,0 +1,489 @@
+protocol: chainlink-pa-v2
+component: PriceManager
+file: src/PriceManager.sol
+domain: oracle
+hunter: FlowHunter
+generated_at: '2026-03-22T00:00:00Z'
+
+# ══════════════════════════════════════════════════════════════════
+#  ANÁLISIS DE FLUJO — FlowHunter
+#  Foco: state consistency, incomplete cleanup, state desync between
+#        s_feedInfo / s_dataStreamsFeedIdToAsset / s_dataStreamsPrice / s_allowlistedAssets
+#
+#  STATE MAPS (4 structures that MUST stay in sync):
+#    s_allowlistedAssets    — EnumerableSet of active asset addresses
+#    s_feedInfo[asset]      — FeedInfo struct (feedId, dataFeed, staleness, decimals)
+#    s_dataStreamsFeedIdToAsset[feedId] — reverse mapping feedId→asset
+#    s_dataStreamsPrice[asset] — cached DataStreams price+timestamp
+#
+#  CRITICAL FLOWS ANALYZED:
+#    1. _applyFeedInfoUpdates (adds + removes) — L209-303
+#    2. transmit() — L133-183 (pre-check → verifyBulk → store)
+#    3. _getAssetPrice() — L372-418 (DataStreams → fallback DataFeed)
+#    4. Feed rotation cleanup — L263-278
+#
+#  KEY FINDING: The pre-check in transmit() (L140-150) extracts the feedId
+#  from the RAW unverified report bytes, while the post-verify loop (L155-182)
+#  decodes feedId from the VERIFIED report struct. These SHOULD match because
+#  the verifier preserves the feedId, but the extraction methods differ:
+#    - Pre-check:  bytes32(reportData) where reportData is the 2nd decoded element
+#    - Post-check: report.dataStreamsFeedId from abi.decode as ReportV3
+#  If verifierProxy returns a different feedId (malicious or upgraded proxy),
+#  the pre-check passes for allowlisted feed but price is stored for a
+#  different (possibly non-allowlisted) asset.
+# ══════════════════════════════════════════════════════════════════
+
+invariants:
+
+- id: PM-F01
+  tier: 1
+  type: property
+  description: >
+    State consistency: every asset in s_allowlistedAssets MUST have a non-zero
+    entry in s_feedInfo (at minimum one of dataStreamsFeedId or usdDataFeed must
+    be non-zero). After any add/remove/update operation, an allowlisted asset
+    with no price source is a critical state desync.
+  attack_scenario: >
+    Feed rotation (L263-278) zeroes the previous asset's dataStreamsFeedId and
+    dataStreamsFeedDecimals. If the previous asset had no usdDataFeed (checked
+    at L271 — this case reverts), it's protected. BUT: if the rotation is done
+    via adds[] and the previous asset is also in the adds[] list with a new
+    feedId, the order of processing matters. The rotation cleanup at L265-278
+    runs BEFORE the previous asset's own add entry at a later index. The
+    previous asset briefly has feedId=0, then gets re-added with new feedId.
+    This is safe only if the array order is correct. If the previous asset
+    appears BEFORE the rotating asset in adds[], its feedInfo gets overwritten
+    first, then the rotation at L283 zeroes the OLD feedId from the overwritten
+    entry — but existingFeedInfo was already replaced. The delete at L290 would
+    delete the wrong (new) feedId mapping. This is a state desync.
+  impact: >
+    s_dataStreamsFeedIdToAsset mapping becomes inconsistent — the new feedId
+    for the previous asset gets deleted. Subsequent transmit() calls for that
+    feedId revert with FeedNotAllowlisted. Asset becomes unpriced, potentially
+    blocking auctions that depend on it.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any _applyFeedInfoUpdates call, for every allowlisted asset:
+    address[] memory assets = priceManager.getAllowlistedAssets();
+    for (uint256 i = 0; i < assets.length; i++) {
+        PriceManager.FeedInfo memory fi = priceManager.getFeedInfo(assets[i]);
+        // At least one price source must exist
+        bool hasStreams = fi.dataStreamsFeedId != bytes32(0);
+        bool hasFeed = address(fi.usdDataFeed) != address(0);
+        t(hasStreams || hasFeed, "PM-F01: allowlisted asset has no price source");
+        // If streams configured, reverse mapping must point back
+        if (hasStreams) {
+            address mapped = priceManager.getAssetFromDataStreamsFeedId(fi.dataStreamsFeedId);
+            eq(mapped, assets[i], "PM-F01: feedId reverse mapping inconsistent");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    The specific ordering attack requires two entries in adds[] with related
+    feedIds. Requires ASSET_ADMIN_ROLE which is trusted, but misconfiguration
+    by admin leads to permanent state corruption with no self-healing path.
+
+- id: PM-F02
+  tier: 1
+  type: property
+  description: >
+    Reverse mapping consistency: for every non-zero feedId in any s_feedInfo[asset],
+    s_dataStreamsFeedIdToAsset[feedId] MUST equal that asset. And conversely, every
+    feedId→asset mapping must have s_feedInfo[asset].dataStreamsFeedId == feedId.
+  attack_scenario: >
+    During _applyFeedInfoUpdates, when an already-allowlisted asset changes its
+    feedId (L287-292), the old feedId→asset mapping is deleted and old price is
+    deleted. Then s_feedInfo[asset] is overwritten at L294-299. But the NEW
+    feedId→asset mapping is only set at L280 inside the dataStreamsFeedId!=0
+    block. If the new feedInfo has dataStreamsFeedId=bytes32(0) (switching from
+    streams to data-feed-only), the old feedId→asset mapping IS deleted (L290),
+    but the condition at L287 checks existingFeedInfo.dataStreamsFeedId !=
+    feedInfo.dataStreamsFeedId. Since feedInfo.dataStreamsFeedId is 0 and
+    existing is non-zero, it enters the cleanup branch and deletes correctly.
+    This path is actually correct. The real risk is the INVERSE: updating from
+    feedId=0 to a new feedId when another asset already owns that feedId but
+    was removed in the same call's removes[] phase. The removes[] deletes the
+    feedId→asset mapping (L226), then adds[] tries to set it (L280) — but
+    L265 checks previousAssetForFeedId which is now address(0) because removes
+    already cleaned it. So L280 sets the mapping. This is actually fine.
+    HOWEVER: if the removed asset is NOT in removes[] but was de-allowlisted
+    by a previous add entry's rotation (L275-277), then it stays in
+    s_allowlistedAssets with feedId=0 and no streams — a ghost entry.
+  impact: >
+    Orphaned entries in s_allowlistedAssets with no streams feed, relying solely
+    on data feed fallback. Not directly exploitable but creates confusion and
+    potentially blocks future feed assignments.
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Bidirectional consistency check
+    address[] memory assets = priceManager.getAllowlistedAssets();
+    for (uint256 i = 0; i < assets.length; i++) {
+        PriceManager.FeedInfo memory fi = priceManager.getFeedInfo(assets[i]);
+        if (fi.dataStreamsFeedId != bytes32(0)) {
+            address mapped = priceManager.getAssetFromDataStreamsFeedId(fi.dataStreamsFeedId);
+            eq(mapped, assets[i], "PM-F02: forward->reverse mapping broken");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: >
+    Investigated thoroughly. The cleanup logic at L263-296 is careful but
+    complex. The bidirectional invariant is the strongest way to catch any
+    edge case the manual analysis missed.
+
+- id: PM-F03
+  tier: 1
+  type: property
+  description: >
+    Transmit pre-check / post-verify feedId consistency: the feedId extracted
+    from the raw unverified report in the pre-check loop (L140-150) must match
+    the feedId in the verified report used for price storage (L155-182).
+    A mismatch means the allowlist check passed for feed A but price is stored
+    for feed B.
+  attack_scenario: >
+    The pre-check at L141-146 decodes the unverified report as
+    (bytes32[3], bytes, bytes32[], bytes32[], bytes32) and extracts
+    bytes32(reportData) as the feedId. The post-verify loop at L156 does
+    abi.decode(verifiedReports[i], (ReportV3)) and uses report.dataStreamsFeedId.
+    If the VerifierProxy's verifyBulk returns reports in a different order than
+    the input, or if the verified report's feedId differs from the unverified
+    one (e.g., a proxy upgrade or misconfiguration), the pre-check validates
+    feedId X as allowlisted but the price gets written for feedId Y's asset.
+    If feedId Y maps to a different asset (or address(0)), the price is stored
+    for the wrong asset or the tx silently stores price for a removed/non-
+    allowlisted asset via s_dataStreamsFeedIdToAsset[Y] which might be stale.
+  impact: >
+    Price stored for wrong asset. If the wrong asset is used in an auction
+    (BaseAuction._getAssetPrice), the auction settles at an incorrect price.
+    Direct fund loss for auction bidders or the protocol.
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // This is a logical invariant — in the post-verify loop, the asset
+    // resolved from the verified feedId must be non-zero (allowlisted).
+    // If it's zero, we stored price for a ghost asset.
+    // Can be checked by: after transmit(), every asset that got a
+    // PriceTransmitted event must be in s_allowlistedAssets.
+    // Fuzzing approach: mock verifierProxy to return shuffled reports.
+    // Property: for all feedIds in verified reports,
+    // s_dataStreamsFeedIdToAsset[feedId] != address(0)
+    // AND s_allowlistedAssets.contains(s_dataStreamsFeedIdToAsset[feedId])
+    //
+    // Note: This requires a mock verifierProxy for testing.
+    // The real invariant is:
+    // verifiedReport[i].dataStreamsFeedId == unverifiedReport[i].extractedFeedId
+    // which we cannot check on-chain post-hoc.
+    t(true, "PM-F03: placeholder — requires mock verifier for stateful test");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 40
+  notes: >
+    Low confidence because the VerifierProxy is a trusted Chainlink contract
+    that should preserve feedId ordering and content. However, the pre-check
+    is effectively redundant security that could be bypassed by a misbehaving
+    proxy. The REAL risk is a proxy upgrade or misconfiguration. Worth flagging
+    but unlikely to be accepted as a bounty finding since VerifierProxy is
+    out of scope (trusted Chainlink infra).
+
+- id: PM-F04
+  tier: 2
+  type: property
+  description: >
+    After removing an asset via _applyFeedInfoUpdates(removes), ALL 4 state
+    structures must be fully cleaned: s_allowlistedAssets must not contain
+    the asset, s_feedInfo[asset] must be zeroed, s_dataStreamsFeedIdToAsset
+    for the old feedId must be zeroed, and s_dataStreamsPrice[asset] must be
+    zeroed.
+  attack_scenario: >
+    If any state is not cleaned on removal, a subsequent transmit() could
+    still write prices for the removed asset (via stale s_dataStreamsFeedIdToAsset),
+    or _getAssetPrice could return stale data for a removed asset. In
+    BaseAuction, if an asset is removed from PriceManager but the auction
+    still references it, the stale price could be used.
+  impact: >
+    Stale price data used for auction pricing after asset removal. Could allow
+    bidding at outdated prices.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After calling applyFeedInfoUpdates with removes=[assetX]:
+    // ghost_removedAssets tracks assets passed to removes[]
+    for (uint256 i = 0; i < ghost_removedAssets.length; i++) {
+        address removed = ghost_removedAssets[i];
+        PriceManager.FeedInfo memory fi = priceManager.getFeedInfo(removed);
+        eq(fi.dataStreamsFeedId, bytes32(0), "PM-F04: feedInfo not cleaned on remove");
+        eq(address(fi.usdDataFeed), address(0), "PM-F04: usdDataFeed not cleaned on remove");
+        eq(fi.stalenessThreshold, 0, "PM-F04: staleness not cleaned on remove");
+        eq(fi.dataStreamsFeedDecimals, 0, "PM-F04: decimals not cleaned on remove");
+    }
+  ghost_vars:
+    - "address[] internal ghost_removedAssets;"
+  validated: false
+  priority: medium
+  confidence: 55
+  notes: >
+    The remove logic at L217-231 looks correct — it deletes all 3 mappings
+    and removes from EnumerableSet. But the invariant is still valuable as a
+    regression test. The `delete s_feedInfo[asset]` at L227 should zero all
+    struct fields. Verified: Solidity delete on a mapping struct zeroes all
+    fields. This invariant should PASS — useful as a safety net.
+
+- id: PM-F05
+  tier: 1
+  type: property
+  description: >
+    Feed rotation in adds[] must not leave the previous asset with zero price
+    sources. When feedId is rotated from assetA to assetB (L263-278), assetA's
+    dataStreamsFeedId is zeroed. The check at L271 ensures assetA has a
+    usdDataFeed fallback. But if assetA is ALSO being updated in the SAME
+    adds[] array (at a later index) to remove its usdDataFeed, assetA ends
+    up with no price source.
+  attack_scenario: >
+    ASSET_ADMIN calls applyFeedInfoUpdates with adds=[
+      {asset: assetB, feedInfo: {feedId: FEED_X, usdDataFeed: addr, ...}},
+      {asset: assetA, feedInfo: {feedId: 0, usdDataFeed: address(0), ...}}
+    ]
+    Step 1: assetB's add processes. FEED_X was previously owned by assetA.
+    Rotation cleanup at L266-278: assetA still has usdDataFeed (check passes
+    at L271). assetA's feedId zeroed, price deleted.
+    Step 2: assetA's add processes. feedInfo has feedId=0 and usdDataFeed=0.
+    This SHOULD revert at L244-248 because both are zero. The check is:
+    feedInfo.dataStreamsFeedId == bytes32(0) && feedInfo.usdDataFeed == address(0)
+    → revert InvalidZeroValue. So this specific scenario is BLOCKED.
+    BUT: if assetA's new feedInfo has usdDataFeed=address(0) but feedId=NEW_FEED,
+    then the check passes. assetA gets a new streams feed. If NEW_FEED is
+    invalid or points to a decommissioned stream, assetA has a feed that will
+    never get transmitted, and no data feed fallback — effectively no price.
+  impact: >
+    Asset becomes unpriced if new streams feed never receives transmissions
+    and no data feed fallback exists. Auctions for this asset would revert
+    on _getAssetPrice with withValidation=true (StaleFeedData), blocking
+    legitimate auction operations.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any update, every allowlisted asset should have at least one
+    // FUNCTIONAL price source (streams with recent transmit OR data feed)
+    address[] memory assets = priceManager.getAllowlistedAssets();
+    for (uint256 i = 0; i < assets.length; i++) {
+        (uint256 price, uint256 updatedAt, bool isValid) = priceManager.getAssetPrice(assets[i]);
+        // At minimum, the price query should not revert (DoS check)
+        // isValid may be false for stale data, but price+updatedAt should be
+        // retrievable without revert
+        t(true, "PM-F05: getAssetPrice did not revert for allowlisted asset");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: >
+    Partially mitigated by the zero-check at L244-248. The residual risk is
+    a valid but non-functional streams feed (never transmitted). This is an
+    admin misconfiguration scenario rather than a code bug, reducing
+    severity. Still worth testing as a state consistency invariant.
+
+- id: PM-F06
+  tier: 2
+  type: property
+  description: >
+    _getAssetPrice underflow DoS: if stalenessThreshold is very large (close
+    to or exceeding block.timestamp), the subtraction at L378
+    (block.timestamp - feedInfo.stalenessThreshold) underflows and reverts
+    due to Solidity 0.8 checked math. This blocks ALL price reads for the
+    affected asset.
+  attack_scenario: >
+    ASSET_ADMIN sets stalenessThreshold to a value >= block.timestamp (e.g.,
+    type(uint32).max = 4294967295, which is ~136 years from epoch). At
+    current timestamps (~1.7B), this doesn't underflow. But on a chain with
+    block.timestamp near 0 (test environments, or if block.timestamp is
+    manipulated), or if stalenessThreshold is set to a value > current
+    timestamp, the subtraction underflows.
+    In practice: block.timestamp is ~1.7B (2024), uint32 max is ~4.3B.
+    So stalenessThreshold > 1.7B would cause underflow. The field is uint32,
+    max ~4.3B, so values between 1.7B and 4.3B would cause underflow.
+    An ASSET_ADMIN setting stalenessThreshold > block.timestamp causes
+    permanent DoS on _getAssetPrice for that asset until block.timestamp
+    catches up.
+  impact: >
+    DoS on price reads for the affected asset. All auctions involving this
+    asset would be blocked. No direct fund loss but operational disruption.
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: block.timestamp >= feedInfo.stalenessThreshold for all assets
+    address[] memory assets = priceManager.getAllowlistedAssets();
+    for (uint256 i = 0; i < assets.length; i++) {
+        PriceManager.FeedInfo memory fi = priceManager.getFeedInfo(assets[i]);
+        if (fi.stalenessThreshold > 0) {
+            gte(block.timestamp, fi.stalenessThreshold,
+                "PM-F06: stalenessThreshold > block.timestamp causes underflow DoS");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: >
+    This is a real underflow with real DoS impact, but requires admin
+    misconfiguration (setting threshold > ~54 years). Realistic threshold
+    values are minutes to hours, not decades. Still worth flagging as a
+    defensive check — the contract should use a safe subtraction or cap
+    the result at 0.
+
+- id: PM-F07
+  tier: 2
+  type: property
+  description: >
+    Transmit does NOT check whenNotPaused. The contract inherits
+    PausableWithAccessControl but transmit() only has onlyRole(PRICE_ADMIN_ROLE).
+    If the contract is paused, price transmissions still go through, updating
+    s_dataStreamsPrice. This may be intentional (keep prices fresh even when
+    paused) or a missing guard.
+  attack_scenario: >
+    Contract is paused due to emergency (e.g., price manipulation detected).
+    Admin pauses to prevent auctions. But PRICE_ADMIN can still call transmit()
+    and update prices. If the pause was due to suspicious price data, the
+    attacker (if they have PRICE_ADMIN_ROLE or can influence the verifierProxy)
+    can still inject manipulated prices during pause. When unpause occurs,
+    the manipulated prices are immediately used for auction pricing.
+  impact: >
+    Manipulated prices accepted during pause, used immediately on unpause
+    for auction settlement. Potential loss of funds if auctions settle at
+    manipulated prices.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check: if contract is paused, transmit should not update prices
+    // This is a design question — document whether intentional
+    // If paused && s_dataStreamsPrice[asset].timestamp changed → flag
+    // Note: requires ghost tracking of pause state and pre/post timestamps
+    if (ghost_isPaused) {
+        for (uint256 i = 0; i < ghost_trackedAssets.length; i++) {
+            (,uint256 ts,) = priceManager.getAssetPrice(ghost_trackedAssets[i]);
+            eq(ts, ghost_prePauseTimestamp[ghost_trackedAssets[i]],
+               "PM-F07: price updated while contract paused");
+        }
+    }
+  ghost_vars:
+    - "bool internal ghost_isPaused;"
+    - "address[] internal ghost_trackedAssets;"
+    - "mapping(address => uint256) internal ghost_prePauseTimestamp;"
+  validated: false
+  priority: medium
+  confidence: 45
+  notes: >
+    Likely intentional design — keeping prices fresh during pause is
+    reasonable so that on unpause, prices are not immediately stale.
+    But worth confirming with the team. If pause is meant to freeze ALL
+    state mutations, this is a bug.
+
+- id: PM-F08
+  tier: 1
+  type: property
+  description: >
+    _getAssetPrice fallback does NOT validate Chainlink data feed answer for
+    negative values or answeredInRound < roundId. The SafeCast toUint256()
+    on a negative int256 will revert, causing DoS on the fallback path.
+    This means if the Chainlink feed returns a negative price (circuit breaker
+    scenario), the fallback path reverts instead of gracefully returning
+    isValid=false.
+  attack_scenario: >
+    DataStreams price goes stale (no transmit for stalenessThreshold seconds).
+    Fallback activates and calls usdDataFeed.latestRoundData(). If the
+    Chainlink aggregator returns a negative answer (e.g., during extreme
+    market conditions or feed malfunction), the toUint256() cast at L392
+    reverts. This means _getAssetPrice reverts entirely — even with
+    withValidation=false. The caller (e.g., BaseAuction.bid) cannot get
+    ANY price for this asset, causing complete DoS on all auction operations
+    involving this asset.
+    The DataStreams path (transmit) is protected because report.price is
+    int192 cast via toUint256() which also reverts on negative — but that's
+    in a write path where the PRICE_ADMIN controls input. The fallback read
+    path is passive and should degrade gracefully.
+  impact: >
+    Complete DoS on _getAssetPrice for the affected asset when both DataStreams
+    is stale AND Chainlink feed returns negative. All auctions blocked.
+    No direct fund loss but severe operational impact.
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Property: _getAssetPrice(asset, false) should NEVER revert for an
+    // allowlisted asset — it should return (0, 0, false) in worst case.
+    // Test with mock data feed returning negative answer.
+    // In fuzzing: call getAssetPrice for all allowlisted assets and verify
+    // no revert when withValidation=false.
+    address[] memory assets = priceManager.getAllowlistedAssets();
+    for (uint256 i = 0; i < assets.length; i++) {
+        // This should not revert
+        try priceManager.getAssetPrice(assets[i]) returns (uint256, uint256, bool) {
+            t(true, "PM-F08: getAssetPrice succeeded");
+        } catch {
+            t(false, "PM-F08: getAssetPrice reverted for allowlisted asset — DoS");
+        }
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: >
+    Real issue: SafeCast.toUint256() on negative int256 reverts. Chainlink
+    feeds CAN return negative prices in extreme scenarios (e.g., negative
+    oil prices in 2020). The contract should handle this gracefully in the
+    read path. This is a well-known oracle pattern — checking answer > 0
+    before casting. Likely reportable as Medium.
+
+false_positives:
+- hunter: FlowHunter
+  id: PM-FP-01
+  reason: >
+    Investigated reentrancy via verifierProxy.verifyBulk() callback in
+    transmit(). The verifyBulk call at L153 is an external call to
+    i_streamsVerifierProxy which is an immutable trusted Chainlink contract.
+    Even if it called back into transmit(), the onlyRole check + no state
+    read between pre-check and verifyBulk that could be manipulated makes
+    this unexploitable. The pre-check at L140-150 is read-only and the
+    post-verify loop writes fresh state. No CEI violation because effects
+    (price storage) happen AFTER the interaction (verifyBulk).
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: PM-FP-02
+  reason: >
+    Investigated whether remove+add of same asset in one call could cause
+    issues. The remove phase (L217-231) clears all state, then the add phase
+    (L233-302) rebuilds it. The only "lost" data is s_dataStreamsPrice which
+    is deleted on remove and not restored on add. This is by design — the
+    add creates a fresh feed config and the next transmit() will populate
+    the price. No vulnerability here.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null
+
+- hunter: FlowHunter
+  id: PM-FP-03
+  reason: >
+    Investigated _getAssetPrice reading s_feedInfo for non-allowlisted asset.
+    If called with an asset not in s_allowlistedAssets, s_feedInfo[asset] is
+    all zeros, s_dataStreamsPrice[asset] is all zeros. minTimestamp =
+    block.timestamp - 0 = block.timestamp. updatedAt = 0 < block.timestamp,
+    so stale. usdDataFeed = address(0), so no fallback. Returns (0, 0, false)
+    with withValidation=false, or reverts with withValidation=true. This is
+    correct behavior — no vulnerability.
+  investigated_at: '2026-03-22T00:00:00Z'
+  pending_briefing_update: null

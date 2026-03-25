@@ -1,0 +1,281 @@
+protocol: hyperlane
+component: Mailbox
+file: /home/kali/Documents/Web3/hyperlane-monorepo/solidity/contracts/Mailbox.sol
+domain: access
+hunter: FlowHunter
+generated_at: '2026-03-24T19:00:00Z'
+
+state_machine:
+  states: [UNINITIALIZED, IDLE, DISPATCHING, PROCESSING, DELIVERED]
+  transitions:
+    - from: UNINITIALIZED, to: IDLE, via: "initialize()", guard: "initializer modifier"
+    - from: IDLE, to: DISPATCHING, via: "dispatch()", guard: "none -- permissionless"
+    - from: DISPATCHING, to: IDLE, via: "dispatch() returns", guard: "hooks complete"
+    - from: IDLE, to: PROCESSING, via: "process()", guard: "!delivered(id) && version && destination"
+    - from: PROCESSING, to: DELIVERED, via: "process() completes", guard: "ism.verify && handle succeeds"
+    - from: DELIVERED, to: DELIVERED, via: "process() reverts on replay", guard: "delivered(id) == true"
+  anomalies:
+    - type: cei_violation, state: PROCESSING, description: "deliveries[_id] is written BEFORE ism.verify() and recipient.handle() -- if ism.verify reverts, the delivery record persists as dirty state? No -- revert rollbacks storage. But if ism.verify() has a side effect that reads delivered() during the call, it sees true before verification."
+    - type: reentrancy_window, state: DISPATCHING, description: "nonce and latestDispatchedId updated BEFORE external calls to requiredHook.postDispatch and hook.postDispatch -- reentrancy into dispatch() would use incremented nonce (safe for uniqueness but latestDispatchedId would be overwritten)"
+    - type: illegal_transition, from: PROCESSING, to: PROCESSING, via: "recipient.handle() calls process() reentrantly for a different message -- no reentrancy guard"
+
+invariants:
+- id: M-F-01
+  tier: 1
+  type: property
+  description: "Nonce must be strictly monotonically increasing -- each dispatch increments by exactly 1"
+  attack_scenario: "If nonce skips or repeats, message IDs could collide or be predicted incorrectly, breaking deduplication on destination chains. A reentrant call to dispatch() from a hook could cause nonce to increment multiple times in a single user tx, which is fine for uniqueness but breaks sequential expectations."
+  impact: "Message ID collision could allow replay attacks on destination or skip messages"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint32 currentNonce = originMailbox.nonce();
+    gte(uint256(currentNonce), uint256(ghost_lastNonce), "M-F-01: nonce decreased");
+    if (ghost_lastNonce > 0) {
+      lte(uint256(currentNonce), uint256(ghost_lastNonce) + ghost_callRemoteCount + 10, "M-F-01: nonce jumped unexpectedly");
+    }
+    ghost_lastNonce = currentNonce;
+  ghost_vars:
+  - uint32 internal ghost_lastNonce;
+  validated: false
+  priority: high
+  confidence: 75
+  notes: "dispatch() does nonce += 1 before external calls to hooks. Reentrancy from hook.postDispatch back into dispatch() would increment nonce again -- safe for uniqueness but latestDispatchedId would be overwritten to the reentrant message's ID."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-02
+  tier: 1
+  type: property
+  description: "A message marked as delivered (deliveries[id].blockNumber > 0) must never be processable again"
+  attack_scenario: "If delivered() returns true but process() does not revert, an attacker could replay a cross-chain message to double-execute recipient.handle(), draining funds from the recipient contract."
+  impact: "Double-spend on cross-chain transfers, duplicate governance executions"
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // After any process call, delivered must be true and re-processing must revert
+    // This is tested by tracking all processed IDs
+    if (ghost_lastProcessedId != bytes32(0)) {
+      t(destMailbox.delivered(ghost_lastProcessedId), "M-F-02: processed msg not marked delivered");
+    }
+  ghost_vars:
+  - bytes32 internal ghost_lastProcessedId;
+  validated: false
+  priority: high
+  confidence: 85
+  notes: "The check `require(delivered(_id) == false)` happens BEFORE the EFFECTS block that writes deliveries[_id]. This is correct CEI for the replay check. However, the EFFECTS happen BEFORE ism.verify() -- so if ism.verify() reverts, the entire tx reverts and storage is rolled back. The invariant holds because EVM reverts roll back all state."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-03
+  tier: 1
+  type: property
+  description: "process() writes delivery record BEFORE ism.verify() -- effects before interactions. If ism.verify() calls back into Mailbox, delivered() returns true for this message."
+  attack_scenario: "A malicious ISM could call process() reentrantly with a DIFFERENT message during verify(). Since there is no reentrancy guard, this second process() would succeed. The ISM for the second message could be the same malicious ISM, creating a chain of message injections without proper verification. The first message's ISM never actually returns true, but the delivery record already exists."
+  impact: "If ism.verify() reverts after a reentrant process() succeeds, the reentrant message IS delivered but the original message's delivery is rolled back. However the reentrant message used a potentially malicious ISM path."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Track that deliveries only increase, never decrease
+    // After process, the count of delivered messages should match ghost_handleCount
+    uint256 totalDelivered = 0;
+    for (uint256 i = 0; i < ghost_processedIds.length; i++) {
+      if (destMailbox.delivered(ghost_processedIds[i])) {
+        totalDelivered++;
+      }
+    }
+    eq(totalDelivered, ghost_handleCount, "M-F-03: delivered count != handle count");
+  ghost_vars:
+  - bytes32[] internal ghost_processedIds;
+  validated: false
+  priority: high
+  confidence: 60
+  notes: "The real question is: can ism.verify() reenter process() with a different message? Yes -- no reentrancy guard. But the second message also needs its ISM to verify. If both ISMs are controlled by attacker, this is a governance/configuration issue, not a Mailbox bug per se. The ISM is trusted for that recipient. HOWEVER: if the recipient specifies no ISM and falls back to defaultIsm, and defaultIsm is the malicious one (set by compromised owner), then all messages to all recipients can be force-delivered."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-04
+  tier: 1
+  type: property
+  description: "ETH value sent to dispatch() must be fully forwarded to hooks -- no ETH stuck in Mailbox"
+  attack_scenario: "If requiredHook.quoteDispatch returns a value and the arithmetic msg.value - requiredValue underflows or leaves dust, ETH could be permanently locked in the Mailbox contract. Since Mailbox has no sweep/withdraw function, any stuck ETH is lost forever."
+  impact: "Permanent loss of ETH stuck in Mailbox -- no recovery function exists"
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    uint256 mailboxBalance = address(originMailbox).balance;
+    lte(mailboxBalance, ghost_totalMsgValueSent, "M-F-04: Mailbox accumulated ETH beyond sent value");
+    // Ideally Mailbox should hold 0 ETH after each dispatch
+    // but hooks may forward back. Check it does not grow unboundedly.
+    lte(mailboxBalance, 1 ether, "M-F-04: Mailbox holding significant ETH");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 70
+  notes: "In dispatch(): requiredValue is clamped to msg.value if underpaying (L308-309). Then requiredHook gets requiredValue, hook gets msg.value - requiredValue. Total = msg.value. Arithmetic is safe. But if either hook reverts or does not accept the ETH, the entire dispatch reverts. If a hook accepts ETH but does not use it (no payable fallback forwards), the ETH sits in the hook, not Mailbox. The real risk is if a hook sends ETH back to Mailbox via a callback -- Mailbox has no receive/fallback so it would revert. Safe by design."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-05
+  tier: 1
+  type: property
+  description: "process() forwards all msg.value to recipient.handle() -- no value retained by Mailbox"
+  attack_scenario: "If process() is called with msg.value but handle() does not receive it (or receives partial), the ETH is stuck in Mailbox. Since Mailbox lacks receive/fallback/withdraw, the ETH is permanently lost."
+  impact: "ETH loss for relayers who send value with process() calls"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    uint256 destMailboxBal = address(destMailbox).balance;
+    // destMailbox should not accumulate ETH from process() calls
+    lte(destMailboxBal, 1 ether, "M-F-05: destMailbox holding significant ETH");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 65
+  notes: "L241: handle{value: msg.value} forwards ALL msg.value. If handle reverts, entire process() reverts. If handle succeeds, all value is in the recipient. The only way ETH stays in Mailbox is if handle() sends it back, which is unlikely but possible."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-06
+  tier: 1
+  type: property
+  description: "latestDispatchedId must match the ID of the most recently dispatched message, and must not be corrupted by reentrancy"
+  attack_scenario: "If hook.postDispatch reenters dispatch(), latestDispatchedId gets overwritten to the reentrant message's ID. Any post-dispatch hook that relies on latestDispatchedId for auth (e.g., MerkleTreeHook checks latestDispatchedId == message.id()) would authorize the wrong message, potentially allowing unauthorized merkle insertions."
+  impact: "Reentrant dispatch could corrupt latestDispatchedId, breaking hooks that rely on it for authorization. MerkleTreeHook.postDispatch uses latestDispatchedId to authenticate the message being inserted."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a dispatch, latestDispatchedId should be the ID of the last dispatched message
+    // Reentrancy would overwrite this -- check it matches last known
+    bytes32 currentLatest = originMailbox.latestDispatchedId();
+    t(currentLatest != bytes32(0) || originMailbox.nonce() == 0, "M-F-06: latestDispatchedId is zero after dispatch");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 72
+  notes: "This is the most interesting FlowHunter finding. In dispatch() L300-312: latestDispatchedId = id; nonce += 1; then INTERACTIONS with hooks. If requiredHook.postDispatch or hook.postDispatch calls dispatch() reentrantly, latestDispatchedId is overwritten. When the reentrant dispatch returns, the ORIGINAL hook.postDispatch (L312) continues but latestDispatchedId now points to the REENTRANT message. If requiredHook uses latestDispatchedId for auth (MerkleTreeHook does: require(mailbox.latestDispatchedId() == id)), the reentrant call's requiredHook.postDispatch would see the reentrant ID and pass. But when we return to the outer requiredHook.postDispatch, it already ran before the reentrancy (L311). The optional hook.postDispatch (L312) runs after -- if IT checks latestDispatchedId, it sees the wrong one."
+  poc_sketch: |
+    // 1. Deploy MaliciousHook that calls dispatch() in postDispatch()
+    // 2. Call dispatch() with MaliciousHook as custom hook
+    // 3. In postDispatch, MaliciousHook calls dispatch() again
+    // 4. latestDispatchedId is overwritten
+    // 5. Any subsequent hook reading latestDispatchedId sees wrong ID
+  call_stack: ''
+
+- id: M-F-07
+  tier: 2
+  type: property
+  description: "recipientIsm() must never return address(0) as ISM -- always falls back to defaultIsm"
+  attack_scenario: "If recipientIsm() returns an ISM at address(0) or a non-contract address, ism.verify() would call into a zero/EOA address. Solidity high-level calls to non-contracts succeed with empty return data (for functions returning void) or revert. For bool-returning verify(), calling address(0) would return false (empty returndata decoded as false) and process would revert."
+  impact: "DoS -- messages to recipients with broken ISM specification cannot be delivered"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // recipientIsm should never return address(0)
+    address testRecipient = address(destMailbox);
+    address ism = address(destMailbox.recipientIsm(testRecipient));
+    t(ism != address(0), "M-F-07: recipientIsm returned zero address");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: "recipientIsm() L443-450: if staticcall succeeds AND returnData is non-empty AND decoded address != 0, use it. Otherwise return defaultIsm. The check is thorough. The only risk is if defaultIsm itself is address(0) -- but setDefaultIsm requires isContract. However, before initialize() is called, defaultIsm IS address(0). If process() is called before initialize(), recipientIsm falls back to address(0). But OwnableUpgradeable would likely block this path."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-08
+  tier: 2
+  type: property
+  description: "dispatch() with custom hook address(0) must fall back to defaultHook, not call address(0)"
+  attack_scenario: "If the fallback to defaultHook fails or defaultHook is misconfigured, calling postDispatch on address(0) would silently succeed (empty code = no-op for high-level calls returning void? No -- postDispatch returns void, so calling a non-contract could succeed). Actually Solidity reverts on high-level calls to non-contracts since 0.8.x."
+  impact: "DoS for dispatches if defaultHook is address(0) -- but setDefaultHook requires isContract"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    address dh = address(originMailbox.defaultHook());
+    t(dh != address(0), "M-F-08: defaultHook is zero address");
+    address rh = address(originMailbox.requiredHook());
+    t(rh != address(0), "M-F-08: requiredHook is zero address");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 85
+  notes: "L284-286: if hook == address(0), hook = defaultHook. defaultHook is set via setDefaultHook which requires isContract. Safe by design AFTER initialization. Pre-initialization risk exists but is a deployment concern."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-09
+  tier: 1
+  type: property
+  description: "No reentrancy guard on process() -- reentrant process() with different message ID during recipient.handle() callback can process arbitrary additional messages"
+  attack_scenario: "A malicious recipient's handle() function calls process() with a different message+metadata. If the attacker controls an ISM that returns true for verify(), they can force-deliver arbitrary messages during the handle callback. The outer process() has already written deliveries[originalId] and will complete normally. This is bounded by the fact that each message needs its own ISM to verify, but if defaultIsm is permissive or the recipient specifies a malicious ISM, this enables message injection."
+  impact: "Arbitrary message delivery during handle callback if ISM is compromised for the target recipient"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Process should not be reenterable for the SAME message ID
+    // Different message IDs are OK by design (no reentrancy guard)
+    // Verify that a processed ID stays processed
+    if (ghost_lastProcessedId != bytes32(0)) {
+      t(destMailbox.delivered(ghost_lastProcessedId), "M-F-09: previously processed ID no longer delivered");
+      uint48 processedBlock = destMailbox.processedAt(ghost_lastProcessedId);
+      t(processedBlock > 0, "M-F-09: processedAt returned 0 for delivered message");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 65
+  notes: "No ReentrancyGuard on process(). Reentrancy from recipient.handle() -> process() with different ID would succeed. This is arguably by design -- the Mailbox is a message bus and each message has independent delivery state. The security boundary is the ISM, not the Mailbox itself. However, read-only reentrancy could be an issue if any external contract reads Mailbox state (nonce, latestDispatchedId) during a callback."
+  poc_sketch: ''
+  call_stack: ''
+
+- id: M-F-10
+  tier: 2
+  type: property
+  description: "delivered() uses blockNumber > 0 as sentinel -- block 0 messages appear undelivered"
+  attack_scenario: "If a message is processed at block.number == 0 (genesis block or certain L2s), delivered() returns false even though the message was processed. An attacker could replay this message. On mainnet block 0 is unreachable, but on some L2s (Arbitrum, zkSync) block.number can behave differently."
+  impact: "Message replay on chains where block.number can be 0 during process()"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that block.number > 0 in the test environment
+    // This is a chain-specific concern
+    t(block.number > 0, "M-F-10: block.number is 0 -- delivered() sentinel would fail");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 50
+  notes: "L362: delivered() returns blockNumber > 0. L227: blockNumber = uint48(block.number). If block.number == 0, the message is stored but delivered() returns false, allowing replay. In practice, block 0 is the genesis block and no user transactions occur there. On L2s, block.number is typically > 0 by the time user txs execute. This is a theoretical edge case but worth noting for exotic chains."
+  poc_sketch: ''
+  call_stack: ''
+
+false_positives:
+- hunter: FlowHunter
+  id: M-F-FP-01
+  reason: "dispatch() has no reentrancy guard, but reentrancy through hooks does not violate any critical invariant -- nonce still increments (uniqueness preserved), latestDispatchedId overwrite is intentional (hooks read it per-call). The only concern is if a hook caches latestDispatchedId before the reentrant call and uses the stale value after -- but hooks read it fresh. This is by design per Hyperlane architecture."
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Hyperlane Mailbox dispatch() is intentionally reentrancy-safe through nonce monotonicity and per-call latestDispatchedId reads in hooks. No reentrancy guard needed."
+    briefing_update_applied: false
+
+- hunter: FlowHunter
+  id: M-F-FP-02
+  reason: "process() writing deliveries BEFORE ism.verify() looks like a CEI violation, but if verify() reverts, the entire tx reverts and storage is rolled back. The pre-write only matters if verify() does NOT revert but has side effects that observe the delivery state -- which is ISM-specific behavior, not a Mailbox bug."
+  investigated_at: '2026-03-24T19:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: cross-chain-messaging.md
+    content: "Mailbox process() writes delivery before ISM verify -- this is intentional to prevent reentrancy-based double-processing. If verify reverts, EVM rollback undoes the write. Not a CEI violation in the traditional sense."
+    briefing_update_applied: false
