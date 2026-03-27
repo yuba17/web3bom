@@ -39,6 +39,20 @@ STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 KNOWLEDGE_DIR = WEB3_DIR / "knowledge"
 SOLODIT_SEARCH = AUDIT_AGENTS_DIR / "solodit_search.py"
 
+
+def get_hyp_dir(protocol: str) -> Path:
+    """Return protocol-namespaced hypotheses directory."""
+    d = HUNT_SESSION_DIR / "hypotheses" / protocol
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_context_dir(protocol: str) -> Path:
+    """Return protocol-namespaced context directory."""
+    d = HUNT_SESSION_DIR / "context" / protocol
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 HUNTER_DOMAINS = {
     "MathHunter":    ("math",    "Overflow, rounding, precision, exchange rate math, share price manipulation"),
     "AccessHunter":  ("access",  "Access control, missing modifiers, privilege escalation, role misconfig"),
@@ -1427,7 +1441,7 @@ def generate_hunter_prompt(
         else:
             contract_preview = full_src
 
-    hyp_output = str(WEB3_DIR / f"hunt_session/hypotheses/hyp_{component}_{hunter_name}.yaml")
+    hyp_output = str(get_hyp_dir(protocol) / f"hyp_{component}_{hunter_name}.yaml")
 
     # Generate asset flow map
     asset_flow_map = generate_asset_flow_map(contract_path)
@@ -1522,7 +1536,7 @@ def generate_deepdive_prompt(
     protocol: str,
 ) -> str:
     """Genera el prompt del DeepDiveHunter usando resultados de los 7 hunters."""
-    hyp_dir = HUNT_SESSION_DIR / "hypotheses"
+    hyp_dir = get_hyp_dir(protocol)
 
     # Collect all hypotheses from the 7 hunters
     all_hypotheses = []
@@ -1610,7 +1624,7 @@ def generate_deepdive_prompt(
     if not abbreviation:
         abbreviation = component[:3].upper()
 
-    hyp_output = str(HUNT_SESSION_DIR / f"hypotheses/hyp_{component}_DeepDiveHunter.yaml")
+    hyp_output = str(get_hyp_dir(protocol) / f"hyp_{component}_DeepDiveHunter.yaml")
 
     return f"""# DeepDiveHunter — {component} Deep Analysis
 
@@ -1734,8 +1748,7 @@ def create_context_file(
     symmetric_output: str = "",
 ) -> Path:
     """Crea el archivo de contexto compartido para todos los hunters."""
-    context_dir = HUNT_SESSION_DIR / "context"
-    context_dir.mkdir(parents=True, exist_ok=True)
+    context_dir = get_context_dir(protocol)
     context_file = context_dir / f"{component}_context.md"
 
     locs = count_locs(contract_path) if contract_path else 0
@@ -1988,7 +2001,8 @@ def print_status(state: dict):
             print(f"    {icon} [{c.get('priority', '?')}] {c['name']} ({c.get('loc', '?')} LOC) {files}{deps}")
 
     # Check hypotheses
-    hyps = list((HUNT_SESSION_DIR / "hypotheses").glob(f"hyp_*.yaml"))
+    _protocol = state.get("protocol", "unknown")
+    hyps = list(get_hyp_dir(_protocol).glob(f"hyp_*.yaml"))
     if hyps:
         print(f"\n  Hipótesis ({len(hyps)}):")
         for h in sorted(hyps):
@@ -2294,7 +2308,7 @@ def main():
             print(prompt[:500] + "...(truncado)")
 
     # Guardar prompts en context/
-    prompts_dir = HUNT_SESSION_DIR / "context"
+    prompts_dir = get_context_dir(protocol)
     for name, prompt in prompts.items():
         prompt_file = prompts_dir / f"{component}_{name}_prompt.md"
         prompt_file.write_text(prompt)
@@ -2302,7 +2316,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  LISTO PARA HUNT AUTÓNOMO")
     print(f"{'='*60}")
-    print(f"\n  Prompts generados en: hunt_session/context/")
+    print(f"\n  Prompts generados en: hunt_session/context/{protocol}/")
     print(f"  Ficha creada en:      {ficha_path}")
     print(f"  Context en:           {ctx_file}")
     print(f"\n  SIGUIENTE PASO — ejecutar en Claude con Agent tool:")
@@ -2310,7 +2324,7 @@ def main():
     print(f"  Agent(subagent_type='general', prompt=<contenido de cada _prompt.md>)")
     print(f"\n  Cada hunter escribe su resultado en:")
     for h in selected_hunters:
-        print(f"    hunt_session/hypotheses/hyp_{component}_{h}.yaml")
+        print(f"    hunt_session/hypotheses/{protocol}/hyp_{component}_{h}.yaml")
     print(f"\n  Cuando todos terminen (pipeline completo):")
     print(f"    python3 audit-agents/merge_invariants.py              # YAML → Properties.sol")
     print(f"    FOUNDRY_PROFILE=chimera forge build --build-info      # compilar")
