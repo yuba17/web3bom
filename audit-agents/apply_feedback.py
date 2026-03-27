@@ -27,6 +27,20 @@ from pathlib import Path
 WEB3_DIR = Path.home() / "Documents/Web3"
 KNOWLEDGE_DIR = WEB3_DIR / "knowledge"
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
+STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
+
+def _load_protocol() -> str:
+    """Load current protocol from hunt state."""
+    if STATE_FILE.exists():
+        state = json.loads(STATE_FILE.read_text())
+        return state.get("protocol", "unknown")
+    return "unknown"
+
+def get_hyp_dir(protocol: str) -> Path:
+    d = HUNT_SESSION_DIR / "hypotheses" / protocol
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 MEMORY_DIR = Path.home() / ".claude/MEMORY"
 SYNTHESIS_DIR = MEMORY_DIR / "LEARNING/SYNTHESIS"
 FAILURES_DIR = MEMORY_DIR / "LEARNING/FAILURES"
@@ -402,13 +416,13 @@ def main():
 
     # Modo: solo hipótesis
     elif args.hypotheses:
-        hyp_dir = Path(args.hyp_dir) if args.hyp_dir else HUNT_SESSION_DIR / "hypotheses"
+        hyp_dir = Path(args.hyp_dir) if args.hyp_dir else get_hyp_dir(_load_protocol())
         print("Procesando archivos de hipótesis...")
         total_applied += process_hypothesis_files(hyp_dir, args.dry_run)
 
     # Modo: todas las fichas del hunt activo
     else:
-        fichas_dir = Path(args.fichas_dir) if args.fichas_dir else HUNT_SESSION_DIR / "fichas"
+        fichas_dir = Path(args.fichas_dir) if args.fichas_dir else HUNT_SESSION_DIR / "fichas" / _load_protocol()
 
         # Procesar fichas
         if fichas_dir.exists():
