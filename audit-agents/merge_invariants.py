@@ -49,7 +49,11 @@ from collections import defaultdict
 
 WEB3_DIR = Path.home() / "Documents/Web3"
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-HYPOTHESES_DIR = HUNT_SESSION_DIR / "hypotheses"
+def get_hyp_dir(protocol: str) -> Path:
+    """Return protocol-namespaced hypotheses directory."""
+    d = HUNT_SESSION_DIR / "hypotheses" / protocol
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 
 # Mapeo hunter → sufijo del archivo
@@ -869,15 +873,17 @@ def main():
         print(f"  IDs: {', '.join(sorted(existing_ids))}")
 
     # Localizar hipótesis
+    protocol = hunt.get("protocol", "")
+
     if args.hyp:
         hyp_files = [Path(args.hyp)]
         if not hyp_files[0].exists():
-            hyp_files = [HYPOTHESES_DIR / args.hyp]
+            hyp_files = [get_hyp_dir(protocol) / args.hyp]
         if not hyp_files[0].exists():
             print(f"✗ Hipótesis no encontrada: {args.hyp}")
             return 1
     else:
-        hyp_dir = Path(args.hypotheses_dir) if args.hypotheses_dir else HYPOTHESES_DIR
+        hyp_dir = Path(args.hypotheses_dir) if args.hypotheses_dir else get_hyp_dir(protocol)
         if not hyp_dir.exists():
             print(f"✗ No existe directorio de hipótesis: {hyp_dir}")
             return 1
