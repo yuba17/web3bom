@@ -52,8 +52,28 @@ import yaml
 
 WEB3_DIR = Path(__file__).resolve().parent.parent
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-HYP_DIR = HUNT_SESSION_DIR / "hypotheses"
 STATE_FILE = Path.home() / ".claude" / "MEMORY" / "STATE" / "current_hunt.json"
+
+
+def get_hyp_dir(protocol: str) -> Path:
+    """Return protocol-namespaced hypotheses directory."""
+    d = HUNT_SESSION_DIR / "hypotheses" / protocol
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_context_dir(protocol: str) -> Path:
+    """Return protocol-namespaced context directory."""
+    d = HUNT_SESSION_DIR / "context" / protocol
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_gate_status_file(protocol: str) -> Path:
+    """Return protocol-specific gate_status file."""
+    d = HUNT_SESSION_DIR / "gate_status"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{protocol}.json"
 
 HUNTER_NAMES = [
     "AccessHunter", "DomainHunter", "FlowHunter", "MathHunter",
@@ -159,7 +179,8 @@ def check_scope(component: str, repo: str = "") -> tuple[bool, list[str], list[s
         failed.append("NO_MAP: component_map empty. Run: python3 audit-agents/run_hunt.py --map-components")
 
     # 4. Context file exists (run_hunt.py --component was executed)
-    ctx_file = HUNT_SESSION_DIR / "context" / f"{component}_context.md"
+    protocol = state.get("protocol", "")
+    ctx_file = get_context_dir(protocol) / f"{component}_context.md"
     if ctx_file.exists():
         size = ctx_file.stat().st_size
         passed.append(f"OK: context file exists ({size:,} bytes)")
@@ -169,7 +190,7 @@ def check_scope(component: str, repo: str = "") -> tuple[bool, list[str], list[s
     # 5. Hunter prompts generated
     prompts_found = 0
     for hunter in HUNTER_NAMES:
-        prompt_file = HUNT_SESSION_DIR / "context" / f"{component}_{hunter}_prompt.md"
+        prompt_file = get_context_dir(protocol) / f"{component}_{hunter}_prompt.md"
         if prompt_file.exists():
             prompts_found += 1
     if prompts_found >= 7:  # Allow some new hunters to not have prompts yet
@@ -201,8 +222,12 @@ def check_hunters(component: str) -> tuple[bool, list[str], list[str]]:
     passed = []
     failed = []
 
+    state = load_state()
+    protocol = state.get("protocol", "")
+    hyp_dir = get_hyp_dir(protocol)
+
     for hunter in HUNTER_NAMES:
-        hyp_file = HYP_DIR / f"hyp_{component}_{hunter}.yaml"
+        hyp_file = hyp_dir / f"hyp_{component}_{hunter}.yaml"
         if not hyp_file.exists():
             failed.append(f"MISSING: {hyp_file.name}")
             continue
@@ -246,7 +271,9 @@ def check_hunters(component: str) -> tuple[bool, list[str], list[str]]:
 
 def check_deepdive(component: str) -> tuple[bool, list[str], list[str]]:
     """Check that DeepDiveHunter produced output."""
-    hyp_file = HYP_DIR / f"hyp_{component}_DeepDiveHunter.yaml"
+    state = load_state()
+    protocol = state.get("protocol", "")
+    hyp_file = get_hyp_dir(protocol) / f"hyp_{component}_DeepDiveHunter.yaml"
     if not hyp_file.exists():
         return False, [], [f"MISSING: {hyp_file.name}"]
 
@@ -318,9 +345,11 @@ def check_merge(component: str, repo_path: str = "") -> tuple[bool, list[str], l
         failed.append("MISSING: TargetFunctions.sol not found — handlers not generated (checklist item 5)")
 
     # Count how many hypothesis invariants have solidity vs how many are in Properties.sol
+    protocol = state.get("protocol", "")
+    hyp_dir = get_hyp_dir(protocol)
     total_solidity_invariants = 0
     for hunter in HUNTER_NAMES + ["DeepDiveHunter"]:
-        hyp_file = HYP_DIR / f"hyp_{component}_{hunter}.yaml"
+        hyp_file = hyp_dir / f"hyp_{component}_{hunter}.yaml"
         if not hyp_file.exists():
             continue
         try:
@@ -600,8 +629,6 @@ GATE_CHECKS = {
 
 # ─── Gate Status JSON Export ──────────────────────────────────────────────────
 
-GATE_STATUS_FILE = HUNT_SESSION_DIR / "gate_status.json"
-
 DISPLAY_GATES = [g for g in GATE_ORDER if g != "complete"]
 
 
@@ -614,32 +641,36 @@ def _map_gate_state(ok: bool, detail: str) -> str:
     return "fail"
 
 
-def _load_gate_status() -> dict:
-    """Load existing gate_status.json or return empty structure."""
-    if GATE_STATUS_FILE.exists():
+def _load_gate_status(protocol: str) -> dict:
+    """Load existing per-protocol gate_status JSON or return empty structure."""
+    gate_file = get_gate_status_file(protocol)
+    if gate_file.exists():
         try:
-            return json.loads(GATE_STATUS_FILE.read_text())
+            return json.loads(gate_file.read_text())
         except json.JSONDecodeError:
             pass
     return {"component_gates": {}, "finding_gates": {}, "updated_at": ""}
 
 
-def _save_gate_status(data: dict):
-    """Write gate_status.json atomically."""
+def _save_gate_status(data: dict, protocol: str):
+    """Write per-protocol gate_status JSON atomically."""
+    gate_file = get_gate_status_file(protocol)
     data["updated_at"] = datetime.now().isoformat()
-    GATE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = GATE_STATUS_FILE.with_suffix(".tmp")
+    gate_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = gate_file.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        tmp.rename(GATE_STATUS_FILE)
+        tmp.rename(gate_file)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
 
 
 def export_gate_status(component: str, repo: str = ""):
-    """Run all gates for a component and write results to gate_status.json."""
-    status = _load_gate_status()
+    """Run all gates for a component and write results to per-protocol gate_status.json."""
+    state_data = load_state()
+    protocol = state_data.get("protocol", "")
+    status = _load_gate_status(protocol)
     comp_data = {}
     first_fail = None
     passed_count = 0
@@ -668,7 +699,6 @@ def export_gate_status(component: str, repo: str = ""):
     status["component_gates"][component] = comp_data
 
     # Also export finding_queue_summary from current_hunt.json
-    state_data = load_state()
     queue = state_data.get("finding_queue", [])
     status["finding_queue_summary"] = {
         "total": len(queue),
@@ -676,7 +706,7 @@ def export_gate_status(component: str, repo: str = ""):
         "in_pipeline": sum(1 for f in queue if f.get("status") == "in_pipeline"),
     }
 
-    _save_gate_status(status)
+    _save_gate_status(status, protocol)
 
 
 def run_gate(component: str, gate: str, repo: str = "") -> bool:
@@ -785,7 +815,10 @@ RESULTS_DIR = HUNT_SESSION_DIR / "results"
 
 def _find_hyp_with_finding(finding_id: str) -> dict | None:
     """Search all hypothesis YAMLs for a specific finding ID."""
-    for hyp_file in HYP_DIR.glob("hyp_*.yaml"):
+    state = load_state()
+    protocol = state.get("protocol", "")
+    hyp_dir = get_hyp_dir(protocol)
+    for hyp_file in hyp_dir.glob("hyp_*.yaml"):
         try:
             content = yaml.safe_load(hyp_file.read_text())
         except yaml.YAMLError:
@@ -1055,8 +1088,10 @@ FINDING_GATE_CHECKS = {
 
 
 def export_finding_gate_status(finding_id: str):
-    """Run all finding gates and write results to gate_status.json."""
-    status = _load_gate_status()
+    """Run all finding gates and write results to per-protocol gate_status.json."""
+    state_data = load_state()
+    protocol = state_data.get("protocol", "")
+    status = _load_gate_status(protocol)
     hyp = _find_hyp_with_finding(finding_id)
 
     f_data = {}
@@ -1087,7 +1122,7 @@ def export_finding_gate_status(finding_id: str):
     f_data["blocked_at"] = first_fail
 
     status["finding_gates"][finding_id] = f_data
-    _save_gate_status(status)
+    _save_gate_status(status, protocol)
 
 
 def run_finding_gate(finding_id: str, gate: str) -> bool:
@@ -1186,7 +1221,10 @@ def mark_finding_gate(finding_id: str, gate: str):
         return
 
     # Find the hyp file
-    for hyp_file in HYP_DIR.glob("hyp_*.yaml"):
+    state = load_state()
+    protocol = state.get("protocol", "")
+    hyp_dir = get_hyp_dir(protocol)
+    for hyp_file in hyp_dir.glob("hyp_*.yaml"):
         try:
             content = yaml.safe_load(hyp_file.read_text())
         except yaml.YAMLError:
@@ -1448,7 +1486,9 @@ def main():
 
     if args.export_json:
         export_gate_status(args.component, args.repo)
-        print(f"Exported gate status for {args.component} to {GATE_STATUS_FILE}")
+        state = load_state()
+        protocol = state.get("protocol", "")
+        print(f"Exported gate status for {args.component} to {get_gate_status_file(protocol)}")
         sys.exit(0)
 
     if args.status:
