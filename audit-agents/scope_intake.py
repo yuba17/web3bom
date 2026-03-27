@@ -199,6 +199,9 @@ def generate_fichas(state: dict):
     protocol = state["protocol"]
     fichas_dir = HUNT_SESSION_DIR / "fichas" / protocol
     fichas_dir.mkdir(parents=True, exist_ok=True)
+    (HUNT_SESSION_DIR / "hypotheses" / protocol).mkdir(parents=True, exist_ok=True)
+    (HUNT_SESSION_DIR / "context" / protocol).mkdir(parents=True, exist_ok=True)
+    (HUNT_SESSION_DIR / "gate_status").mkdir(parents=True, exist_ok=True)
 
     template = {
         "protocol": protocol,
