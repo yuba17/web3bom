@@ -1,0 +1,306 @@
+component: DomainRoutingIsm
+hunter: TrustBoundaryHunter
+date: "2026-03-27"
+files_analyzed:
+  - solidity/contracts/isms/routing/DomainRoutingIsm.sol
+  - solidity/contracts/isms/routing/AbstractRoutingIsm.sol
+  - solidity/contracts/isms/routing/DefaultFallbackRoutingIsm.sol
+  - solidity/contracts/isms/routing/DomainRoutingIsmFactory.sol
+  - solidity/contracts/isms/routing/IncrementalDomainRoutingIsm.sol
+  - solidity/contracts/isms/NoopIsm.sol
+  - solidity/contracts/Mailbox.sol
+  - solidity/contracts/libs/Message.sol
+  - solidity/contracts/client/MailboxClient.sol
+
+trust_model:
+  description: |
+    Mailbox -> recipientIsm -> DomainRoutingIsm -> child ISM (per origin domain).
+    Routing decision based on message.origin() which is UNTRUSTED data being verified.
+    Owner controls domain->ISM mapping. DefaultFallbackRoutingIsm adds implicit fallback to mailbox.defaultIsm().
+
+hypotheses:
+
+  - id: DRI-TB-01
+    title: "Uninitialized implementation contract in factory — anyone can call initialize() and take ownership"
+    description: |
+      DomainRoutingIsmFactory deploys a DomainRoutingIsm as implementation in its constructor
+      (line 49: `_implementation = address(new DomainRoutingIsm())`). This implementation contract
+      is never initialized — there is no `_disableInitializers()` call in DomainRoutingIsm's constructor.
+      Anyone can call `initialize(attacker_address)` on the implementation directly, becoming its owner.
+
+      While minimal proxies delegate to the implementation's logic (not its storage), if the implementation
+      is later used in a different context (e.g., UUPS upgrade pattern) or if any code trusts
+      `implementation()` as a "canonical" ISM, the attacker-owned implementation becomes a trust violation.
+
+      However: EIP-1167 minimal proxies have their OWN storage. The implementation's storage is separate.
+      So taking ownership of the implementation doesn't affect proxies. The real risk is:
+      1. Implementation address is returned by `implementation()` — if anyone uses it directly as ISM
+      2. Implementation could be selfdestructed (pre-Dencun) to brick all proxies
+    confidence: 25
+    severity: low
+    status: investigating
+    attack_scenario: |
+      1. DomainRoutingIsmFactory is deployed, creating implementation at address X
+      2. Attacker calls X.initialize(attacker) — succeeds because no `_disableInitializers()`
+      3. Attacker is now owner of the implementation contract
+      4. Pre-Dencun: if implementation had selfdestruct, attacker could brick all proxies
+      5. Post-Dencun/current: selfdestruct is disabled, so impact is limited to:
+         - Anyone who mistakenly uses implementation address directly as ISM
+         - Attacker can set arbitrary domain->ISM mappings on implementation (not proxies)
+    solidity:
+      vulnerable_code: |
+        // DomainRoutingIsmFactory.sol:48-49
+        constructor() {
+            _implementation = address(new DomainRoutingIsm());
+            // Missing: DomainRoutingIsm(_implementation).initialize(address(this));
+            // Or: Missing _disableInitializers() in DomainRoutingIsm constructor
+        }
+      invariant: |
+        // Implementation should not be initializable by arbitrary callers
+        function test_implementationNotInitializable() public {
+            DomainRoutingIsmFactory factory = new DomainRoutingIsmFactory();
+            address impl = factory.implementation();
+            // This should revert but currently succeeds:
+            DomainRoutingIsm(impl).initialize(address(this));
+        }
+
+  - id: DRI-TB-02
+    title: "DefaultFallbackRoutingIsm — unregistered domains silently fall back to defaultIsm, bypassing per-domain security"
+    description: |
+      DefaultFallbackRoutingIsm.module() returns mailbox.defaultIsm() for ANY origin domain
+      not explicitly registered. This creates an implicit trust assumption: the default ISM
+      provides adequate security for ALL possible origin chains.
+
+      If an attacker controls a chain (or sends from a domain ID that maps to no real chain),
+      the message gets verified by the default ISM. The default ISM (e.g., MultisigIsm) may
+      have validators configured for specific chains — but an unknown domain ID would have
+      NO validators configured, potentially passing verification trivially.
+
+      The critical question: does the defaultIsm correctly handle messages from domains it
+      has no configuration for? If defaultIsm is a MultisigIsm, it checks signatures against
+      a validator set per origin — an unconfigured origin would have threshold=0 and pass.
+    confidence: 55
+    severity: high
+    status: investigating
+    attack_scenario: |
+      1. DefaultFallbackRoutingIsm is deployed with domains [1, 2, 3] mapped to strict MultisigIsms
+      2. Default ISM is a MultisigIsm with validators for known chains only
+      3. Attacker crafts message with origin=99999 (unregistered domain)
+      4. DomainRoutingIsm falls back to defaultIsm
+      5. defaultIsm.verify() checks signatures for domain 99999 — if no validators configured,
+         threshold is 0 and verification passes trivially
+      6. Message is delivered to recipient as if it came from a legitimate chain
+    solidity:
+      vulnerable_code: |
+        // DefaultFallbackRoutingIsm.sol:21-30
+        function module(uint32 origin) public view override returns (IInterchainSecurityModule) {
+            (bool contained, bytes32 _module) = _modules.tryGet(origin);
+            if (contained) {
+                return IInterchainSecurityModule(_module.bytes32ToAddress());
+            } else {
+                return mailbox.defaultIsm(); // <-- ANY unknown domain gets default
+            }
+        }
+      invariant: |
+        // Every domain that passes verification must be explicitly registered
+        function invariant_noUnregisteredDomainPasses(bytes calldata metadata, bytes calldata message) public {
+            uint32 origin = Message.origin(message);
+            (bool contained,) = _modules.tryGet(origin);
+            if (!contained) {
+                // Should revert, not fall back silently
+                vm.expectRevert();
+                ism.verify(metadata, message);
+            }
+        }
+
+  - id: DRI-TB-03
+    title: "Metadata passthrough — metadata crafted for child ISM-A may accidentally validate on child ISM-B after domain remapping"
+    description: |
+      AbstractRoutingIsm.verify() passes metadata AS-IS to whichever child ISM is selected:
+      `route(_message).verify(_metadata, _message)`. The metadata format is child-ISM-specific.
+
+      If an owner changes the ISM for domain X from MultisigIsm-A (with validators [V1,V2,V3])
+      to MultisigIsm-B (with validators [V4,V5,V6]), there is a race condition window:
+      - Relayer prepared metadata with signatures from V1,V2,V3 for MultisigIsm-A
+      - Owner calls set(X, MultisigIsm-B)
+      - If the relayer's metadata happens to contain valid signatures for V4,V5,V6 (extremely unlikely
+        for MultisigIsm, but possible for weaker ISM types like TrustedRelayerIsm)
+
+      More realistic: if owner downgrades from MultisigIsm to NoopIsm (or a weaker ISM),
+      ANY pending undelivered message from that domain suddenly passes with ANY metadata.
+      This is by design (owner trust), but the race window is a trust boundary concern.
+    confidence: 20
+    severity: medium
+    status: investigating
+    attack_scenario: |
+      1. Domain X uses MultisigIsm with strict 3/5 validation
+      2. Attacker has a pending malicious message for domain X (cannot get valid signatures)
+      3. Owner changes domain X ISM to a weaker ISM (e.g., TrustedRelayerIsm, NoopIsm)
+      4. Attacker delivers the pending message — now passes the weaker verification
+      5. Malicious message is delivered to recipient
+      Note: Requires owner misconfiguration or compromised owner key. Owner is trusted.
+    solidity:
+      vulnerable_code: |
+        // AbstractRoutingIsm.sol:38-43
+        function verify(
+            bytes calldata _metadata,
+            bytes calldata _message
+        ) public returns (bool) {
+            return route(_message).verify(_metadata, _message);
+            // _metadata is passed unchanged — no format validation
+        }
+      invariant: |
+        // After ISM change, pending messages should not auto-validate
+        // This is an owner-trust issue, not easily invariant-checked
+
+  - id: DRI-TB-04
+    title: "NoopIsm as child ISM — isContract() check passes but verify() always returns true"
+    description: |
+      DomainRoutingIsm._set() validates `require(_module.isContract(), "ISM must be a contract")`.
+      This prevents setting address(0) or EOAs, but NoopIsm (contracts/isms/NoopIsm.sol) is a
+      valid contract whose verify() always returns true for any metadata and any message.
+
+      If an owner sets NoopIsm for a domain, ALL messages from that domain pass verification
+      without any actual security check. This is technically "by design" (owner is trusted),
+      but it means there's no guard against misconfiguration.
+
+      More critically: if the factory or any deployment script accidentally uses NoopIsm as
+      a placeholder, it creates a complete security bypass for that domain.
+    confidence: 30
+    severity: medium
+    status: investigating
+    attack_scenario: |
+      1. Owner (or automated deployment) sets domain X ISM to NoopIsm
+      2. Attacker crafts arbitrary message with origin=X
+      3. Calls Mailbox.process(emptyMetadata, maliciousMessage)
+      4. DomainRoutingIsm routes to NoopIsm which returns true
+      5. Mailbox delivers malicious message to recipient
+    solidity:
+      vulnerable_code: |
+        // DomainRoutingIsm.sol:133-136
+        function _set(uint32 _domain, address _module) internal virtual {
+            require(_module.isContract(), "ISM must be a contract");
+            // No check that _module.verify() is not trivially true
+            // No check against known-insecure ISM types like NoopIsm
+            _modules.set(_domain, _module.addressToBytes32());
+        }
+
+        // NoopIsm.sol:10-15 — always returns true
+        function verify(bytes calldata, bytes calldata) public pure override returns (bool) {
+            return true;
+        }
+      invariant: |
+        // Child ISM moduleType should never be NULL (NoopIsm type)
+        function invariant_noNullTypeChildIsm() public {
+            uint256[] memory domains = ism.domains();
+            for (uint256 i = 0; i < domains.length; i++) {
+                IInterchainSecurityModule child = ism.module(uint32(domains[i]));
+                assertTrue(child.moduleType() != uint8(IInterchainSecurityModule.Types.NULL),
+                    "Child ISM must not be NULL/Noop type");
+            }
+        }
+
+  - id: DRI-TB-05
+    title: "Origin domain as routing key is attacker-controlled before verification — circular trust in verification"
+    description: |
+      The core trust issue: DomainRoutingIsm uses message.origin() to SELECT which ISM
+      should verify the message. But message.origin() is part of the untrusted message
+      that NEEDS to be verified. The routing ISM trusts the message origin to pick
+      the verifier, and the verifier trusts the routing ISM to have picked correctly.
+
+      This is not a bug per se — it's the intended design. The child ISM is supposed to
+      verify that the message actually came from the claimed origin. But it creates a
+      subtle invariant: the child ISM for domain X MUST verify that the message truly
+      originated from domain X. If a child ISM only verifies signature validity (not
+      origin binding), an attacker could:
+      - Craft a message claiming origin=X
+      - Get it routed to ISM-X
+      - ISM-X verifies signatures but doesn't check that signers are actually validators for X
+
+      This is mitigated by MultisigIsm which checks validators per-origin. But custom ISMs
+      that don't bind verification to origin would be vulnerable.
+    confidence: 35
+    severity: high
+    status: investigating
+    attack_scenario: |
+      1. DomainRoutingIsm has domain 42 -> CustomIsm
+      2. CustomIsm verifies a signature but doesn't check that the signer is a validator for domain 42
+      3. Attacker gets a valid signature from any entity recognized by CustomIsm
+      4. Crafts message with origin=42, destination=local
+      5. DomainRoutingIsm routes to CustomIsm -> CustomIsm.verify() returns true
+      6. Mailbox delivers message as if it came from domain 42
+    solidity:
+      vulnerable_code: |
+        // AbstractRoutingIsm.sol:38-43 — routes based on untrusted origin
+        function verify(bytes calldata _metadata, bytes calldata _message) public returns (bool) {
+            return route(_message).verify(_metadata, _message);
+            // route() uses _message.origin() — attacker-controlled
+        }
+
+        // DomainRoutingIsm.sol:106-110
+        function route(bytes calldata _message) public view override returns (IInterchainSecurityModule) {
+            return module(_message.origin()); // origin from untrusted message
+        }
+      invariant: |
+        // Child ISM must bind verification to the claimed origin domain
+        // This is an architectural invariant, not easily tested in isolation
+
+  - id: DRI-TB-06
+    title: "Owner can remove domain ISM while messages are in-flight, causing DoS or security downgrade"
+    description: |
+      DomainRoutingIsm allows the owner to call remove(_domain) which deletes the ISM mapping.
+      After removal, any message from that domain will revert with "No ISM found for origin: X"
+      in the base DomainRoutingIsm, or silently fall back to defaultIsm in DefaultFallbackRoutingIsm.
+
+      For DefaultFallbackRoutingIsm: removing a domain doesn't revert — it silently downgrades
+      to the default ISM. This could be weaker than the removed domain-specific ISM.
+
+      IncrementalDomainRoutingIsm mitigates this by preventing removal entirely.
+    confidence: 30
+    severity: medium
+    status: investigating
+    attack_scenario: |
+      1. DefaultFallbackRoutingIsm has domain 1 -> StrictMultisigIsm (3/5 threshold)
+      2. Default ISM is a WeakMultisigIsm (1/3 threshold)
+      3. Owner calls remove(1) — perhaps by mistake or social engineering
+      4. Messages from domain 1 now fall back to WeakMultisigIsm
+      5. Attacker only needs 1 compromised validator instead of 3
+    solidity:
+      vulnerable_code: |
+        // DomainRoutingIsm.sol:81-83
+        function remove(uint32 _domain) external onlyOwner {
+            _remove(_domain);
+        }
+        // After removal in DefaultFallbackRoutingIsm, falls back to defaultIsm silently
+      invariant: |
+        // Domain removal should not silently downgrade security
+        // IncrementalDomainRoutingIsm prevents this by design:
+        function _remove(uint32) internal override {
+            revert("IncrementalDomainRoutingIsm: removal not supported");
+        }
+
+summary: |
+  6 hipotesis analizadas para DomainRoutingIsm trust boundaries:
+
+  - DRI-TB-01 (Low, 25%): Implementation sin inicializar en factory. Impacto limitado post-Dencun,
+    solo riesgo si alguien usa implementation() directamente como ISM.
+
+  - DRI-TB-02 (High, 55%): DefaultFallbackRoutingIsm silently falls back to defaultIsm for
+    unregistered domains. Si defaultIsm no maneja domains desconocidos correctamente (threshold=0),
+    mensajes de dominios fantasma pasan verificacion. INVESTIGAR MAS — depende de como
+    MultisigIsm maneja domains sin validators configurados.
+
+  - DRI-TB-03 (Medium, 20%): Metadata passthrough sin validacion de formato. Race condition
+    entre cambio de ISM y delivery de mensajes. Requiere owner misconfiguration.
+
+  - DRI-TB-04 (Medium, 30%): NoopIsm pasa isContract() check pero verify() siempre retorna true.
+    Misconfiguration risk, no hay guard contra ISMs triviales.
+
+  - DRI-TB-05 (High, 35%): Origin domain como routing key es data no verificada. Si child ISM
+    no valida binding entre origen y firmas, se rompe el trust model completo.
+
+  - DRI-TB-06 (Medium, 30%): Owner puede remover domain ISMs causando downgrade silencioso
+    en DefaultFallbackRoutingIsm. IncrementalDomainRoutingIsm mitiga esto.
+
+  PRIORIDAD INMEDIATA: DRI-TB-02 (defaultIsm fallback para domains fantasma).
+  Requiere investigar como MultisigIsm maneja un origin sin validators configurados.

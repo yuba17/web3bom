@@ -1,0 +1,663 @@
+hunter: DomainHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+hypotheses:
+
+  - id: CSW-D-01
+    title: "Cross-chain removeOwnerAtIndex replay borra owner diferente por divergencia de indices"
+    severity: high
+    confidence: 85
+    tier: 1
+    description: |
+      executeWithoutChainIdValidation() permite que removeOwnerAtIndex se replique en todas las
+      chains sin chain ID. El bug: el parametro `index` es posicional. Si el estado del array
+      ownerAtIndex diverge entre chains (por transacciones chain-specific), replicar
+      removeOwnerAtIndex(N, ownerA) en chain B puede intentar borrar el owner en el slot N de
+      chain B, que puede ser distinto. La proteccion WrongOwnerAtIndex mitiga el caso obvio
+      (revertion si owner en ese slot != ownerA), PERO el riesgo real documentado en C4 [H-01]
+      es cuando un owner es re-anadido en el mismo indice despues de ser removido en una chain:
+      la operacion cross-chain de remove puede borrar al owner que reemplazo al original en ese
+      indice, sin que el firmante lo haya pretendido.
+    attack_scenario: |
+      1. Wallet en chain A y chain B: owners = [Alice(0), Bob(1)]
+      2. En chain A (tx chain-specific): addOwnerAddress(Carol) -> Carol en index 2
+      3. En chain A (tx chain-specific): removeOwnerAtIndex(1, Bob) -> Bob removido
+         Estado chain A: {0: Alice, 2: Carol}; Estado chain B: {0: Alice, 1: Bob}
+      4. En chain B (tx chain-specific): removeOwnerAtIndex(1, Bob), addOwnerAddress(Dave)
+         Dave queda en index 2 en chain B
+         Estado chain B: {0: Alice, 2: Dave}
+      5. Alice firma cross-chain: removeOwnerAtIndex(2, Carol) - para remover Carol de chain A
+         Se replica en chain B: index 2 en chain B = Dave, no Carol
+         -> WrongOwnerAtIndex REVIERTE en chain B (CORRECTO)
+      6. CASO PELIGROSO: si Alice firma cross-chain addOwnerAddress(Eve), Eve queda como
+         index 3 en ambas chains. Luego cross-chain removeOwnerAtIndex(3, Eve) funciona igual
+         en ambas. El problema es cuando la divergencia hace que un indice tenga un owner
+         DIFERENTE en cada chain y el firmante no lo sabe.
+      Caso especifico de H-01 C4: removeOwnerAtIndex(oldIndex, oldOwner) replicado en chain
+      donde oldOwner fue re-anadido a ese mismo indice despues de ser removido -> lo borra.
+    impact: |
+      Un propietario puede ser eliminado de chains donde no se pretendia. En el peor caso,
+      el wallet queda sin acceso si se elimina al unico owner valido en esa chain.
+      Perdida permanente de fondos en esa chain.
+    solidity: |
+      // Invariante: tras executeWithoutChainIdValidation, ownerCount >= 1 en todo momento
+      // y los owners removidos son exactamente los especificados en el calldata
+      function invariant_crossChainRemoveOwnerConsistency() public view {
+          // Si hay calls de removeOwnerAtIndex en el batch,
+          // el owner en ese index debe ser exactamente el especificado
+          // (enforced por _removeOwnerAtIndex WrongOwnerAtIndex check)
+          t(wallet.ownerCount() >= 1, "CSW-D-01: ownerCount must be >= 1 after cross-chain remove");
+      }
+    status: investigate
+    notes: |
+      Confirmado como H-01 en C4. La proteccion WrongOwnerAtIndex mitiga el caso directo.
+      El vector real es la divergencia de indices cuando hay combinacion de txs chain-specific
+      y cross-chain. Verificar si fue parchado en la version actual.
+
+  - id: CSW-D-02
+    title: "removeLastOwner cross-chain brickea wallet en todas las chains simultaneamente"
+    severity: high
+    confidence: 70
+    tier: 1
+    description: |
+      removeLastOwner esta en canSkipChainIdValidation allowlist. Una tx cross-chain
+      removeLastOwner(index, owner) se ejecuta en TODAS las chains donde el wallet existe
+      con el mismo owner en ese index. Esto elimina al ultimo owner en todas las chains.
+      El resultado: ownerCount() == 0 en todas las chains, el wallet queda permanentemente
+      sin control. initialize() verifica nextOwnerIndex() != 0 - como nextOwnerIndex solo
+      crece y nunca se resetea, re-inicializacion es IMPOSIBLE.
+      Un co-owner malicioso puede: (1) remover a todos los otros owners, (2) llamar
+      removeLastOwner cross-chain, brickeando el wallet en todas las chains simultaneamente.
+      No hay mecanismo de recovery.
+    attack_scenario: |
+      1. Wallet con owners [Alice(0), Bob(1)] en chain A y chain B
+      2. Bob (co-owner malicioso) hace tx chain-specific: removeOwnerAtIndex(0, Alice)
+         -> Estado en AMBAS chains: solo Bob(1) queda (si la tx aplica en ambas? NO:
+         tx chain-specific solo aplica en la chain donde se envio)
+      3. Bob hace tx chain-specific en chain A: removeOwnerAtIndex(0, Alice)
+         -> Estado chain A: {1: Bob}; Estado chain B: {0: Alice, 1: Bob}
+      4. Bob hace removeLastOwner cross-chain en chain A cuando solo queda Bob ahi:
+         removeLastOwner(1, Bob) -> chain A bricked
+         En chain B, Bob tambien esta en index 1 -> chain B bricked tambien
+      5. Wallet bricked en TODAS las chains. Fondos congelados para siempre.
+      Condicion: requiere que Bob sea co-owner y que el mismo indice tenga el mismo owner en ambas chains.
+    impact: |
+      Congelacion permanente de fondos en todas las chains. No hay recovery path.
+      initialize() no puede re-ejecutarse porque nextOwnerIndex > 0.
+      Critico si un co-owner malicioso puede ejecutarlo.
+    solidity: |
+      // Invariante: ownerCount NUNCA debe llegar a 0 despues de inicializacion
+      function invariant_ownerCountGtZero() public view {
+          // removeLastOwner() PERMITE ownerCount = 0 por diseno
+          // Verificar si es by-design o bug de diseno
+          uint256 count = wallet.ownerCount();
+          // Si count == 0, el wallet esta bricked permanentemente
+          t(count >= 1, "CSW-D-02: ownerCount must remain >= 1 (wallet bricked if 0)");
+      }
+    status: investigate
+    notes: |
+      removeLastOwner es una funcion EXPLICITA que permite ownerCount=0. Puede ser by-design
+      para "suicidio controlado" del wallet. Verificar si el scope lo considera un bug.
+      El riesgo real es co-owner malicioso que ejecuta esto cross-chain sin consentimiento.
+
+  - id: CSW-D-03
+    title: "validateUserOp revierte (no retorna 1) cuando ownerIndex apunta a slot removido"
+    severity: medium
+    confidence: 80
+    tier: 1
+    description: |
+      Cuando un owner es removido, ownerAtIndex[index] queda con bytes vacios (length=0).
+      En _isValidSignature(), si ownerBytes.length no es 32 ni 64, se hace:
+        revert InvalidOwnerBytesLength(ownerBytes)
+      En validateUserOp, esta ruta se invoca via _isValidSignature(userOpHash, userOp.signature).
+      El ERC-4337 spec requiere que signature failure retorne 1 (no revertir).
+      Un revert en validateUserOp tiene consecuencias diferentes a return 1:
+      - Con return 1: el bundler puede manejar la tx como "invalid signature" y penalizar la cuenta
+      - Con revert: el bundler recibe un revert inesperado que puede griefearle si pago gas en simulacion
+      Un atacante con conocimiento del estado del wallet puede construir userOps con
+      ownerIndex de un slot removido para causar reverts en validateUserOp.
+    attack_scenario: |
+      1. Wallet ha removido al owner en index 1 (slot vacio)
+      2. Atacante construye userOp con signature.ownerIndex = 1
+      3. Bundler simula: validateUserOp -> _isValidSignature -> ownerAtIndex(1) = bytes("")
+         -> InvalidOwnerBytesLength revert
+      4. Bundler ve revert en lugar de return 1 (invalid signature)
+      5. Segun ERC-4337 spec, el bundler debe penalizar la cuenta por gas de simulacion fallida
+         PERO la penalizacion asume return 1, no revert
+      6. Si muchos wallets tienen este comportamiento, bundlers son griefados repetidamente
+      7. DoS contra bundlers: atacante envio muchos userOps con slots removidos
+    impact: |
+      DoS contra bundlers ERC-4337. El wallet no pierde fondos directamente, pero bundlers
+      pueden sufrir perdidas de gas y potencialmente ser expulsados de la red por
+      enviar operaciones que causan reverts inesperados en validateUserOp.
+    solidity: |
+      // Test: ownerIndex con slot removido causa revert en validateUserOp
+      function testRemovedOwnerIndexCausesRevertNotReturn1() public {
+          // Agregar y luego remover un owner
+          vm.prank(address(wallet));
+          wallet.addOwnerAddress(bob);  // index 1
+          vm.prank(address(wallet));
+          wallet.removeOwnerAtIndex(1, abi.encode(bob)); // slot 1 ahora vacio
+
+          bytes memory badSig = abi.encode(
+              CoinbaseSmartWallet.SignatureWrapper({
+                  ownerIndex: 1,  // slot removido -> bytes("")
+                  signatureData: bytes("arbitrary")
+              })
+          );
+
+          UserOperation memory userOp;
+          userOp.sender = address(wallet);
+          userOp.signature = badSig;
+          userOp.nonce = 0;
+          userOp.callData = abi.encodeCall(wallet.execute, (address(0), 0, ""));
+
+          // Debe REVERTIR con InvalidOwnerBytesLength
+          // En lugar de retornar 1 (lo correcto segun ERC-4337)
+          vm.expectRevert(
+              abi.encodeWithSelector(MultiOwnable.InvalidOwnerBytesLength.selector, bytes(""))
+          );
+          vm.prank(ENTRY_POINT);
+          wallet.validateUserOp(userOp, bytes32(0), 0);
+      }
+    status: investigate
+
+  - id: CSW-D-04
+    title: "getUserOpHashWithoutChainId omite chainId pero incluye entryPoint hardcodeado — incompatibilidad con EntryPoint v0.7"
+    severity: medium
+    confidence: 65
+    tier: 2
+    description: |
+      getUserOpHashWithoutChainId calcula:
+        keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))
+      donde entryPoint() retorna HARDCODED 0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789 (v0.6).
+
+      El hash normal del EntryPoint v0.6 es:
+        keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint(), block.chainid))
+
+      El getUserOpHashWithoutChainId simplemente remueve block.chainid y usa el mismo
+      entryPoint address. Esto funciona correctamente para v0.6.
+
+      PROBLEMA: EntryPoint v0.7 tiene una address diferente y un struct UserOperation diferente.
+      Si CoinbaseSmartWallet es actualizado (via upgradeToAndCall cross-chain) para soportar v0.7,
+      pero el metodo getUserOpHashWithoutChainId sigue usando la address de v0.6,
+      el hash cross-chain seria incorrecto para el nuevo entrypoint.
+
+      MAS URGENTE: validateUserOp recibe userOpHash del EntryPoint (parametro externo).
+      Para operaciones cross-chain, lo REEMPLAZA con getUserOpHashWithoutChainId.
+      Esto significa que el hash que se pasa externamente es IGNORADO para cross-chain ops.
+      Si un bundler malicioso pasa un userOpHash incorrecto para una op cross-chain,
+      no importa - se recalcula. CORRECTO Y SEGURO por diseno.
+
+      Verificar: el hash sin chain ID NO incluye address(this) del wallet directamente,
+      solo via userOp.sender (que ES address del wallet). Si dos wallets en la misma chain
+      tienen el mismo sender en el userOp (imposible - sender es el wallet address),
+      habria colision. No es un problema practico.
+    attack_scenario: |
+      Escenario: EntryPoint v0.7 deployment en el futuro
+      1. CoinbaseSmartWallet hace upgrade a nueva implementacion para soportar v0.7
+      2. La nueva impl sobreescribe validateUserOp pero no getUserOpHashWithoutChainId
+      3. getUserOpHashWithoutChainId sigue usando entryPoint() que ahora retorna v0.7 address
+      4. Si el override no actualiza correctamente, los hashes cross-chain son incorrectos
+      5. Operaciones cross-chain fallan o se firman incorrectamente
+    impact: |
+      Bajo impacto en el presente. Riesgo futuro si se migra a EntryPoint v0.7 sin
+      actualizar correctamente getUserOpHashWithoutChainId y entryPoint().
+    solidity: |
+      // Verificar: getUserOpHashWithoutChainId es deterministico y no incluye chainId
+      function testCrossChainHashIsDeterministic() public {
+          UserOperation memory userOp;
+          userOp.sender = address(wallet);
+          bytes32 h1 = wallet.getUserOpHashWithoutChainId(userOp);
+          bytes32 h2 = wallet.getUserOpHashWithoutChainId(userOp);
+          assertEq(h1, h2, "CSW-D-04: hash should be deterministic");
+          // Tambien verificar que no incluye block.chainid
+          // (imposible de verificar directamente sin fork, pero el calculo es visible)
+          // keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))
+          // NO incluye block.chainid -> mismo hash en todas las chains para mismo userOp
+      }
+    status: low_priority
+
+  - id: CSW-D-05
+    title: "isValidSignature vs validateUserOp — separacion de contextos de firma es correcta pero fragil"
+    severity: low
+    confidence: 88
+    tier: 2
+    description: |
+      Existen DOS rutas de validacion de firma:
+      1. ERC-1271 isValidSignature(hash, sig):
+         -> _isValidSignature(replaySafeHash(hash), sig)
+         -> hash efectivo = keccak256("\x19\x01" || domainSeparator(chainId, address(this)) || hashStruct(hash))
+      2. ERC-4337 validateUserOp(userOp, userOpHash, ...):
+         -> para txs normales: _isValidSignature(userOpHash, sig) [hash del EntryPoint con chainId]
+         -> para txs cross-chain: _isValidSignature(getUserOpHashWithoutChainId(userOp), sig)
+
+      La separacion funciona porque los hashes son completamente diferentes:
+      - ERC-1271: hash envuelto en EIP-712 con domainSeparator
+      - ERC-4337: hash crudo del UserOperation (o sin chain ID)
+
+      Una firma para ERC-1271 NO puede usarse en ERC-4337 y viceversa porque los hashes difieren.
+      ESTO ES CORRECTO. Sin embargo, la fragmentacion crea superficie de confusion para
+      desarrolladores que integran el wallet y para futuros upgrades que podrian romper
+      accidentalmente la separacion.
+    attack_scenario: |
+      No hay vector de ataque directo. La separacion funciona correctamente.
+      Riesgo: si en un upgrade futuro se cambia como se calcula replaySafeHash o
+      getUserOpHashWithoutChainId, y los cambios no son simetricos, podria crearse
+      una colision entre los dos contextos.
+    impact: |
+      Actualmente ninguno. Riesgo latente para futuros upgrades mal implementados.
+    solidity: |
+      // Verificar: firma para ERC-1271 NO puede usarse en validateUserOp
+      function testERC1271SigNotReusableInValidateUserOp() public {
+          bytes32 appHash = keccak256("some_dapp_hash");
+          bytes32 replaySafe = wallet.replaySafeHash(appHash);
+
+          (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerKey, replaySafe);
+          bytes memory sig = abi.encodePacked(r, s, v);
+          bytes memory wrappedSig = abi.encode(
+              CoinbaseSmartWallet.SignatureWrapper({ownerIndex: 0, signatureData: sig})
+          );
+
+          // ERC-1271 funciona
+          assertEq(wallet.isValidSignature(appHash, wrappedSig), bytes4(0x1626ba7e));
+
+          // Misma firma en validateUserOp con appHash como userOpHash -> debe retornar 1
+          UserOperation memory userOp;
+          userOp.sender = address(wallet);
+          userOp.signature = wrappedSig;
+          userOp.callData = abi.encodeCall(wallet.execute, (address(0), 0, ""));
+
+          vm.prank(ENTRY_POINT);
+          uint256 result = wallet.validateUserOp(userOp, appHash, 0);
+          // La firma fue para replaySafeHash(appHash), NO para appHash
+          // -> debe retornar 1 (invalid sig)
+          assertEq(result, 1, "CSW-D-05: ERC-1271 sig must not work in validateUserOp");
+      }
+    status: investigate
+    notes: |
+      Despues del analisis, la separacion es correcta. El test de arriba DEBERIA pasar
+      (retornar 1, no 0). Documentar como false positive si el test confirma comportamiento correcto.
+
+  - id: CSW-D-06
+    title: "domainSeparator usa block.chainid — manipulable en chains con chain ID mutable (ej: EVM fork chains)"
+    severity: informational
+    confidence: 50
+    tier: 3
+    description: |
+      El domainSeparator en ERC1271.sol usa block.chainid en cada llamada (no cacheado).
+      Esto es generalmente correcto y previene que el domainSeparator quede stalado tras un fork.
+
+      Sin embargo, en chains donde el chain ID puede cambiar durante la vida del contrato
+      (escenario teorico pero posible en testnets o chains experimentales), las firmas
+      generadas con el chainId anterior serian invalidas con el nuevo chainId.
+
+      Tambien: el eip712Domain() tiene un bug cosmetico:
+        salt = salt;  // asigna variable local a si misma (siempre bytes32(0))
+        extensions = extensions;  // asigna variable local a si misma (siempre array vacio)
+      Esto viola la implementacion correcta de ERC-5267 pero no tiene impacto de seguridad.
+      Los campos deberian retornar sus valores reales (que en este caso son los zero values).
+
+      NOTA: el campo `fields` = 0x0f = 0b00001111 indica que SOLO se usan name, version, chainId,
+      verifyingContract (bits 0-3). NO se usa salt (bit 4) ni extensions (bits 5+).
+      Por lo tanto salt=0 y extensions=[] son correctos para este domainSeparator.
+      El bug cosmetico de `salt = salt` es confuso pero no incorrecto en resultado.
+    attack_scenario: |
+      No hay vector de ataque en la practica. El bug cosmetico de salt=salt no tiene impacto.
+    impact: |
+      Informacional. Riesgo solo en chains con chain ID mutable.
+    solidity: |
+      // Verificar que domainSeparator incluye chainId y address(this)
+      function testDomainSeparatorComponents() public {
+          bytes32 ds = wallet.domainSeparator();
+          // ds depende de block.chainid y address(wallet)
+          // Cambiar chain (fork) o address -> ds diferente
+          assertNotEq(ds, bytes32(0), "CSW-D-06: domainSeparator must be non-zero");
+
+          // Verificar eip712Domain fields
+          (bytes1 fields,,, uint256 chainId, address verifyingContract,,) = wallet.eip712Domain();
+          assertEq(fields, hex"0f"); // name, version, chainId, verifyingContract activos
+          assertEq(chainId, block.chainid);
+          assertEq(verifyingContract, address(wallet));
+      }
+    status: low_priority
+
+  - id: CSW-D-07
+    title: "upgradeToAndCall en batch cross-chain — validacion de newImplementation solo en chain local"
+    severity: high
+    confidence: 73
+    tier: 1
+    description: |
+      En validateUserOp(), para operaciones cross-chain (executeWithoutChainIdValidation) que
+      incluyen upgradeToAndCall, se verifica:
+        if (newImplementation.code.length == 0) revert InvalidImplementation(newImplementation)
+
+      Esta verificacion ocurre en la chain donde se valida la UserOp. La MISMA UserOp
+      (sin chain ID) puede ser replicada en otras chains donde:
+      1. newImplementation NO existe: validateUserOp en esa chain revierte -> bundler no incluye -> SEGURO
+      2. newImplementation EXISTE pero con codigo DIFERENTE: validacion pasa -> upgrade ocurre
+         con codigo potencialmente diferente/malicioso
+
+      Escenario atacante: si un atacante puede desplegar codigo malicioso en la misma address
+      que la nueva implementacion legitima en alguna chain (usando CREATE2 front-running),
+      el upgrade cross-chain instalara el malware en esa chain.
+
+      La address de la implementacion suele ser deterministicamente derivada (CREATE2), pero
+      si hay una ventana entre el deploy en chain A y el deploy en chain B, un atacante puede
+      front-run el deploy en chain B con codigo malicioso en esa address.
+    attack_scenario: |
+      1. Coinbase prepara nueva implementacion X para desplegar en Ethereum y Base
+      2. X es desplegada en Ethereum (address deterministica via CREATE2)
+      3. Usuario firma upgradeToAndCall cross-chain apuntando a X
+      4. Antes de que X sea desplegada en Base, atacante front-runs el deploy en Base
+         con codigo malicioso en la misma address X (usando la misma factory/salt)
+      5. La UserOp cross-chain se replica en Base:
+         - validateUserOp verifica X.code.length > 0 -> pasa (codigo malicioso tiene code)
+         - upgradeToAndCall(X, "") se ejecuta -> wallet hace upgrade al malware
+      6. Atacante drena el wallet en Base
+    impact: |
+      Compromiso total del wallet en la chain afectada. Perdida de todos los fondos.
+      Requiere que el atacante pueda front-run el deploy de la nueva implementacion.
+      Factibilidad baja pero consecuencias criticas.
+    solidity: |
+      // Verificar: el check de implementacion es suficiente
+      function testUpgradeCheckCodeLength() public {
+          // Deploy de implementacion maliciosa
+          address malImpl = address(new MaliciousImpl());
+
+          bytes[] memory calls = new bytes[](1);
+          calls[0] = abi.encodeCall(
+              UUPSUpgradeable.upgradeToAndCall,
+              (malImpl, "")
+          );
+
+          UserOperation memory userOp;
+          userOp.nonce = uint256(REPLAYABLE_NONCE_KEY) << 64;
+          userOp.callData = abi.encodeCall(
+              wallet.executeWithoutChainIdValidation,
+              (calls)
+          );
+
+          // validateUserOp verifica malImpl.code.length > 0
+          // Si malImpl tiene codigo (aunque malicioso), la validacion PASA
+          // -> Invariante violada: code.length > 0 no garantiza que la impl sea la correcta
+          vm.prank(ENTRY_POINT);
+          // Esta linea NO deberia revertir con InvalidImplementation
+          // (malImpl tiene codigo -> check pasa)
+          uint256 result = wallet.validateUserOp(userOp, bytes32(0), 0);
+          // La firma sera invalida (return 1) pero el check de implementacion PASO
+      }
+    status: investigate
+
+  - id: CSW-D-08
+    title: "REPLAYABLE_NONCE_KEY = 8453 coincide con Base chain ID — confusion semantica y riesgo futuro"
+    severity: low
+    confidence: 65
+    tier: 2
+    description: |
+      REPLAYABLE_NONCE_KEY = 8453 = Base chain ID. Esta constante se usa como un nonce key
+      en el NonceManager del EntryPoint para operaciones cross-chain en TODAS las chains.
+
+      El riesgo actual: ninguno, porque el nonce key es solo un namespace para el NonceManager.
+      El riesgo futuro: si se despliega una chain con chain ID 8453 Y EntryPoint v0.6,
+      el REPLAYABLE_NONCE_KEY coincidira con el chain ID de esa chain. Esto no crea una
+      vulnerabilidad directa, pero genera confusion semantica: ¿es una operacion en
+      "la chain 8453" o es una operacion "replayable cross-chain"?
+
+      MAS IMPORTANTE (design concern): el enforcement de nonce key es bidireccional:
+      - executeWithoutChainIdValidation DEBE usar key 8453
+      - Otras ops NO DEBEN usar key 8453
+      Si alguna chain legitima necesita usar el key 8453 para sus nonces normales,
+      chocaria con el espacio reservado para operaciones cross-chain.
+
+      Verificar: el EntryPoint NonceManager separa nonces por key -> no hay colision
+      entre cross-chain nonces (key 8453) y nonces normales (key 0).
+    attack_scenario: |
+      No hay vector de ataque directo con el diseno actual.
+    impact: |
+      Bajo. Confusion semantica y posible confusion futura con chains que tengan chain ID 8453.
+    solidity: |
+      // Verificar el enforcement bidireccional del nonce key
+      function testNonceKeyEnforcement() public {
+          // Op con executeWithoutChainIdValidation y key != REPLAYABLE_NONCE_KEY -> revert
+          UserOperation memory userOp;
+          userOp.nonce = 0; // key = 0, no 8453
+          userOp.callData = abi.encodeCall(wallet.executeWithoutChainIdValidation, (new bytes[](0)));
+
+          vm.expectRevert(
+              abi.encodeWithSelector(CoinbaseSmartWallet.InvalidNonceKey.selector, uint256(0))
+          );
+          vm.prank(ENTRY_POINT);
+          wallet.validateUserOp(userOp, bytes32(0), 0);
+
+          // Op normal con key == REPLAYABLE_NONCE_KEY -> revert
+          userOp.nonce = uint256(REPLAYABLE_NONCE_KEY) << 64;
+          userOp.callData = abi.encodeCall(wallet.execute, (address(0), 0, ""));
+
+          vm.expectRevert(
+              abi.encodeWithSelector(CoinbaseSmartWallet.InvalidNonceKey.selector, REPLAYABLE_NONCE_KEY)
+          );
+          vm.prank(ENTRY_POINT);
+          wallet.validateUserOp(userOp, bytes32(0), 0);
+      }
+    status: low_priority
+
+  - id: CSW-D-09
+    title: "WebAuthn requireUV=false — autenticacion sin verificacion biometrica del usuario"
+    severity: medium
+    confidence: 75
+    tier: 2
+    description: |
+      En _isValidSignature() para owners con public keys (passkeys/WebAuthn):
+        WebAuthn.verify({challenge: abi.encode(hash), requireUV: false, ...})
+
+      requireUV = false: el authenticator NO necesita User Verification (biometria, PIN).
+      Solo necesita User Presence (UP = tocar el dispositivo).
+
+      Con requireUV=false, un atacante con acceso fisico al dispositivo desbloqueado puede
+      generar firmas WebAuthn validas sin biometria. La seguridad depende completamente del
+      bloqueo del OS, no del smart wallet.
+
+      Para transacciones que mueven fondos significativos, la falta de UV representa un
+      riesgo de seguridad: un shoulder-surfer o alguien con acceso momentaneo al dispositivo
+      puede drenar el wallet sin que el usuario lo sepa (si el OS no esta bloqueado).
+
+      El challenge de WebAuthn es abi.encode(hash) = 64 bytes (hash de 32 bytes ABI encoded).
+      Esto es no-standard (WebAuthn espera base64url del challenge), pero es lo que
+      WebAuthn.verify en webauthn-sol espera y maneja correctamente.
+    attack_scenario: |
+      1. Usuario registra passkey (P256 public key) como owner del wallet
+      2. Dispositivo del usuario esta desbloqueado (pantalla encendida, sin lock)
+      3. Atacante tiene acceso fisico momentaneo al dispositivo
+      4. Atacante genera UserOp para transferir fondos + firma con passkey (solo toca el dispositivo)
+         requireUV=false -> no necesita biometria/PIN
+      5. Fondos transferidos al atacante
+    impact: |
+      Posible drenado del wallet si un atacante tiene acceso fisico momentaneo al dispositivo.
+      La protecc depende del lock del OS. Para montos altos, esta es una brecha de seguridad.
+      Conocido como L-04 en C4 y as design trade-off por Coinbase.
+    solidity: |
+      // Este invariante documenta la decision de diseno, no es testeable directamente
+      function testRequireUVIsAlwaysFalse() public {
+          // La verificacion de WebAuthn en _isValidSignature siempre usa requireUV=false
+          // No hay path donde requireUV=true sea usado
+          // Documenta: para owners de tipo public key (64 bytes), UP es suficiente, UV no requerido
+          // La verificacion de biometria queda delegada al OS del dispositivo del usuario
+          t(true, "CSW-D-09: requireUV=false is hardcoded design decision");
+      }
+    status: low_priority
+    notes: |
+      Conocido y reportado como L-04 en C4. Coinbase lo considera un trade-off de usabilidad.
+      Algunos authenticators (YubiKey) no soportan UV -> requireUV=true los excluiria.
+      Probablemente won't fix.
+
+  - id: CSW-D-10
+    title: "initialize() front-running si se deploya proxy manualmente fuera de la factory"
+    severity: medium
+    confidence: 75
+    tier: 2
+    description: |
+      initialize() es externa y solo verifica nextOwnerIndex() == 0.
+      La factory CoinbaseSmartWalletFactory.createAccount() es atomica: deploya el proxy
+      e inicializa en la misma transaccion -> no hay ventana para front-running via factory.
+
+      PERO si alguien deploya un proxy ERC-1967 directamente (apuntando a la impl de CSW)
+      en una transaccion, y llama initialize() en una transaccion SEPARADA, hay una ventana
+      donde un atacante puede front-run la llamada a initialize() con sus propios owners.
+
+      El constructor de la implementation llama _initializeOwners([address(0)]) para que la
+      implementation misma no sea inicializable directamente (nextOwnerIndex=1). Los proxies
+      tienen storage propio -> nextOwnerIndex=0 en el proxy hasta que se llame initialize().
+
+      El riesgo es bajo porque la factory es el camino esperado, pero si alguna integracion
+      deploya proxies manualmente (para pre-computing addresses o vanity addresses), es vulnerable.
+    attack_scenario: |
+      1. Integracion deploya proxy ERC-1967 apuntando a CoinbaseSmartWallet impl
+         (para calcular la address del futuro wallet antes de inicializarlo)
+      2. La integracion envia ETH al proxy (esperando inicializarlo despues)
+      3. Atacante monitorea la tx en el mempool y ve el proxy nuevo con ETH
+      4. Atacante front-runs la llamada a initialize() con sus propios owners
+      5. Atacante es ahora dueno del wallet y puede retirar el ETH
+    impact: |
+      Compromiso total del wallet y robo de ETH si el proxy se deploya fuera de la factory.
+      Riesgo bajo en la practica (la factory es el flujo esperado).
+    solidity: |
+      // Verificar que initialize no puede ser llamado dos veces
+      function testInitializeCannotBeCalledTwice() public {
+          // Primera llamada: ya fue ejecutada en setup
+          bytes[] memory newOwners = new bytes[](1);
+          newOwners[0] = abi.encode(attacker);
+
+          vm.expectRevert(CoinbaseSmartWallet.Initialized.selector);
+          wallet.initialize(newOwners);
+          // Correcto: revert si ya fue inicializado
+      }
+    status: low_priority
+
+  - id: CSW-D-11
+    title: "Asimetria critica: addOwnerPublicKey no valida que (x,y) sea punto valido en secp256r1"
+    severity: medium
+    confidence: 70
+    tier: 1
+    description: |
+      addOwnerPublicKey(bytes32 x, bytes32 y) simplemente almacena abi.encode(x, y) sin
+      verificar que (x, y) sea un punto valido en la curva secp256r1 (P-256).
+      Si (x, y) no es un punto valido en la curva, WebAuthn.verify() no podra verificar
+      ninguna firma contra ese public key, efectivamente haciendo que ese owner no pueda
+      firmar ninguna operacion.
+
+      IMPACTO: si el UNICO owner es una clave publica invalida, el wallet queda bricked
+      permanentemente (sin forma de ejecutar ninguna operacion porque todas las firmas fallan).
+
+      Tambien: si (x, y) es el punto en el infinito u otro punto especial, el comportamiento
+      de WebAuthn.verify es indefinido y podria causar panics o resultados inesperados.
+
+      La validacion en _initializeOwners verifica length (32 o 64 bytes) pero NO verifica
+      si la clave publica es un punto valido en la curva.
+
+      SOLODIT REFERENCIA: L-04 menciona falta de validacion de passkey.
+    attack_scenario: |
+      1. Usuario (o script erroneo) llama addOwnerPublicKey con coordenadas invalidas
+         que no corresponden a un punto en secp256r1
+      2. La operacion tiene exito (no hay revert)
+      3. Si ese era el unico/ultimo owner, el wallet queda bricked:
+         no se puede generar ninguna firma valida para ese public key
+      4. Fondos congelados permanentemente
+
+      Variante maliciosa: co-owner malicioso hace removeOwnerAtIndex(0, alice) +
+      addOwnerPublicKey(0, 0) (coordenadas invalidas) para brickear el wallet
+      quedando como el unico "owner" con una clave que no puede firmar nada.
+    impact: |
+      Wallet bricked si el unico owner tiene una clave publica invalida.
+      Perdida permanente de fondos si no hay otros owners que puedan recuperarlo.
+    solidity: |
+      // Test: addOwnerPublicKey con coordenadas invalidas no revierte
+      function testAddInvalidPublicKeyNotReverts() public {
+          // (0, 0) no es un punto valido en secp256r1
+          vm.prank(address(wallet));
+          // Esto NO deberia revertir segun el codigo actual
+          wallet.addOwnerPublicKey(bytes32(0), bytes32(0));
+
+          // Verificar que (0,0) quedo como owner
+          t(wallet.isOwnerPublicKey(bytes32(0), bytes32(0)), "CSW-D-11: invalid point accepted as owner");
+
+          // Verificar que NO se puede firmar con ese punto
+          bytes memory sig = abi.encode(WebAuthn.WebAuthnAuth({
+              // firma invalida
+          }));
+          // _isValidSignature con owner (0,0) y cualquier firma deberia retornar false
+          // (WebAuthn.verify con punto invalido retorna false)
+      }
+    status: investigate
+    notes: |
+      Reportado en C4 como L-04. La falta de validacion on-chain de puntos de curva
+      es comun en WebAuthn implementations porque la validacion on-chain es cara.
+      Los clientes (frontend) deben validar antes de enviar la tx. Known issue.
+
+false_positives:
+  - id: FP-CSW-D-01
+    title: "Cross-chain replay de operaciones admin es BY DESIGN"
+    reason: |
+      executeWithoutChainIdValidation() esta disenada explicitamente para permitir operaciones
+      cross-chain replayables. El allowlist de 5 selectors es tight. El enforcement bidireccional
+      del REPLAYABLE_NONCE_KEY es correcto. El replay es la FEATURE, no el bug.
+
+  - id: FP-CSW-D-02
+    title: "_isValidSignature contextos ERC-1271 vs ERC-4337 correctamente separados"
+    reason: |
+      La separacion entre replaySafeHash (ERC-1271) y el hash directo (ERC-4337) previene
+      cross-context replay. Una firma para isValidSignature no puede usarse en validateUserOp
+      y viceversa porque los hashes son diferentes. SEGURO por diseno.
+
+  - id: FP-CSW-D-03
+    title: "_checkOwner solo verifica address owners — passkey owners via EntryPoint es correcto"
+    reason: |
+      msg.sender es siempre un Ethereum address (20 bytes). Passkey owners (64 bytes) no pueden
+      ser msg.sender. Por lo tanto passkey owners solo pueden operar via UserOps/EntryPoint.
+      Esto es el diseno correcto para ERC-4337 con passkeys.
+
+  - id: FP-CSW-D-04
+    title: "payPrefund ignora fallo silenciosamente — correcto segun ERC-4337 spec"
+    reason: |
+      El ignore del resultado de payPrefund es explicitamente correcto segun el spec de ERC-4337.
+      Es responsabilidad del EntryPoint verificar que los fondos fueron transferidos.
+      Si la tx falla por falta de fondos, el EntryPoint maneja el revert.
+
+symmetric_inspection:
+  pairs:
+    - name: "addOwner / removeOwner"
+      add_functions:
+        - addOwnerAddress(address owner)
+        - addOwnerPublicKey(bytes32 x, bytes32 y)
+      remove_functions:
+        - removeOwnerAtIndex(uint256 index, bytes calldata owner)
+        - removeLastOwner(uint256 index, bytes calldata owner)
+      asymmetries:
+        - "add: asigna index automaticamente (nextOwnerIndex++); remove: requiere conocer el index"
+        - "add: NO valida que public key sea punto valido en secp256r1 (L-04 C4)"
+        - "removeLastOwner: permite ownerCount=0 (bricked wallet); add: no puede revertir esta situacion sin action"
+        - "add: emite AddOwner(index, owner); remove: emite RemoveOwner(index, owner) — SIMETRICO"
+        - "ambos: onlyOwner modifier — SIMETRICO"
+        - "ambos: en canSkipChainIdValidation allowlist — SIMETRICO"
+
+    - name: "execute / executeBatch"
+      asymmetries:
+        - "execute: un solo call; executeBatch: N calls atomicos — funcionalmente equivalentes"
+        - "ambos: onlyEntryPointOrOwner modifier — SIMETRICO"
+        - "ambos: usan _call() internamente — SIMETRICO"
+        - "execute: puede enviar ETH; executeBatch: cada Call tiene su propio value — SIMETRICO"
+
+    - name: "validateUserOp (ERC-4337) / isValidSignature (ERC-1271)"
+      asymmetries:
+        - "validateUserOp: usa hash DIRECTO (o sin chain ID para cross-chain)"
+        - "isValidSignature: aplica replaySafeHash() antes de validar"
+        - "validateUserOp: revierte si signature format es invalido (no retorna 1)"
+        - "isValidSignature: revierte si signature format es invalido (no retorna 0xffffffff)"
+        - "ambos usan _isValidSignature internamente — SIMETRICO en la implementacion base"
+
+    - name: "initialize / (no hay deinitialize)"
+      asymmetries:
+        - "initialize: puede llamarse SOLO ONCE (nextOwnerIndex == 0)"
+        - "No hay deinitialize ni reset — asimetria critica"
+        - "removeLastOwner permite ownerCount=0 pero nextOwnerIndex nunca se resetea"
+        - "-> Una vez bricked, NO hay recovery. Asimetria intencional?"

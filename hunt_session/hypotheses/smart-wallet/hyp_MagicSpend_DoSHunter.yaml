@@ -1,0 +1,311 @@
+hunter: DoSHunter
+component: MagicSpend
+contract: MagicSpend.sol
+date: "2026-03-27"
+hypotheses:
+
+  - id: MS-DOS-01
+    title: "Division by zero in _validateRequest if maxWithdrawDenominator is set to 0"
+    severity: low
+    confidence: 75
+    status: pending
+    location:
+      file: src/MagicSpend.sol
+      function: _validateRequest
+      lines: "347"
+    solidity: |
+      // Line 347 - division by zero if maxWithdrawDenominator == 0
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    attack_scenario: |
+      1. Owner calls setMaxWithdrawDenominator(0) — accidentally or via compromised key.
+      2. Every subsequent call to withdraw() or validatePaymasterUserOp() that involves
+         ETH (asset == address(0)) hits _validateRequest which divides by zero.
+      3. All ETH withdrawals and paymaster sponsoring revert permanently until owner
+         sets a non-zero denominator.
+      4. ERC-20 withdrawals via withdraw() would still work (asset != address(0) skips
+         the check on line 348), but the core paymaster functionality is bricked.
+    impact: |
+      Complete DoS of paymaster sponsoring and ETH withdrawals for all users.
+      Owner can fix by calling setMaxWithdrawDenominator(nonZero), but during the
+      window all UserOperations using this paymaster will fail.
+      Severity is Low because it requires owner misconfiguration (trusted role).
+    notes: |
+      No input validation in _setMaxWithdrawDenominator to reject 0.
+      Mitigation: require(newDenominator > 0) in _setMaxWithdrawDenominator.
+
+  - id: MS-DOS-02
+    title: "Same-bundle balance drain causes WithdrawTooLarge for later UserOps"
+    severity: low
+    confidence: 60
+    status: pending
+    location:
+      file: src/MagicSpend.sol
+      function: _validateRequest
+      lines: "347-349"
+    solidity: |
+      // Balance check uses live address(this).balance which decreases intra-bundle
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+          revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+      }
+    attack_scenario: |
+      1. Bundler includes multiple UserOps that all use MagicSpend as paymaster.
+      2. Earlier UserOps drain ETH via postOp (funds sent to accounts).
+      3. For later UserOps, address(this).balance has decreased, so maxAllowed drops.
+      4. A legitimate UserOp that would normally pass now fails WithdrawTooLarge
+         because the balance check is against the depleted live balance.
+      5. Attacker can intentionally submit many small withdraw UserOps to a cooperative
+         bundler to push a victim's UserOp below the maxAllowed threshold.
+    impact: |
+      Temporary DoS: victim's UserOp fails in the current bundle. They can resubmit
+      in the next block. Impact limited by: (a) bundler typically validates ops
+      independently, (b) attacker needs valid signed WithdrawRequests from owner,
+      (c) effect is transient (one block).
+      This is by-design behavior per the code comment on line 153-154.
+    notes: |
+      The maxWithdrawDenominator mechanism exists precisely to mitigate this, but
+      does not fully prevent it when denominator is small (e.g., 2).
+      Severity is Low — transient, attacker needs signed requests, known design tradeoff.
+
+  - id: MS-DOS-03
+    title: "forceSafeTransferETH in postOp sends ETH to account via SELFDESTRUCT fallback — funds unrecoverable in some account implementations"
+    severity: medium
+    confidence: 45
+    status: pending
+    location:
+      file: src/MagicSpend.sol
+      function: postOp
+      lines: "170"
+    solidity: |
+      // Uses forceSafeTransferETH with GAS_STIPEND_NO_STORAGE_WRITES (2300 gas)
+      // Solady: if call fails, falls back to deploying a SELFDESTRUCT contract
+      SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+    attack_scenario: |
+      1. A smart contract wallet (SCW) has a receive() function that requires >2300 gas
+         (e.g., emits an event with indexed params, or updates a balance mapping).
+      2. The low-gas call to the SCW's receive() fails.
+      3. forceSafeTransferETH falls back to deploying a self-destructing contract that
+         sends ETH to the SCW address via SELFDESTRUCT.
+      4. If the SCW has no way to handle ETH received via SELFDESTRUCT (no sweep
+         function, only expects ETH via call), these funds may be trapped or
+         unaccounted for in the SCW's internal bookkeeping.
+      5. Post EIP-6780 (Dencun), SELFDESTRUCT in a newly created contract still
+         transfers ETH, but the behavior may change in future EIPs.
+    impact: |
+      User's excess ETH (withdrawAmount - actualGasCost) is force-sent to the account.
+      The ETH arrives but may not be properly tracked by certain SCW implementations.
+      Not a loss of funds per se (ETH is at the account address), but can cause
+      accounting issues in SCWs that track balance via storage rather than address.balance.
+      Confidence is moderate — depends on SCW implementation details.
+    notes: |
+      This is a known design choice by Solady and MagicSpend. The alternative
+      (reverting postOp) would be worse — it triggers PostOpMode.postOpReverted
+      which hard reverts (line 157-159), and per EntryPoint v0.6, the entire bundle
+      may revert (PR #293 reference on line 156).
+      Most standard SCW implementations (including Coinbase Smart Wallet) handle
+      plain ETH receives fine within 2300 gas.
+
+  - id: MS-DOS-04
+    title: "Nonce front-running on withdraw() is impossible — nonces are per-account"
+    severity: informational
+    confidence: 95
+    status: rejected
+    location:
+      file: src/MagicSpend.sol
+      function: _validateRequest
+      lines: "343-352"
+    solidity: |
+      // Nonces are scoped per-account — attacker cannot burn victim's nonce
+      mapping(uint256 nonce => mapping(address user => bool used)) internal _nonceUsed;
+      // ...
+      if (_nonceUsed[withdrawRequest.nonce][account]) {
+          revert InvalidNonce(withdrawRequest.nonce);
+      }
+      _nonceUsed[withdrawRequest.nonce][account] = true;
+    attack_scenario: |
+      Attempted attack: attacker observes victim's withdraw() tx in mempool, front-runs
+      with the same nonce to invalidate it.
+      Why it fails: _nonceUsed is keyed by (nonce, account). Attacker calling withdraw()
+      uses their own address as `account` (msg.sender on line 199). They cannot burn
+      victim's nonce. Additionally, the signature is bound to `account` in getHash(),
+      so attacker cannot replay victim's WithdrawRequest.
+    impact: "None — not exploitable."
+    notes: |
+      Per-account nonce design correctly prevents cross-user nonce burning.
+      The only way to burn a user's nonce is to front-run the same user's tx with the
+      same signed request, but the user themselves would need two txs with the same
+      nonce, and the first one to land wins — standard replay protection.
+
+  - id: MS-DOS-05
+    title: "Nonce burning attack via validatePaymasterUserOp — EntryPoint uses sender not msg.sender"
+    severity: medium
+    confidence: 55
+    status: pending
+    location:
+      file: src/MagicSpend.sol
+      function: validatePaymasterUserOp
+      lines: "126-144"
+    solidity: |
+      // account is userOp.sender, set by the UserOp submitter
+      WithdrawRequest memory withdrawRequest = abi.decode(userOp.paymasterAndData[20:], (WithdrawRequest));
+      // ...
+      _validateRequest(userOp.sender, withdrawRequest);
+      // _validateRequest marks nonce as used:
+      // _nonceUsed[withdrawRequest.nonce][account] = true;
+    attack_scenario: |
+      1. Victim has a signed WithdrawRequest with nonce N from the MagicSpend owner.
+      2. The paymasterAndData (including the WithdrawRequest) is visible in the mempool
+         when the victim submits their UserOp to the bundler.
+      3. Attacker constructs a UserOp with: sender = victim's SCW address, and copies
+         the same paymasterAndData (containing the signed WithdrawRequest with nonce N).
+      4. For this to reach validatePaymasterUserOp, the UserOp must pass the EntryPoint's
+         account validation (validateUserOp on the victim's SCW). This requires the
+         attacker to control the victim's SCW or have a valid signature for it.
+      5. IF the attacker has a valid signer on the victim's SCW (e.g., one of multiple
+         owners in a multi-sig SCW), they could submit a UserOp that burns the nonce
+         without actually using the funds for the intended purpose.
+    impact: |
+      If exploitable, the victim's signed WithdrawRequest becomes unusable — the nonce
+      is burned. The victim must request a new signed request from the MagicSpend owner.
+      This is a griefing attack, not a fund theft.
+      Confidence is moderate: requires the attacker to pass validateUserOp on the
+      victim's SCW, which normally requires being an authorized signer.
+      For standard single-owner SCWs this is not exploitable (attacker = owner).
+      For multi-owner SCWs, a co-owner could grief.
+    notes: |
+      In ERC-4337, the EntryPoint calls validateUserOp on the account first, then
+      validatePaymasterUserOp. If account validation fails, paymaster is never called.
+      This hypothesis is only relevant for accounts with multiple authorized signers
+      where one signer wants to grief another.
+      Additionally, even if the signature check fails (line 139), the nonce is ALREADY
+      burned on line 137 (_validateRequest is called before signature validation).
+      The sigFailed flag only affects validationData, not execution flow.
+
+  - id: MS-DOS-06
+    title: "Nonce burned even when signature validation fails in validatePaymasterUserOp"
+    severity: medium
+    confidence: 70
+    status: pending
+    location:
+      file: src/MagicSpend.sol
+      function: validatePaymasterUserOp
+      lines: "137-140"
+    solidity: |
+      // Nonce is consumed BEFORE signature check
+      _validateRequest(userOp.sender, withdrawRequest);  // line 137 — marks nonce used
+
+      bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest);  // line 139
+      validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160);  // line 140
+      // If sigFailed=true, EntryPoint will reject the UserOp, but nonce is ALREADY burned
+    attack_scenario: |
+      1. Victim has a valid signed WithdrawRequest for nonce N.
+      2. Attacker (who controls or is an authorized signer on the victim's SCW) submits
+         a UserOp with paymasterAndData containing a WithdrawRequest with the SAME
+         nonce N but a different amount or an invalid/different signature.
+      3. validatePaymasterUserOp is called by EntryPoint. _validateRequest runs first
+         and marks nonce N as used (line 137, then line 352 in _validateRequest).
+      4. Signature check on line 139 returns sigFailed=true.
+      5. EntryPoint sees validationData indicates failure, reverts the UserOp.
+      6. BUT: the nonce state change from _validateRequest persists because EntryPoint
+         v0.6 does NOT revert paymaster state on validation failure — it only reverts
+         account state during simulation.
+      7. Victim's legitimate WithdrawRequest with nonce N is now permanently invalidated.
+    impact: |
+      Permanent nonce burning without valid paymaster signature. Attacker only needs to
+      pass the account's validateUserOp (be an authorized signer on the SCW).
+      The withdraw amount is never transferred, but the nonce is burned.
+      Victim must obtain a new signed WithdrawRequest from the owner.
+      CRITICAL CAVEAT: Need to verify EntryPoint v0.6 state revert behavior during
+      paymaster validation failure. If EntryPoint reverts ALL state on validation
+      failure (including paymaster storage), this is not exploitable.
+    notes: |
+      The ordering of _validateRequest (state change) before isValidWithdrawSignature
+      (view check) is the root issue. If signature check was first, or if nonce was
+      only consumed on successful validation, this would not be possible.
+      EntryPoint v0.6 behavior: during simulation (simulateValidation), paymaster
+      storage changes may be reverted. But in actual handleOps execution, the
+      paymaster's validatePaymasterUserOp runs in the verification loop — need to
+      confirm if failed validation reverts paymaster state.
+      Status pending — requires EntryPoint v0.6 source review to confirm.
+
+  - id: MS-DOS-07
+    title: "Owner can set maxWithdrawDenominator to type(uint256).max blocking all ETH withdrawals"
+    severity: informational
+    confidence: 85
+    status: rejected
+    location:
+      file: src/MagicSpend.sol
+      function: _setMaxWithdrawDenominator
+      lines: "329-333"
+    solidity: |
+      function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+          maxWithdrawDenominator = newDenominator;
+          emit MaxWithdrawDenominatorSet(newDenominator);
+      }
+      // No upper bound check. Setting to type(uint256).max makes maxAllowed = 0
+      // for any realistic balance, blocking all ETH withdrawals.
+    attack_scenario: |
+      1. Compromised or malicious owner sets maxWithdrawDenominator to type(uint256).max.
+      2. maxAllowed = address(this).balance / type(uint256).max = 0 for any balance
+         less than type(uint256).max wei.
+      3. All ETH withdraw requests with amount > 0 revert with WithdrawTooLarge.
+      4. Paymaster sponsoring also blocked since validatePaymasterUserOp calls
+         _validateRequest which applies the same check.
+    impact: |
+      Complete DoS of all ETH operations. Requires compromised owner — trusted role.
+      Informational only: trusted admin can always DoS their own system.
+    notes: |
+      Not a real vulnerability — owner is trusted and can also drain funds directly
+      via ownerWithdraw. Documenting for completeness.
+
+  - id: MS-DOS-08
+    title: "selfdestruct ETH injection inflates balance but cannot cause DoS"
+    severity: informational
+    confidence: 90
+    status: rejected
+    location:
+      file: src/MagicSpend.sol
+      function: _validateRequest
+      lines: "347"
+    solidity: |
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    attack_scenario: |
+      Attempted attack: attacker uses SELFDESTRUCT to force ETH into MagicSpend,
+      inflating address(this).balance to manipulate maxAllowed.
+      Why it fails for DoS: inflating balance INCREASES maxAllowed, making withdrawals
+      easier, not harder. This is the opposite of a DoS — it's potentially beneficial
+      for users.
+      The only theoretical attack would be to inflate balance to make maxAllowed so
+      large that a single withdraw drains the contract, but the withdrawal amount is
+      capped by the signed WithdrawRequest.amount which is owner-controlled.
+    impact: "None — balance inflation cannot cause denial of service."
+    notes: |
+      Balance deflation (draining) would be more concerning, but attacker cannot drain
+      MagicSpend balance without valid signed WithdrawRequests or owner access.
+
+  - id: MS-DOS-09
+    title: "Gas griefing via receive() in account during forceSafeTransferETH is mitigated by gas stipend cap"
+    severity: informational
+    confidence: 90
+    status: rejected
+    location:
+      file: src/MagicSpend.sol
+      function: postOp
+      lines: "170"
+    solidity: |
+      SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+    attack_scenario: |
+      Attempted attack: malicious SCW implements receive() with expensive operations
+      (loops, storage writes) to consume maximum gas during postOp.
+      Why it fails:
+      1. GAS_STIPEND_NO_STORAGE_WRITES = 2300 gas — caps execution in receive().
+      2. If receive() reverts or exceeds stipend, forceSafeTransferETH falls back to
+         SELFDESTRUCT-based transfer which bypasses receive() entirely.
+      3. The SELFDESTRUCT fallback costs ~30K gas but this is bounded and predictable.
+      4. Total gas overhead is capped — no unbounded griefing possible.
+    impact: |
+      No meaningful gas griefing possible. The forceSafeTransferETH design specifically
+      prevents this attack vector by capping the gas stipend and having a fallback.
+    notes: |
+      Well-designed mitigation. The 2300 gas stipend prevents storage writes and
+      complex logic. The SELFDESTRUCT fallback ensures delivery even if receive() fails.

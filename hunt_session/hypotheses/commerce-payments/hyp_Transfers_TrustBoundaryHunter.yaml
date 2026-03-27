@@ -1,0 +1,510 @@
+protocol: commerce-payments
+component: Transfers
+file: commerce-payments/contracts/transfers/Transfers.sol
+domain: reentrancy
+hunter: TrustBoundaryHunter
+generated_at: '2026-03-27T00:00:00Z'
+invariants:
+- id: T-TB-01
+  tier: 1
+  type: property
+  description: >
+    Custom signature prefix enables cross-protocol signature replay.
+    At L97-103, if _intent.prefix is non-empty, the signed message hash is
+    keccak256(abi.encodePacked(_intent.prefix, hash)) — an arbitrary prefix
+    chosen by the caller (not the signer). An attacker could choose a prefix
+    such that the resulting signedMessageHash matches a hash the operator
+    previously signed for a DIFFERENT purpose (e.g., EIP-712 typed data,
+    another dApp's personal_sign, or a Gnosis Safe tx). The operator's
+    signature from that other context would then validate here, allowing
+    the attacker to forge a TransferIntent the operator never authorized.
+  attack_scenario: >
+    1. Operator signs an EIP-712 message for another protocol (e.g., a
+       Seaport order, a Permit2 approval, a Gnosis Safe tx).
+    2. Attacker computes the TransferIntent hash H for a malicious intent
+       (draining operator's registered feeDestination or paying to attacker).
+    3. Attacker finds a prefix P such that keccak256(P || H) equals the
+       hash the operator signed in step 1. Because P is arbitrary bytes and
+       not length-prefixed, the attacker controls the preimage structure.
+    4. Attacker calls any transfer function with this forged intent + the
+       operator's existing signature from the other protocol.
+    5. validIntent passes: ECDSA.recover returns the operator's address.
+    6. Payment executes with attacker-chosen recipient/amounts.
+  impact: "Total theft of payment amounts — attacker sets recipient to themselves with arbitrary recipientAmount, operator pays fees to attacker-controlled feeDestination"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Property: a signature valid under custom prefix must NOT be valid
+    // under any other known signing scheme for the same signer.
+    // This is a design-level issue — the invariant checks that
+    // the prefix cannot be empty-string equivalent to EIP-191.
+    bytes memory eip191Prefix = "\x19Ethereum Signed Message:\n32";
+    bytes32 hash = keccak256(abi.encodePacked(
+        intent.recipientAmount, intent.deadline, intent.recipient,
+        intent.recipientCurrency, intent.refundDestination,
+        intent.feeAmount, intent.id, intent.operator,
+        block.chainid, sender, address(transfers)
+    ));
+    bytes32 customHash = keccak256(abi.encodePacked(intent.prefix, hash));
+    bytes32 defaultHash = keccak256(abi.encodePacked(eip191Prefix, hash));
+    // If these are equal with a non-empty prefix, the prefix mimics EIP-191
+    if (intent.prefix.length > 0) {
+        t(customHash != defaultHash, "T-TB-01: custom prefix mimics EIP-191");
+    }
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 75
+  notes: >
+    The real risk is not prefix=EIP-191 (which would just duplicate default behavior),
+    but prefix being crafted to produce a hash matching something the operator signed
+    elsewhere. The prefix is NOT part of the signed data — it's caller-supplied.
+    The operator signs over the raw hash, and the contract wraps it with the prefix.
+    Actually, re-reading: the operator signs the signedMessageHash (which includes
+    the prefix). So the operator must have signed keccak256(prefix || hash).
+    This means the operator's off-chain signer must use the same prefix.
+    BUT: the prefix is in the calldata, not signed by the operator separately.
+    The operator signs the RESULT of keccak256(prefix || hash), which means
+    the prefix IS implicitly committed to. This reduces the attack surface
+    significantly but does not eliminate cross-protocol replay if the operator's
+    other-protocol signature happens to be over keccak256(prefix || hash) for
+    some prefix + hash combination. Confidence reduced to 75%.
+  poc_sketch: ''
+  call_stack: ''
+
+- id: T-TB-02
+  tier: 1
+  type: property
+  description: >
+    feeDestination is NOT included in the operator's signed hash (L81-93).
+    The operator signs over: recipientAmount, deadline, recipient,
+    recipientCurrency, refundDestination, feeAmount, id, operator,
+    chainId, sender, address(this). But feeDestinations[operator] is
+    resolved at EXECUTION time (L588, L674, L725-727, L731-735).
+    If the operator's feeDestination is changed between signing and
+    execution (by anyone who calls registerOperatorWithFeeDestination
+    from the operator's address, or if the operator's key is
+    compromised for registration but not for intent signing), fees
+    go to an unexpected address.
+  attack_scenario: >
+    1. Operator signs a valid TransferIntent with feeAmount=1000 USDC.
+    2. Before the payer executes the intent, the operator (or attacker
+       who compromised operator's EOA for low-value registration tx)
+       calls registerOperatorWithFeeDestination(attackerAddress).
+    3. Payer calls transferTokenPreApproved with the valid intent.
+    4. feeAmount (1000 USDC) goes to attackerAddress instead of the
+       legitimate fee destination the operator intended.
+    5. The operator has no on-chain recourse — the signature is valid,
+       the intent is marked processed.
+  impact: "Fee theft — all feeAmount from any pending intent goes to attacker-controlled address. Scale depends on volume of pending intents."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Track feeDestination at signature time vs execution time
+    // If they differ, fees went to wrong address
+    address feeDestAtSign = ghost_feeDestAtSign[intent.operator];
+    address feeDestAtExec = transfers.feeDestinations(intent.operator);
+    if (feeDestAtSign != address(0)) {
+        eq(feeDestAtSign, feeDestAtExec,
+           "T-TB-02: feeDestination changed between sign and exec");
+    }
+  ghost_vars:
+  - "mapping(address => address) internal ghost_feeDestAtSign;"
+  validated: true
+  priority: high
+  confidence: 85
+  notes: >
+    This is a real design concern. The operator controls their own feeDestination,
+    so in the normal case the operator changes it themselves (self-inflicted).
+    But in a multi-sig operator setup or when an operator key is partially
+    compromised, this becomes exploitable. Also relevant if operator is a
+    contract that can be manipulated. The feeDestination SHOULD be part of
+    the signed hash or at minimum locked per-intent.
+
+- id: T-TB-03
+  tier: 1
+  type: property
+  description: >
+    Malicious recipient can grief/DOS payments via revert in receive().
+    sendNative (L757-766) uses .call{value}("") to send ETH. If the
+    recipient is a contract that reverts in receive(), the entire
+    transferNative/unwrapAndTransfer tx reverts. The operator signed
+    the intent with this recipient, but the recipient could become
+    malicious AFTER the intent was signed (e.g., upgradeable proxy
+    recipient, or a contract that conditionally reverts).
+  attack_scenario: >
+    1. Operator creates an intent with recipient = contractA (a proxy).
+    2. Payer sends ETH via transferNative.
+    3. contractA's implementation is upgraded to revert on receive().
+    4. sendNative reverts → entire payment fails.
+    5. The intent is NOT marked as processed (revert undoes state).
+    6. Payer's ETH is returned, but the payment cannot be completed.
+    7. The operator cannot create a new intent with a different recipient
+       for the same id without a new signature.
+    8. Payment is permanently stuck until deadline expires or operator
+       signs a new intent.
+  impact: "Payment DOS — legitimate payments blocked indefinitely. No fund loss but service disruption for commerce platform."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After a native transfer, the payment must either succeed
+    // or the intent must remain unprocessed (atomicity check)
+    bool processed = transfers.processedTransferIntents(
+        intent.operator, intent.id
+    );
+    if (intent.recipientCurrency == address(0) && intent.recipientAmount > 0) {
+        // If recipient is a contract, it must accept ETH
+        uint256 recipientCodeSize;
+        assembly { recipientCodeSize := extcodesize(intent.recipient) }
+        if (recipientCodeSize > 0) {
+            // This is a griefing vector — flag it
+            t(processed, "T-TB-03: native payment to contract recipient failed");
+        }
+    }
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 80
+  notes: >
+    The fee destination has the same issue — if feeDestination is a contract
+    that reverts, fees block the entire payment. This is a known pattern
+    with .call{value}. The contract does NOT have a pull-payment fallback.
+    ReentrancyGuard prevents reentrancy, but cannot prevent reverts.
+
+- id: T-TB-04
+  tier: 2
+  type: property
+  description: >
+    subsidizedTransferToken EIP-2612 permit can be frontrun, causing
+    the subsidized tx to revert. At L530-536, the contract calls
+    IERC7597.permit() with the user's signature. If a frontrunner
+    extracts the permit signature from the mempool and calls permit()
+    directly on the token contract first, the nonce is consumed.
+    When the original subsidizedTransferToken tx executes, the permit
+    call reverts (nonce already used). However, the allowance WAS set
+    by the frontrunner's tx, so the transfer would work if the permit
+    didn't revert. But standard ERC-2612 permit reverts on replayed nonce.
+  attack_scenario: >
+    1. Relayer submits subsidizedTransferToken tx to mempool.
+    2. Frontrunner extracts the EIP-2612 signature from calldata.
+    3. Frontrunner calls token.permit(owner, spender, value, deadline, sig)
+       directly — this succeeds, sets allowance, increments nonce.
+    4. Original tx arrives: permit() call reverts (nonce consumed).
+    5. Entire subsidizedTransferToken reverts.
+    6. Payment fails despite valid user intent.
+    7. Must be retried with a new permit signature — costs gas, delays payment.
+  impact: "Gasless payment DOS — any subsidized transfer can be griefed by frontrunning the permit. Low direct cost to attacker (just gas for permit call)."
+  impact_rating: Low
+  likelihood: High
+  severity_final: null
+  solidity: |
+    // The permit call should be wrapped in a try-catch to handle
+    // frontrun scenarios. Check that allowance is sufficient regardless.
+    IERC20 erc20 = IERC20(intent.recipientCurrency);
+    uint256 neededAmount = intent.recipientAmount + intent.feeAmount;
+    uint256 allowanceBefore = erc20.allowance(
+        signatureTransferData.owner, address(transfers)
+    );
+    // If allowance is already sufficient, permit frontrun is harmless
+    // The contract should check allowance BEFORE calling permit
+    t(allowanceBefore >= neededAmount,
+       "T-TB-04: permit frontrun can DOS subsidized transfer");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 90
+  notes: >
+    This is a well-known issue with EIP-2612 permits. The standard mitigation
+    is to wrap the permit call in try-catch and proceed if allowance is
+    already sufficient. OpenZeppelin's SafeERC20 has tryPermit for this.
+    The contract does NOT use this pattern — it calls permit directly and
+    reverts on failure. This is a confirmed griefing vector.
+
+- id: T-TB-05
+  tier: 2
+  type: property
+  description: >
+    Uniswap router pre-existing token balance inflates amountSwapped
+    return value. In swapTokens L699, the return is calculated as
+    (payerBalanceBefore + routerBalanceBefore) - (payerBalanceAfter + routerBalanceAfter).
+    If another transaction deposits tokens into the router between
+    the balance snapshots (within the same block via a sandwich), or
+    if the router has tokens from a failed/partial previous tx, the
+    SWEEP command sends them to the payer, inflating payerBalanceAfter
+    and deflating the apparent amountSwapped. This could make
+    succeedPayment emit incorrect spentAmount.
+  attack_scenario: >
+    1. Attacker deposits tokenIn directly to the Uniswap router address
+       right before the victim's swap tx (same block).
+    2. Victim's swapAndTransferUniswapV3TokenPreApproved executes.
+    3. routerBalanceBefore includes attacker's deposit.
+    4. SWEEP sends all router's leftover tokenIn (including attacker's
+       deposit) to the payer.
+    5. payerBalanceAfter is higher than expected.
+    6. Return value (amountSwapped) is artificially reduced.
+    7. Transferred event emits wrong spentAmount — accounting mismatch.
+  impact: "Incorrect event emission — off-chain systems relying on spentAmount from Transferred event will have wrong accounting. No direct fund loss since actual token transfers are correct."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // The amountSwapped returned should equal the actual tokens consumed
+    // from the payer (not including router's pre-existing balance)
+    uint256 payerBefore = IERC20(tokenIn).balanceOf(payer);
+    // ... execute swap ...
+    uint256 payerAfter = IERC20(tokenIn).balanceOf(payer);
+    uint256 actualSpent = payerBefore - payerAfter;
+    // amountSwapped should equal actualSpent
+    eq(amountSwapped, actualSpent,
+       "T-TB-05: amountSwapped != actual payer spend");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 60
+  notes: >
+    The code explicitly accounts for router pre-existing balance
+    (L603, L627, L699 comment). The formula (payerBefore + routerBefore) -
+    (payerAfter + routerAfter) is designed to handle this. However,
+    if tokens are added to the router DURING execution by a third party
+    (sandwich), the accounting breaks. The actual token flows (recipient
+    and fee amounts) are still correct since those use TRANSFER commands
+    with exact amounts. The issue is only in the return value / event.
+
+- id: T-TB-06
+  tier: 1
+  type: property
+  description: >
+    abi.encodePacked hash collision between different TransferIntents.
+    The hash at L80-93 uses abi.encodePacked with multiple adjacent
+    address/uint256 fields. While all individual types are fixed-size,
+    bytes16(id) is 16 bytes followed by address(operator) which is
+    20 bytes. In abi.encodePacked, bytes16 occupies exactly 16 bytes
+    and address occupies 20 bytes — both are fixed size, so there is
+    no collision risk from packed encoding with these types.
+    HOWEVER, the hash does NOT include a domain separator or type hash.
+    Two different Transfers contract deployments on the same chain
+    (different addresses) are protected by address(this) in the hash.
+    But there is no EIP-712 domain separator, making the signature
+    scheme non-standard and harder to verify off-chain.
+  attack_scenario: >
+    1. This is more of a defense-in-depth concern than an active exploit.
+    2. The hash includes chainid and address(this), which provides
+       replay protection across chains and contracts.
+    3. But without EIP-712 structured data, wallet UIs cannot display
+       human-readable signing prompts — users sign opaque hashes.
+    4. A phishing attack could trick an operator into signing a hash
+       that looks like something else (e.g., a normal message) but is
+       actually a valid TransferIntent hash.
+  impact: "Phishing risk — operators sign opaque hashes without EIP-712 structured display. Social engineering could extract valid intent signatures."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify that the hash construction prevents cross-contract replay
+    bytes32 hash1 = keccak256(abi.encodePacked(
+        intent.recipientAmount, intent.deadline, intent.recipient,
+        intent.recipientCurrency, intent.refundDestination,
+        intent.feeAmount, intent.id, intent.operator,
+        block.chainid, sender, address(transfers)
+    ));
+    // Same intent on different contract should produce different hash
+    bytes32 hash2 = keccak256(abi.encodePacked(
+        intent.recipientAmount, intent.deadline, intent.recipient,
+        intent.recipientCurrency, intent.refundDestination,
+        intent.feeAmount, intent.id, intent.operator,
+        block.chainid, sender, otherTransfersAddress
+    ));
+    t(hash1 != hash2, "T-TB-06: cross-contract replay possible");
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 70
+  notes: >
+    The encodePacked is safe from collision because all types are fixed-size.
+    The real concern is the non-standard signature scheme vs EIP-712.
+    The custom prefix feature (T-TB-01) compounds this risk.
+
+- id: T-TB-07
+  tier: 1
+  type: property
+  description: >
+    Operator can unregister AFTER signing intents, then re-register
+    with a different feeDestination to redirect fees. The operator
+    registration is permissionless (anyone can register as operator).
+    The unregisterOperator function (L794-798) deletes the
+    feeDestination mapping. If the operator re-registers with a
+    new feeDestination, all pending signed intents will now direct
+    fees to the new destination. Combined with T-TB-02, this is
+    a fee redirection attack vector.
+  attack_scenario: >
+    1. Legitimate operator registers with feeDestination = treasuryA.
+    2. Operator signs 100 intents with feeAmount = 10 USDC each.
+    3. Operator's key is compromised (or insider threat).
+    4. Attacker calls unregisterOperator() then
+       registerOperatorWithFeeDestination(attackerWallet).
+    5. As payers execute the 100 pending intents, all 1000 USDC
+       in fees go to attackerWallet instead of treasuryA.
+    6. The operator signed the intents — signature is valid.
+    7. The feeDestination was changed — but it's not in the hash.
+  impact: "Fee theft via feeDestination swap — all pending intent fees redirected. Scale: sum of feeAmount across all unexecuted intents for that operator."
+  impact_rating: High
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // After an operator re-registers, old intents' fees must still
+    // go to the original feeDestination
+    address currentFeeDest = transfers.feeDestinations(intent.operator);
+    // This should match what was expected when intent was signed
+    t(currentFeeDest != address(0),
+       "T-TB-07: operator unregistered with pending intents");
+  ghost_vars: []
+  validated: true
+  priority: high
+  confidence: 85
+  notes: >
+    This is essentially the same root cause as T-TB-02 but with a more
+    concrete attack path. The fix is the same: include feeDestination
+    in the signed hash, or lock it per-intent. Marking as separate
+    hypothesis because the attack vector (unregister + re-register)
+    is distinct from simple feeDestination change.
+
+- id: T-TB-08
+  tier: 2
+  type: property
+  description: >
+    USDC/USDT blocklist can permanently DOS payments. If the Transfers
+    contract address is added to USDC or USDT's blocklist, ALL token
+    transfers through the contract fail permanently. The contract
+    receives tokens first (safeTransferFrom to address(this)) then
+    forwards them — a blocklisted address cannot receive tokens.
+    This is a centralization risk inherent to the custodial flow.
+  attack_scenario: >
+    1. Circle/Tether adds the Transfers contract to their blocklist
+       (e.g., due to regulatory action, or an attacker using the
+       contract for illicit transfers triggers a compliance flag).
+    2. All transferToken, transferTokenPreApproved, and swap functions
+       for USDC/USDT revert on the safeTransferFrom to address(this).
+    3. The contract has no fallback mechanism — all USDC/USDT payments
+       are permanently blocked.
+    4. A new contract must be deployed and all operators must re-register.
+  impact: "Complete DOS of all USDC/USDT payments through the contract. No fund loss but catastrophic service disruption for a commerce platform."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Check that the contract can receive and send the token
+    IERC20 erc20 = IERC20(intent.recipientCurrency);
+    uint256 balBefore = erc20.balanceOf(address(transfers));
+    // If this reverts, the token has blocklisted the contract
+    erc20.safeTransferFrom(payer, address(transfers), neededAmount);
+    uint256 balAfter = erc20.balanceOf(address(transfers));
+    eq(balAfter - balBefore, neededAmount,
+       "T-TB-08: token blocklist or transfer restriction");
+  ghost_vars: []
+  validated: true
+  priority: medium
+  confidence: 75
+  notes: >
+    This is a known risk for any contract that custodies blocklist tokens.
+    The commerce-payments use case makes this particularly impactful since
+    USDC is likely the primary payment currency. The contract has no
+    direct-transfer mode that bypasses custody (payer → recipient directly).
+
+- id: T-TB-09
+  tier: 1
+  type: property
+  description: >
+    Zero-amount intent bypass — when recipientAmount + feeAmount = 0,
+    multiple functions skip all transfers but still mark the intent
+    as processed and emit Transferred. transferToken (L189),
+    transferTokenPreApproved (L247), unwrapAndTransfer (L315),
+    subsidizedTransferToken (L544) — all have `if (neededAmount > 0)`
+    guards that skip the actual transfer. A zero-amount intent gets
+    marked as processed (succeedPayment at end) without any value
+    transfer. This could be used to burn valid intent IDs.
+  attack_scenario: >
+    1. Operator signs an intent with recipientAmount=0, feeAmount=0.
+    2. Anyone calls transferTokenPreApproved with this intent.
+    3. No tokens are transferred (neededAmount = 0, skips transfer).
+    4. succeedPayment marks processedTransferIntents[operator][id] = true.
+    5. The intent ID is now burned — cannot be reused.
+    6. If the operator intended to later create a non-zero intent with
+       the same ID, it will be rejected as AlreadyProcessed.
+    7. Alternatively: operator accidentally signs a zero intent, and
+       a bot processes it immediately, burning the ID.
+  impact: "Intent ID squatting — zero-value intents consume intent IDs without transferring value. Low direct impact but could disrupt operator workflows."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Zero-amount intents should not be processable
+    uint256 neededAmount = intent.recipientAmount + intent.feeAmount;
+    bool processed = transfers.processedTransferIntents(
+        intent.operator, intent.id
+    );
+    if (neededAmount == 0) {
+        t(!processed, "T-TB-09: zero-amount intent was processed");
+    }
+  ghost_vars: []
+  validated: true
+  priority: low
+  confidence: 80
+  notes: >
+    The operator signs the intent, so they consent to the zero amount.
+    But the sender field is also in the hash — the operator specifies
+    who can execute. The concern is more about accidental zero intents
+    or an operator signing a zero intent for testing that gets executed.
+    Low impact since operators control their own IDs.
+
+false_positives:
+- hunter: TrustBoundaryHunter
+  id: T-TB-FP-01
+  reason: >
+    ERC777 reentrancy via tokensReceived hook — investigated but the
+    contract uses ReentrancyGuard (nonReentrant modifier) on ALL
+    external functions. Even if an ERC777 token triggers a callback
+    on transfer, the reentrancy guard prevents re-entering any function.
+    The contract also uses SafeERC20 for all token interactions.
+    Not exploitable.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: T-TB-FP-02
+  reason: >
+    abi.encodePacked collision risk — investigated the hash at L80-93.
+    All types are fixed-size (uint256, uint256, address, address,
+    address, uint256, bytes16, address, uint256, address, address).
+    bytes16 is padded to exactly 16 bytes in encodePacked. No dynamic
+    types that could cause adjacent field collision. Safe.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false
+
+- hunter: TrustBoundaryHunter
+  id: T-TB-FP-03
+  reason: >
+    Sweepable could steal in-flight funds — investigated but sweep
+    functions are restricted to onlySweeper (set by owner). The
+    contract processes payments atomically within a single tx
+    (receive → forward), so funds should never sit in the contract
+    between transactions. The sweeper is a safety mechanism for
+    stuck funds, not a vulnerability. The only edge case is if a
+    tx partially executes and leaves funds (which can't happen due
+    to atomicity). Safe by design.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

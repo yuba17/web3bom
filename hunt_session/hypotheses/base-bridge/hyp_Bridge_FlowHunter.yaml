@@ -1,0 +1,783 @@
+hunter: FlowHunter
+component: Bridge (Base-Solana Bridge)
+scope: Bridge.sol, BridgeValidator.sol, Twin.sol, CrossChainERC20.sol, CrossChainERC20Factory.sol, TokenLib.sol, MessageLib.sol, MessageStorageLib.sol, CallLib.sol, SVMBridgeLib.sol, SVMLib.sol, VerificationLib.sol, RelayerOrchestrator.sol, IPartner.sol
+date: 2026-03-27
+platform: Coinbase ($5M bounty)
+
+# ============================================================
+# STATE MACHINE MODEL
+# ============================================================
+
+state_machines:
+
+  message_lifecycle:
+    description: >
+      Incoming messages (Solana->Base) go through: pre-validated -> relayed (success/failure) -> retry on failure.
+      Outgoing messages (Base->Solana) go through: sendMessage -> MMR leaf appended -> root updated.
+    states:
+      - unvalidated: "Message hash not in BridgeValidator.validMessages"
+      - pre_validated: "BridgeValidator.validMessages[hash] = true (set in registerMessages)"
+      - relayed_success: "Bridge.successes[hash] = true, failures[hash] deleted"
+      - relayed_failure: "Bridge.failures[hash] = true, successes[hash] still false"
+    transitions:
+      - from: unvalidated
+        to: pre_validated
+        trigger: "BridgeValidator.registerMessages() with valid signatures + nonce"
+        guard: "signatures meet base + partner thresholds, nonce sequential"
+      - from: pre_validated
+        to: relayed_success
+        trigger: "Bridge._validateAndRelay() -> this.__relayMessage() succeeds"
+        guard: "successes[hash] == false, validMessages[hash] == true"
+        effect: "successes[hash] = true, delete failures[hash]"
+      - from: pre_validated
+        to: relayed_failure
+        trigger: "Bridge._validateAndRelay() -> this.__relayMessage() reverts"
+        guard: "successes[hash] == false, validMessages[hash] == true"
+        effect: "failures[hash] = true"
+      - from: relayed_failure
+        to: relayed_success
+        trigger: "Bridge._validateAndRelay() called again (retry)"
+        guard: "successes[hash] still false, validMessages[hash] still true"
+        notes: >
+          CONFIRMED: _validateAndRelay does NOT check failures[hash] before retrying.
+          Messages that failed can be retried unlimited times. The gasLimit is baked
+          into the IncomingMessage struct and thus into the messageHash, so a different
+          gasLimit would produce a different hash — there is NO way to change the
+          gasLimit for a failed message. The message must succeed within the original
+          gasLimit or it's permanently stuck.
+      - from: relayed_success
+        to: "TERMINAL - no transition back"
+        notes: >
+          CONFIRMED: successes[hash] is only set to true, never to false.
+          Once successful, _validateAndRelay returns early on `if (successes[messageHash]) return`.
+          No path to replay a successful message.
+    invariants:
+      - "successes[hash] == true => message was executed exactly once"
+      - "successes[hash] == true => failures[hash] == false (delete in catch block)"
+      - "A message cannot go from success to any other state"
+      - "gasLimit is immutable per messageHash (baked into hash via IncomingMessage struct)"
+
+  token_lifecycle_outgoing:
+    description: >
+      Base->Solana token bridging: lock/burn tokens -> serialize message -> MMR leaf.
+      Three paths: ETH (lock), CrossChainERC20 (burn), native ERC20 (lock).
+    states:
+      - idle: "No transfer in progress"
+      - tokens_locked_or_burned: "initializeTransfer completed: tokens moved, deposits updated"
+      - message_serialized: "SVMBridgeLib.serializeTransfer completed"
+      - message_stored: "MessageStorageLib.sendMessage completed, MMR leaf added"
+    transitions:
+      - from: idle
+        to: tokens_locked_or_burned
+        trigger: "TokenLib.initializeTransfer()"
+        paths:
+          eth_path:
+            guard: "localToken == ETH_ADDRESS, scalar != 0, msg.value == remoteAmount * scalar"
+            effect: "ETH held by Bridge, deposits[ETH][remote] += localAmount"
+          crosschain_erc20_path:
+            guard: "isCrossChainErc20(localToken), remoteToken matches or bytes32(0)"
+            effect: "CrossChainERC20.burn(msg.sender, remoteAmount) — NO deposits tracking"
+          native_erc20_path:
+            guard: "!isCrossChainErc20(localToken), scalar != 0, msg.value == 0"
+            effect: "safeTransferFrom(sender -> bridge), deposits[local][remote] += localAmount, dust returned"
+      - from: tokens_locked_or_burned
+        to: message_serialized
+        trigger: "SVMBridgeLib.serializeTransfer()"
+        notes: "Pure function, cannot fail except OOM"
+      - from: message_serialized
+        to: message_stored
+        trigger: "MessageStorageLib.sendMessage()"
+        effect: "MMR leaf appended, root updated, nonce incremented, event emitted"
+    invariants:
+      - "All steps happen in same tx — if any step reverts, all revert (atomic)"
+      - "deposits[local][remote] tracks locked ETH and native ERC20 balances"
+      - "CrossChainERC20 burns are NOT tracked in deposits (mint/burn model, no custody)"
+      - "For fee-on-transfer tokens: remoteAmount is adjusted IN MEMORY before serialization"
+
+  token_lifecycle_incoming:
+    description: >
+      Solana->Base token delivery: validate message -> finalize transfer (unlock/mint).
+    states:
+      - validated: "Message in BridgeValidator.validMessages"
+      - tokens_delivered: "finalizeTransfer completed"
+    transitions:
+      - from: validated
+        to: tokens_delivered
+        trigger: "TokenLib.finalizeTransfer() via __relayMessage"
+        paths:
+          eth_path:
+            guard: "localToken == ETH_ADDRESS, scalar != 0"
+            effect: "deposits[ETH][remote] -= localAmount, safeTransferETH(to, localAmount)"
+          crosschain_erc20_path:
+            guard: "isCrossChainErc20(localToken), remoteToken matches"
+            effect: "CrossChainERC20.mint(to, remoteAmount)"
+          native_erc20_path:
+            guard: "!isCrossChainErc20(localToken), scalar != 0"
+            effect: "deposits[local][remote] -= localAmount, safeTransfer(to, localAmount)"
+    invariants:
+      - "For custody tokens (ETH, native ERC20): withdraw <= deposits (underflow revert)"
+      - "For CrossChainERC20: mint is unbounded by any on-chain tracking (Solana side controls)"
+
+  twin_lifecycle:
+    description: >
+      Twin deployment is lazy — created on first Call/TransferAndCall from a Solana sender.
+    states:
+      - non_existent: "twins[sender] == address(0)"
+      - deployed: "twins[sender] == deployed beacon proxy address"
+    transitions:
+      - from: non_existent
+        to: deployed
+        trigger: "__relayMessage with message.ty == Call or TransferAndCall, sender not REMOTE_BRIDGE"
+        effect: "LibClone.deployDeterministicERC1967BeaconProxy(TWIN_BEACON, sender), twins[sender] = address"
+    invariants:
+      - "Once deployed, twins[sender] never changes (no re-deployment path)"
+      - "Transfer messages SKIP twin logic entirely — no twin deployment needed"
+      - "Twin address is deterministic: predictable from sender pubkey + beacon"
+      - "All twins share same beacon — beacon upgrade affects ALL twins simultaneously"
+      - "Twin.execute() authorized only for BRIDGE or self (Twin itself)"
+
+# ============================================================
+# HYPOTHESES
+# ============================================================
+
+hypotheses:
+
+  - id: BRIDGE-FLOW-01
+    title: "Reentrancy via this.__relayMessage external self-call bypassing ReentrancyGuardTransient"
+    severity: critical
+    confidence: 30
+    status: investigating
+    description: >
+      Bridge.relayMessages -> _validateAndRelay -> this.__relayMessage{gas: message.gasLimit}(message).
+      The `this.` syntax makes an EXTERNAL call to self. ReentrancyGuardTransient uses transient storage
+      (EIP-1153) on all networks because _useTransientReentrancyGuardOnlyOnMainnet returns FALSE.
+
+      The reentrancy guard is set in relayMessages (nonReentrant), and __relayMessage is an external
+      function that does NOT have the nonReentrant modifier. However, __relayMessage enforces
+      _assertSenderIsEntrypoint (msg.sender == address(this)).
+
+      Attack vector: During __relayMessage execution, if Twin.execute makes a call back to
+      Bridge.relayMessages (which has nonReentrant), it WOULD be blocked by the reentrancy guard.
+      But what about Bridge.bridgeToken or Bridge.bridgeCall? Those also have nonReentrant.
+
+      ANALYSIS: The `this.__relayMessage` call happens WITHIN the nonReentrant context of relayMessages.
+      Since _useTransientReentrancyGuardOnlyOnMainnet returns false, transient storage guard is active
+      on Base too. The guard is set before the for loop in relayMessages, and any callback to any
+      nonReentrant function would hit the guard.
+
+      HOWEVER: __relayMessage itself is NOT nonReentrant. If Twin.execute could somehow call
+      Bridge.__relayMessage directly (passing _assertSenderIsEntrypoint), it would need
+      msg.sender == address(Bridge). Twin cannot do this unless via delegatecall into Bridge...
+      but Twin.execute supports DelegateCall type.
+    attack_path:
+      - "1. Attacker crafts a Solana message with type=Call targeting a Twin"
+      - "2. The Call instructs Twin to delegatecall to some contract"
+      - "3. That contract, executing in Twin context, calls Bridge.__relayMessage"
+      - "4. But msg.sender would be Twin, not Bridge — _assertSenderIsEntrypoint fails"
+      - "5. ALTERNATIVELY: Twin calls Bridge with CallType.Call — msg.sender = Twin, fails too"
+    conclusion: >
+      LIKELY SAFE. The _assertSenderIsEntrypoint check (msg.sender == address(this) where this = Bridge)
+      prevents any external party from calling __relayMessage. Twin.execute with DelegateCall executes
+      in Twin's context, so msg.sender for any call from Twin would be Twin, not Bridge.
+      The nonReentrant on relayMessages/bridgeToken/bridgeCall blocks re-entry to those.
+      No viable reentrancy path found, but the pattern of external self-call is unusual and warrants
+      deeper verification.
+    solidity: |
+      // Bridge._validateAndRelay line 358:
+      try this.__relayMessage{gas: message.gasLimit}(message) {
+      // __relayMessage line 216:
+      require(msg.sender == address(this), SenderIsNotEntrypoint());
+
+  - id: BRIDGE-FLOW-02
+    title: "TransferAndCall atomicity — Twin.execute revert loses tokens"
+    severity: critical
+    confidence: 15
+    status: investigating
+    description: >
+      In __relayMessage for TransferAndCall (line 253-257):
+        TokenLib.finalizeTransfer(...) — mints/unlocks tokens to Twin
+        Twin(payable(twinAddress)).execute(call) — executes arbitrary call
+
+      If Twin.execute reverts, does finalizeTransfer also revert?
+
+      YES — because both calls are inside __relayMessage which is called via try/catch
+      in _validateAndRelay (line 358). If __relayMessage reverts at any point, the
+      entire call reverts (including the token transfer), and the message is marked as
+      failed (failures[hash] = true).
+
+      BUT: For the Transfer type (not TransferAndCall), tokens are minted/transferred
+      directly to the `to` address (line 236-237). If `to` is a contract that reverts
+      on receive (e.g., no receive/fallback for ETH, or revert in ERC20 transfer),
+      the whole message reverts and is marked failed.
+
+      KEY QUESTION: For TransferAndCall, the tokens go to... WHERE? Let me re-check.
+      finalizeTransfer sends tokens to `address(bytes20(transfer.to))`. This is the `to`
+      field of the Transfer struct, not the Twin address. So tokens go to transfer.to,
+      then execute runs on Twin. If execute reverts, tokens were already sent BUT the
+      entire __relayMessage reverts via the try/catch. So tokens are NOT lost.
+    conclusion: >
+      SAFE. The try/catch in _validateAndRelay ensures full atomicity. If any part of
+      __relayMessage reverts, the entire state change (including token transfers) is rolled back.
+      The message is marked as failure and can be retried.
+    solidity: |
+      // Bridge.__relayMessage lines 253-257:
+      } else if (message.ty == MessageType.TransferAndCall) {
+          (Transfer memory transfer, Call memory call) = abi.decode(message.data, (Transfer, Call));
+          TokenLib.finalizeTransfer({transfer: transfer, crossChainErc20Factory: CROSS_CHAIN_ERC20_FACTORY});
+          Twin(payable(twinAddress)).execute(call);
+      }
+
+  - id: BRIDGE-FLOW-03
+    title: "Failed message retry with baked-in gasLimit — permanent fund lock"
+    severity: high
+    confidence: 60
+    status: investigating
+    description: >
+      When a message fails (failures[hash] = true), it can be retried by calling
+      relayMessages again with the same message. The _validateAndRelay function only
+      checks `successes[messageHash]`, not `failures[messageHash]`.
+
+      HOWEVER: the gasLimit is part of the IncomingMessage struct, which determines the
+      messageHash. There is NO mechanism to change the gasLimit for a failed message.
+      The message must be re-submitted with the EXACT same parameters (including gasLimit)
+      to produce the same messageHash.
+
+      If a message fails because gasLimit was too low (e.g., complex ERC20 with hooks,
+      or gas costs increased due to EIP changes), there is NO path to retry with higher gas.
+      A new message with different gasLimit would produce a different hash, which would
+      need to be pre-validated again by validators.
+
+      IMPACT: For Transfer messages, tokens were sent from Solana but cannot be delivered
+      on Base. Tokens are effectively locked on the Solana side. The bridge validators could
+      potentially register a new message with higher gasLimit, but this requires the Solana
+      side to create a new OutgoingMessage.
+
+      MITIGATING FACTOR: The gasLimit is set by the sender on Solana. If they set it too low,
+      it's user error. But gas costs can increase over time (e.g., state growth, EVM upgrades).
+      Also, the message.gasLimit is forwarded as the gas stipend to __relayMessage, and the
+      relayer must provide enough gas in the outer tx. If the relayer provides enough outer gas
+      but message.gasLimit is too low, the internal call fails.
+    attack_path:
+      - "1. User bridges tokens from Solana with gasLimit=X"
+      - "2. Validators register the message on Base"
+      - "3. Relayer calls relayMessages — __relayMessage runs with gas=X"
+      - "4. Execution needs more than X gas (e.g., token with hooks, or gas repricing)"
+      - "5. __relayMessage reverts, failures[hash] = true"
+      - "6. Any retry with same message will also fail (same gasLimit)"
+      - "7. New message with higher gasLimit needs new Solana OutgoingMessage + new validation"
+      - "8. If Solana side doesn't support re-sending, funds are permanently locked"
+    conclusion: >
+      DESIGN CONCERN rather than exploitable bug. This is inherent to any bridge with
+      pre-committed gas limits. The severity depends on whether the Solana side supports
+      re-creating failed messages with updated gasLimit. If not, this is a real fund-lock risk.
+      Worth reporting as Medium if the Solana side doesn't have a recovery mechanism.
+    solidity: |
+      // gasLimit is part of IncomingMessage and thus part of the hash:
+      struct IncomingMessage {
+          Pubkey outgoingMessagePubkey;
+          uint64 nonce;
+          Pubkey sender;
+          uint64 gasLimit;  // <-- baked into messageHash
+          MessageType ty;
+          bytes data;
+      }
+      // _validateAndRelay line 358:
+      try this.__relayMessage{gas: message.gasLimit}(message) {
+
+  - id: BRIDGE-FLOW-04
+    title: "Twin beacon upgrade drains all Twin-held assets"
+    severity: high
+    confidence: 40
+    status: investigating
+    description: >
+      All Twin contracts are deployed as ERC-1967 beacon proxies pointing to TWIN_BEACON.
+      The beacon owner can upgrade the implementation, affecting ALL twins simultaneously.
+
+      If the beacon is upgraded to a malicious implementation, all assets held by any Twin
+      (ETH, ERC20s, NFTs) can be drained in a single transaction.
+
+      This is a TRUST ASSUMPTION, not a bug per se. But:
+      1. The TWIN_BEACON is immutable in Bridge (set in constructor) — good
+      2. But the beacon itself is upgradeable by its owner
+      3. Bridge.owner() can set guardians but cannot change TWIN_BEACON
+
+      For TransferAndCall: tokens are sent to transfer.to (which could be the Twin address
+      or another address), then execute runs on the Twin. If tokens are sent to the Twin,
+      a malicious beacon upgrade could steal them.
+
+      ADDITIONALLY: Twin supports DelegateCall. A beacon upgrade could add a sweepAll()
+      function that delegatecalls to drain tokens.
+    conclusion: >
+      TRUST ASSUMPTION — the beacon owner is a trusted party. This is standard for
+      upgradeable beacon pattern. Not a bug but worth noting as a centralization risk.
+      In bug bounty context, likely out of scope as admin privilege.
+    solidity: |
+      // Bridge.sol line 39:
+      address public immutable TWIN_BEACON;
+      // Twin deployment at line 244:
+      twinAddress = LibClone.deployDeterministicERC1967BeaconProxy({
+          beacon: TWIN_BEACON, salt: Pubkey.unwrap(message.sender)
+      });
+
+  - id: BRIDGE-FLOW-05
+    title: "CrossChainERC20 mint unbounded by deposits — Solana-side trust"
+    severity: medium
+    confidence: 35
+    status: investigating
+    description: >
+      For CrossChainERC20 tokens (wrapped Solana tokens on Base), the mint path in
+      finalizeTransfer does NOT check any deposits mapping. It simply mints
+      `transfer.remoteAmount` tokens to the recipient.
+
+      This is by design (burn/mint model vs lock/unlock), but the invariant is:
+      "Total minted on Base <= Total burned on Solana (for each token pair)"
+
+      This invariant is enforced ONLY by the validator set. If validators are compromised
+      or collude, they can register arbitrary messages that mint unlimited CrossChainERC20 tokens.
+
+      For the lock/unlock path (native ETH/ERC20), there IS a deposits check:
+      `deposits[local][remote] -= localAmount` would underflow-revert if trying to unlock
+      more than deposited. This provides a hard on-chain bound.
+
+      ASYMMETRY: Lock/unlock tokens have on-chain safety bounds. Mint/burn tokens rely
+      entirely on validator honesty.
+    conclusion: >
+      DESIGN PATTERN, not a bug. The mint/burn model inherently trusts the source chain
+      and validator set. The deposits mapping protects lock/unlock tokens from over-withdrawal.
+      This asymmetry is standard for bridges but worth verifying the validator threshold is
+      sufficiently high.
+    solidity: |
+      // finalizeTransfer for CrossChainERC20 (no deposits check):
+      localAmount = transfer.remoteAmount;
+      CrossChainERC20(transfer.localToken).mint({to: to, amount: localAmount});
+      // vs native ERC20 (deposits check):
+      localAmount = transfer.remoteAmount * scalar;
+      $.deposits[transfer.localToken][transfer.remoteToken] -= localAmount; // underflow protection
+
+  - id: BRIDGE-FLOW-06
+    title: "registerRemoteToken has no access control — arbitrary scalar injection"
+    severity: critical
+    confidence: 65
+    status: investigating
+    description: >
+      TokenLib.registerRemoteToken() is called from __relayMessage when message.sender == REMOTE_BRIDGE.
+      It sets: scalars[localToken][remoteToken] = 10 ** scalarExponent
+
+      There is NO check that a scalar already exists. A second registerRemoteToken call for the
+      same (localToken, remoteToken) pair OVERWRITES the scalar.
+
+      Attack scenario:
+      1. Token pair (USDC, SOL_USDC) is registered with scalar = 10^12 (6 decimals ERC20, 6 decimals SPL)
+      2. Users deposit USDC: deposits[USDC][SOL_USDC] = 1_000_000e6 (1M USDC locked)
+      3. Validators process a new registerRemoteToken for (USDC, SOL_USDC) with scalarExponent = 0
+         → scalar becomes 1 (was 10^12)
+      4. Now finalizeTransfer computes localAmount = remoteAmount * 1 instead of remoteAmount * 10^12
+      5. Withdrawals return dust amounts (e.g., 1 wei per 1 remote unit instead of 10^12 wei)
+      6. Deposited USDC is permanently locked — withdrawals drastically under-pay
+
+      ALTERNATIVELY: scalar increased to steal more:
+      1. Set scalar higher → each remote unit unlocks more local tokens
+      2. But deposits underflow would eventually revert
+
+      HOWEVER: This requires the VALIDATORS to sign a malicious registerRemoteToken message
+      claiming to be from REMOTE_BRIDGE. The trust model puts this in admin/validator trust.
+
+      But what about the Solana side? If the Solana bridge program can send registerRemoteToken
+      messages, and there's a vulnerability on the Solana side that lets someone trigger this...
+    conclusion: >
+      The registerRemoteToken path is gated by message.sender == REMOTE_BRIDGE, which is
+      the Solana bridge program itself. Only the Solana bridge can trigger this, and only
+      if validators sign the message. The scalar overwrite is a design concern — no protection
+      against re-registration. If the Solana bridge or validators are compromised, scalar
+      manipulation could lock/steal deposited tokens. Worth reporting as Medium centralization risk.
+    solidity: |
+      // Bridge.__relayMessage lines 222-231:
+      if (message.sender == REMOTE_BRIDGE) {
+          Call memory call = abi.decode(message.data, (Call));
+          (address localToken, Pubkey remoteToken, uint8 scalarExponent) =
+              abi.decode(call.data, (address, Pubkey, uint8));
+          TokenLib.registerRemoteToken({
+              localToken: localToken, remoteToken: remoteToken, scalarExponent: scalarExponent
+          });
+          return;
+      }
+      // TokenLib.registerRemoteToken — NO existing scalar check:
+      function registerRemoteToken(address localToken, Pubkey remoteToken, uint8 scalarExponent) internal {
+          TokenLibStorage storage $ = getTokenLibStorage();
+          $.scalars[localToken][remoteToken] = 10 ** scalarExponent;  // OVERWRITES existing
+      }
+
+  - id: BRIDGE-FLOW-07
+    title: "Fee-on-transfer token dust rounding allows tiny value extraction per tx"
+    severity: low
+    confidence: 45
+    status: investigating
+    description: >
+      In initializeTransfer for native ERC20 path (lines 176-208):
+      1. transferLocalAmount = remoteAmount * scalar
+      2. safeTransferFrom(sender, bridge, transferLocalAmount)
+      3. receivedLocalAmount = balanceAfter - balanceBefore (accounts for fee)
+      4. receivedRemoteAmount = receivedLocalAmount / scalar (truncating division)
+      5. localAmount = receivedRemoteAmount * scalar
+      6. dust = receivedLocalAmount - localAmount → returned to sender
+
+      The truncating division at step 4 means: receivedLocalAmount % scalar is lost.
+      Wait no — step 6 returns the dust. So dust = receivedLocalAmount - (receivedRemoteAmount * scalar).
+      That equals receivedLocalAmount % scalar, which is returned to sender.
+
+      Actually this is CORRECT. The dust is returned. No value extracted.
+
+      But what about the deposits tracking?
+      deposits += localAmount = receivedRemoteAmount * scalar
+
+      And on withdrawal: deposits -= remoteAmount * scalar
+
+      The amount bridged (remoteAmount in the message) is receivedRemoteAmount (step 4).
+      On the Solana side, the user receives receivedRemoteAmount tokens.
+      When bridging back, the message contains remoteAmount = receivedRemoteAmount.
+      finalizeTransfer: localAmount = remoteAmount * scalar = receivedRemoteAmount * scalar
+      deposits -= localAmount. This matches what was added.
+    conclusion: >
+      SAFE. The dust handling is correct. Truncated amounts are returned to sender,
+      and deposits tracking is consistent with the actual remoteAmount bridged.
+    solidity: |
+      // TokenLib.initializeTransfer native ERC20 path:
+      uint256 receivedRemoteAmount = receivedLocalAmount / scalar;
+      localAmount = receivedRemoteAmount * scalar;
+      uint256 dust = receivedLocalAmount - localAmount;
+      if (dust > 0) {
+          SafeTransferLib.safeTransfer({token: transfer.localToken, to: msg.sender, amount: dust});
+      }
+      transfer.remoteAmount = SafeCastLib.toUint64(receivedRemoteAmount);
+
+  - id: BRIDGE-FLOW-08
+    title: "Transfer to address(0) via truncated bytes32 in finalizeTransfer"
+    severity: medium
+    confidence: 50
+    status: investigating
+    description: >
+      In TokenLib.finalizeTransfer line 227:
+        address to = address(bytes20(transfer.to));
+
+      This takes the FIRST 20 bytes of the 32-byte `to` field. If the Solana side encodes
+      an EVM address in the wrong position (e.g., right-padded instead of left-padded),
+      `to` could become address(0) or a wrong address.
+
+      For CrossChainERC20.mint: there's a check `require(to != address(0), MintToZeroAddress())`.
+      For SafeTransferLib.safeTransferETH and safeTransfer: sending to address(0) would succeed
+      (safeTransferLib typically doesn't check for zero address).
+
+      However, if to == address(0):
+      - ETH sent to address(0) is burned (no receive function)
+      - ERC20 sent to address(0) depends on token implementation
+
+      WAIT: Let me re-check. SafeTransferLib.safeTransferETH uses low-level call.
+      Sending ETH to address(0) would likely succeed (empty account receives ETH).
+      That ETH would be permanently lost.
+
+      But deposits[local][remote] was already decremented, so the accounting is correct —
+      the bridge doesn't owe those tokens anymore. The loss is on the user who provided
+      a wrong `to` address from Solana.
+
+      The real question: can a Solana sender manipulate `to` to be address(0) to
+      unlock tokens from deposits without actually delivering them to anyone useful?
+      No — the tokens are still delivered (just to address(0)), and deposits are decremented.
+      The sender loses their tokens. No profit vector.
+    conclusion: >
+      LOW RISK. Sending to address(0) would lose the user's funds but there's no exploit.
+      The Solana side should validate the `to` field. The EVM side does check for address(0)
+      on mint (CrossChainERC20) but not on safeTransfer/safeTransferETH. This is user error,
+      not a vulnerability.
+    solidity: |
+      // TokenLib.finalizeTransfer line 227:
+      address to = address(bytes20(transfer.to));
+      // ETH path — no address(0) check:
+      SafeTransferLib.safeTransferETH({to: to, amount: localAmount});
+      // CrossChainERC20 path — HAS address(0) check:
+      CrossChainERC20(transfer.localToken).mint({to: to, amount: localAmount});
+
+  - id: BRIDGE-FLOW-09
+    title: "Twin DelegateCall can manipulate Twin storage to steal held assets"
+    severity: high
+    confidence: 50
+    status: investigating
+    description: >
+      Twin.execute supports CallType.DelegateCall, which runs arbitrary code in the Twin's
+      storage context. A Solana user can instruct their Twin to delegatecall to ANY address.
+
+      This is BY DESIGN — the Twin is the Solana user's "representative" on Base. They have
+      full control over it. But consider:
+
+      1. Twin is an ERC-1967 beacon proxy
+      2. DelegateCall in the proxy context can overwrite proxy storage slots
+      3. Specifically, it could overwrite the beacon pointer (ERC-1967 slot)
+      4. This would brick the Twin or redirect it to a malicious implementation
+
+      But this only affects the Solana user's OWN Twin. They're only hurting themselves.
+
+      HOWEVER: What if another user has sent tokens to a Twin address (e.g., via direct
+      transfer, or airdrop)? The Twin owner could delegatecall to steal those tokens.
+      Again, the Twin owner has full control — this is expected behavior.
+
+      MORE INTERESTING: Could a delegatecall from Twin affect Bridge storage?
+      No — delegatecall runs in Twin's context, not Bridge's. msg.sender inside the
+      delegatecalled code would be Bridge (since Bridge called Twin.execute), but
+      storage modifications would be to Twin's storage, not Bridge's.
+    conclusion: >
+      BY DESIGN. Twin owners have full control over their Twin via DelegateCall.
+      This cannot affect Bridge or other users' Twins. Each Twin's storage is isolated.
+    solidity: |
+      // Twin.execute with DelegateCall:
+      } else if (call.ty == CallType.DelegateCall) {
+          require(call.value == 0, DelegateCallCannotHaveValue());
+          (bool success, bytes memory result) = call.to.delegatecall(call.data);
+          require(success, string(result));
+      }
+
+  - id: BRIDGE-FLOW-10
+    title: "Deposit overflow protection — CumulativeDepositExceedsU64 can lock bridge for a token pair"
+    severity: medium
+    confidence: 40
+    status: investigating
+    description: >
+      _addToDeposits checks: `require(newDeposits / scalar <= type(uint64).max)`.
+
+      If cumulative deposits for a token pair approach uint64.max * scalar, further
+      deposits are blocked. This is a safety check to prevent Solana-side overflow
+      (Solana uses u64 for token amounts).
+
+      But this means an attacker could intentionally deposit a large amount of a
+      low-value token to hit the uint64 cap, blocking legitimate users from bridging
+      that token pair.
+
+      COST: The attacker must actually deposit real tokens. For high-scalar pairs
+      (e.g., scalar = 10^12), the maximum deposit in local units is:
+      uint64.max * 10^12 = 18.4 * 10^18 * 10^12 = 18.4 * 10^30 wei ≈ 18.4 * 10^12 ETH
+
+      This is unrealistically large for ETH. For low-value tokens, it might be feasible
+      but the attacker locks their own capital. Not a realistic attack.
+    conclusion: >
+      NOT EXPLOITABLE in practice. The uint64 cap requires astronomically large deposits
+      for typical scalars. For edge-case tokens with very low scalar (scalar=1), the cap
+      is uint64.max ≈ 18.4 * 10^18 wei, which is still ~18 ETH worth. Low severity DoS
+      only for very specific token configurations.
+    solidity: |
+      function _addToDeposits(...) private {
+          uint256 newDeposits = $.deposits[localToken][remoteToken] + additionalLocalAmount;
+          require(newDeposits / scalar <= type(uint64).max, CumulativeDepositExceedsU64());
+          $.deposits[localToken][remoteToken] = newDeposits;
+      }
+
+  - id: BRIDGE-FLOW-11
+    title: "BridgeValidator nonce sequentiality — single failed batch bricks all subsequent messages"
+    severity: high
+    confidence: 55
+    status: investigating
+    description: >
+      BridgeValidator.registerMessages requires sequential nonces starting from nextNonce.
+      The nonce is incremented AFTER all messages in a batch are processed (line 195).
+
+      If a batch of N messages is registered, nonces are assigned as [nextNonce, nextNonce+1, ..., nextNonce+N-1].
+      The messageHash is computed from (nonce, outgoingMessagePubkey, innerMessageHash).
+
+      CRITICAL OBSERVATION: The nonces assigned here (in BridgeValidator) must match the nonces
+      in the IncomingMessage structs that will be passed to Bridge.relayMessages. But the
+      IncomingMessage struct has its own `nonce` field (line 27 of MessageLib.sol).
+
+      Wait — let me re-read. In MessageLib.getMessageHash (used by Bridge.getMessageHash):
+        hash = EfficientHashLib.hash(bytes32(nonce), Pubkey.unwrap(outgoingMessagePubkey), innerMessageHash)
+
+      And in BridgeValidator.registerMessages:
+        messageHashes[i] = MessageLib.getMessageHash(currentNonce++, signedMessages[i].outgoingMessagePubkey, signedMessages[i].innerMessageHash)
+
+      So the nonce in the Bridge's IncomingMessage.nonce MUST equal the currentNonce assigned
+      during registerMessages for the hashes to match.
+
+      If the off-chain system gets nonces wrong (e.g., processes messages out of order),
+      the hashes won't match and messages will be rejected by Bridge._validateAndRelay
+      (BridgeValidator.validMessages check).
+
+      This is a liveness concern, not a security issue. If the nonce sequence gets stuck
+      (e.g., one message can't be validated), ALL subsequent messages are blocked until
+      the stuck one is resolved, because nextNonce only advances sequentially.
+    conclusion: >
+      LIVENESS CONCERN. Sequential nonce requirement means a single problematic message
+      can block the entire pipeline. This is a design tradeoff for replay protection vs
+      availability. Worth noting but not a funds-at-risk vulnerability.
+    solidity: |
+      // BridgeValidator.registerMessages:
+      uint256 currentNonce = nextNonce;
+      for (uint256 i; i < len; i++) {
+          messageHashes[i] = MessageLib.getMessageHash(
+              currentNonce++, signedMessages[i].outgoingMessagePubkey, signedMessages[i].innerMessageHash
+          );
+      }
+      // ... validation ...
+      nextNonce = currentNonce;  // Only advances after successful batch
+
+  - id: BRIDGE-FLOW-12
+    title: "relayMessages processes multiple messages — partial execution with mixed success/failure"
+    severity: medium
+    confidence: 35
+    status: investigating
+    description: >
+      Bridge.relayMessages iterates over all messages in the array. For each message,
+      _validateAndRelay is called. If one message succeeds and the next fails, the
+      successful one is permanently committed (successes[hash] = true) while the
+      failed one is marked for retry (failures[hash] = true).
+
+      This is correct behavior. But consider: a relayer can intentionally order messages
+      to front-run or back-run specific messages. For example:
+
+      1. Message A: Transfer 100 tokens to User
+      2. Message B: registerRemoteToken changing scalar
+
+      If processed in order A then B, user gets tokens at old scalar.
+      If B is processed first (in a previous batch), then A uses new scalar.
+
+      But registerRemoteToken messages come from REMOTE_BRIDGE and would have their own
+      nonce/hash. The ordering depends on the order the validators register them.
+
+      The relayer has freedom to choose which pre-validated messages to relay and in what order.
+      But each message is independent — its effect is determined by its contents, not its
+      position relative to other messages (except for scalar changes).
+    conclusion: >
+      ORDERING CONCERN. A malicious relayer could strategically order registerRemoteToken
+      messages to affect subsequent transfers. But this requires validator complicity (they
+      must register the messages) and the scalar change itself requires REMOTE_BRIDGE authority.
+      Low practical risk.
+    solidity: |
+      function relayMessages(IncomingMessage[] calldata messages) external nonReentrant whenNotPaused {
+          for (uint256 i; i < messages.length; i++) {
+              _validateAndRelay(messages[i]);
+          }
+      }
+
+  - id: BRIDGE-FLOW-13
+    title: "nextNonce overflow in MessageStorageLib — unchecked increment"
+    severity: low
+    confidence: 20
+    status: investigating
+    description: >
+      MessageStorageLib.sendMessage (line 158):
+        unchecked { ++$.nextNonce; }
+
+      nextNonce is uint64, max value 2^64 - 1 ≈ 1.8 * 10^19.
+      With unchecked increment, at 2^64 - 1 it wraps to 0.
+
+      At 1 message per block (2 seconds on Base), reaching overflow takes:
+      2^64 / (365.25 * 24 * 3600 / 2) ≈ 1.17 * 10^12 years.
+
+      Not a practical concern.
+    conclusion: >
+      NOT EXPLOITABLE. Nonce overflow would take over a trillion years at maximum throughput.
+    solidity: |
+      unchecked { ++$.nextNonce; }
+
+  - id: BRIDGE-FLOW-14
+    title: "Transfer type skips Twin — tokens sent to arbitrary address without Twin deployment"
+    severity: info
+    confidence: 90
+    status: confirmed_safe
+    description: >
+      In __relayMessage (line 235-239), Transfer type messages bypass the Twin mechanism
+      entirely. Tokens are sent directly to `address(bytes20(transfer.to))`.
+
+      This means:
+      1. No Twin is deployed for simple transfers (gas saving)
+      2. The recipient can be ANY EVM address, not just a Twin
+      3. The sender on Solana can send tokens to anyone on Base
+
+      This is correct and by design. The comment on line 233 confirms it:
+      "For simple transfers, skip the twin logic."
+
+      HOWEVER: This means for Transfer type, there's no "execute" step.
+      For TransferAndCall, tokens go to transfer.to AND execute runs on Twin.
+      The Twin is determined by message.sender (Solana sender), not by transfer.to.
+      So tokens go to one address and execution happens on another (the Twin).
+
+      Is there a confusion vector? Could someone expect tokens to go to the Twin
+      but they go to transfer.to instead? The Solana side must set transfer.to correctly.
+    conclusion: >
+      BY DESIGN. Transfer type sends tokens directly to transfer.to without Twin.
+      TransferAndCall sends tokens to transfer.to AND executes on the sender's Twin.
+      No confusion vector on the EVM side — the Solana side must encode correctly.
+
+  - id: BRIDGE-FLOW-15
+    title: "Scalar of 0 blocks finalization — tokens locked on Solana permanently"
+    severity: medium
+    confidence: 40
+    status: investigating
+    description: >
+      In finalizeTransfer for ETH and native ERC20 paths:
+        uint256 scalar = $.scalars[transfer.localToken][transfer.remoteToken];
+        require(scalar != 0, WrappedSplRouteNotRegistered());
+
+      If a scalar is set to 0 (or was never registered), finalization reverts.
+      This means tokens bridged from Solana to Base cannot be delivered.
+
+      The scalar is set by registerRemoteToken(localToken, remoteToken, scalarExponent)
+      where scalar = 10 ** scalarExponent. Since scalarExponent is uint8, min value is 0,
+      giving scalar = 10^0 = 1. So scalar can never be 0 via normal registration.
+
+      BUT: What if a scalar was registered and then a bug or state corruption sets it to 0?
+      Or what if the token pair was never registered but tokens are somehow bridged?
+      The Solana side should prevent bridging unregistered token pairs. If it doesn't,
+      tokens could be locked.
+
+      Also: registerRemoteToken OVERWRITES. If called with scalarExponent=0, scalar becomes 1 (not 0).
+      There's no way to set scalar to 0 through the normal path.
+    conclusion: >
+      SAFE by normal paths. scalar = 10 ** scalarExponent >= 1 always. The require(scalar != 0)
+      protects against unregistered pairs. Registration requires REMOTE_BRIDGE authority.
+      No path to set scalar to 0 through normal code flow.
+
+# ============================================================
+# FUND FLOW SUMMARY
+# ============================================================
+
+fund_flow_analysis:
+  outgoing_base_to_solana:
+    eth_path:
+      lock: "ETH held by Bridge contract (msg.value)"
+      accounting: "deposits[ETH_ADDRESS][remoteToken] += localAmount"
+      message: "MMR leaf with WrappedToken type"
+    crosschain_erc20_path:
+      lock: "CrossChainERC20.burn(msg.sender, amount) — tokens destroyed"
+      accounting: "NO deposits tracking (burn/mint model)"
+      message: "MMR leaf with Sol or Spl type"
+    native_erc20_path:
+      lock: "safeTransferFrom(sender, bridge, amount) — tokens held by Bridge"
+      accounting: "deposits[localToken][remoteToken] += localAmount"
+      message: "MMR leaf with WrappedToken type"
+
+  incoming_solana_to_base:
+    eth_path:
+      unlock: "safeTransferETH(to, localAmount)"
+      accounting: "deposits[ETH_ADDRESS][remoteToken] -= localAmount (underflow reverts)"
+    crosschain_erc20_path:
+      unlock: "CrossChainERC20.mint(to, remoteAmount) — tokens created"
+      accounting: "NO deposits tracking (burn/mint model)"
+    native_erc20_path:
+      unlock: "safeTransfer(localToken, to, localAmount)"
+      accounting: "deposits[localToken][remoteToken] -= localAmount (underflow reverts)"
+
+  invariants:
+    - "For lock/unlock tokens: sum(deposits) == sum(locked_in_bridge) at all times"
+    - "For lock/unlock tokens: total_unlocked <= total_locked (deposits underflow protection)"
+    - "For burn/mint tokens: total_minted_on_base <= total_burned_on_solana (off-chain invariant, no on-chain enforcement)"
+    - "All token movements are atomic within their respective transactions"
+    - "No token can be locked without a corresponding MMR message (same tx atomicity)"
+    - "No token can be unlocked without a pre-validated message hash (BridgeValidator)"
+
+# ============================================================
+# CRITICAL FINDINGS SUMMARY
+# ============================================================
+
+priority_findings:
+  - id: BRIDGE-FLOW-06
+    why: "registerRemoteToken overwrites scalar without checking existing value — could break deposit accounting if validators compromised"
+  - id: BRIDGE-FLOW-03
+    why: "Failed messages with baked-in gasLimit have no recovery path on EVM side — potential permanent fund lock"
+  - id: BRIDGE-FLOW-11
+    why: "Sequential nonce in BridgeValidator means one stuck message blocks all subsequent messages"

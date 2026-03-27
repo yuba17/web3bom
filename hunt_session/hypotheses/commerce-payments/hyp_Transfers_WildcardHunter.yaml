@@ -1,0 +1,381 @@
+# WildcardHunter Analysis — Transfers.sol
+# Contract: commerce-payments/contracts/transfers/Transfers.sol
+# Focus: unusual patterns, cross-cutting concerns, edge cases, unexpected interactions
+# Analyst: WildcardHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: TR-W-01
+    title: "Custom prefix in validIntent allows signature domain separation bypass via abi.encodePacked collision"
+    description: |
+      Line 102: `signedMessageHash = keccak256(abi.encodePacked(_intent.prefix, hash))`.
+      The prefix is variable-length bytes concatenated with a fixed 32-byte hash using abi.encodePacked.
+      Since abi.encodePacked does not length-prefix dynamic types, a prefix that ends with N bytes
+      identical to the first N bytes of hash could collide with a different (shorter prefix, different hash) pair.
+      Concretely: encodePacked(prefix1, hash1) == encodePacked(prefix2, hash2) when
+      prefix1 = prefix2 || hash2[:k] and hash1 = hash2[k:] || suffix (impossible since hash is 32 bytes fixed).
+      Actually, since hash is always exactly 32 bytes and the result of keccak256, the only way to collide
+      is prefix1 || hash1 == prefix2 || hash2 as raw bytes. Since hash is 32 bytes, we'd need
+      prefix1 to be prefix2 + first bytes of hash2 and hash1 to match remaining bytes -- but hash1 is
+      independently computed from intent fields, not controllable to match arbitrary bytes.
+      The operator controls prefix and signs the hash, so they'd need to find two different intents
+      producing the same keccak256 output -- a hash collision. Not practical.
+      However, the non-standard prefix (vs EIP-191) means signatures are NOT replay-protected by
+      standard EIP-191 domain separation. A malicious operator could craft a prefix that makes the
+      signed message look like a valid signature for a different protocol.
+    confidence: 25
+    severity: low
+    status: speculative
+    attack_scenario: |
+      1. Operator signs intent with custom prefix that matches another protocol's signing scheme
+      2. The signature could potentially be valid in both contexts
+      3. However, the operator IS the signer, so they'd be attacking themselves
+      4. Cross-protocol replay requires the other protocol to accept the exact same hash format
+      5. Extremely unlikely in practice -- operator is trusted to sign their own intents
+    solidity: |
+      // Invariant: custom prefix signatures cannot collide with EIP-191 signatures
+      function property_TR_W_01_prefix_domain_separation() public returns (bool) {
+        // Two intents with different prefixes should never produce the same signedMessageHash
+        bytes memory prefix1 = hex"1234";
+        bytes memory prefix2 = hex"123456";
+        bytes32 hash1 = keccak256("test1");
+        bytes32 hash2 = keccak256("test2");
+        bytes32 sig1 = keccak256(abi.encodePacked(prefix1, hash1));
+        bytes32 sig2 = keccak256(abi.encodePacked(prefix2, hash2));
+        return sig1 != sig2; // Should always be true for different inputs
+      }
+
+  - id: TR-W-02
+    title: "Zero-amount intent marks payment as processed without fund movement"
+    description: |
+      When recipientAmount = 0 and feeAmount = 0, neededAmount = 0. All transfer functions
+      (transferNative L160, transferToken L189, transferTokenPreApproved L247, wrapAndTransfer L281,
+      unwrapAndTransfer L315, etc.) skip the actual transfer logic with `if (neededAmount > 0)` or
+      `if (msg.value > 0)` guards, but STILL call `succeedPayment()` at L753 which sets
+      `processedTransferIntents[operator][id] = true` and emits `Transferred`.
+      This means an operator can sign a zero-amount intent, anyone executes it, and the intent ID
+      is permanently marked as processed. If the system later tries to process a real payment with
+      that same intent ID, it reverts with AlreadyProcessed.
+      Attack: operator signs intent with id=X, amount=0. Attacker front-runs the real payment by
+      submitting the zero-amount intent first. Real payment with same id=X fails.
+    confidence: 70
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Operator signs intent {id: 0x1234, recipientAmount: 100 USDC, feeAmount: 5 USDC} for Alice
+      2. Operator also (or attacker obtains) a zero-amount intent with same id 0x1234
+      3. Wait -- the signature includes recipientAmount and feeAmount (L80-93), so a different
+         amount means a different signature. The operator would have to sign BOTH intents.
+      4. Since the operator must sign the zero-amount intent themselves, this is only exploitable
+         if the operator is malicious or compromised.
+      5. A malicious operator can grief ANY payer by signing zero-amount intents and racing them.
+      6. The payer's real payment reverts, but the event says the payment was "completed" with 0.
+    solidity: |
+      // Invariant: a zero-amount intent should not block a non-zero intent with different params
+      // Note: same id + same operator but different amounts = different signatures, so both can exist
+      function property_TR_W_02_zero_amount_dos() public returns (bool) {
+        // After processing a zero-amount intent, the intent ID is consumed
+        // succeedPayment always marks processedTransferIntents[operator][id] = true
+        // This is by-design (idempotency) but enables operator griefing
+        return true; // Confirmed: operator must sign both, so operator-only attack
+      }
+
+  - id: TR-W-03
+    title: "Operator unregister front-runs valid signed intent causing payer DoS"
+    description: |
+      The operator registration system is permissionless: anyone calls registerOperator() (L788)
+      and unregisterOperator() (L794). The operatorIsRegistered modifier (L128-132) checks
+      feeDestinations[operator] != address(0) at transaction execution time.
+      An operator can sign a valid intent, the payer submits the tx, and between signing and
+      execution the operator calls unregisterOperator(). The payer's tx reverts with
+      OperatorNotRegistered. The payer has wasted gas and the payment is blocked.
+      More critically: in the subsidizedTransferToken flow (L505-559), a relayer pays gas on behalf
+      of the payer. The operator can grief the relayer by repeatedly signing intents then
+      unregistering before execution, causing relayer gas losses.
+    confidence: 75
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Malicious operator registers, signs valid intents for multiple payers
+      2. Payers/relayers submit transactions to execute the intents
+      3. Operator front-runs by calling unregisterOperator() in the same block
+      4. All payer/relayer transactions revert, wasting gas
+      5. Operator re-registers and repeats
+      6. For subsidizedTransferToken: relayer loses gas on every griefed attempt
+      7. No funds at risk but sustained DoS and gas griefing against relayers
+    solidity: |
+      // Invariant: operator registration status should be stable during intent validity period
+      function property_TR_W_03_operator_unregister_dos() public returns (bool) {
+        // feeDestinations[operator] can change between intent signing and execution
+        // operatorIsRegistered is checked at modifier time, not at signing time
+        // No lock-in period or cooldown on unregister
+        return true; // Design limitation, not exploitable for fund theft
+      }
+
+  - id: TR-W-04
+    title: "Sweepable can extract funds mid-payment if sweeper and recipient/feeDestination collude"
+    description: |
+      Sweepable.sweepETH/sweepToken (inherited from Sweepable.sol L41-66) can extract ALL contract
+      balances at any time. During token transfer flows (transferToken, transferTokenPreApproved),
+      the contract receives tokens at L202/L252, then distributes via transferFundsToDestinations
+      at L213/L258. These are within a single atomic transaction, so sweep cannot interleave.
+      However, if the sweeper IS the owner (or owner-appointed), they could front-run unwrap flows
+      where ETH sits in the contract between WETH.withdraw() and sendNative() calls (L742-744).
+      But again, these are atomic within the same transaction.
+      The REAL risk: if the contract holds any residual balance (from previous failed operations,
+      selfdestruct deposits, or rounding), sweeper can extract those. This is intended behavior
+      but creates a trust assumption on the sweeper role.
+    confidence: 40
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Contract receives ETH via selfdestruct (bypassing receive() check)
+      2. Contract holds residual WETH from a partial unwrap edge case
+      3. Sweeper extracts all ETH/tokens including any that might be mid-flow
+      4. Since all payment flows are atomic (single tx), sweep cannot interleave
+      5. The only extractable funds are residuals not belonging to any active payment
+      6. Trust assumption: sweeper role must be trusted not to front-run with pause+sweep
+    solidity: |
+      // Invariant: contract should hold zero balance after every completed payment
+      function property_TR_W_04_no_residual_balance() public returns (bool) {
+        // After any successful transfer function call, address(this).balance should be 0
+        // and all ERC20 balances should be 0 (transit-only contract)
+        return address(this).balance == 0;
+      }
+
+  - id: TR-W-05
+    title: "Uniswap router pre-existing balance inflates amountSwapped calculation"
+    description: |
+      In swapTokens() L592-699, the return value calculation at L699 is:
+      `(payerBalanceBefore + routerBalanceBefore) - (payerBalanceAfter + routerBalanceAfter)`
+      This accounts for tokens the router already held (L603/L627). The SWEEP command in the
+      Uniswap execution sends leftover input tokens back to the payer.
+      If an attacker donates tokenIn to the Uniswap router before the swap tx, routerBalanceBefore
+      increases. After execution, SWEEP sends all leftover (including donated tokens) to the payer.
+      payerBalanceAfter increases by the donated amount, routerBalanceAfter decreases by the same.
+      Net effect on the formula: (pBefore + rBefore + donation) - (pAfter + donation + rAfter - donation)
+      Wait -- let's recalculate: rBefore includes the donation. After SWEEP, rAfter = 0 (swept),
+      pAfter = pOriginalAfter + donation. So:
+      (pBefore + rBefore+donation) - (pAfter+donation + 0) = (pBefore + rBefore+donation) - pAfter - donation
+      = pBefore + rBefore - pAfter. The donation cancels out.
+      The developers explicitly accounted for this in the comment at L684-687. Safe.
+    confidence: 80
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Attacker donates 100 tokenIn to Uniswap router address
+      2. Payer calls swapAndTransferUniswapV3Token with maxWillingToPay = 500
+      3. routerBalanceBefore = 100, payerBalanceBefore = payer.balance + 500
+      4. Swap consumes 400 tokenIn, SWEEP sends 100 (leftover) + 100 (donated) to payer
+      5. payerBalanceAfter = original - 500 + 200 = original - 300
+      6. routerBalanceAfter = 0
+      7. Return = (original+500 + 100) - (original-300 + 0) = 900... Wait that's wrong.
+      8. Actually: pBefore = balanceOf(payer) + maxWillingToPay (L626), so pBefore already
+         includes the maxWillingToPay. Let's say payer had 1000 before: pBefore = 1000 + 500 = 1500.
+         rBefore = 100 (donated). Swap uses 400. Sweep sends 100+100=200 to payer.
+         pAfter = 1000 - 500 + 200 = 700. rAfter = 0.
+         Return = (1500 + 100) - (700 + 0) = 900. But actual consumed = 400. Off by 500.
+         Hmm, but pBefore = balanceOf(payer) + maxWillingToPay. BEFORE the safeTransferFrom.
+         After safeTransferFrom: payer loses maxWillingToPay. So pBefore IS the pre-transfer balance.
+         Then after swap + sweep: payer gets back (maxWillingToPay - consumed) + donated.
+         pAfter = pBefore - maxWillingToPay + (maxWillingToPay - consumed) + donated = pBefore - consumed + donated.
+         rAfter = 0. Return = (pBefore + rBefore) - (pBefore - consumed + donated + 0)
+         = rBefore + consumed - donated = 100 + 400 - 100 = 400. Correct!
+         The formula works correctly even with donations. Safe.
+    solidity: |
+      // Invariant: amountSwapped should reflect actual tokens consumed, not inflated by router balance
+      function property_TR_W_05_swap_amount_accuracy() public returns (bool) {
+        // swapTokens return value = actual amount consumed by the swap
+        // Pre-existing router balance is accounted for in the formula
+        return true; // Safe: donation attack self-cancels in the math
+      }
+
+  - id: TR-W-06
+    title: "subsidizedTransferToken allows anyone to execute another user's gasless payment"
+    description: |
+      In subsidizedTransferToken (L505-559), the validIntent modifier receives
+      `_signatureTransferData.owner` as the sender parameter (L513), NOT _msgSender().
+      This means the intent hash is computed with the token owner as sender, and ANY address
+      can call this function to execute the payment on behalf of the owner.
+      The EIP-2612 permit at L530-536 authorizes the contract to spend owner's tokens.
+      This is by design for meta-transactions/gasless payments. However, it means:
+      1. A relayer can front-run another relayer to claim the gas payment (if any off-chain incentive)
+      2. The owner cannot prevent execution once the permit + intent signatures are broadcast
+      3. If the owner changes their mind, they cannot cancel -- the permit is executable by anyone
+      The only protection is the intent deadline and the operator signature.
+    confidence: 60
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. Alice signs EIP-2612 permit + operator signs intent for gasless USDC payment
+      2. Alice broadcasts to relayer network for gasless execution
+      3. Alice changes her mind, but cannot revoke the permit (no on-chain nonce increment yet)
+      4. Any relayer (or MEV bot) can execute the payment before Alice can cancel
+      5. Alice loses the funds even though she wanted to cancel
+      6. Mitigation: Alice could front-run with a self-permit to increment nonce, but race condition
+    solidity: |
+      // Invariant: subsidizedTransferToken should only be callable by authorized relayers
+      // Current: anyone can call it with valid signatures
+      function property_TR_W_06_subsidized_caller_unrestricted() public returns (bool) {
+        // _msgSender() is not checked against any whitelist
+        // validIntent uses _signatureTransferData.owner, not _msgSender()
+        // By design for gasless, but creates irrevocability risk
+        return true; // Design tradeoff, not a bug per se
+      }
+
+  - id: TR-W-07
+    title: "registerOperatorWithFeeDestination allows setting feeDestination to contract addresses that reject ETH"
+    description: |
+      registerOperatorWithFeeDestination (L781-785) accepts any non-implicit-zero address as
+      feeDestination. If the feeDestination is a contract that rejects ETH (no receive/fallback),
+      then transferNative and unwrap flows will revert at sendNative (L762) when trying to send
+      the fee portion.
+      The operator signed the intent expecting payment processing, but the feeDestination they
+      registered blocks ETH transfers. This causes ALL native currency payments to that operator
+      to permanently fail.
+      More interestingly: if feeDestination is a contract with a malicious receive() that consumes
+      all gas, the sendNative call at L762 uses `.call{value}("")` which forwards all available gas.
+      With ReentrancyGuard active, re-entry is blocked, but gas griefing is possible -- the call
+      could consume enormous gas causing the payer to pay high gas fees.
+    confidence: 65
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. Operator registers with feeDestination = contract without receive()
+      2. Payer tries transferNative() with this operator's signed intent
+      3. sendNative() to feeDestination reverts -> entire tx reverts
+      4. Payer wasted gas, payment fails
+      5. Variant: feeDestination has receive() with while(true){} -> consumes all gas
+      6. Payer pays massive gas fee for a failing transaction
+      7. Operator can grief payers systematically since payer has no way to verify
+         feeDestination is safe before submitting the transaction
+    solidity: |
+      // Invariant: feeDestination should always be able to receive native currency
+      function property_TR_W_07_feeDestination_accepts_eth() public returns (bool) {
+        // No validation that feeDestination can accept ETH
+        // sendNative uses .call{value} which can fail or consume all gas
+        // Operator self-griefs but also griefs payers
+        return true;
+      }
+
+  - id: TR-W-08
+    title: "unwrapAndTransfer skips fee-on-transfer check for WETH unlike other token flows"
+    description: |
+      In unwrapAndTransfer (L295-337), after permit2.permitTransferFrom transfers WETH to the
+      contract (L325-330), there is NO revertIfInexactTransfer check before calling
+      unwrapAndTransferFundsToDestinations. Compare with transferToken (L210) and
+      transferTokenPreApproved (L255) which both check for fee-on-transfer.
+      The assumption is that WETH is not a fee-on-transfer token, which is true for canonical
+      WETH. However, the contract uses IWrappedNativeCurrency interface -- if deployed on a chain
+      where the wrapped native currency IS a fee-on-transfer token (non-standard), then:
+      1. Permit2 transfers neededAmount of WETH to contract
+      2. Actual received = neededAmount - fee
+      3. unwrapAndTransferFundsToDestinations tries to withdraw full neededAmount
+      4. WETH.withdraw(neededAmount) fails because contract only has neededAmount - fee
+      5. Transaction reverts -- no fund loss, just DoS
+      Similarly, unwrapAndTransferPreApproved (L342-377) also skips the check.
+    confidence: 45
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Deploy on a chain where wrappedNativeCurrency has fee-on-transfer
+      2. Payer calls unwrapAndTransfer with neededAmount = 100
+      3. After permit2 transfer, contract receives 99 (1% fee)
+      4. wrappedNativeCurrency.withdraw(100) fails -- insufficient balance
+      5. Transaction reverts, payer's WETH is returned (permit2 reverts atomically)
+      6. Result: DoS for unwrap flows on non-standard WETH chains
+      7. Not exploitable for fund theft, and canonical WETH has no fee
+    solidity: |
+      // Invariant: unwrap flows assume WETH is not fee-on-transfer
+      function property_TR_W_08_unwrap_no_fot_check() public returns (bool) {
+        // unwrapAndTransfer and unwrapAndTransferPreApproved skip revertIfInexactTransfer
+        // Safe for canonical WETH, would DoS on non-standard wrapped tokens
+        return true;
+      }
+
+  - id: TR-W-09
+    title: "Pause+sweep combo by compromised owner drains all in-transit funds"
+    description: |
+      Owner can pause() (L801-803) which blocks all payment functions (whenNotPaused modifier).
+      Owner also appoints sweeper via setSweeper (Sweepable.sol L36-38).
+      If owner is compromised or malicious:
+      1. Wait for a block where multiple payments are being processed
+      2. Front-run with pause() to prevent new payments from completing
+      3. Any ETH/tokens already in the contract (from selfdestruct, rounding, or pre-sweep)
+         can be extracted via sweepETH/sweepToken
+      However, the contract is transit-only -- funds are never stored between transactions.
+      All payment functions transfer funds in then immediately out in the same transaction.
+      So there should be zero balance to sweep at any point (unless selfdestruct is used).
+      The only real risk is if the owner pauses the contract indefinitely, blocking all payments.
+      This is a centralization risk inherent to the Ownable+Pausable pattern.
+    confidence: 55
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Compromised owner calls pause()
+      2. All payment functions revert with whenNotPaused
+      3. Owner calls setSweeper(attacker) then sweepETH/sweepToken
+      4. But contract should hold 0 balance (transit-only design)
+      5. Real impact: indefinite payment DoS until owner is replaced
+      6. Standard centralization risk, not a novel vulnerability
+    solidity: |
+      // Invariant: pause should not enable fund extraction (transit-only contract)
+      function property_TR_W_09_pause_sweep_no_extraction() public returns (bool) {
+        // Contract should hold 0 balance at rest
+        // Pause only blocks new payments, doesn't create extractable state
+        return address(this).balance == 0;
+      }
+
+  - id: TR-W-10
+    title: "swapAndTransferUniswapV3Native has no minimum output validation before swap"
+    description: |
+      In swapAndTransferUniswapV3Native (L384-410), there is NO exactValueSent modifier.
+      The payer sends arbitrary msg.value, all of which goes to swapTokens as maxAmountWillingToPay.
+      Inside swapTokens, the swap uses V3_SWAP_EXACT_OUT with neededAmount as the exact output.
+      The payer could send much more ETH than needed. The SWEEP command at L614 sends leftover
+      ETH back to the payer via UNWRAP_WETH + SWEEP(ETH, _msgSender(), 0).
+      However, if the Uniswap pool has very thin liquidity, the swap could consume almost all of
+      msg.value for a small output. The payer has no control over the maximum input beyond what
+      they send. The swap IS exact-output, so neededAmount of output is guaranteed, but the
+      INPUT consumed could be up to all of msg.value.
+      This is actually by design -- the payer chooses how much to send as their max slippage.
+      But combined with MEV sandwich attacks, a MEV bot could:
+      1. Manipulate the pool to make the swap very expensive
+      2. Payer's swap consumes all msg.value for the exact output
+      3. MEV bot profits from the price manipulation
+    confidence: 55
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Payer sends 10 ETH to swapAndTransferUniswapV3Native for a 100 USDC payment
+      2. MEV bot sees the pending tx, front-runs by buying USDC with ETH (pumping price)
+      3. Payer's swap executes at inflated price, consuming 9.5 ETH instead of expected 0.05 ETH
+      4. MEV bot back-runs, selling USDC back to ETH at the inflated price
+      5. Payer gets their 100 USDC delivered but loses 9.45 ETH extra to MEV
+      6. The payer's only protection is sending a tight msg.value as max slippage
+      7. No on-chain minimum output validation since it's exact-output swap
+    solidity: |
+      // Invariant: payer should not lose more than reasonable slippage on swaps
+      function property_TR_W_10_swap_max_slippage() public returns (bool) {
+        // swapAndTransferUniswapV3Native: msg.value is the implicit max input
+        // No additional slippage protection beyond V3_SWAP_EXACT_OUT
+        // MEV sandwich is the primary risk vector
+        return true; // Design relies on payer setting tight msg.value
+      }
+
+summary:
+  total_hypotheses: 10
+  investigate:
+    - TR-W-02 — Zero-amount intent marks payment as processed without fund movement (medium)
+    - TR-W-03 — Operator unregister front-runs valid signed intent causing payer DoS (medium)
+    - TR-W-06 — subsidizedTransferToken allows anyone to execute another user's gasless payment (low)
+    - TR-W-07 — registerOperatorWithFeeDestination allows feeDestination that rejects ETH (low)
+    - TR-W-10 — swapAndTransferUniswapV3Native has no minimum input validation, MEV sandwich risk (medium)
+  safe:
+    - TR-W-04 — Sweepable cannot interleave with atomic payment flows (low)
+    - TR-W-05 — Uniswap router pre-existing balance correctly accounted for in formula (info)
+    - TR-W-08 — unwrap flows skip fee-on-transfer check, safe for canonical WETH (info)
+    - TR-W-09 — Pause+sweep combo is centralization risk, no novel vuln (low)
+  speculative:
+    - TR-W-01 — Custom prefix signature domain separation is non-standard but collision-resistant (low)

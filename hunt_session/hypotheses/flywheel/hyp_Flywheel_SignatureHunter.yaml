@@ -1,0 +1,326 @@
+hunter: SignatureHunter
+component: Flywheel Protocol (all src/)
+date: "2026-03-27"
+hypotheses:
+
+  - id: SIG-FW-01
+    title: "AdConversion: no eventId uniqueness check allows duplicate attribution replay"
+    description: |
+      In AdConversion._onSend(), Attribution[] is decoded from hookData and each attribution is processed
+      without any check that the eventId (bytes16) has been seen before. The attributionProvider (trusted
+      role) submits attributions, so this is gated by access control. However, if the attributionProvider
+      is compromised or acts maliciously, they can submit the same eventId multiple times to drain the
+      campaign funds. There is no on-chain deduplication of eventId — the only protection is the trust
+      assumption on the attributionProvider. This is by design since the attributionProvider is a trusted
+      party, but worth noting as a trust boundary finding.
+    severity: low
+    confidence: 40
+    affected_functions:
+      - "AdConversion._onSend()"
+    attack_scenario: |
+      1. AttributionProvider calls Flywheel.send() with hookData containing Attribution with eventId=X, payoutAmount=100
+      2. Campaign pays out 100 tokens (minus fee) to recipient
+      3. AttributionProvider calls Flywheel.send() again with same eventId=X, payoutAmount=100
+      4. Campaign pays out another 100 tokens — no replay protection
+      5. Repeat until campaign is drained down to solvency limit
+    solidity_invariant: |
+      // Invariant: Each eventId should only be processed once per campaign
+      // NOTE: Not currently enforced on-chain — trust assumption on attributionProvider
+      // mapping(address campaign => mapping(bytes16 eventId => bool used)) public usedEventIds;
+      // assert(!usedEventIds[campaign][eventId], "eventId already used");
+
+  - id: SIG-FW-02
+    title: "CashbackRewards: bytes32(bytes20(payer)) key collision merges allocations across payments"
+    description: |
+      In CashbackRewards._onAllocate(), the allocation key is bytes32(bytes20(payer)). When the same
+      payer makes multiple payments, all allocations share the same key in Flywheel.allocatedPayout.
+      This means the total allocated amount for that key is the sum across all payments from the same
+      payer. When _onDeallocate or _onDistribute is called, the Flywheel subtracts from
+      allocatedPayout[campaign][token][key]. The CashbackRewards contract tracks per-paymentHash
+      state internally (rewards mapping), so accounting is correct at the hook level. However, at the
+      Flywheel level, deallocating one payment's allocation could underflow if another payment's
+      allocation was already distributed. This is safe because the hook validates per-payment allocated
+      amounts before returning allocations, and Flywheel only sees the net effect. No actual vulnerability
+      — the dual-tracking (hook-level per-payment + Flywheel-level per-key) is consistent.
+    severity: info
+    confidence: 80
+    affected_functions:
+      - "CashbackRewards._onAllocate()"
+      - "CashbackRewards._onDeallocate()"
+      - "CashbackRewards._onDistribute()"
+      - "Flywheel.allocate()"
+      - "Flywheel.deallocate()"
+    attack_scenario: |
+      1. Payer 0xABC makes payment P1 (100 tokens), manager allocates 10 reward via allocate()
+      2. Payer 0xABC makes payment P2 (200 tokens), manager allocates 20 reward via allocate()
+      3. allocatedPayout[campaign][token][bytes32(bytes20(0xABC))] = 30
+      4. Manager distributes P2 reward (20 tokens) — Flywheel key goes to 10, hook P2.allocated=0
+      5. Manager distributes P1 reward (10 tokens) — Flywheel key goes to 0, hook P1.allocated=0
+      6. Accounting stays consistent. No exploit possible because hook validates per-payment.
+    solidity_invariant: |
+      // Invariant: Sum of per-payment allocations for a payer == Flywheel allocated amount for that key
+      // For all payments P from payer:
+      //   sum(rewards[campaign][P].allocated) == FLYWHEEL.allocatedPayout(campaign, token, bytes32(bytes20(payer)))
+
+  - id: SIG-FW-03
+    title: "BridgeReferralFees._processBuilderCode try/catch may swallow legitimate reverts"
+    description: |
+      _processBuilderCode wraps BUILDER_CODES.toTokenId() and BUILDER_CODES.payoutAddress() in
+      try/catch blocks. If BuilderCodes is a proxy that gets upgraded to a malicious implementation,
+      or if it has a bug that returns a valid-looking but incorrect payoutAddress, the try/catch would
+      accept it without validation. More importantly, the try/catch catches ALL errors including
+      out-of-gas. If the external call runs out of gas (63/64 rule), the catch silently returns
+      (false, 0, 0), making feeBps=0 and the full bridged amount goes to the user with zero fees.
+      An attacker could manipulate gas to ensure BuilderCodes calls fail, stealing the builder's fee.
+    severity: medium
+    confidence: 35
+    affected_functions:
+      - "BridgeReferralFees._processBuilderCode()"
+      - "BridgeReferralFees._onSend()"
+    attack_scenario: |
+      1. Builder has registered code "alice" with valid payout address
+      2. Attacker calls Flywheel.send() with hookData encoding (attacker, "alice", 250) [max bps]
+      3. Attacker provides exactly enough gas so that the outer call succeeds but the
+         BUILDER_CODES.toTokenId("alice") call runs out of gas (63/64 rule)
+      4. try/catch catches the OOG, returns (false, 0, 0)
+      5. feeBps is set to 0, full bridgedAmount goes to attacker, builder gets nothing
+      6. The builder's legitimate fee is stolen
+    solidity_invariant: |
+      // Invariant: If a valid builder code is provided and the code is registered,
+      // the fee should always be deducted (feeBps should never be zero due to gas manipulation)
+      // assert(feeBps > 0 || !BUILDER_CODES.isRegistered(code))
+
+  - id: SIG-FW-04
+    title: "BridgeReferralFees._onSend has no access control — anyone can claim bridged funds"
+    description: |
+      BridgeReferralFees._onSend() does not have any access control modifier. The comment on line 140
+      explicitly acknowledges this: "If tokens are sent into the campaign outside of this scope on
+      accident, anyone can take them (no access control for onSend hook)." The `user` parameter in
+      hookData is attacker-controlled — the attacker specifies who receives the funds. The bridgedAmount
+      is calculated as campaign balance minus allocated fees. If tokens are sent to the campaign address
+      (which is deterministic via predictCampaignAddress), anyone can call send() to claim them. This is
+      documented as intended design, but represents a significant trust assumption for integrators.
+    severity: medium
+    confidence: 70
+    affected_functions:
+      - "BridgeReferralFees._onSend()"
+      - "Flywheel.send()"
+    attack_scenario: |
+      1. Someone sends 100 ETH to campaign address (e.g., bridge deposit)
+      2. Before the intended recipient calls send(), attacker front-runs with:
+         Flywheel.send(campaign, NATIVE_TOKEN, abi.encode(attacker, "", 0))
+      3. bridgedAmount = campaign.balance - totalAllocatedFees = 100 ETH
+      4. feeBps = 0 (empty code), feeAmount = 0
+      5. Payout: 100 ETH sent to attacker
+      6. Legitimate recipient's transaction reverts (insufficient funds)
+    solidity_invariant: |
+      // Invariant: Only the intended recipient should receive bridge payouts
+      // NOTE: This is acknowledged as a design tradeoff — atomic bridge+send is expected usage
+      // In non-atomic usage, front-running is possible
+
+  - id: SIG-FW-05
+    title: "ABI trailing bytes: hookData with extra bytes passes abi.decode without error"
+    description: |
+      Solidity's abi.decode ignores trailing bytes. If hookData contains extra data beyond what's
+      expected by the decode call, it will be silently ignored. This applies to ALL hooks. In most
+      cases this is harmless because the decoded values are what matter. However, for
+      Flywheel._campaignSalt(), the full hookData is included in the salt calculation:
+      keccak256(abi.encode(hooks, nonce, hookData)). Two different hookData values that decode to
+      the same parameters (one with trailing bytes, one without) would produce DIFFERENT campaign
+      addresses. This means a campaign created with trailing bytes in hookData cannot be referenced
+      by the "canonical" hookData, though predictCampaignAddress would still work if the exact
+      hookData is known. This is by design (deterministic addressing) but could cause integration confusion.
+    severity: info
+    confidence: 85
+    affected_functions:
+      - "Flywheel._campaignSalt()"
+      - "Flywheel.createCampaign()"
+      - "Flywheel.predictCampaignAddress()"
+    attack_scenario: |
+      1. Creator calls createCampaign(hooks, 0, hookData_with_trailing_bytes)
+      2. Campaign is created at address X = predictCampaignAddress(hooks, 0, hookData_with_trailing_bytes)
+      3. Someone tries predictCampaignAddress(hooks, 0, hookData_without_trailing_bytes)
+      4. Gets address Y != X, thinks campaign doesn't exist
+      5. Could create a SECOND campaign at address Y with the "clean" hookData
+      6. No fund loss — just confusion and potentially duplicate campaigns with same logical config
+    solidity_invariant: |
+      // Invariant: Campaign salt is unique per distinct hookData bytes, even if they decode identically
+      // This is correct behavior but may confuse integrators
+      // assert(predictCampaignAddress(h, n, data1) != predictCampaignAddress(h, n, data2)) when data1 != data2
+
+  - id: SIG-FW-06
+    title: "Campaign.contractURI circular call — view function DoS if campaign not registered"
+    description: |
+      Campaign.contractURI() calls Flywheel.campaignURI(address(this)), which has the onlyExists
+      modifier. For cloned Campaign contracts, the FLYWHEEL immutable is set to the deploying Flywheel.
+      If somehow the campaign address is not registered in _campaigns (e.g., if contractURI is called
+      on a Campaign that was deployed via a different path), the call would revert with
+      CampaignDoesNotExist. Additionally, campaignURI calls hooks.campaignURI(campaign) which is an
+      external call to the hooks contract. If the hooks contract is malicious or self-destructs, the
+      view function would revert. This only affects metadata/UI and cannot cause fund loss.
+    severity: info
+    confidence: 90
+    affected_functions:
+      - "Campaign.contractURI()"
+      - "Flywheel.campaignURI()"
+    attack_scenario: |
+      1. Campaign clone is deployed by Flywheel at address X
+      2. hooks contract self-destructs or becomes non-functional
+      3. Anyone calling Campaign(X).contractURI() gets a revert
+      4. ERC-7572 metadata is broken for this campaign
+      5. No fund loss — purely metadata/display impact
+    solidity_invariant: |
+      // Invariant: contractURI should not revert for any valid campaign
+      // assert(Campaign(campaign).contractURI() does not revert) for all existing campaigns
+
+  - id: SIG-FW-07
+    title: "AdConversion: attributionProviderFeeBps cached at creation, never updateable"
+    description: |
+      In AdConversion._onCreateCampaign(), attributionProviderFeeBps is stored in CampaignState and
+      used in _onSend() for fee calculation. There is no function to update this value after campaign
+      creation. If the attribution provider needs to change their fee (e.g., due to market conditions
+      or agreement changes), a new campaign must be created. This is a design choice but could be
+      problematic if large amounts are already deposited in the campaign. The attribution provider could
+      refuse to process attributions until a new campaign with their preferred fee is created, effectively
+      holding funds hostage (though the advertiser can finalize and withdraw).
+    severity: info
+    confidence: 75
+    affected_functions:
+      - "AdConversion._onCreateCampaign()"
+      - "AdConversion._onSend()"
+    attack_scenario: |
+      1. Campaign created with attributionProviderFeeBps = 500 (5%)
+      2. Advertiser funds campaign with 1000 ETH
+      3. Attribution provider demands 10% fee, refuses to submit attributions
+      4. Advertiser must wait for FINALIZING period, then FINALIZE, then withdraw
+      5. During this time, funds are locked and campaign is non-operational
+    solidity_invariant: |
+      // Invariant: attributionProviderFeeBps is immutable per campaign after creation
+      // assert(state[campaign].attributionProviderFeeBps == initialFeeBps) for all time
+
+  - id: SIG-FW-08
+    title: "SimpleRewards._onSend: manager-controlled hookData allows arbitrary payout recipients"
+    description: |
+      In SimpleRewards._onSend(), hookData is decoded directly as Flywheel.Payout[] with no validation
+      on recipients or amounts. The manager can specify any address as recipient and any amount. This
+      is by design (the manager is trusted), but means a compromised or malicious manager can drain
+      the entire campaign balance in a single transaction by specifying themselves as recipient for
+      the full balance. The solvency check in Flywheel only ensures allocated amounts are covered,
+      but send() sends from unallocated funds.
+    severity: info
+    confidence: 85
+    affected_functions:
+      - "SimpleRewards._onSend()"
+      - "Flywheel.send()"
+    attack_scenario: |
+      1. Campaign has 1000 tokens, 200 allocated
+      2. Compromised manager calls send() with hookData = [Payout(attacker, 800, "")]
+      3. Flywheel sends 800 tokens to attacker
+      4. Solvency check passes (200 allocated <= 200 remaining)
+      5. Legitimate allocated recipients can still be served, but unallocated surplus is gone
+    solidity_invariant: |
+      // Invariant: Manager trust is a prerequisite for campaign fund safety
+      // This is by design — SimpleRewards gives full control to the manager
+
+  - id: SIG-FW-09
+    title: "BridgeReferralFees._onDistributeFees uses raw hookData as string without validation"
+    description: |
+      In BridgeReferralFees._onDistributeFees(), hookData is cast directly to string via
+      string(hookData) on line 120 and passed to _processBuilderCode(). No abi.decode is used.
+      This means the hookData is interpreted as raw UTF-8 bytes for the builder code. If hookData
+      contains non-UTF-8 bytes, string() will accept them but BuilderCodes.toTokenId() may behave
+      unexpectedly. The try/catch in _processBuilderCode handles this gracefully (returns false),
+      so no fund loss is possible — the distribution would simply return empty and no fees would
+      be distributed. However, this is inconsistent with _onSend which uses abi.decode.
+    severity: info
+    confidence: 70
+    affected_functions:
+      - "BridgeReferralFees._onDistributeFees()"
+      - "BridgeReferralFees._processBuilderCode()"
+    attack_scenario: |
+      1. Builder code "alice" has accumulated fees in allocatedFee[campaign][token][tokenId]
+      2. Someone calls distributeFees() with hookData = "alice" (raw bytes, not abi.encoded)
+      3. _processBuilderCode("alice") succeeds, returns correct tokenId and payoutAddress
+      4. Distribution works correctly in this case
+      5. But if hookData is abi.encode("alice") instead, string(hookData) would be garbage
+      6. _processBuilderCode would fail, return (false, 0, 0), and no fees distributed
+      7. Caller must know to pass raw string bytes, not abi.encoded — potential integration footgun
+    solidity_invariant: |
+      // Invariant: distributeFees hookData encoding must match the expected format
+      // _onSend uses abi.decode(hookData, (address, string, uint8))
+      // _onDistributeFees uses string(hookData) — these are NOT the same encoding
+
+  - id: SIG-FW-10
+    title: "AdConversion._onSend: netAmount=0 skipped silently when found=false, losing attribution events"
+    description: |
+      In AdConversion._onSend(), when feeBps is high enough that netAmount becomes 0 after fee
+      deduction (e.g., payoutAmount=1 with feeBps=10000), the code at line 479 checks
+      `if (!found && netAmount > 0)` — if netAmount is 0, the recipient is never added. However,
+      the conversion event IS still emitted (lines 487-491). The attribution is recorded in events
+      but no payout is created. The fee is still accumulated in feeAmount. This means the attribution
+      provider gets their full fee even though the recipient gets nothing. With feeBps=10000 (100%),
+      the entire payout goes to fees and recipient gets zero. This is mathematically correct but
+      potentially unexpected.
+    severity: low
+    confidence: 60
+    affected_functions:
+      - "AdConversion._onSend()"
+    attack_scenario: |
+      1. Campaign created with attributionProviderFeeBps = 10000 (100%)
+      2. Attribution provider submits attribution with payoutAmount = 1000
+      3. Fee = 1000 * 10000 / 10000 = 1000, netAmount = 0
+      4. Recipient gets nothing, attribution provider gets 1000 in fees
+      5. Event emitted showing conversion was "processed" but recipient got zero
+      6. Effectively, the attribution provider steals the entire payout via fees
+    solidity_invariant: |
+      // Invariant: feeBps should be < MAX_BPS to ensure recipient gets something
+      // Currently allows feeBps == MAX_BPS (100% fee)
+      // assert(state[campaign].attributionProviderFeeBps < MAX_BPS) at creation time
+
+  - id: SIG-FW-11
+    title: "BridgeReferralFees._onSend bridgedAmount calculation includes unrelated tokens"
+    description: |
+      In BridgeReferralFees._onSend() line 78, bridgedAmount is calculated as the campaign's full
+      token balance minus totalAllocatedFees. This assumes all unallocated balance is the "bridged
+      amount" for this specific send operation. If multiple send() calls are batched or if tokens
+      arrive from multiple sources, the first send() caller gets ALL available balance. There's no
+      way to specify "I'm claiming exactly X amount." Combined with the lack of access control
+      (SIG-FW-04), this creates a race condition where multiple bridge operations compete for the
+      same campaign balance.
+    severity: medium
+    confidence: 55
+    affected_functions:
+      - "BridgeReferralFees._onSend()"
+    attack_scenario: |
+      1. Bridge deposits 10 ETH for user A into campaign
+      2. Bridge deposits 5 ETH for user B into same campaign (same block or before A claims)
+      3. User A calls send() first: bridgedAmount = 15 ETH - 0 fees = 15 ETH
+      4. User A receives 15 ETH (their 10 ETH + user B's 5 ETH)
+      5. User B calls send(): bridgedAmount = 0 ETH, payout = 0
+      6. User B loses their 5 ETH to user A
+    solidity_invariant: |
+      // Invariant: Each bridge recipient should only receive their own deposited amount
+      // Currently NO per-user deposit tracking exists
+      // assert(payoutAmount <= userDeposit[user]) — not enforced
+
+  - id: SIG-FW-12
+    title: "Flywheel._campaignSalt includes hookData — large hookData inflates CREATE2 gas costs"
+    description: |
+      _campaignSalt hashes hooks, nonce, and the full hookData via keccak256(abi.encode(hooks, nonce, hookData)).
+      For AdConversion._onCreateCampaign, hookData can contain large arrays (allowedPublisherRefCodes[],
+      ConversionConfigInput[]). Very large hookData means expensive keccak256 computation. This is
+      not a vulnerability but could cause out-of-gas on campaign creation with many configs/publishers.
+      The salt collision risk is negligible (keccak256 preimage resistance). Different hookData always
+      produces different salts, preventing accidental overwrites.
+    severity: info
+    confidence: 90
+    affected_functions:
+      - "Flywheel._campaignSalt()"
+      - "Flywheel.createCampaign()"
+    attack_scenario: |
+      1. Attacker cannot exploit this — keccak256 is collision-resistant
+      2. Worst case: advertiser creates campaign with 65535 conversion configs
+      3. Gas cost for hashing is O(hookData.length) — expensive but no security impact
+    solidity_invariant: |
+      // Invariant: Different (hooks, nonce, hookData) tuples always produce different salts
+      // keccak256 collision resistance guarantees this with overwhelming probability

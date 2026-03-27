@@ -1,0 +1,399 @@
+hunter: WildcardHunter
+component: MagicSpend
+source: /home/kali/Documents/Web3/MagicSpend/src/MagicSpend.sol
+date: "2026-03-27"
+hypotheses:
+
+  - id: MS-W-01
+    title: "Force-sent ETH via SELFDESTRUCT inflates maxAllowed, enabling oversized withdrawals"
+    severity: Low
+    confidence: 60
+    status: pending
+    solidity: |
+      // MagicSpend.sol L347
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+          revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+      }
+    attack_scenario: |
+      1. MagicSpend has 100 ETH, maxWithdrawDenominator=10, so maxAllowed=10 ETH per request.
+      2. Attacker creates a contract with 900 ETH, SELFDESTRUCTs targeting MagicSpend.
+      3. MagicSpend now has 1000 ETH balance, maxAllowed=100 ETH.
+      4. Attacker uses a valid WithdrawRequest signed by owner for 100 ETH (which normally would be rejected).
+      5. The withdrawal succeeds because the inflated balance passes the maxAllowed check.
+      LIMITATION: The attacker still needs a valid owner-signed WithdrawRequest for the inflated amount.
+      The owner would never sign a request for more than intended. The attack requires collusion
+      with the owner or a compromised signing backend that signs amounts based on current maxAllowed.
+    impact: |
+      If the signing backend dynamically computes max amounts based on on-chain maxAllowed, an attacker
+      could manipulate the backend into signing larger requests than intended. Practically, the owner
+      controls signatures so impact is limited to specific backend implementations.
+      The force-sent ETH itself is lost to the attacker (they burned 900 ETH to inflate maxAllowed).
+    notes: |
+      receive() is present so normal sends work too, but SELFDESTRUCT bypasses any receive() logic.
+      Post-Dencun, SELFDESTRUCT only works within the same transaction as CREATE, limiting this vector
+      on chains that implement EIP-6780. On pre-Dencun chains or L2s, still works.
+
+  - id: MS-W-02
+    title: "withdrawGasExcess + postOp: _withdrawable accumulates across multiple UserOps in same bundle"
+    severity: Medium
+    confidence: 45
+    status: pending
+    solidity: |
+      // validatePaymasterUserOp L143 - _withdrawable accumulates additively
+      _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+
+      // postOp L165-168 - reads FULL accumulated _withdrawable, deletes, sends
+      uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+      delete _withdrawable[account];
+      if (withdrawable > 0) {
+          SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+      }
+    attack_scenario: |
+      1. In ERC-4337 v0.6, ALL validations run first, THEN execution+postOp runs sequentially.
+      2. Attacker submits 2 UserOps in same bundle, both using MagicSpend as paymaster:
+         - UserOp1: amount=10 ETH, maxCost=9 ETH, nonce=1 → _withdrawable[sender] += 1 ETH
+         - UserOp2: amount=10 ETH, maxCost=9 ETH, nonce=2 → _withdrawable[sender] += 1 ETH (now 2 ETH)
+      3. UserOp1 execution: wallet calls withdrawGasExcess() → gets 2 ETH (both ops' excess!)
+      4. UserOp1 postOp: _withdrawable is 0, sends (9 - actualGas1) ETH
+      5. UserOp2 postOp: _withdrawable is 0, sends (9 - actualGas2) ETH
+      6. Total received = 2 + (9-gas1) + (9-gas2) = 20 - gas1 - gas2 (CORRECT total)
+
+      The total is mathematically correct. However, the DISTRIBUTION is skewed: postOp1 context
+      encodes maxCost=9 for UserOp1, but _withdrawable has excess from BOTH ops. If UserOp1's
+      execution calls withdrawGasExcess and gets both excesses, and then UserOp1's callData does
+      something with those funds that reverts... the revert only rolls back UserOp1's execution,
+      but _withdrawable was already consumed.
+
+      Edge case: If UserOp1 execution reverts (inner call fails), does _withdrawable state persist?
+      In ERC-4337, if the inner call reverts, postOp is called with PostOpMode.opReverted.
+      The _withdrawable state from validation persists because validation is in a separate context.
+    impact: |
+      If a bundle contains N UserOps from the same sender, the first postOp sends all accumulated
+      _withdrawable excess. This creates a timing dependency where the order of ops in the bundle
+      affects fund distribution. In worst case, if the first op's postOp transfer fails (account
+      rejects ETH), all accumulated excess from N ops could be stuck until another UserOp is submitted.
+      No direct fund loss but potential griefing of the paymaster's gas accounting.
+    notes: |
+      EntryPoint v0.6 validates all UserOps before executing any. The += accumulation pattern in
+      _withdrawable is the root cause. A mapping per-nonce or per-userOpHash would prevent this.
+
+  - id: MS-W-03
+    title: "maxWithdrawDenominator set to 0 bricks all native ETH withdrawals via division by zero"
+    severity: Low
+    confidence: 85
+    status: pending
+    solidity: |
+      // _setMaxWithdrawDenominator L329 - no zero check
+      function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+          maxWithdrawDenominator = newDenominator;
+          emit MaxWithdrawDenominatorSet(newDenominator);
+      }
+
+      // _validateRequest L347 - division by zero reverts
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    attack_scenario: |
+      1. Owner (or compromised owner key) calls setMaxWithdrawDenominator(0).
+      2. No validation prevents setting denominator to 0.
+      3. All subsequent calls to _validateRequest revert with division-by-zero panic.
+      4. Both withdraw() and validatePaymasterUserOp() call _validateRequest.
+      5. The paymaster is bricked for all native ETH withdrawals until owner fixes it.
+      6. ownerWithdraw() still works (bypasses _validateRequest), so funds aren't permanently lost.
+      7. ERC-20 withdrawals via withdraw() also revert because _validateRequest runs before
+         the asset check branch (L348: asset == address(0) is checked AFTER the division).
+
+      Wait - re-reading L348: the division happens unconditionally, but the revert only triggers
+      if asset == address(0) AND amount > maxAllowed. For ERC-20 (asset != address(0)):
+      The division at L347 still executes and reverts with panic before reaching L348.
+      So ALL withdrawals (ETH and ERC-20) are bricked.
+    impact: |
+      Owner-controlled DoS. All withdraw and paymaster functionality permanently broken until
+      the owner calls setMaxWithdrawDenominator with a non-zero value. If owner key is compromised
+      or in a multisig dispute, this could freeze the paymaster indefinitely.
+      Funds recoverable via ownerWithdraw which doesn't call _validateRequest.
+    notes: |
+      This is a QA/governance issue. The owner is trusted, so intentional sabotage is out of scope
+      for most programs. However, the missing zero-check is a code quality issue that could cause
+      accidental bricking if the owner fat-fingers the value.
+
+  - id: MS-W-04
+    title: "paymasterAndData accepts trailing bytes beyond WithdrawRequest - signature covers less than full payload"
+    severity: Informational
+    confidence: 70
+    status: pending
+    solidity: |
+      // validatePaymasterUserOp L126 - abi.decode ignores trailing bytes
+      WithdrawRequest memory withdrawRequest = abi.decode(userOp.paymasterAndData[20:], (WithdrawRequest));
+
+      // getHash L300-311 - only hashes specific fields, not raw paymasterAndData
+      function getHash(address account, WithdrawRequest memory withdrawRequest) public view returns (bytes32) {
+          return SignatureCheckerLib.toEthSignedMessageHash(
+              abi.encode(
+                  address(this), account, block.chainid,
+                  withdrawRequest.asset, withdrawRequest.amount,
+                  withdrawRequest.nonce, withdrawRequest.expiry
+              )
+          );
+      }
+    attack_scenario: |
+      1. A valid WithdrawRequest is signed by the owner for user Alice.
+      2. An attacker (or Alice herself) appends arbitrary bytes after the encoded WithdrawRequest
+         in paymasterAndData[20:].
+      3. abi.decode silently ignores trailing data and decodes the WithdrawRequest correctly.
+      4. The signature validates because getHash only covers the decoded fields.
+      5. The extra bytes are ignored by MagicSpend but could be used by:
+         a. The bundler or other on-chain observers as a covert data channel.
+         b. To create distinct UserOp hashes for the same WithdrawRequest (different paymasterAndData
+            → different UserOp hash → different EntryPoint nonce requirements).
+      LIMITATION: This doesn't enable fund theft. The decoded WithdrawRequest determines the withdrawal.
+    impact: |
+      No direct financial impact. The trailing bytes don't affect MagicSpend logic.
+      Theoretically, creating multiple distinct UserOps with the same WithdrawRequest but different
+      trailing data could confuse off-chain monitoring/indexing systems.
+      The nonce check in _validateRequest prevents the same WithdrawRequest from being used twice
+      regardless of trailing data.
+    notes: |
+      Standard ABI encoding behavior. Not a vulnerability per se, but worth documenting.
+      Many paymasters have this property.
+
+  - id: MS-W-05
+    title: "CoinbaseSmartWallet can call withdrawGasExcess during execution AND receive postOp refund - no double spend but fund timing mismatch"
+    severity: Informational
+    confidence: 80
+    status: pending
+    solidity: |
+      // validatePaymasterUserOp L143
+      _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+      context = abi.encode(maxCost, userOp.sender);
+
+      // withdrawGasExcess L178-185 - callable during execution phase
+      function withdrawGasExcess() external {
+          uint256 amount = _withdrawable[msg.sender];
+          if (amount == 0) revert NoExcess();
+          delete _withdrawable[msg.sender];
+          _withdraw(address(0), msg.sender, amount);
+      }
+
+      // postOp L165-171 - refunds gas excess
+      uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+      delete _withdrawable[account];
+    attack_scenario: |
+      1. UserOp with amount=10 ETH, maxCost=8 ETH → _withdrawable[wallet] = 2 ETH.
+      2. During execution, CoinbaseSmartWallet calls MagicSpend.withdrawGasExcess() → receives 2 ETH.
+         _withdrawable[wallet] = 0.
+      3. postOp runs: withdrawable = 0 + (8 - actualGas) = 8 - actualGas.
+         Wallet receives (8 - actualGas) ETH via forceSafeTransferETH.
+      4. Total: 2 + (8 - actualGas) = 10 - actualGas. CORRECT.
+
+      This is the INTENDED flow per the NatSpec comment on withdrawGasExcess:
+      "Can be called back during the UserOperation execution to sponsor funds for non-gas related
+      use cases (e.g., swap or mint)."
+
+      No vulnerability. The accounting is correct. The wallet gets exactly amount - actualGas
+      regardless of whether withdrawGasExcess is called during execution.
+    impact: |
+      No impact. This is by design. The _withdrawable pattern correctly handles the split between
+      execution-phase withdrawal (withdrawGasExcess) and gas refund (postOp).
+    notes: |
+      Confirmed safe. The key insight is that postOp uses the context-encoded maxCost
+      (not the original amount), so the gas refund portion is independent of _withdrawable.
+
+  - id: MS-W-06
+    title: "ERC-20 withdraw bypasses maxWithdrawDenominator limit entirely"
+    severity: Medium
+    confidence: 75
+    status: pending
+    solidity: |
+      // _validateRequest L347-349
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+          revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+      }
+    attack_scenario: |
+      1. The maxWithdrawDenominator check ONLY applies when asset == address(0) (native ETH).
+      2. For any ERC-20 token, there is NO limit on withdrawal amount.
+      3. If MagicSpend holds 1M USDC and maxWithdrawDenominator is 10:
+         - ETH: maxAllowed = balance / 10
+         - USDC: no limit, entire 1M USDC can be withdrawn in one request.
+      4. The withdraw() function (L190) allows ERC-20 withdrawals with valid owner signature.
+      5. A compromised signing backend could sign a single ERC-20 request draining all tokens.
+
+      NOTE: validatePaymasterUserOp forces asset == address(0) (L133-135), so this only applies
+      to direct withdraw() calls, not the paymaster flow.
+
+      LIMITATION: Owner must sign the request. If the owner is honest, they wouldn't sign
+      a draining request. But the maxWithdrawDenominator was presumably designed as a safety
+      mechanism, and it doesn't protect ERC-20s.
+    impact: |
+      The maxWithdrawDenominator safety mechanism is ETH-only. A compromised or buggy signing
+      backend could drain all ERC-20 tokens held by MagicSpend in a single transaction.
+      The denominator provides no rate-limiting for ERC-20 assets.
+      Severity depends on whether MagicSpend is expected to hold significant ERC-20 balances.
+    notes: |
+      This might be intentional design - the comment says "Helps prevent withdraws in the same
+      transaction leading to reverts and hurting paymaster reputation." Since ERC-20s aren't used
+      in the paymaster flow, the denominator's purpose is paymaster-specific.
+      Still, if MagicSpend holds ERC-20s for direct withdrawals, the safety net is missing.
+
+  - id: MS-W-07
+    title: "Flash loan ETH to MagicSpend inflates maxAllowed during validation, funds leave before postOp"
+    severity: Low
+    confidence: 40
+    status: pending
+    solidity: |
+      // _validateRequest L347
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    attack_scenario: |
+      1. Attacker flash-loans X ETH and sends it to MagicSpend via receive().
+      2. In the same transaction, attacker submits a UserOp bundle where MagicSpend validates
+         a larger-than-normal WithdrawRequest (maxAllowed is inflated by flash loan ETH).
+      3. After validation, the attacker needs to reclaim the flash-loaned ETH.
+
+      PROBLEM: The attacker cannot reclaim ETH from MagicSpend without owner permission.
+      There's no way to get ETH back from MagicSpend without a valid WithdrawRequest signature
+      or being the owner. The flash loan would fail because the attacker can't repay.
+
+      ALTERNATIVE: The attacker IS a bundler and controls the bundle ordering. They send ETH
+      to MagicSpend, include their UserOp, then... they still can't get the flash loan repaid
+      because MagicSpend has no callback mechanism.
+
+      CONCLUSION: This attack vector is NOT viable because:
+      a) MagicSpend has no flash loan callback or arbitrary call mechanism.
+      b) Sent ETH cannot be recovered without owner-signed WithdrawRequest.
+      c) The flash loan would time out / revert because repayment is impossible.
+    impact: |
+      Not exploitable. MagicSpend acts as a "roach motel" for unsolicited ETH - it goes in
+      but only comes out via owner-signed requests. Flash loan attacks require the ability to
+      recover the loaned funds in the same transaction, which MagicSpend prevents.
+    notes: |
+      Marking as Low/not-exploitable but documenting because it was a specific question.
+      The maxAllowed check uses live balance which IS manipulable, but the lack of fund recovery
+      mechanism makes this a dead end.
+
+  - id: MS-W-08
+    title: "postOp revert on second call (PostOpMode.postOpReverted) causes ETH to be stuck in _withdrawable"
+    severity: Low
+    confidence: 55
+    status: pending
+    solidity: |
+      // postOp L157-159
+      if (mode == PostOpMode.postOpReverted) {
+          revert UnexpectedPostOpRevertedMode();
+      }
+
+      // postOp L165-171
+      uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+      delete _withdrawable[account];
+      if (withdrawable > 0) {
+          SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+      }
+    attack_scenario: |
+      1. Per ERC-4337 spec, if postOp reverts, EntryPoint calls postOp again with PostOpMode.postOpReverted.
+      2. MagicSpend reverts on PostOpMode.postOpReverted (L157-159).
+      3. Per the EntryPoint code (v0.6), if the SECOND postOp call also reverts, the entire
+         UserOp is charged for gas but the postOp state changes are reverted.
+      4. This means: if the first postOp reverts (e.g., forceSafeTransferETH somehow fails despite
+         using SELFDESTRUCT fallback), then:
+         - _withdrawable[account] is NOT deleted (state reverted)
+         - The gas is still charged
+         - The user's _withdrawable persists and can be claimed via withdrawGasExcess later
+
+      Question: Can forceSafeTransferETH fail? Solady's implementation uses SELFDESTRUCT as
+      fallback, which cannot fail (it always sends ETH). So in practice, postOp should never
+      revert unless MagicSpend's balance is insufficient.
+
+      Edge case: If multiple UserOps in a bundle deplete MagicSpend's balance, a later postOp
+      could fail because insufficient ETH remains. The _withdrawable state would persist.
+    impact: |
+      If postOp somehow reverts (unlikely given forceSafeTransferETH), _withdrawable state persists.
+      The user can later call withdrawGasExcess() to recover funds. No permanent fund loss.
+      The main risk is gas being charged without the user receiving their excess.
+    notes: |
+      The comment in the code acknowledges this is "highly unlikely." Solady's forceSafeTransferETH
+      is designed to never fail. The real risk is balance depletion across multiple ops in a bundle.
+
+  - id: MS-W-09
+    title: "withdraw() does not check maxWithdrawDenominator for ETH effectively - check uses stale balance"
+    severity: Low
+    confidence: 50
+    status: pending
+    solidity: |
+      // withdraw() L190-203
+      function withdraw(WithdrawRequest memory withdrawRequest) external {
+          if (block.timestamp > withdrawRequest.expiry) revert Expired();
+          if (!isValidWithdrawSignature(msg.sender, withdrawRequest)) revert InvalidSignature();
+          _validateRequest(msg.sender, withdrawRequest);  // checks maxAllowed
+          _withdraw(withdrawRequest.asset, msg.sender, withdrawRequest.amount);  // sends ETH
+      }
+
+      // _validateRequest L347
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    attack_scenario: |
+      1. MagicSpend has 100 ETH, maxWithdrawDenominator=10, maxAllowed=10 ETH.
+      2. Alice has 10 valid WithdrawRequests, each for 10 ETH, with different nonces.
+      3. Alice calls withdraw() 10 times in the SAME transaction (via a batch contract):
+         - Call 1: balance=100, maxAllowed=10, withdraws 10 → balance=90
+         - Call 2: balance=90, maxAllowed=9, withdraws 10 → REVERTS (10 > 9)
+      4. Actually, the maxAllowed decreases after each withdrawal because balance decreases.
+      5. So the denominator IS effective at rate-limiting within a transaction.
+
+      HOWEVER: If Alice has requests of DECREASING amounts (10, 9, 8, 7, ...):
+         - Call 1: balance=100, maxAllowed=10, withdraws 10 → balance=90
+         - Call 2: balance=90, maxAllowed=9, withdraws 9 → balance=81
+         - Call 3: balance=81, maxAllowed=8.1, withdraws 8 → balance=73
+         - ...can drain ~65 ETH in one tx with denominator=10
+      With denominator=10, theoretical max drain per tx = sum of floor(balance/10) series.
+
+      ACROSS transactions: There's no global rate limit. Each new tx sees the current balance.
+    impact: |
+      The maxWithdrawDenominator provides diminishing protection within a single transaction
+      (geometric series) but no protection across transactions. An attacker with multiple valid
+      signed requests can drain the contract across multiple transactions.
+      This is likely by design - the denominator prevents accidental single-request draining,
+      not a determined attacker with multiple valid signatures.
+    notes: |
+      The denominator is described as helping "prevent withdraws in the same transaction leading
+      to reverts" (for paymaster reputation). It's not a security mechanism against malicious
+      withdrawals - the signature requirement is the primary security.
+
+  - id: MS-W-10
+    title: "Cross-chain replay protection relies on block.chainid which can change during hard forks"
+    severity: Low
+    confidence: 35
+    status: pending
+    solidity: |
+      // getHash L300-311 - uses block.chainid at runtime
+      function getHash(address account, WithdrawRequest memory withdrawRequest) public view returns (bytes32) {
+          return SignatureCheckerLib.toEthSignedMessageHash(
+              abi.encode(
+                  address(this),
+                  account,
+                  block.chainid,  // runtime chainid
+                  withdrawRequest.asset,
+                  withdrawRequest.amount,
+                  withdrawRequest.nonce,
+                  withdrawRequest.expiry
+              )
+          );
+      }
+    attack_scenario: |
+      1. MagicSpend is deployed at the same address on ETH mainnet (chainid=1).
+      2. A hard fork creates a new chain with a different chainid.
+      3. On the forked chain, MagicSpend exists at the same address with the same owner.
+      4. WithdrawRequests signed for chainid=1 cannot be replayed on the fork (different chainid).
+      5. HOWEVER: the nonce state also forks. Nonces used pre-fork are marked on BOTH chains.
+         New nonces post-fork are independent.
+      6. If the owner signs new requests for the new chain, they're valid only on that chain.
+
+      NOT EXPLOITABLE: block.chainid correctly differentiates chains post-fork.
+      The signature includes address(this) + block.chainid, providing full replay protection.
+
+      EDGE CASE: If chainid is somehow manipulated (e.g., via a malicious L2 sequencer that
+      lies about chainid), then cross-chain replays become possible. But this requires a
+      compromised chain environment, not a MagicSpend vulnerability.
+    impact: |
+      No practical impact. The chainid + contract address combination provides robust
+      replay protection. This is documented as informational for completeness.
+    notes: |
+      Using block.chainid (runtime) vs a cached immutable chainid is actually BETTER for
+      fork scenarios because it automatically adapts to the new chain.

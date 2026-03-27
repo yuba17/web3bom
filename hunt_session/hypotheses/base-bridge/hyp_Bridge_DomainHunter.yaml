@@ -1,0 +1,755 @@
+# DomainHunter Analysis — Base↔Solana Bridge
+# Contracts: bridge/base/src/Bridge.sol, BridgeValidator.sol, CrossChainERC20Factory.sol,
+#            CrossChainERC20.sol, Twin.sol, libraries/TokenLib.sol, libraries/MessageLib.sol,
+#            libraries/MessageStorageLib.sol, libraries/CallLib.sol, libraries/VerificationLib.sol,
+#            libraries/SVMLib.sol, libraries/SVMBridgeLib.sol, periphery/RelayerOrchestrator.sol
+# Focus: Cross-chain bridge domain bugs — replay, accounting desync, token registration races,
+#         fee-on-transfer inconsistency, MMR consistency, validator signature domain separation
+# Analyst: DomainHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: BR-D-01
+    title: "Message hash lacks chain ID and bridge address — cross-deployment replay"
+    description: |
+      MessageLib.getMessageHash computes:
+        hash(nonce, outgoingMessagePubkey, innerMessageHash)
+      using EfficientHashLib.hash(bytes32, bytes32, bytes32).
+
+      There is NO chain ID, NO bridge contract address, and NO domain separator in this hash.
+      The nonce is monotonic per-BridgeValidator (nextNonce), and the outgoingMessagePubkey
+      is a Solana account key. If the same bridge is deployed on multiple EVM chains (e.g.,
+      Base mainnet + Base testnet, or Base + Optimism in future OP Stack expansion), or if a
+      new version of the bridge is deployed on the same chain, a message validated on one
+      deployment could be replayed on another deployment that shares the same validator set.
+
+      Attack path: BridgeValidator on chain A validates messageHash H at nonce N. If chain B's
+      BridgeValidator is at nonce N and the same validators sign for both, the same registerMessages
+      call can be replayed on chain B. The outgoingMessagePubkey refers to the same Solana
+      account, so the inner message is identical. The successes mapping on chain B has no
+      record of H, so relayMessages would execute it.
+
+      CRITICAL NUANCE: The signature in registerMessages is over abi.encode(messageHashes),
+      and messageHashes are derived from nonce + outgoingMessagePubkey + innerMessageHash.
+      Since the signature itself also lacks chain ID (it uses raw eth_sign, not EIP-712),
+      the SAME signature is valid on any chain where the validator keys are trusted.
+    confidence: 65
+    severity: critical
+    status: investigate
+    attack_scenario: |
+      1. Bridge deployed on Base (chain A) and Optimism (chain B), same validator set.
+      2. Solana user sends message M. Validators sign registerMessages on chain A at nonce 0.
+      3. Attacker takes the exact same registerMessages calldata (signedMessages + validatorSigs)
+         and submits it to BridgeValidator on chain B (which is also at nonce 0).
+      4. BridgeValidator on chain B: derives same messageHashes (nonce=0, same pubkey, same inner hash),
+         recovers same signers from identical signature, passes threshold check.
+      5. validMessages[H] = true on chain B.
+      6. Attacker constructs IncomingMessage matching H and calls relayMessages on chain B's Bridge.
+      7. Message executes on chain B — tokens minted/transferred that were never deposited on chain B.
+    solidity: |
+      // Invariant: message hash MUST include deployment-specific domain separation
+      // Current code (MessageLib.sol:42-48):
+      //   return EfficientHashLib.hash(bytes32(nonce), Pubkey.unwrap(outgoingMessagePubkey), innerMessageHash);
+      // Missing: chain ID, bridge address, or any domain separator
+      // A proper implementation would be:
+      //   return keccak256(abi.encode(block.chainid, address(this), nonce, outgoingMessagePubkey, innerMessageHash));
+      //
+      // Additionally, BridgeValidator._getSignersFromSigs signs:
+      //   ECDSA.toEthSignedMessageHash(abi.encode(messageHashes))
+      // This also lacks chain ID — same signature valid on any EVM chain.
+      //
+      // Property to test: two Bridge deployments with same nonce should NOT accept same signature
+      function invariant_BR_D_01_cross_chain_replay() public {
+          // If messageHash = hash(nonce, pubkey, innerHash) with no chainid,
+          // then hash is identical across chains for same nonce+pubkey+innerHash
+          bytes32 hash1 = MessageLib.getMessageHash(0, testPubkey, testInnerHash);
+          bytes32 hash2 = MessageLib.getMessageHash(0, testPubkey, testInnerHash);
+          // These are trivially equal — the invariant is that they SHOULD differ per deployment
+          t(hash1 == hash2, "BR-D-01: hashes identical across deployments (no chain separation)");
+      }
+    validated: false
+    priority: critical
+
+  - id: BR-D-02
+    title: "registerRemoteToken has no access control — attacker sets arbitrary scalar"
+    description: |
+      TokenLib.registerRemoteToken (called from Bridge.__relayMessage when message.sender == REMOTE_BRIDGE)
+      simply writes:
+        $.scalars[localToken][remoteToken] = 10 ** scalarExponent;
+
+      The ONLY gate is that message.sender must equal REMOTE_BRIDGE (the Solana bridge pubkey).
+      This means the Solana bridge program controls which (localToken, remoteToken) pairs get
+      which scalar. If the Solana side is compromised or has a bug, an attacker could register
+      an arbitrary scalar for any token pair.
+
+      MORE IMPORTANTLY: registerRemoteToken can be called MULTIPLE TIMES for the same
+      (localToken, remoteToken) pair — it just overwrites the scalar. There is no check that
+      the scalar was previously unset. If an attacker can get the Solana bridge to send a second
+      registerRemoteToken message for an existing pair, they could change the scalar and
+      manipulate the conversion rate.
+
+      With scalar=10^0=1, a token with 18 decimals would have 1:1 conversion to Solana's
+      typically 9-decimal tokens. If scalar is later changed to 10^9, existing deposits
+      would suddenly be worth 10^9x more on withdrawal.
+    confidence: 45
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Token pair (USDC, solUSDC) registered with scalar = 10^12 (18-dec to 6-dec).
+      2. Users deposit 1000 USDC (deposits[USDC][solUSDC] = 1000e18).
+      3. Attacker exploits Solana bridge to send registerRemoteToken(USDC, solUSDC, 0).
+      4. Scalar changes to 10^0 = 1.
+      5. Attacker bridges 1000 solUSDC back. finalizeTransfer computes localAmount = 1000 * 1 = 1000.
+      6. deposits -= 1000 (succeeds since deposits = 1000e18 > 1000).
+      7. Attacker receives 1000 wei of USDC. Not profitable here.
+      8. REVERSE: attacker registers scalar = 10^18. localAmount = 1000 * 10^18 = 1000e18.
+         deposits -= 1000e18 (succeeds). Attacker gets 1000e18 USDC but only deposited
+         1000 units on Solana. Profitable if Solana side doesn't enforce correct amounts.
+    solidity: |
+      // Invariant: scalar for a registered token pair should not change after initial registration
+      // Current code (TokenLib.sol:269-272):
+      //   function registerRemoteToken(address localToken, Pubkey remoteToken, uint8 scalarExponent) internal {
+      //       TokenLibStorage storage $ = getTokenLibStorage();
+      //       $.scalars[localToken][remoteToken] = 10 ** scalarExponent;
+      //   }
+      // No check: require($.scalars[localToken][remoteToken] == 0, "already registered");
+      function invariant_BR_D_02_scalar_immutable() public {
+          uint256 scalarBefore = tokenLib.scalars(localToken, remoteToken);
+          // After registerRemoteToken called again
+          uint256 scalarAfter = tokenLib.scalars(localToken, remoteToken);
+          if (scalarBefore != 0) {
+              t(scalarBefore == scalarAfter, "BR-D-02: scalar changed for existing pair");
+          }
+      }
+    validated: false
+    priority: high
+
+  - id: BR-D-03
+    title: "Fee-on-transfer token accounting desync between initializeTransfer and finalizeTransfer"
+    description: |
+      initializeTransfer handles fee-on-transfer tokens correctly for ERC20→Solana:
+      it measures balanceBefore/balanceAfter, computes receivedRemoteAmount, and adjusts
+      transfer.remoteAmount in memory before serialization (lines 176-198 of TokenLib.sol).
+      deposits[localToken][remoteToken] is incremented by the actual localAmount received.
+
+      However, finalizeTransfer (Solana→ERC20) does NOT handle fee-on-transfer:
+      Line 252: $.deposits[localToken][remoteToken] -= localAmount;
+      Line 254: SafeTransferLib.safeTransfer({token: transfer.localToken, to: to, amount: localAmount});
+
+      The deposits mapping is decremented by localAmount BEFORE the transfer. If the token
+      has a fee, the recipient receives less than localAmount, but deposits was decremented
+      by the full localAmount. Over time, this creates a systematic deficit where:
+      deposits tracks the "theoretical" balance, but actual token balance < deposits.
+
+      Eventually, the bridge contract will not have enough tokens to honor withdrawals.
+      The last users to withdraw will find the bridge insolvent.
+
+      KEY: The Solana side sends back remoteAmount, and the Base side computes
+      localAmount = remoteAmount * scalar. If the token charges 1% fee on transfer,
+      each round-trip leaks 1% from the bridge's real balance without reducing deposits
+      proportionally. After 100 round-trips of the full balance, ~63% of real tokens are gone
+      but deposits still tracks the original amount.
+    confidence: 75
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Fee-on-transfer token FOT (1% fee) registered with scalar = 10^9.
+      2. User bridges 1000 FOT to Solana. initializeTransfer correctly measures:
+         received = 990 FOT, remoteAmount = 990/scalar, deposits += 990 * scalar.
+      3. User bridges 990-equivalent back from Solana. finalizeTransfer computes:
+         localAmount = remoteAmount * scalar = 990 * scalar.
+         deposits -= 990 * scalar. ✓ deposits balanced.
+         safeTransfer(FOT, user, 990 * scalar). But 1% fee → user gets 980.1, bridge lost 9.9.
+      4. Bridge's real FOT balance is now 9.9 less than deposits tracks.
+      5. After many round-trips, bridge becomes insolvent for last withdrawers.
+      6. Worse: attacker can accelerate by repeatedly bridging back and forth.
+    solidity: |
+      // Invariant: bridge's actual token balance >= total deposits for that token
+      // After finalizeTransfer, the bridge's balance should still cover remaining deposits
+      function invariant_BR_D_03_solvency() public {
+          uint256 actualBalance = IERC20(localToken).balanceOf(address(bridge));
+          uint256 trackedDeposits = bridge.deposits(localToken, remoteToken);
+          gte(actualBalance, trackedDeposits, "BR-D-03: bridge insolvent - actual < tracked deposits");
+      }
+    validated: false
+    priority: high
+
+  - id: BR-D-04
+    title: "CrossChainERC20Factory.deploy is permissionless — front-running token registration"
+    description: |
+      CrossChainERC20Factory.deploy is fully permissionless (no access control). Anyone can
+      call deploy(remoteToken, name, symbol, decimals) to create a CrossChainERC20 for any
+      remoteToken.
+
+      The salt for CREATE2 is: keccak256(abi.encode(remoteToken, name, symbol, decimals)).
+      So deploying with the SAME parameters gives the SAME address (idempotent).
+      But deploying with DIFFERENT name/symbol/decimals for the SAME remoteToken gives a
+      DIFFERENT address.
+
+      Attack: Attacker front-runs the official deployment by deploying a CrossChainERC20 with
+      the same remoteToken but different name/symbol (e.g., name="FakeUSDC", symbol="FUSDC").
+      This creates a valid CrossChainERC20 at address X. The factory marks
+      isCrossChainErc20[X] = true.
+
+      Later, the official deployment uses correct parameters and deploys at address Y.
+      isCrossChainErc20[Y] = true. Both X and Y are "valid" CrossChainERC20s for the same
+      remoteToken.
+
+      When the Solana bridge sends registerRemoteToken(localToken=Y, remoteToken, scalarExp),
+      only Y gets the scalar. But X is also a valid isCrossChainErc20, and users could interact
+      with X thinking it's the official token. The bridge would mint X tokens for incoming
+      Solana transfers if the message specifies localToken=X.
+
+      HOWEVER: finalizeTransfer checks that CrossChainERC20(localToken).remoteToken() matches
+      transfer.remoteToken. So both X and Y would pass this check since they share remoteToken.
+      The bridge would freely mint tokens on BOTH contracts for the same Solana token.
+    confidence: 55
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Attacker deploys CrossChainERC20 via factory: deploy(solUSDC, "Fake USDC", "FUSDC", 6).
+         Factory creates token at address FAKE_ADDR. isCrossChainErc20[FAKE_ADDR] = true.
+      2. Official deployment: deploy(solUSDC, "USD Coin", "USDC", 6). Token at OFFICIAL_ADDR.
+      3. Solana bridge registers: registerRemoteToken(OFFICIAL_ADDR, solUSDC, 0).
+      4. Attacker constructs a Solana→Base transfer with localToken=FAKE_ADDR, remoteToken=solUSDC.
+      5. finalizeTransfer: isCrossChainErc20[FAKE_ADDR] = true (check passes).
+         CrossChainERC20(FAKE_ADDR).remoteToken() == solUSDC (check passes).
+         Mints tokens on FAKE_ADDR to recipient.
+      6. These FAKE_ADDR tokens are backed by real Solana USDC but exist on a different ERC20
+         contract. Users on secondary markets could be confused. The minting is unbounded
+         by deposits since this is the CrossChainERC20 path (mint, not transfer from deposits).
+    solidity: |
+      // Invariant: for a given remoteToken, only ONE CrossChainERC20 should be mintable by the bridge
+      // Current code allows multiple deployments for the same remoteToken with different metadata
+      // The factory has no uniqueness constraint on remoteToken
+      function invariant_BR_D_04_unique_wrapped_token() public {
+          // After deploying two CrossChainERC20s for same remoteToken but different params:
+          address token1 = factory.deploy(remoteToken, "Name1", "SYM1", 18);
+          address token2 = factory.deploy(remoteToken, "Name2", "SYM2", 18);
+          // Both are isCrossChainErc20 = true, both have same remoteToken()
+          // Bridge can mint on both — this should not be possible
+          t(token1 == token2 || !factory.isCrossChainErc20(token2),
+            "BR-D-04: multiple wrapped tokens for same remoteToken");
+      }
+    validated: false
+    priority: medium
+
+  - id: BR-D-05
+    title: "Deposit underflow on finalizeTransfer — Solana-side over-minting drains bridge"
+    description: |
+      When bridging native ERC20 back from Solana to Base, finalizeTransfer computes:
+        localAmount = transfer.remoteAmount * scalar
+        $.deposits[localToken][remoteToken] -= localAmount
+
+      This subtraction will revert on underflow (Solidity 0.8.28 checked arithmetic).
+      So if the Solana side tries to withdraw more than was deposited, the transaction reverts.
+
+      This is actually a SAFETY mechanism — the deposits mapping acts as a ceiling on
+      withdrawals. However, consider the interaction with registerRemoteToken:
+
+      If an attacker can change the scalar (see BR-D-02), they could:
+      1. Deposit with scalar S1 → deposits += amount * S1
+      2. Change scalar to S2 < S1
+      3. Withdraw → localAmount = remoteAmount * S2 < original deposit
+      4. deposits -= localAmount (small amount)
+      5. Repeat to drain more than deposited
+
+      Also: for CrossChainERC20 path (not native ERC20), there's NO deposit tracking at all.
+      The bridge just mints freely. If Solana allows burning more than was locked in its vaults,
+      infinite minting on Base is possible. The only defense is Solana-side correctness.
+    confidence: 50
+    severity: critical
+    status: investigate
+    attack_scenario: |
+      1. ERC20 token registered with scalar = 10^9.
+      2. User deposits 1000e18 local tokens → deposits[token][remote] += 1000e18.
+      3. On Solana, a bug allows burning 2000 remote tokens (only 1000 were minted).
+      4. Solana sends finalizeTransfer with remoteAmount = 2000.
+      5. localAmount = 2000 * 10^9 = 2000e12.
+      6. deposits -= 2000e12. Since deposits = 1000e18 > 2000e12, this succeeds!
+      7. Attacker receives 2000e12 tokens but only deposited 1000e18 in local terms.
+         Wait — 2000e12 < 1000e18, so attacker actually gets less. The scalar prevents overwithdrawal
+         in absolute terms because deposits is tracked in local units.
+      8. REVISED: If remoteAmount = 1001 (one more than deposited on Solana as 1000),
+         localAmount = 1001 * 10^9. deposits -= 1001e9. deposits = 1000e18 - 1001e9 ≈ 1000e18.
+         Still safe because deposits is much larger in local units.
+      9. Real risk: scalar manipulation or CrossChainERC20 infinite mint path.
+    solidity: |
+      // Invariant: cumulative withdrawals <= cumulative deposits for native ERC20 tokens
+      // For CrossChainERC20 path: totalSupply(localToken) <= amount locked on Solana (cross-chain invariant)
+      function invariant_BR_D_05_deposit_ceiling() public {
+          uint256 deposits = bridge.deposits(localToken, remoteToken);
+          uint256 balance = IERC20(localToken).balanceOf(address(bridge));
+          // deposits should always be <= actual balance (no phantom deposits)
+          lte(deposits, balance, "BR-D-05: phantom deposits exceed real balance");
+      }
+    validated: false
+    priority: high
+
+  - id: BR-D-06
+    title: "Twin delegatecall enables storage collision with Bridge's ERC-7201 slots"
+    description: |
+      Twin.execute supports CallType.DelegateCall, which executes arbitrary code in the
+      Twin's storage context. Since Twin is a beacon proxy (ERC-1967), its storage layout
+      is minimal. However, the Bridge contract uses ERC-7201 namespaced storage at fixed
+      slots for MessageStorageLib, TokenLib, and VerificationLib.
+
+      Twins are deployed by the Bridge via LibClone.deployDeterministicERC1967BeaconProxy.
+      The Twin proxy delegates to the Twin implementation. If a Solana user sends a
+      DelegateCall to a malicious contract, that contract executes in Twin's context, NOT
+      Bridge's context. So this cannot directly corrupt Bridge storage.
+
+      However, if the Twin delegatecalls to a contract that writes to the same ERC-7201
+      slots that the Bridge uses, and if the Bridge later reads Twin's storage (it doesn't
+      seem to), there could be confusion. In practice, Bridge only reads its own storage,
+      never Twin's. So this is LOW risk.
+
+      Real concern: Twin delegatecall to a contract that self-destructs (pre-Dencun) or
+      creates unexpected state. Post-Dencun, SELFDESTRUCT only sends ETH without destroying.
+    confidence: 20
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Solana user sends Call message with CallType.DelegateCall.
+      2. Target contract writes to storage slot X in Twin's context.
+      3. If slot X happens to be Bridge's ERC-7201 slot — irrelevant because Twin and Bridge
+         are separate contracts with separate storage.
+      4. Only risk: Twin's own beacon proxy slot (ERC-1967) could be overwritten, bricking
+         the Twin. But this is self-inflicted by the Solana user.
+    solidity: |
+      // Invariant: delegatecall from Twin cannot affect Bridge storage
+      // This is architecturally safe since Twin and Bridge are separate contracts
+      // Verify Twin has no storage overlap with Bridge
+      function invariant_BR_D_06_twin_isolation() public {
+          // After Twin delegatecall to malicious contract:
+          bytes32 bridgeRoot = bridge.getRoot();
+          // Bridge root should be unchanged
+          eq(bridgeRoot, expectedRoot, "BR-D-06: bridge storage corrupted by twin delegatecall");
+      }
+    validated: false
+    priority: low
+
+  - id: BR-D-07
+    title: "Validator signature replay — eth_sign digest lacks domain separation (EIP-712 absent)"
+    description: |
+      BridgeValidator._getSignersFromSigs computes:
+        bytes32 signedHash = ECDSA.toEthSignedMessageHash(abi.encode(messageHashes));
+
+      This is a raw eth_sign prefix ("\x19Ethereum Signed Message:\n32" + hash).
+      There is NO EIP-712 domain separator with chain ID, verifying contract address, etc.
+
+      The signature is over the hash of messageHashes array. Since messageHashes themselves
+      lack chain ID (see BR-D-01), the entire signature chain from message content to
+      validator approval has ZERO chain-specific binding.
+
+      If the same validator set operates across multiple bridge deployments (e.g., testnet
+      and mainnet during migration, or Base and another OP chain), a single signature
+      is valid everywhere.
+
+      ALSO: The UnsortedSigners check (currentValidator > lastValidator) prevents duplicate
+      signatures but does not prevent the same signature set from being used across chains.
+    confidence: 70
+    severity: critical
+    status: investigate
+    attack_scenario: |
+      1. Validators V1, V2, V3 operate both Base mainnet bridge and Base testnet bridge.
+      2. Testnet bridge at nonce 5. Mainnet bridge at nonce 5 (could happen after reset/redeploy).
+      3. Validators sign batch for testnet: registerMessages([msg1, msg2], sigs).
+      4. Attacker replays exact calldata on mainnet BridgeValidator.
+      5. Nonce matches (5), message hashes derived identically, signatures recover to V1/V2/V3.
+      6. Messages pre-validated on mainnet without validators intending it.
+      7. Attacker relays messages on mainnet Bridge.
+    solidity: |
+      // Invariant: validator signatures must be bound to a specific bridge deployment
+      // Current: ECDSA.toEthSignedMessageHash(abi.encode(messageHashes))
+      // Should be: ECDSA.toEthSignedMessageHash(abi.encode(block.chainid, address(this), messageHashes))
+      // Or better: EIP-712 typed data with domain separator
+      //
+      // Property: same message content signed for chain A should not validate on chain B
+      function invariant_BR_D_07_signature_domain_bound() public {
+          // This is a design-level issue - signatures lack chain binding
+          // The signature over abi.encode(messageHashes) is identical across chains
+          // since messageHashes lack chain ID
+          bytes32 digest = ECDSA.toEthSignedMessageHash(abi.encode(messageHashes));
+          // digest is deterministic and chain-independent — this IS the bug
+      }
+    validated: false
+    priority: critical
+
+  - id: BR-D-08
+    title: "MMR root atomicity — sendMessage and relayMessages in same transaction"
+    description: |
+      When bridgeCall/bridgeToken calls MessageStorageLib.sendMessage, the MMR root is
+      updated atomically within the transaction. relayMessages also executes within a single
+      transaction (nonReentrant protected).
+
+      The concern is whether a message sent via sendMessage in the same BLOCK as a
+      relayMessages call could cause a consistency issue for the Solana side.
+
+      Analysis: The Solana side reads the MMR root to verify inclusion of Base→Solana messages.
+      If the root changes between when the Solana observer reads it and when the proof is
+      generated, the proof would be invalid. But this is a liveness issue, not a safety issue —
+      the Solana side would simply reject the stale proof, and a new proof with the updated
+      root would be needed.
+
+      The MMR is append-only. A proof for leaf N against root R(N) remains valid for any
+      root R(M) where M >= N, provided the proof includes the additional peaks. Actually,
+      MMR proofs are root-specific, so a proof for R(N) is NOT valid for R(N+1). But this
+      is standard MMR behavior and doesn't create a vulnerability — just requires the prover
+      to use the correct root.
+    confidence: 15
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Block B has tx1: sendMessage(msg_A) which updates root to R1.
+      2. Same block B has tx2: sendMessage(msg_B) which updates root to R2.
+      3. Solana observer sees R2 as the final root for block B.
+      4. To prove msg_A's inclusion, prover must use R2 and include msg_B's leaf in the proof.
+      5. This is standard MMR operation — no exploit possible.
+    solidity: |
+      // Invariant: MMR is append-only and root reflects all appended leaves
+      function invariant_BR_D_08_mmr_consistency() public {
+          uint64 nonce = bridge.getNextNonce();
+          bytes32 root = bridge.getRoot();
+          // After sending a message, nonce increments and root changes
+          // Previous proofs for previous roots are invalidated — this is by design
+      }
+    validated: false
+    priority: low
+
+  - id: BR-D-09
+    title: "Nonce gap in BridgeValidator enables selective message censorship"
+    description: |
+      BridgeValidator.registerMessages processes messages with strictly sequential nonces
+      starting from nextNonce. The function increments currentNonce for each message in
+      the batch:
+        messageHashes[i] = MessageLib.getMessageHash(currentNonce++, ...)
+
+      After the batch: nextNonce = currentNonce.
+
+      This means messages MUST be registered in strict nonce order. If validators skip a
+      nonce (don't include message N in any batch), message N can NEVER be registered because
+      nextNonce will have advanced past it.
+
+      This gives validators censorship power: they can permanently drop any message by
+      simply not including it in a batch while including later messages. The Solana side
+      may have created the message, but it can never be executed on Base.
+
+      For a bridge with $5M bounty, validator censorship is likely a known trust assumption
+      (Stage 0 design). But it's worth flagging because the monotonic nonce creates an
+      irrecoverable gap — there's no mechanism to retry or skip.
+    confidence: 85
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Messages on Solana: nonce 0 (legitimate $1M transfer), nonce 1 (attacker's msg).
+      2. Malicious validator colludes to register only nonce 0 and 1, skipping nonce 0's
+         actual content by providing a different innerMessageHash.
+      3. Wait — validators sign over the hashes, not the contents. They can't forge a
+         different innerMessageHash without controlling the Solana side.
+      4. REVISED: Validators simply refuse to sign a batch containing nonce N.
+         They sign nonce N+1 instead. But BridgeValidator requires sequential nonces from
+         nextNonce. So they MUST include nonce N before N+1.
+      5. Validators can censor by refusing to sign ANY batch until nonce N is replaced
+         on Solana, or by signing a batch with a bogus innerMessageHash for nonce N
+         (making it unreplayable on Base since the IncomingMessage won't match).
+    solidity: |
+      // Invariant: every nonce from 0 to nextNonce-1 has been registered
+      // This is enforced by construction since nonces are sequential
+      // The risk is at the validator/social layer, not the smart contract layer
+      function invariant_BR_D_09_nonce_sequential() public {
+          // BridgeValidator.nextNonce is always incremented sequentially
+          // No nonce gap is possible in the contract — gaps happen at the signing layer
+          uint256 nonce = bridgeValidator.nextNonce();
+          // Every hash from nonce 0 to nonce-1 should be in validMessages
+      }
+    validated: false
+    priority: medium
+
+  - id: BR-D-10
+    title: "relayMessage gas limit manipulation — griefing via insufficient gas"
+    description: |
+      Bridge._validateAndRelay calls:
+        try this.__relayMessage{gas: message.gasLimit}(message)
+
+      The gasLimit is set by the Solana sender as part of the IncomingMessage. The relayer
+      (msg.sender of relayMessages) only needs to provide enough gas for the outer loop.
+
+      If message.gasLimit is set too low, __relayMessage will revert due to OOG, and the
+      message is marked as failures[messageHash] = true. The message can be retried by
+      calling relayMessages again (successes check passes, BridgeValidator.validMessages
+      check passes again).
+
+      However, there's a subtle 63/64 rule issue. The outer call retains 1/64 of remaining
+      gas. If the relayer provides exactly enough gas for the outer call but the inner call
+      needs more than 63/64 of that, the inner call gets less gas than message.gasLimit
+      requested.
+
+      The relayer could intentionally provide just enough gas that the inner call gets
+      slightly less than gasLimit, causing it to fail. But since the message can be retried,
+      this is a griefing/liveness issue, not a fund-loss issue.
+
+      IMPORTANT: failures mapping is set on failure but the message is NOT locked. Any future
+      call to relayMessages with the same message will attempt execution again (only successes
+      prevents re-execution). So this is safe against permanent lock.
+    confidence: 30
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Message M has gasLimit = 500000.
+      2. Malicious relayer calls relayMessages with just enough gas for outer loop.
+      3. Inner call gets 400000 gas (63/64 rule), execution fails.
+      4. failures[H] = true, but message is NOT permanently blocked.
+      5. Honest relayer retries with sufficient gas. Message executes successfully.
+      6. Impact: temporary delay only.
+    solidity: |
+      // Invariant: failed messages can always be retried
+      function invariant_BR_D_10_retry_after_failure() public {
+          bytes32 messageHash = bridge.getMessageHash(message);
+          // After failure:
+          t(bridge.failures(messageHash) == true, "message marked as failed");
+          t(bridge.successes(messageHash) == false, "message not yet successful");
+          // Retry should be possible — successes[H] is still false
+          bridge.relayMessages(messages);
+          t(bridge.successes(messageHash) == true, "BR-D-10: retry succeeded");
+      }
+    validated: false
+    priority: low
+
+  - id: BR-D-11
+    title: "CrossChainERC20 mint is unbounded — no total supply cap tied to Solana-side locks"
+    description: |
+      When finalizing a transfer for a CrossChainERC20 (Solana native → Base wrapped):
+        localAmount = transfer.remoteAmount;
+        CrossChainERC20(transfer.localToken).mint({to: to, amount: localAmount});
+
+      There is NO deposits tracking for CrossChainERC20 mints. The deposits mapping
+      is only used for native ERC20/ETH paths. For CrossChainERC20, the mint is completely
+      unbounded on the Base side.
+
+      The security relies ENTIRELY on the Solana side correctly locking tokens before
+      allowing the bridge message. If the Solana program has a bug that allows creating
+      bridge messages without proper token locking, infinite minting is possible on Base.
+
+      This is the classic bridge pattern where one side trusts the other side's accounting.
+      For a $5M bounty, the Solana side is presumably audited separately, but the Base
+      contracts have no defense-in-depth against Solana-side bugs.
+
+      Compare with native ERC20 path: deposits[localToken][remoteToken] acts as a hard
+      ceiling. Even if Solana over-reports withdrawals, the subtraction underflows and reverts.
+      The CrossChainERC20 path has no such safety net.
+    confidence: 60
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Solana bridge program has a reentrancy or double-spend bug.
+      2. Attacker locks 100 SOL, but creates 2 bridge messages each claiming 100 SOL.
+      3. Both messages pass validator signatures (validators attest what Solana says).
+      4. Both messages are relayed on Base. Bridge mints 100 + 100 = 200 wrapped SOL.
+      5. Total supply of wrapped SOL on Base = 200, but only 100 locked on Solana.
+      6. Attacker dumps 200 wrapped SOL on DEX for ~200 SOL equivalent.
+      7. Bridge becomes insolvent — only 100 SOL backs 200 wrapped SOL in circulation.
+    solidity: |
+      // Invariant: totalSupply of any CrossChainERC20 <= locked amount on Solana
+      // This CANNOT be verified purely on-chain from Base side
+      // But we can track cumulative mints vs burns as a proxy
+      function invariant_BR_D_11_mint_bounded() public {
+          uint256 totalSupply = CrossChainERC20(wrappedSol).totalSupply();
+          // Should be <= Solana-side locked balance (cross-chain invariant, not verifiable on-chain)
+          // Best we can do: track ghost variable for cumulative mints - cumulative burns
+          eq(totalSupply, ghost_cumulativeMints - ghost_cumulativeBurns,
+             "BR-D-11: supply mismatch");
+      }
+    validated: false
+    priority: high
+
+  - id: BR-D-12
+    title: "BridgeValidator nonce and Bridge nonce are independent — no cross-validation"
+    description: |
+      BridgeValidator has its own nextNonce (for incoming Solana→Base messages).
+      Bridge's MessageStorageLib has its own nextNonce (for outgoing Base→Solana messages).
+      These are completely independent counters with no cross-validation.
+
+      The BridgeValidator nonce is used in message hash computation:
+        getMessageHash(nonce, outgoingMessagePubkey, innerMessageHash)
+      This nonce is the BridgeValidator's sequential counter, not the Solana-side nonce.
+
+      The IncomingMessage struct has a `nonce` field (message.nonce) which is the Solana-side
+      nonce embedded in the message. But this nonce is part of the innerMessageHash (via
+      getInnerMessageHash which hashes sender, ty, data — and data includes the full message).
+
+      Wait — looking more carefully: getMessageHashCd hashes message.nonce (the Solana nonce)
+      as the first argument to getMessageHash. And BridgeValidator.registerMessages uses
+      currentNonce (its own sequential counter) as the first argument.
+
+      So there are TWO different nonces:
+      1. BridgeValidator.nextNonce: sequential counter used in hash computation during registration
+      2. IncomingMessage.nonce: Solana-side nonce embedded in the message struct
+
+      For the messageHash to match between registration and relay, the BridgeValidator nonce
+      used during registration MUST equal the IncomingMessage.nonce. This means
+      BridgeValidator.nextNonce must stay in sync with Solana's outgoing message nonce.
+      If they drift, messages can never be validated.
+    confidence: 40
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Solana sends message with nonce 5.
+      2. BridgeValidator is at nextNonce = 5. Registration computes hash with nonce 5. ✓
+      3. But if BridgeValidator missed registering nonce 4 (due to validator downtime),
+         nextNonce is still 4. Registration of nonce-5 message would use nonce 4 in hash.
+      4. Hash mismatch: registered hash (nonce=4) ≠ relay hash (message.nonce=5).
+      5. Message can never be executed — permanent loss of bridged funds.
+      6. The only fix is to register a dummy message for nonce 4 first.
+      7. But validators can only sign valid messages from Solana — they can't forge nonce 4.
+      8. If the Solana message for nonce 4 is lost/corrupted, all subsequent messages are stuck.
+    solidity: |
+      // Invariant: BridgeValidator.nextNonce must match Solana's expected nonce
+      // Otherwise message hash computation diverges and messages become unrelayable
+      function invariant_BR_D_12_nonce_sync() public {
+          // After registerMessages:
+          bytes32 registeredHash = MessageLib.getMessageHash(
+              bridgeValidatorNonce, msg.outgoingMessagePubkey, msg.innerMessageHash);
+          bytes32 relayHash = MessageLib.getMessageHashCd(incomingMessage);
+          eq(registeredHash, relayHash, "BR-D-12: nonce desync breaks message relay");
+      }
+    validated: false
+    priority: medium
+
+  - id: BR-D-13
+    title: "Partner validator key rotation — newEvmAddress accepts signatures during transition"
+    description: |
+      IPartner.Signer has two fields: evmAddress and newEvmAddress. In
+      BridgeValidator._indexOf, both addresses are checked:
+        if (addr == addrs[i].evmAddress || addr == addrs[i].newEvmAddress)
+
+      During key rotation, a partner validator has TWO valid keys simultaneously. The
+      DuplicateSigner check uses a bitmap indexed by partnerIndex (position in array),
+      not by address. So if both evmAddress and newEvmAddress of the SAME signer sign,
+      only one signature is counted (the second hit for the same partnerIndex is caught
+      by the bitmap check... wait, actually:
+
+      The bitmap is set on first match: signedBitMap |= _BIT << partnerIndex.
+      On second match (same partnerIndex), the check `signedBitMap & (_BIT << partnerIndex) != 0`
+      triggers DuplicateSigner revert.
+
+      So the same partner CANNOT sign twice (once with old key, once with new key).
+      This is correctly handled.
+
+      However: the recoveredSigners array from _getSignersFromSigs requires strictly
+      ascending signer addresses. If evmAddress and newEvmAddress are both in the signer set
+      but only one is used, this is fine. But the UnsortedSigners check is on recovered
+      addresses, not on partner indices, so there's no issue.
+    confidence: 15
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Partner validator P has evmAddress=A, newEvmAddress=B (during rotation).
+      2. P signs with key A (address A recovered).
+      3. P also signs with key B (address B recovered).
+      4. Both signatures in the sigData, sorted by address.
+      5. _countPartnerSigners: first sig (address A) matches P at index i, sets bit i.
+         Second sig (address B) also matches P at index i, bitmap check triggers DuplicateSigner.
+      6. Correctly prevented. No vulnerability.
+    solidity: |
+      // Invariant: same partner signer cannot contribute twice to threshold
+      // This is correctly enforced by the bitmap in _countPartnerSigners
+      function invariant_BR_D_13_no_double_partner_sig() public {
+          // The bitmap indexed by partnerIndex prevents double counting
+          // even when both evmAddress and newEvmAddress are valid
+      }
+    validated: false
+    priority: low
+
+  - id: BR-D-14
+    title: "Transfer.to is bytes32 but cast to address(bytes20) — Solana pubkey truncation"
+    description: |
+      In finalizeTransfer:
+        address to = address(bytes20(transfer.to));
+
+      transfer.to is bytes32 (to accommodate both EVM addresses and Solana pubkeys).
+      When the message comes from Solana (for Base-side finalization), transfer.to should
+      be a left-padded EVM address (20 bytes in the high bits, 12 zero bytes low).
+
+      bytes20(transfer.to) takes the FIRST 20 bytes (high-order bytes in Solidity).
+      address(bytes20(...)) converts those 20 bytes to an address.
+
+      If the Solana side incorrectly encodes the EVM address (e.g., right-padded instead of
+      left-padded), the recipient address would be wrong, and tokens would be sent to an
+      uncontrolled address — permanent loss.
+
+      This is a cross-chain encoding convention issue. If Solana pads the EVM address
+      on the RIGHT (low bytes), then bytes20 would extract the address correctly since
+      Solidity takes high bytes. Actually, for an address like 0xABCD...1234:
+      - Left-padded (12 zero bytes + 20 address bytes): bytes20 gets zeros → WRONG
+      - Right-padded (20 address bytes + 12 zero bytes): bytes20 gets address → CORRECT
+
+      The convention must be: EVM address in the first 20 bytes of the 32-byte field.
+      This is likely handled correctly on the Solana side, but worth verifying.
+    confidence: 25
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Solana user bridges SOL to Base, specifying recipient 0xAlice.
+      2. Solana program encodes: transfer.to = 0x000000000000000000000000Alice (left-padded).
+      3. Base side: address(bytes20(0x000000000000000000000000Alice)) = 0x0000000000000000000000000000 (first 20 bytes are zeros).
+      4. Tokens sent to address(0) or near-zero address — permanently lost.
+      5. This depends entirely on Solana-side encoding convention.
+    solidity: |
+      // Invariant: transfer.to high 20 bytes must be a valid non-zero EVM address
+      // for Base-bound transfers
+      function invariant_BR_D_14_valid_recipient() public {
+          address to = address(bytes20(transfer.to));
+          t(to != address(0), "BR-D-14: transfer recipient is zero address");
+      }
+    validated: false
+    priority: medium
+
+  - id: BR-D-15
+    title: "Scalar overflow in localAmount = remoteAmount * scalar"
+    description: |
+      In both initializeTransfer and finalizeTransfer, localAmount is computed as:
+        localAmount = transfer.remoteAmount * scalar
+
+      transfer.remoteAmount is uint64 (max 2^64 - 1 ≈ 1.8e19).
+      scalar = 10^scalarExponent where scalarExponent is uint8 (max 255).
+
+      10^255 is astronomically large. uint64_max * 10^255 overflows uint256.
+      uint256 max ≈ 1.15e77. 1.8e19 * 10^57 ≈ 1.8e76 (fits). 1.8e19 * 10^58 overflows.
+
+      So any scalarExponent > 57 could cause overflow when remoteAmount is large.
+      registerRemoteToken accepts any uint8 scalarExponent (0-255) and stores 10^scalarExponent.
+
+      If scalarExponent >= 58, and remoteAmount is near uint64 max, the multiplication
+      reverts due to Solidity checked arithmetic. This permanently bricks transfers for
+      that token pair — no one can bridge in or out.
+
+      The Solana bridge controls scalarExponent via registerRemoteToken messages. A malicious
+      or buggy Solana bridge could register an absurd scalar and brick a token pair.
+
+      Even scalarExponent = 77 makes 10^77 ≈ uint256 max, and any remoteAmount > 1 overflows.
+    confidence: 55
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Solana bridge sends registerRemoteToken(USDC, solUSDC, 100).
+      2. scalar = 10^100 stored.
+      3. User tries to bridge USDC: localAmount = remoteAmount * 10^100.
+      4. Any remoteAmount > 0 causes overflow → revert.
+      5. Token pair permanently bricked on Base side.
+      6. Since registerRemoteToken can be called again (BR-D-02), the fix would be to
+         re-register with a sane scalar. But if that's also blocked, the pair is stuck.
+    solidity: |
+      // Invariant: scalar should not be so large that localAmount computation overflows
+      // scalarExponent should be bounded to prevent overflow with uint64 max remoteAmount
+      function invariant_BR_D_15_scalar_overflow() public {
+          uint256 scalar = bridge.scalars(localToken, remoteToken);
+          if (scalar > 0) {
+              // Check: type(uint64).max * scalar should not overflow uint256
+              uint256 maxLocal = type(uint64).max * scalar; // will revert if overflow
+              // If we reach here, scalar is safe
+          }
+      }
+    validated: false
+    priority: medium

@@ -1,0 +1,667 @@
+# TrustBoundaryHunter Analysis — Base↔Solana Bridge
+# Contracts: Bridge.sol, Twin.sol, BridgeValidator.sol, CrossChainERC20Factory.sol, CrossChainERC20.sol, TokenLib.sol, CallLib.sol, VerificationLib.sol
+# Focus: trust assumptions, cross-contract boundaries, upgradability, permissionless entry points, message decoding trust
+# Analyst: TrustBoundaryHunter
+# Date: 2026-03-27
+# Bounty: Coinbase $5M
+
+hypotheses:
+
+  #############################################################################
+  # 1. TWIN AS EXECUTION CONTEXT — DelegateCall / Create / Create2
+  #############################################################################
+
+  - id: BR-TB-01
+    title: "Twin.execute DelegateCall can overwrite ERC-1967 beacon slot"
+    description: |
+      Twin is deployed as an ERC-1967 beacon proxy. The beacon address is stored at slot
+      0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50 (ERC-1967 beacon slot).
+      Twin.execute supports CallType.DelegateCall, which executes arbitrary code in Twin's storage context.
+      A Solana user (via validated bridge message) could craft a DelegateCall to a contract that writes to
+      the beacon slot, effectively redirecting their Twin's implementation to a malicious contract.
+
+      After overwriting the beacon slot, future calls to Twin.execute would use the attacker-controlled
+      implementation, bypassing the BRIDGE authorization check entirely because the proxy would delegate
+      to a different contract that doesn't check msg.sender == BRIDGE.
+
+      KEY QUESTION: Does LibClone.deployDeterministicERC1967BeaconProxy store the beacon address in
+      immutable bytecode (ERC-1967 beacon proxy pattern) or in a storage slot? If it's bytecode, the
+      delegatecall cannot overwrite it. If it's a storage slot, this is CRITICAL.
+
+      Solady's ERC-1967 beacon proxy stores the beacon address in storage slot per ERC-1967 spec.
+      A delegatecall to a contract that does `sstore(BEACON_SLOT, attacker_beacon)` would redirect
+      the Twin's implementation permanently.
+    confidence: 75
+    severity: critical
+    status: investigating
+    attack_scenario: |
+      1. Attacker has a Solana account and sends a bridge message of type Call
+      2. Message contains: CallType.DelegateCall, target = attacker-deployed contract on Base
+      3. Attacker's contract executes: assembly { sstore(0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50, attacker_beacon) }
+      4. Twin's beacon now points to attacker_beacon, which returns attacker_implementation
+      5. Attacker calls Twin.execute again — but now the proxy delegates to attacker_implementation
+      6. attacker_implementation has NO authorization check, attacker can drain Twin's ETH/tokens
+
+      IMPACT: Attacker can only affect their OWN Twin. But if the Twin holds tokens (from TransferAndCall
+      flows or direct sends), those are stolen. The Bridge contract itself is NOT affected — each Twin
+      is isolated. However, if other users send tokens TO this Twin expecting it to behave normally,
+      those tokens are lost.
+
+      SCOPE CHECK: This is a feature — Solana users are intended to have full control of their Twin.
+      The Twin IS the user's representative. Overwriting their own beacon is like the user self-destructing
+      their own wallet. Not a vulnerability unless it can affect OTHER Twins or the Bridge.
+
+      CRITICAL EXCEPTION: If the overwritten Twin can be used to attack the Bridge (e.g., via reentrancy
+      during __relayMessage), that would be a real vuln. Check: __relayMessage calls Twin.execute last
+      in the Call/TransferAndCall paths, and Bridge has ReentrancyGuardTransient. Safe.
+    solidity: |
+      // Invariant: DelegateCall from Twin cannot affect Bridge or other Twins
+      function property_BR_TB_01_twin_isolation() public returns (bool) {
+        // Setup: Twin A executes delegatecall that overwrites beacon slot
+        // Verify: Bridge.successes, Bridge.twins mappings unchanged
+        // Verify: Other Twin B's beacon slot unchanged
+        return true; // Twin modification is self-contained
+      }
+
+  - id: BR-TB-02
+    title: "Twin.execute Create/Create2 deploys contracts with Twin as msg.sender origin"
+    description: |
+      CallType.Create and Create2 in CallLib deploy new contracts from the Twin's address context.
+      The deployed contract's address depends on Twin's address and nonce (Create) or salt (Create2).
+
+      A Solana user can deploy arbitrary contracts through their Twin. These contracts have Twin as
+      their deployer. This is a feature, not a bug — it's how Solana users can deploy contracts on Base.
+
+      HOWEVER: If a deployed contract calls back into the Bridge during deployment (constructor), and
+      the Bridge is in the middle of __relayMessage, reentrancy could be an issue. But Bridge uses
+      ReentrancyGuardTransient, and __relayMessage is called via this.__relayMessage (external call to self),
+      so reentrancy guard is active.
+
+      ALSO: Create2 allows predictable addresses. An attacker could precompute a Create2 address from a
+      specific Twin, then have other users/protocols approve tokens to that address BEFORE the contract
+      is deployed. When the Twin deploys via Create2, the new contract can immediately use those approvals.
+      This is standard CREATE2 behavior, not specific to the bridge.
+    confidence: 85
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Attacker computes CREATE2 address from their Twin + known salt
+      2. Tricks victim into approving tokens to that address
+      3. Deploys contract via Twin Create2 that drains victim's approved tokens
+      This is generic CREATE2 social engineering, not a bridge-specific vulnerability.
+    solidity: |
+      // Informational: Twin can deploy contracts, this is by design
+      function property_BR_TB_02_create_isolation() public view returns (bool) {
+        return true; // Feature, not vulnerability
+      }
+
+  - id: BR-TB-03
+    title: "Twin DelegateCall target can selfdestruct Twin proxy (EVM version dependent)"
+    description: |
+      If the EVM version supports SELFDESTRUCT with effect (pre-Cancun for most behaviors),
+      a DelegateCall to a contract containing SELFDESTRUCT would destroy the Twin proxy.
+      Post-Dencun, SELFDESTRUCT only transfers ETH without destroying the contract unless
+      it's in the same transaction as creation.
+
+      On Base (OP Stack, post-Dencun): SELFDESTRUCT sends ETH but doesn't destroy the contract.
+      So the Twin survives. This is safe on Base's current EVM version.
+
+      If Base ever adopts pre-Dencun SELFDESTRUCT semantics (unlikely), this would be dangerous:
+      the Twin address slot in Bridge.twins would point to destroyed code, and a new Twin couldn't
+      be deployed at the same address (deterministic deployment would fail as code exists at 0).
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Solana user delegatecalls to a contract with SELFDESTRUCT. On Base (post-Dencun), ETH is
+      sent but contract is not destroyed. No impact to bridge operations.
+    solidity: |
+      // Safe on Base: SELFDESTRUCT in delegatecall context doesn't destroy proxy post-Dencun
+      function property_BR_TB_03_no_selfdestruct() public view returns (bool) {
+        return true; // Base uses post-Dencun semantics
+      }
+
+  #############################################################################
+  # 2. registerRemoteToken TRUST — REMOTE_BRIDGE message.sender check
+  #############################################################################
+
+  - id: BR-TB-04
+    title: "registerRemoteToken accepts arbitrary localToken without CrossChainERC20 validation"
+    description: |
+      In __relayMessage, when message.sender == REMOTE_BRIDGE, the code decodes (localToken, remoteToken,
+      scalarExponent) and calls TokenLib.registerRemoteToken. There is NO check that localToken is actually
+      a CrossChainERC20 deployed by the factory, or even a valid ERC20 at all.
+
+      registerRemoteToken simply sets $.scalars[localToken][remoteToken] = 10 ** scalarExponent.
+
+      This means the Solana bridge program can register a scalar for ANY address as localToken. If someone
+      then calls bridgeToken with that localToken + remoteToken pair, and the token is NOT a CrossChainERC20
+      (factory check returns false), the code enters the "native ERC20" path which does safeTransferFrom
+      and tracks deposits.
+
+      The trust assumption is: REMOTE_BRIDGE messages are only sent by the Solana bridge program, which
+      only registers tokens that were actually wrapped on Solana. If the Solana program is compromised
+      or has a bug, it could register arbitrary scalars for arbitrary tokens.
+
+      CRITICAL: If a scalar is registered for a token like USDC (6 decimals) with scalarExponent = 0
+      (scalar = 1), then 1 remote unit = 1 local unit. But if scalarExponent = 12, then 1 remote unit
+      = 10^12 local units. A wrong scalar would cause the bridge to release more tokens than were deposited,
+      or lock more than intended.
+
+      THIS IS A CROSS-CHAIN TRUST BOUNDARY: The EVM side trusts the Solana side to send correct registration
+      data. No on-chain validation exists on the EVM side.
+    confidence: 70
+    severity: high
+    status: investigating
+    attack_scenario: |
+      1. Solana bridge program (or attacker who compromises it) sends registerRemoteToken message:
+         localToken = USDC (0xA0b86991...), remoteToken = attacker_pubkey, scalarExponent = 18
+      2. This sets scalars[USDC][attacker_pubkey] = 10^18
+      3. Now 1 remote unit = 10^18 USDC local units = 10^12 USDC (with 6 decimals)
+      4. When Solana side sends a finalizeTransfer for 1 remote unit of attacker_pubkey to USDC,
+         the bridge tries to release 10^18 USDC from deposits — but deposits are empty, so it underflows/reverts
+
+      MITIGATING FACTOR: finalizeTransfer for non-CrossChainERC20 tokens subtracts from deposits mapping.
+      If no one deposited USDC with that remoteToken, deposits[USDC][attacker_pubkey] = 0 and the
+      subtraction reverts. So the attack requires actual USDC deposits with the malicious remoteToken.
+
+      But if the scalar is registered FIRST, and then legitimate users bridge USDC using that remoteToken,
+      they'd deposit at the inflated scalar. The deposits would be tracked correctly. The issue is:
+      does the Solana side handle this correctly? This is a cross-chain consistency question.
+
+      ON-CHAIN IMPACT: Without Solana-side compromise, the validator signatures prevent arbitrary messages.
+      The real risk is: validators sign a message from REMOTE_BRIDGE with a wrong scalar. This requires
+      validator collusion or Solana program bug.
+    solidity: |
+      // Invariant: registerRemoteToken only called with valid CrossChainERC20 or known native token pairs
+      // Cannot enforce on-chain — trust relies on REMOTE_BRIDGE message authenticity via validators
+      function property_BR_TB_04_register_trust() public view returns (bool) {
+        // Check: scalars only set for factory-deployed tokens OR ETH
+        // This CANNOT be enforced on the EVM side — it's a cross-chain trust assumption
+        return true;
+      }
+
+  - id: BR-TB-05
+    title: "registerRemoteToken overwrites existing scalar without check"
+    description: |
+      TokenLib.registerRemoteToken unconditionally sets $.scalars[localToken][remoteToken] = 10 ** scalarExponent.
+      If a scalar was already registered for a (localToken, remoteToken) pair, it gets overwritten.
+
+      If there are existing deposits tracked at the old scalar, changing the scalar would break the
+      accounting. Example:
+      - Old scalar = 10^9 (9 decimal difference). User deposits 1e9 local tokens for 1 remote token.
+        deposits[token][remote] = 1e9.
+      - Scalar changed to 10^12. Now finalizeTransfer for 1 remote token tries to release 10^12 local tokens.
+        But only 1e9 are deposited. The subtraction reverts.
+      - Conversely if scalar decreases: finalizeTransfer releases less than deposited. Funds stuck.
+
+      This is a trust assumption on the Solana bridge program: it should never re-register a scalar for
+      an existing token pair. But there's no on-chain protection.
+    confidence: 65
+    severity: high
+    status: investigating
+    attack_scenario: |
+      1. REMOTE_BRIDGE registers scalar 10^9 for (WBTC, solana_wbtc_pubkey)
+      2. Users deposit 10 WBTC (10e8 local units, recorded as deposits = 10e8)
+      3. REMOTE_BRIDGE sends new registration: scalar 10^18 for same pair
+      4. Now finalizeTransfer for 1 remote unit = 10^18 local units = 10^10 WBTC
+      5. deposits[WBTC][solana_wbtc_pubkey] = 10e8, but release needs 10^18 → reverts (underflow)
+      6. Legitimate withdrawals are permanently blocked for this token pair
+
+      REVERSE: If scalar decreases, deposits release less than owed. Excess funds locked forever.
+    solidity: |
+      // Invariant: scalar for a token pair should not change once deposits exist
+      function property_BR_TB_05_scalar_immutable_after_deposit() public returns (bool) {
+        // After deposits > 0 for (localToken, remoteToken), scalar must remain constant
+        // Cannot enforce on-chain — relies on Solana program correctness
+        return true;
+      }
+
+  #############################################################################
+  # 3. PERMISSIONLESS CrossChainERC20Factory.deploy
+  #############################################################################
+
+  - id: BR-TB-06
+    title: "Permissionless CrossChainERC20 deployment — anyone can create mintable tokens recognized by bridge"
+    description: |
+      CrossChainERC20Factory.deploy is permissionless. Anyone can call it with arbitrary (remoteToken, name,
+      symbol, decimals). The factory marks the deployed token as isCrossChainErc20[token] = true.
+
+      When TokenLib processes a transfer, it checks isCrossChainErc20. If true, it uses mint/burn instead
+      of transfer/lock. This means:
+
+      1. Attacker deploys CrossChainERC20 with remoteToken = X, name = "Fake USDC", decimals = 6
+      2. Factory marks it as isCrossChainErc20 = true
+      3. On finalizeTransfer, if localToken = attacker's fake USDC and remoteToken matches, the bridge
+         MINTS tokens to the recipient
+
+      BUT: The attacker's fake USDC is a different contract address from real USDC. For finalizeTransfer
+      to use it, the Solana→Base message must specify localToken = attacker's fake USDC address.
+      This means the Solana bridge program must have recognized this specific contract address.
+
+      The protection is: the bridge message specifies the exact localToken address. An attacker cannot
+      trick the bridge into using their fake token unless the Solana side is compromised to send messages
+      with the fake token address.
+
+      HOWEVER: If an attacker deploys a CrossChainERC20 with the SAME remoteToken as a legitimate token
+      but different name/symbol/decimals, they get a different local address (CREATE2 salt includes all
+      params). Both addresses are marked as isCrossChainErc20. The bridge message determines which one
+      is used. No collision possible because CREATE2 salt differs.
+
+      REMAINING CONCERN: If users interact with the attacker's fake CrossChainERC20 thinking it's the
+      real one (social engineering), they could bridgeToken with localToken = fake, which would burn
+      the fake tokens. On Solana side, the remoteToken matches a real Solana token. When bridging back,
+      the Solana side sends a message with localToken = real CrossChainERC20 (deployed by legitimate deployer).
+      The fake tokens are burned but real tokens are minted. This could be an arbitrage vector.
+
+      WAIT: bridgeToken for CrossChainERC20 burns from msg.sender. If user holds fake tokens and calls
+      bridgeToken(fake_local, ...), the bridge burns fake tokens and sends a message to Solana referencing
+      the fake token's remoteToken. On Solana, this maps to a real SPL token. Solana releases the real SPL.
+      When bridging back, Solana sends finalizeTransfer with localToken = ???. It depends on how Solana
+      maps remoteToken back to localToken. If Solana picks the legitimate CrossChainERC20, then real tokens
+      get minted while fake tokens were burned. But the fake tokens have NO backing — they're freshly deployed.
+
+      KEY INSIGHT: The attacker must first get fake tokens. CrossChainERC20 can only be minted by the Bridge.
+      The bridge only mints during finalizeTransfer. So the attacker needs the Solana side to send a
+      finalizeTransfer message targeting the fake token. This requires the Solana bridge to recognize
+      the fake token's address, which it won't unless explicitly configured.
+
+      CONCLUSION: Permissionless deployment is safe because:
+      1. Only Bridge can mint CrossChainERC20 tokens
+      2. Bridge only mints via validated messages from Solana
+      3. Solana side must explicitly reference the localToken address
+      4. Different parameters = different CREATE2 address = no collision
+    confidence: 85
+    severity: low
+    status: safe
+    attack_scenario: |
+      Attacker deploys fake CrossChainERC20 with same remoteToken as legitimate one. The factory
+      marks both as isCrossChainErc20 = true. However, only the Bridge can mint either token, and
+      minting requires a validated Solana message referencing the exact localToken address. The Solana
+      side would only reference the legitimate token's address. No practical attack vector.
+    solidity: |
+      // Invariant: multiple CrossChainERC20 with same remoteToken don't cause conflicts
+      function property_BR_TB_06_no_ccerc20_collision() public view returns (bool) {
+        // Even with multiple isCrossChainErc20 = true for same remoteToken,
+        // bridge messages specify exact localToken, so no confusion
+        return true;
+      }
+
+  #############################################################################
+  # 4. BridgeValidator → IPartner TRUST
+  #############################################################################
+
+  - id: BR-TB-07
+    title: "IPartner.getSigners() is called during validation — external contract can return inconsistent results"
+    description: |
+      In _validateSigs, if partnerValidatorThreshold > 0, the code calls:
+        IPartner(PARTNER_VALIDATORS).getSigners()
+
+      This is an external call to an immutable address. The returned Signer[] array is used to count
+      how many recovered signers are partner validators.
+
+      RISK 1: If PARTNER_VALIDATORS contract is upgradeable or compromised, it could return an empty
+      array (making partner threshold impossible to meet → DoS) or return attacker-controlled addresses
+      (allowing forged partner signatures).
+
+      RISK 2: getSigners() is called ONCE per registerMessages call. But if called multiple times in
+      different contexts (e.g., during dispute resolution), it could return different values. This is
+      not an issue here since it's called exactly once.
+
+      RISK 3: The Signer struct has evmAddress and newEvmAddress. _indexOf matches against BOTH:
+        if (addr == addrs[i].evmAddress || addr == addrs[i].newEvmAddress)
+      During key rotation, a signer has TWO valid addresses. If a malicious signer creates a rotation
+      to a Base validator's address, they could make a single Base validator signature count as BOTH
+      a base signer AND a partner signer, reducing total required unique signers.
+
+      ATTACK: Base validator V signs the message. Partner validator P sets newEvmAddress = V.address.
+      Now V's signature counts as 1 base signer AND 1 partner signer. If base threshold = 1 and
+      partner threshold = 1, a single compromised base validator could satisfy both thresholds.
+
+      MITIGATION: The signatures array requires strictly ascending signer addresses (UnsortedSigners check).
+      Each address appears at most once. But _indexOf checks BOTH evmAddress and newEvmAddress of each
+      partner signer. So V's address matches partner signer P via newEvmAddress. The same signature
+      of V counts as both base AND partner. This is a real overlap concern.
+    confidence: 70
+    severity: high
+    status: investigating
+    attack_scenario: |
+      1. Base validators: {A, B, C} with threshold = 2
+      2. Partner validators: {P1(evm=X, new=A), P2(evm=Y, new=B)} with threshold = 1
+      3. Only A and B sign the message (2 base signatures, meeting base threshold)
+      4. _countPartnerSigners: checks A against P1.evmAddress (X) — no match. Checks A against
+         P1.newEvmAddress (A) — MATCH! Partner count = 1. Threshold met.
+      5. Only 2 unique entities (A, B) needed instead of 3 (2 base + 1 separate partner)
+
+      If partner sets newEvmAddress to overlap with base validator, the effective security threshold
+      is reduced. This depends on who controls the PARTNER_VALIDATORS contract and whether they can
+      set newEvmAddress arbitrarily.
+    solidity: |
+      // Invariant: base signer and partner signer sets should not overlap
+      function property_BR_TB_07_no_signer_overlap() public view returns (bool) {
+        // If a recovered signer counts as both base AND partner, effective threshold is reduced
+        // This relies on PARTNER_VALIDATORS contract not setting newEvmAddress to base validator addresses
+        return true;
+      }
+
+  - id: BR-TB-08
+    title: "PARTNER_VALIDATORS is immutable — cannot be updated if partner contract is compromised"
+    description: |
+      BridgeValidator stores PARTNER_VALIDATORS as an immutable address. If the partner contract is
+      compromised or needs replacement, there's no way to update it without redeploying BridgeValidator.
+
+      Since Bridge stores BRIDGE_VALIDATOR as immutable too, replacing BridgeValidator requires
+      redeploying Bridge as well (or Bridge would need upgradeability which it doesn't have via
+      standard patterns — it uses OwnableRoles + Initializable but no proxy).
+
+      HOWEVER: BridgeValidator has partnerValidatorThreshold which can be set. If set to 0, partner
+      validation is skipped entirely. This is an emergency escape hatch controlled by... wait,
+      there's no setter for partnerValidatorThreshold visible in the code besides initialize().
+
+      ACTUALLY: Looking more carefully, initialize() is the only place partnerValidatorThreshold is set.
+      There's no updatePartnerThreshold function. The threshold is immutable after initialization.
+      If the partner contract is compromised, the only option is to pause the bridge via guardian.
+    confidence: 80
+    severity: medium
+    status: investigating
+    attack_scenario: |
+      1. PARTNER_VALIDATORS contract is compromised
+      2. Attacker makes getSigners() return addresses they control
+      3. Attacker signs messages as "partner validators"
+      4. Combined with base threshold signatures (requires base validator compromise too), attacker
+         can register arbitrary messages
+      5. No way to replace PARTNER_VALIDATORS or change threshold — must pause bridge
+    solidity: |
+      // Informational: PARTNER_VALIDATORS is immutable, no update mechanism
+      function property_BR_TB_08_partner_immutable() public view returns (bool) {
+        // If partner contract compromised, only recourse is pausing the bridge
+        return true;
+      }
+
+  #############################################################################
+  # 5. MESSAGE DATA DECODING TRUST
+  #############################################################################
+
+  - id: BR-TB-09
+    title: "Message type vs data encoding mismatch can cause revert or silent misinterpretation"
+    description: |
+      In __relayMessage, message.ty determines the decoding path:
+      - MessageType.Transfer → abi.decode(message.data, (Transfer))
+      - MessageType.Call → abi.decode(message.data, (Call))
+      - MessageType.TransferAndCall → abi.decode(message.data, (Transfer, Call))
+
+      The message hash includes message.ty and message.data (via innerMessageHash = keccak256(abi.encode(
+      message.sender, message.ty, message.data))). So the validators signed a specific (ty, data) pair.
+
+      If ty = Transfer but data is actually encoded as a Call, abi.decode would revert (wrong format)
+      or silently decode garbage if the byte layout happens to be ABI-compatible. ABI decoding is
+      permissive — it reads offsets and lengths, and misaligned data typically reverts due to out-of-bounds.
+
+      HOWEVER: The real concern is not the relayer crafting mismatches (the hash binds ty + data together),
+      but the Solana side encoding a message where ty doesn't match the actual data content. This would
+      be a Solana-side bug, not exploitable from the EVM side.
+
+      EDGE CASE: What if ty = Call but message.sender == REMOTE_BRIDGE? The code checks
+      message.sender == REMOTE_BRIDGE first (line 222), before checking ty. So a REMOTE_BRIDGE message
+      with ty = Transfer would still be decoded as a Call (since the REMOTE_BRIDGE path doesn't check ty).
+      This is intentional — REMOTE_BRIDGE messages are always treated as registerRemoteToken calls.
+
+      But: if a REMOTE_BRIDGE message has ty = Transfer, the message hash includes ty = Transfer.
+      Validators signed this. The Bridge treats it as a registerRemoteToken call regardless. The ty
+      field is essentially ignored for REMOTE_BRIDGE messages. This is fine — it's a special case.
+    confidence: 85
+    severity: low
+    status: safe
+    attack_scenario: |
+      Relayer submits message with ty/data mismatch. Since the hash binds both fields and validators
+      signed the hash, the relayer cannot alter either field independently. A mismatch would have to
+      originate from the Solana side, which is a Solana program bug (out of EVM scope).
+    solidity: |
+      // Invariant: message hash commits to both ty and data — tamper-proof
+      function property_BR_TB_09_message_hash_binding() public pure returns (bool) {
+        // MessageLib.getInnerMessageHash includes message.sender, message.ty, message.data
+        // Changing any field changes the hash, invalidating validator signatures
+        return true;
+      }
+
+  - id: BR-TB-10
+    title: "REMOTE_BRIDGE message path does not validate message.ty — any type triggers registerRemoteToken"
+    description: |
+      When message.sender == REMOTE_BRIDGE, __relayMessage immediately decodes message.data as a Call
+      and extracts (localToken, remoteToken, scalarExponent) from call.data. The message.ty field is
+      completely ignored.
+
+      This means if the Solana bridge sends a REMOTE_BRIDGE message with ty = Transfer (or TransferAndCall),
+      it's still decoded as a registerRemoteToken Call. The validators sign the hash which includes ty,
+      so the specific message is validated. But the Bridge doesn't enforce that REMOTE_BRIDGE messages
+      must have ty = Call.
+
+      IMPACT: Minimal. The message is validated by signatures regardless. But it's a code quality issue —
+      the Bridge accepts any ty for REMOTE_BRIDGE messages and silently ignores it. If in the future
+      REMOTE_BRIDGE messages need different handling per ty, this would need refactoring.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      No practical attack. The message hash includes ty, so validators sign a specific ty. The Bridge
+      ignores ty for REMOTE_BRIDGE messages but the validation is still sound.
+    solidity: |
+      // Informational: REMOTE_BRIDGE path ignores message.ty
+      function property_BR_TB_10_remote_bridge_ty_ignored() public pure returns (bool) {
+        return true;
+      }
+
+  #############################################################################
+  # 6. BEACON PROXY UPGRADEABILITY
+  #############################################################################
+
+  - id: BR-TB-11
+    title: "Twin beacon upgrade changes ALL Twins simultaneously — in-flight messages may execute under new logic"
+    description: |
+      All Twin contracts are ERC-1967 beacon proxies pointing to a single TWIN_BEACON. The beacon owner
+      can upgrade the implementation, instantly changing behavior for ALL Twins.
+
+      RISK: If a message is validated (registered in BridgeValidator.validMessages) but not yet relayed,
+      and the Twin beacon is upgraded between validation and relay, the message executes under the new
+      implementation. The message was signed/validated under the assumption of the OLD implementation.
+
+      Example: Old implementation checks authorization. New implementation has a bug that bypasses auth.
+      A message that was safe under old implementation becomes dangerous under new one.
+
+      ALSO: Bridge.TWIN_BEACON is immutable. The beacon ADDRESS cannot change. But the beacon's
+      IMPLEMENTATION pointer can change (that's the purpose of a beacon). The beacon owner controls this.
+
+      QUESTION: Who is the beacon owner? This is outside the audited scope (it's a deployment config),
+      but it's a critical trust assumption. If beacon owner is a multisig with timelock, the risk is
+      lower. If it's an EOA, it's a single point of failure for ALL Twins.
+    confidence: 75
+    severity: medium
+    status: investigating
+    attack_scenario: |
+      1. Beacon owner (compromised or malicious) upgrades Twin implementation to malicious code
+      2. All existing Twins now delegate to malicious implementation
+      3. Next relayMessages call for any user's Twin executes under malicious code
+      4. Malicious implementation could: drain Twin ETH, make unexpected external calls, etc.
+
+      MITIGATING: This requires beacon owner compromise. Standard trust assumption for upgradeable
+      contracts. Not a code bug but an architecture trust boundary.
+    solidity: |
+      // Invariant: Twin implementation should only change through governed upgrade process
+      function property_BR_TB_11_beacon_governance() public view returns (bool) {
+        // Trust assumption: beacon owner is a secure multisig/timelock
+        // Cannot enforce in contract code
+        return true;
+      }
+
+  - id: BR-TB-12
+    title: "Bridge contract is not upgradeable — immutable trust anchors but no emergency upgrade path"
+    description: |
+      Bridge uses Initializable but is NOT a proxy. All critical addresses (TWIN_BEACON, CROSS_CHAIN_ERC20_FACTORY,
+      BRIDGE_VALIDATOR, REMOTE_BRIDGE) are immutable. If any of these need replacement, a new Bridge must
+      be deployed, and all state (successes, failures, twins mappings) is lost.
+
+      The only governance action is setPaused (guardian role). No mechanism to migrate state, update
+      validators, or change factory.
+
+      IMPLICATION: If a bug is found in BridgeValidator, the entire bridge must be redeployed. All
+      pre-validated messages in validMessages are orphaned. All Twin deployments are tied to the old
+      Bridge address.
+
+      This is a design choice — immutability increases security but reduces flexibility. For a $5M
+      bounty bridge, this is appropriate. But the operational risk should be understood.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Not an attack vector. This is a design characteristic. The bridge is immutable by design,
+      with pause as the only emergency mechanism.
+    solidity: |
+      // Informational: Bridge is not upgradeable
+      function property_BR_TB_12_bridge_immutable() public view returns (bool) {
+        return true; // Design choice, not vulnerability
+      }
+
+  #############################################################################
+  # 7. ADDITIONAL TRUST BOUNDARIES
+  #############################################################################
+
+  - id: BR-TB-13
+    title: "Twin.execute self-call allows chaining — Twin can call itself to execute multi-step operations"
+    description: |
+      Twin.execute allows msg.sender == address(this). This means during a DelegateCall or regular Call,
+      if the target calls back into Twin.execute, it succeeds (msg.sender = Twin itself).
+
+      A Solana user can send a single Call message where:
+      1. CallType.Call to a contract that calls Twin.execute(anotherCall)
+      2. The inner call executes because msg.sender == Twin (from the outer call's context)
+
+      This is INTENTIONAL — allows multi-step operations from a single bridge message.
+
+      BUT: Combined with DelegateCall, this creates a powerful primitive. A DelegateCall to a
+      malicious contract can call Twin.execute with arbitrary parameters, executing any sequence
+      of calls/delegatecalls/creates. This is equivalent to full control — which IS the design intent
+      for the Solana user's own Twin.
+
+      RISK: If a Solana user's key is compromised, the attacker has full control of the Twin and
+      all its assets. This is equivalent to wallet key compromise — not a bridge vulnerability.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Solana user sends CallType.Call to a batching contract that calls back into Twin.execute
+      multiple times. Each sub-call executes because msg.sender = Twin. This is a feature for
+      complex DeFi operations from Solana.
+    solidity: |
+      // Feature: Twin self-calls enable multi-step execution
+      function property_BR_TB_13_self_call_feature() public view returns (bool) {
+        return true;
+      }
+
+  - id: BR-TB-14
+    title: "gasLimit in IncomingMessage controls __relayMessage execution — insufficient gas causes silent failure"
+    description: |
+      _validateAndRelay calls this.__relayMessage{gas: message.gasLimit}(message). If gasLimit is too low,
+      the external call reverts due to OOG (out of gas). The catch block records failures[messageHash] = true.
+
+      The message can be replayed (successes[messageHash] is not set), so this is retryable. But the
+      gasLimit is part of the signed message. If the Solana sender specified an insufficient gasLimit,
+      the message can NEVER succeed — it will always fail with OOG.
+
+      WAIT: gasLimit is NOT part of the inner message hash. Let me check...
+      innerMessageHash = keccak256(abi.encode(message.sender, message.ty, message.data))
+      messageHash = hash(nonce, outgoingMessagePubkey, innerMessageHash)
+
+      gasLimit is NOT included in the inner hash or the message hash! This means:
+      - The relayer can submit the SAME message with DIFFERENT gasLimit values
+      - The message hash stays the same regardless of gasLimit
+
+      CONCERN: A malicious relayer could submit a valid message with gasLimit = 1, causing it to
+      fail. Then failures[messageHash] = true. But the message can be retried with correct gasLimit
+      since successes[messageHash] is false.
+
+      ACTUALLY THIS IS IMPORTANT: gasLimit is part of the IncomingMessage struct but NOT part of the
+      hash. So the relayer controls gasLimit. A griefing relayer can set gasLimit = 0 to make messages
+      fail. But any other relayer can resubmit with correct gasLimit. The message is only in failures
+      mapping, not successes, so retries work.
+
+      This is a design choice — gasLimit is a relayer parameter, not a user-committed parameter.
+      The griefing is temporary and costless to recover from (another relayer resubmits).
+    confidence: 80
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Malicious relayer submits valid message with gasLimit = 1000 (way too low)
+      2. __relayMessage reverts with OOG, failures[hash] = true
+      3. Any honest relayer resubmits same message with gasLimit = 500000
+      4. Message executes successfully, successes[hash] = true, failures[hash] deleted
+      Griefing is temporary and self-correcting.
+    solidity: |
+      // Invariant: gasLimit griefing is temporary — retry always possible
+      function property_BR_TB_14_retry_after_gas_grief() public returns (bool) {
+        // After failure due to low gas, same messageHash can succeed with higher gas
+        // failures[hash] doesn't prevent retry; only successes[hash] blocks replay
+        return true;
+      }
+
+  - id: BR-TB-15
+    title: "Transfer finalizeTransfer recipient is bytes32-to-address truncation — Solana-side trust"
+    description: |
+      In TokenLib.finalizeTransfer, the recipient is derived as:
+        address to = address(bytes20(transfer.to));
+
+      transfer.to is bytes32 (from the Solana message). Only the first 20 bytes become the EVM address.
+      The remaining 12 bytes are silently discarded.
+
+      If two different Solana recipients share the same first 20 bytes but differ in last 12 bytes,
+      they'd both map to the same EVM address. This is NOT exploitable from the EVM side — the Solana
+      side is responsible for encoding the correct EVM address in 32 bytes (zero-padded).
+
+      RISK: If the Solana program encodes the address incorrectly (e.g., right-padded instead of
+      left-padded), tokens could be sent to the wrong address or address(0). This is a Solana-side
+      correctness issue, not an EVM-side vulnerability.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Solana program encodes EVM address in wrong byte position of bytes32 field. Tokens sent to
+      wrong address. This would be a Solana program bug, not an EVM contract issue.
+    solidity: |
+      // Trust: Solana encodes EVM addresses correctly in bytes32 (left-padded, first 20 bytes)
+      function property_BR_TB_15_address_encoding() public pure returns (bool) {
+        return true;
+      }
+
+  - id: BR-TB-16
+    title: "Nonce monotonicity in BridgeValidator ensures message ordering — but gap skipping is possible"
+    description: |
+      BridgeValidator.registerMessages increments nextNonce monotonically. Each message hash includes
+      its nonce: messageHash = hash(currentNonce++, outgoingMessagePubkey, innerMessageHash).
+
+      Messages must be registered in batch order. If a batch of 3 messages is registered, they get
+      nonces N, N+1, N+2. The next batch starts at N+3.
+
+      CONCERN: If a batch fails (e.g., due to invalid signatures), the nonces are NOT consumed.
+      The transaction reverts, nextNonce stays at N. This is correct — failed registration doesn't
+      advance nonces.
+
+      However, there's no mechanism to skip nonces. If message N is malformed on Solana side,
+      all subsequent messages are blocked because batch registration requires starting from nextNonce.
+
+      WAIT: Each batch can contain multiple messages. A relayer could register messages N through N+K
+      in one batch. If message N is problematic, the relayer cannot skip it — they must include it
+      in the batch (validators must sign ALL messages in the batch). This means a single bad message
+      blocks the pipeline until it's resolved.
+
+      This is a liveness concern, not a security vulnerability. The bridge can be paused as emergency.
+    confidence: 85
+    severity: low
+    status: safe
+    attack_scenario: |
+      Message N has an issue (e.g., references non-existent token). Validators refuse to sign
+      a batch containing message N. All subsequent messages (N+1, N+2, ...) cannot be registered
+      because nonces must be sequential. Bridge is blocked until message N is resolved.
+    solidity: |
+      // Informational: sequential nonces mean one bad message blocks subsequent ones
+      function property_BR_TB_16_nonce_liveness() public view returns (bool) {
+        return true; // Liveness concern, not security
+      }

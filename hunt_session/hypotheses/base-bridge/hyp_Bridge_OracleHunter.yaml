@@ -1,0 +1,479 @@
+# OracleHunter Analysis — Base↔Solana Bridge
+# Contracts: src/Bridge.sol, src/BridgeValidator.sol, src/CrossChainERC20.sol, src/CrossChainERC20Factory.sol, src/Twin.sol
+# Libraries: TokenLib.sol, MessageLib.sol, MessageStorageLib.sol, VerificationLib.sol, CallLib.sol, SVMBridgeLib.sol, SVMLib.sol
+# Focus: scalar as exchange rate oracle, partner validator set as oracle, token balance reads, remoteToken() as oracle, MMR root integrity
+# Analyst: OracleHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: BR-O-01
+    title: "registerRemoteToken permite sobrescribir scalar existente — inflación de retiros"
+    description: |
+      TokenLib.registerRemoteToken() (línea 269-272) escribe directamente en $.scalars[localToken][remoteToken]
+      sin verificar si ya existe un valor previo. La función simplemente asigna:
+        $.scalars[localToken][remoteToken] = 10 ** scalarExponent;
+
+      Escenario: si una ruta (localToken, remoteToken) ya tiene depósitos con scalar = 10^9 y se re-registra
+      con scalarExponent = 18, el nuevo scalar = 10^18. Ahora finalizeTransfer calcula:
+        localAmount = remoteAmount * scalar (nuevo, 10^18)
+      mientras que los depósitos originales se hicieron con scalar = 10^9.
+      Resultado: un retiro de 1 remoteAmount devuelve 10^18 local tokens en vez de 10^9. Factor 10^9 de inflación.
+
+      PERO: registerRemoteToken solo se ejecuta si message.sender == REMOTE_BRIDGE (Bridge.sol línea 222).
+      Esto significa que el mensaje debe originarse del programa bridge de Solana y pasar la validación de
+      firmas (Base validators + partner validators). Un atacante necesitaría comprometer el programa de Solana
+      O la mayoría de validators para enviar un mensaje registerRemoteToken malicioso.
+
+      Análisis adicional: no hay check de `scalar != 0` (ya registrado) ni de `deposits > 0` (fondos activos).
+      Si los validators o el programa Solana son comprometidos, esto es el vector de mayor impacto.
+    confidence: 35
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Token pair (USDC, solUSDC) registrado con scalarExponent=9, scalar=10^9
+      2. Usuarios depositan 1000 USDC (= 1000 * 10^9 = 10^12 en local units)
+      3. Atacante compromete Solana bridge program O validators
+      4. Envía mensaje registerRemoteToken con scalarExponent=18 para la misma pareja
+      5. scalar ahora = 10^18
+      6. Atacante ejecuta finalizeTransfer con remoteAmount=1 → recibe 10^18 local tokens (1B USDC)
+      7. deposits underflow no lo protege porque deposits se resta en local units: deposits -= 1 * 10^18
+         pero deposits solo tiene ~10^12 → revert por underflow
+      8. MITIGACIÓN PARCIAL: el underflow en $.deposits protege contra drenaje total, pero solo para
+         ERC20/ETH nativos. Para CrossChainERC20 (mint path), NO hay deposits tracking → mint infinito.
+    solidity: |
+      // Invariant: scalar para un par registrado nunca debe cambiar si hay depósitos activos
+      function property_BR_O_01_scalar_immutable_with_deposits() public view returns (bool) {
+        // Si deposits[localToken][remoteToken] > 0, scalar no debe cambiar
+        // Requiere snapshot del scalar antes y después de registerRemoteToken
+        return true; // placeholder — necesita ghost variable tracking
+      }
+
+  - id: BR-O-02
+    title: "IPartner.getSigners() como oráculo externo mutable — cambio de validator set entre llamadas"
+    description: |
+      BridgeValidator._validateSigs() (línea 229) llama:
+        IPartner(PARTNER_VALIDATORS).getSigners()
+
+      PARTNER_VALIDATORS es immutable (set en constructor), pero el contrato detrás de esa dirección
+      podría ser upgradeable (proxy). Si el partner actualiza su implementación, el set de signers
+      retornado por getSigners() puede cambiar arbitrariamente.
+
+      Escenarios de riesgo:
+      a) Partner rota keys entre dos registerMessages calls → firmas válidas con keys antiguas
+         son rechazadas, causando DoS temporal.
+      b) Partner añade un signer malicioso → reduce la seguridad efectiva del threshold.
+      c) Partner devuelve array vacío → si partnerValidatorThreshold > 0, todo registerMessages falla (DoS).
+      d) Partner devuelve array enorme → gas griefing en el loop O(n*m) de _countPartnerSigners.
+
+      Sin embargo: MAX_PARTNER_VALIDATOR_THRESHOLD = 5, y el threshold se valida en initialize.
+      El contrato partner es un contrato externo de confianza (business partner de Coinbase).
+      El riesgo real depende de la governance del contrato partner.
+
+      La verificación de firmas usa _indexOf que hace linear search — no hay caché del validator set.
+      Cada llamada a registerMessages hace una external call view a PARTNER_VALIDATORS.
+    confidence: 40
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Partner contract es un proxy upgradeable
+      2. Partner (o atacante que compromete governance del partner) actualiza implementación
+      3. getSigners() ahora retorna un set que incluye una dirección controlada por el atacante
+      4. Atacante firma mensajes con su key + keys de Base validators legítimos
+      5. registerMessages pasa porque tanto Base threshold como partner threshold se cumplen
+      6. Atacante puede registrar mensajes arbitrarios (registerRemoteToken, transfers falsos)
+
+      Variante DoS:
+      1. Partner actualiza getSigners() para retornar array vacío
+      2. partnerValidatorThreshold > 0 pero no hay partner signers → revert PartnerThresholdNotMet
+      3. Bridge queda bloqueado hasta que guardian setee partnerValidatorThreshold = 0
+    solidity: |
+      // Invariant: partner validator set no debe cambiar dentro de la misma tx
+      // (no es verificable on-chain sin snapshot, pero se documenta como riesgo)
+      function property_BR_O_02_partner_signers_stable() public view returns (bool) {
+        // External dependency — cannot enforce immutability from this contract
+        // Risk accepted if partner contract is trusted
+        return true;
+      }
+
+  - id: BR-O-03
+    title: "Token balance como oráculo — reentrancy en fee-on-transfer path mitigada"
+    description: |
+      TokenLib.initializeTransfer() (líneas 180-185) usa balanceBefore/balanceAfter pattern:
+        uint256 balanceBefore = SafeTransferLib.balanceOf(token, address(this));
+        SafeTransferLib.safeTransferFrom(token, from, address(this), amount);
+        uint256 balanceAfter = SafeTransferLib.balanceOf(token, address(this));
+        uint256 receivedLocalAmount = balanceAfter - balanceBefore;
+
+      Preocupación: un token ERC20 malicioso con hook en transfer podría re-entrar al Bridge
+      durante safeTransferFrom y manipular el balance entre las dos lecturas.
+
+      VERIFICACIÓN: Bridge.bridgeToken() tiene modifier `nonReentrant` (ReentrancyGuardTransient).
+      Esto previene reentrancy directa al Bridge. Pero ¿qué pasa con reentrancy a otros contratos?
+
+      - El token malicioso podría llamar a un contrato externo que envía tokens al Bridge,
+        inflando balanceAfter. PERO esto requiere que el token tenga un hook que ejecute
+        código durante transferFrom, Y que ese código envíe más tokens del mismo tipo al Bridge.
+      - Si el atacante envía tokens extra al Bridge durante el transfer hook, balanceAfter
+        sería mayor, receivedLocalAmount sería inflado, y el atacante recibiría más remoteAmount
+        en Solana de lo que realmente depositó.
+      - PERO: el atacante tendría que tener esos tokens extra. No hay amplificación de fondos.
+
+      La protección NonReentrant previene que el atacante llame bridgeToken de nuevo.
+      La donación directa (transfer sin bridgeToken) inflaría balanceAfter pero esos fondos
+      quedarían atrapados en el Bridge sin deposits tracking.
+
+      RESULTADO: path seguro para tokens estándar. Para tokens con transfer hooks, el
+      nonReentrant guard protege adecuadamente. Riesgo residual: donación directa que infla
+      balance, pero el atacante pierde esos fondos.
+    confidence: 85
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Token malicioso con hook en transferFrom
+      2. Durante transfer, hook envía tokens adicionales al Bridge
+      3. balanceAfter inflado → receivedLocalAmount inflado
+      4. Atacante obtiene más remoteAmount en Solana
+      PERO: nonReentrant previene re-entrada a bridgeToken. La donación directa solo
+      perjudica al atacante (pierde los tokens donados sin correspondencia en deposits).
+    solidity: |
+      // Invariant: balance change debe corresponder exactamente al transfer real
+      function property_BR_O_03_balance_accounting() public view returns (bool) {
+        // Protected by ReentrancyGuardTransient on bridgeToken
+        // Fee-on-transfer tokens: receivedLocalAmount <= transferLocalAmount (always true)
+        return true;
+      }
+
+  - id: BR-O-04
+    title: "CrossChainERC20.remoteToken() como oráculo — beacon proxy upgrade podría cambiar remoteToken"
+    description: |
+      En finalizeTransfer (TokenLib línea 241), se lee:
+        bytes32 remoteToken = CrossChainERC20(transfer.localToken).remoteToken();
+        require(Pubkey.wrap(remoteToken) == transfer.remoteToken, IncorrectRemoteToken());
+
+      CrossChainERC20 usa beacon proxy pattern (deployDeterministicERC1967BeaconProxy).
+      Si el beacon se actualiza con una nueva implementación que retorna un remoteToken diferente,
+      la verificación IncorrectRemoteToken podría pasar con un par (localToken, remoteToken) incorrecto
+      O fallar para pares legítimos.
+
+      ANÁLISIS:
+      - _remoteToken se almacena en storage del proxy (línea 29 de CrossChainERC20), no en la implementación.
+      - Una actualización del beacon cambia la lógica (código), no el storage.
+      - Para que remoteToken() retorne algo diferente, la nueva implementación tendría que:
+        a) Leer de un slot de storage diferente, O
+        b) Retornar un valor hardcoded
+      - Con implementación honesta, el storage slot es el mismo → remoteToken() retorna el mismo valor.
+
+      RIESGO RESIDUAL: si el beacon owner es malicioso/comprometido y despliega una implementación
+      que lee de otro slot o retorna un valor fijo, TODOS los CrossChainERC20 se verían afectados.
+      Esto permitiría mint arbitrario: atacante envía transfer con localToken=legítimo pero
+      remoteToken=manipulado, la verificación pasa porque remoteToken() retorna el valor manipulado.
+
+      El beacon owner es externo al scope del Bridge contract. Es un trust assumption documentada.
+    confidence: 30
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Beacon owner (o atacante que compromete al owner) actualiza implementación
+      2. Nueva implementación de CrossChainERC20.remoteToken() retorna bytes32(0) o un valor arbitrario
+      3. finalizeTransfer: require(Pubkey.wrap(newValue) == transfer.remoteToken) pasa si transfer usa el nuevo valor
+      4. Mint de tokens a un destino arbitrario con un remoteToken que no corresponde al real
+      PERO: requiere compromiso del beacon owner — trust assumption del sistema.
+    solidity: |
+      // Invariant: remoteToken() de un CrossChainERC20 es inmutable post-inicialización
+      function property_BR_O_04_remoteToken_immutable() public view returns (bool) {
+        // Beacon upgrade could theoretically change logic but not storage
+        // Safe as long as new implementation reads from same storage slot
+        return true;
+      }
+
+  - id: BR-O-05
+    title: "MMR root como oráculo para Solana — no manipulable por usuarios"
+    description: |
+      El MMR (Merkle Mountain Range) en MessageStorageLib almacena mensajes Base→Solana.
+      Solana lee el MMR root para verificar mensajes entrantes.
+
+      Análisis de manipulabilidad:
+      - sendMessage() (línea 151) es internal, solo llamable desde Bridge.bridgeCall/bridgeToken.
+      - El hash del leaf incluye: nonce (secuencial), sender (msg.sender), data (serialized payload).
+      - Un usuario NO puede controlar la posición de su leaf en el MMR.
+      - Un usuario NO puede insertar un leaf arbitrario (el nonce es auto-incrementado).
+      - _hashInternalNode usa sorted hashing (commutative) dentro de montañas.
+      - _hashOrderedPair usa non-commutative hashing para bagging peaks.
+
+      ¿Puede un atacante predecir/manipular el root?
+      - El root depende de TODOS los mensajes previos. Cambiar un bit de cualquier mensaje
+        cambia toda la cadena de hashes.
+      - Un atacante puede enviar mensajes para añadir leaves, pero no puede controlar
+        los leaves de otros usuarios.
+      - El nonce auto-incrementado (uint64, unchecked ++) significa que tras 2^64 mensajes
+        hay overflow y nonce se resetea a 0, pero esto es prácticamente inalcanzable.
+
+      CONCLUSIÓN: el MMR root no es manipulable de forma útil para un atacante.
+      La integridad depende de la correctitud de la implementación del MMR, no de datos externos.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Atacante envía muchos mensajes bridgeCall para llenar el MMR con leaves controlados
+      2. Intenta predecir el root resultante para crear un proof falso en Solana
+      PERO: no puede controlar los leaves de otros usuarios, y el nonce secuencial
+      asegura unicidad. La predicción del root requiere conocer todos los leaves,
+      y el root se publica on-chain, por lo que no hay ventaja informacional.
+    solidity: |
+      // Invariant: MMR root es determinístico basado en todos los leaves
+      function property_BR_O_05_mmr_root_deterministic() public view returns (bool) {
+        // Root is always recomputed from all nodes — no external oracle dependency
+        return true;
+      }
+
+  - id: BR-O-06
+    title: "Scalar overflow/underflow en conversión remoteAmount ↔ localAmount"
+    description: |
+      El scalar es 10^scalarExponent donde scalarExponent es uint8 (max 255).
+      10^255 cabe en uint256, pero las multiplicaciones pueden overflow:
+
+      initializeTransfer (líneas 140, 176):
+        localAmount = transfer.remoteAmount * scalar
+        transfer.remoteAmount es uint64 (max ~1.8e19)
+        scalar max = 10^255
+        Producto: ~1.8e19 * 10^255 = 1.8e274 — OVERFLOW en uint256 (max ~1.15e77)
+
+      Si scalarExponent > 57, la multiplicación remoteAmount * scalar puede overflow
+      para remoteAmount > 1. Solidity 0.8.28 tiene checked arithmetic por defecto,
+      así que esto causaría un revert.
+
+      PERO: ¿quién valida scalarExponent? Solo registerRemoteToken lo recibe, y viene
+      de un mensaje firmado por validators. No hay require(scalarExponent <= X).
+      Un scalarExponent irrazonable (ej: 200) haría que el token pair sea inutilizable
+      (todo transfer revierte por overflow). Esto es un DoS vector si un mensaje
+      registerRemoteToken malicioso pasa la validación.
+
+      Para valores razonables (scalarExponent <= 18, que es lo esperado para diferencias
+      de decimales entre EVM 18 y Solana 6-9), no hay riesgo de overflow.
+
+      finalizeTransfer (líneas 234, 251):
+        localAmount = transfer.remoteAmount * scalar
+        Mismo riesgo si scalar es absurdamente grande.
+
+      _addToDeposits (línea 293):
+        newDeposits / scalar <= type(uint64).max
+        Si scalar = 10^255, cualquier depósito > 0 tendría newDeposits/scalar = 0,
+        y la check pasaría, pero el depósito real sería gigantesco en local units.
+    confidence: 50
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. Mensaje registerRemoteToken con scalarExponent=200 pasa validación
+      2. scalar = 10^200
+      3. Cualquier bridgeToken con ese par revierte por overflow en remoteAmount * scalar
+      4. DoS permanente para ese token pair
+      5. No hay función para des-registrar o corregir un scalar
+
+      Para explotación real (no solo DoS): requiere scalarExponent que no cause overflow
+      pero sí cause desproporción. Ej: si token tiene 18 decimales en EVM y 6 en Solana,
+      scalarExponent debería ser 12. Si se registra con 0, cada unidad remota = 1 wei local.
+    solidity: |
+      // Invariant: scalar debe ser razonable (no causar overflow con uint64 max)
+      function property_BR_O_06_scalar_no_overflow() public view returns (bool) {
+        // 10^scalarExponent * type(uint64).max <= type(uint256).max
+        // scalarExponent <= 57 para seguridad
+        return true;
+      }
+
+  - id: BR-O-07
+    title: "registerRemoteToken path permite mint infinito vía CrossChainERC20 sin deposits tracking"
+    description: |
+      HALLAZGO CLAVE — diferencia entre paths de finalizeTransfer:
+
+      Path 1 (ETH/ERC20 nativo): usa deposits tracking.
+        $.deposits[localToken][remoteToken] -= localAmount;
+        Si no hay suficientes deposits, revert por underflow. SEGURO.
+
+      Path 2 (CrossChainERC20): NO usa deposits. Simplemente hace mint.
+        CrossChainERC20(transfer.localToken).mint({to: to, amount: localAmount});
+        No hay límite excepto el suministro total del token.
+
+      Si un atacante puede enviar un mensaje Transfer falso (vía compromiso de validators),
+      puede hacer mint ilimitado de CrossChainERC20 tokens. No hay check de "¿se quemaron
+      estos tokens previamente en el lado Base?" — la verificación es puramente del lado
+      Solana (burn on Solana → message → mint on Base).
+
+      Esto no es estrictamente un "oracle" bug, sino una dependencia en la integridad del
+      sistema de mensajes como fuente de verdad. El "oráculo" aquí son los validators que
+      atestiguan que el burn ocurrió en Solana.
+
+      RELACIÓN CON BR-O-01: si registerRemoteToken puede sobrescribir un scalar, Y el token
+      es un CrossChainERC20 que se finalizó por el path de mint (no el path de deposits),
+      entonces el scalar no es relevante (el mint path no usa scalar). Pero si un ERC20 nativo
+      es re-registrado con scalar más grande, el deposits underflow protege.
+    confidence: 60
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. CrossChainERC20 (wrapped SOL) desplegado por factory, isCrossChainErc20 = true
+      2. Atacante compromete majority de validators (Base + partner)
+      3. Envía mensaje Transfer falso: localToken=wrappedSOL, remoteToken=SOL_PUBKEY,
+         to=atacante, remoteAmount=MAX_UINT64
+      4. finalizeTransfer → isCrossChainErc20 = true → mint path
+      5. CrossChainERC20.mint(atacante, MAX_UINT64) → éxito
+      6. Atacante tiene ~1.8e19 wrapped SOL tokens
+      7. Sin deposits check, no hay límite natural
+
+      MITIGACIÓN: requiere compromiso de validators. Pero comparado con el path nativo
+      (que tiene deposits cap), el path CrossChainERC20 tiene una superficie de ataque mayor
+      si los validators son comprometidos.
+    solidity: |
+      // Invariant: mint de CrossChainERC20 debe corresponder a burn previo en Solana
+      // No verificable on-chain sin cross-chain state — trust assumption en validators
+      function property_BR_O_07_mint_matches_burn() public view returns (bool) {
+        // Cannot verify cross-chain state on-chain
+        // Validator compromise = infinite mint for CrossChainERC20
+        // vs. bounded by deposits for native tokens
+        return true;
+      }
+
+  - id: BR-O-08
+    title: "Nonce monótono en BridgeValidator previene replay pero no previene mensajes fuera de orden"
+    description: |
+      BridgeValidator.registerMessages() usa un nonce estrictamente creciente (línea 180-186):
+        messageHashes[i] = MessageLib.getMessageHash(currentNonce++, ...)
+        nextNonce = currentNonce;
+
+      El nonce se incrementa por batch. Si un batch de 3 mensajes se registra, nonces son
+      [N, N+1, N+2] y nextNonce = N+3.
+
+      Esto previene replay (mismo mensaje no puede registrarse dos veces con mismo nonce).
+      PERO: no hay verificación de que los mensajes correspondan a nonces específicos de Solana.
+      El innerMessageHash es opaco — los validators firman messageHashes que incluyen el nonce
+      asignado por BridgeValidator, no un nonce de Solana.
+
+      ¿Implicación? Los validators podrían teóricamente re-ordenar mensajes o inventar mensajes
+      que nunca existieron en Solana, siempre que controlen las firmas. Esto es by design
+      (Stage 0 trust model), pero documenta la dependencia oráculo.
+
+      El outgoingMessagePubkey en SignedMessage se usa para el hash pero no se verifica
+      contra ningún estado on-chain de Solana.
+    confidence: 75
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — by design in Stage 0. Validators are trusted to relay messages faithfully.
+      Stage 1 (OP Stack CrossL2Inbox) will replace this trust assumption.
+    solidity: |
+      // Invariant: nonce is strictly monotonic
+      function property_BR_O_08_nonce_monotonic() public view returns (bool) {
+        // Verified by construction — nextNonce only increases
+        return true;
+      }
+
+  - id: BR-O-09
+    title: "Partner validator _indexOf acepta newEvmAddress — key rotation window permite doble conteo"
+    description: |
+      BridgeValidator._indexOf (línea 308-315) busca un signer en la lista de partner validators:
+        if (addr == addrs[i].evmAddress || addr == addrs[i].newEvmAddress)
+
+      Esto acepta TANTO la key actual como la key de rotación. ¿Qué pasa si ambas keys
+      firman el mismo batch?
+
+      _countPartnerSigners usa un bitmap (signedBitMap) para prevenir doble conteo POR ÍNDICE.
+      Si la misma dirección aparece como evmAddress de signer[0] Y como newEvmAddress de signer[1],
+      _indexOf retornaría 0 para la primera firma y 1 para la segunda. Ambas pasarían el bitmap check
+      (diferentes bits) y contarían como 2 firmas de partner distintas.
+
+      PERO: esto requiere que una misma dirección esté en dos entries del partner validator set
+      como evmAddress en una y newEvmAddress en otra. El contrato partner debería prevenir esto,
+      pero Bridge/BridgeValidator NO lo verifica.
+
+      Adicionalmente: si un signer tiene evmAddress=A y newEvmAddress=B, y otro tiene
+      evmAddress=B y newEvmAddress=C, entonces una firma con key B matchearía AMBOS entries.
+      _indexOf retorna el PRIMER match, así que solo contaría una vez. Esto es correcto.
+
+      El riesgo real: durante una rotación de keys, si evmAddress=OLD y newEvmAddress=NEW,
+      una firma con OLD matchea index i, y una firma con NEW también matchea index i
+      (mismo entry). El bitmap check: bit i ya está set → revert DuplicateSigner. CORRECTO.
+
+      PERO: ¿qué pasa si recoveredSigners tiene OLD y NEW en la misma lista?
+      OLD → _indexOf returns i → bit i set
+      NEW → _indexOf returns i → bit i already set → revert DuplicateSigner
+      PROTEGIDO.
+
+      Caso edge: OLD es evmAddress de signer[0], NEW es evmAddress de signer[1] (dos entries).
+      OLD → index 0, NEW → index 1. Ambas pasan. Pero esto es legítimo: son dos signers diferentes.
+    confidence: 70
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Un signer con evmAddress=A y newEvmAddress=B intenta firmar con ambas keys.
+      _indexOf(A) → i, _indexOf(B) → i (mismo entry). Bitmap bit i duplicado → revert.
+      PROTEGIDO por DuplicateSigner check.
+    solidity: |
+      // Invariant: cada partner signer entry solo puede contribuir 1 firma al conteo
+      function property_BR_O_09_no_double_count() public pure returns (bool) {
+        // Bitmap per-index prevents double counting from same entry
+        // Cross-entry overlap is prevented by partner contract design
+        return true;
+      }
+
+  - id: BR-O-10
+    title: "gasLimit en IncomingMessage como oráculo de ejecución — DoS por gas insuficiente"
+    description: |
+      Bridge._validateAndRelay (línea 358):
+        try this.__relayMessage{gas: message.gasLimit}(message)
+
+      El gasLimit viene del mensaje firmado por validators. Si gasLimit es demasiado bajo,
+      __relayMessage falla y el mensaje se marca como `failures[messageHash] = true`.
+
+      PERO: el mensaje puede re-intentarse. _validateAndRelay revisa successes[messageHash]
+      pero no failures. Un relayer puede re-enviar el mismo mensaje con suficiente gas externo
+      (el gasLimit del message es el cap, el gas disponible en la tx debe ser >= gasLimit).
+
+      Si gasLimit en el mensaje es permanentemente bajo (ej: 21000 para un transfer complejo),
+      el mensaje NUNCA podrá ejecutarse exitosamente. Pero esto requiere que los validators
+      hayan firmado un mensaje con gasLimit inadecuado — error operacional, no un ataque.
+
+      NOTA: no hay mecanismo para "actualizar" el gasLimit de un mensaje ya registrado.
+      Un mensaje con gasLimit=0 quedaría perpetuamente en estado de fallo.
+    confidence: 80
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Validators firman un mensaje con gasLimit muy bajo (ej: 1)
+      2. relayMessages() → __relayMessage con 1 gas → falla
+      3. Mensaje marcado como failure, pero puede reintentarse
+      4. Cada reintento falla porque gasLimit es parte del mensaje (immutable)
+      5. Fondos de un transfer quedan bloqueados permanentemente en el lado Solana
+      PERO: requiere error de validators, no un ataque externo.
+    solidity: |
+      // Invariant: gasLimit debe ser suficiente para la operación codificada en el mensaje
+      // No verificable on-chain sin simular la ejecución
+      function property_BR_O_10_sufficient_gas() public pure returns (bool) {
+        return true; // operational concern, not oracle vulnerability
+      }
+
+summary:
+  total_hypotheses: 10
+  investigate:
+    - BR-O-01 — Scalar overwrite sin check de depósitos existentes (Medium, 35% confianza)
+    - BR-O-02 — Partner validator set mutable vía external contract (Medium, 40% confianza)
+    - BR-O-06 — Scalar overflow con scalarExponent > 57 (Low, 50% confianza)
+    - BR-O-07 — Mint infinito de CrossChainERC20 sin deposits cap si validators comprometidos (High, 60% confianza)
+  safe:
+    - BR-O-03 — Balance reads protegidos por ReentrancyGuardTransient
+    - BR-O-04 — remoteToken() en storage, no afectado por beacon upgrade de lógica
+    - BR-O-05 — MMR root determinístico, no manipulable por usuarios
+    - BR-O-08 — Nonce monótono previene replay (by design Stage 0)
+    - BR-O-09 — Bitmap previene doble conteo de partner signers
+    - BR-O-10 — gasLimit insuficiente es error operacional, no oracle attack
+  key_finding: |
+    El hallazgo más relevante es BR-O-01 + BR-O-07 combinados:
+    1. registerRemoteToken puede sobrescribir scalars sin verificar depósitos existentes
+    2. CrossChainERC20 mint path no tiene deposits cap
+    3. Ambos requieren compromiso de validators, pero el modelo de amenaza de Stage 0
+       explicítamente confía en validators. Para Stage 1 (OP Stack), estos paths
+       serían protegidos por el CrossL2Inbox.
+
+    La dependencia más preocupante como "oráculo" es IPartner.getSigners() (BR-O-02):
+    es una external call view a un contrato no controlado por el Bridge, ejecutada
+    en cada registerMessages. Si el contrato partner es comprometido, el threshold
+    de seguridad se reduce efectivamente.

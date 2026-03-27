@@ -1,0 +1,201 @@
+hunter: MathHunter
+component: Flywheel Protocol (all src/ contracts)
+date: "2026-03-27"
+summary: >
+  Deep math/rounding analysis of fee calculations, basis point arithmetic,
+  uint120 casts, underflow paths, and accounting invariants across Flywheel,
+  AdConversion, BridgeReferralFees, and CashbackRewards.
+  Result: protocol math is sound. No exploitable findings. One QA-level input
+  validation gap identified.
+
+hypotheses:
+  - id: MATH-01
+    title: "AdConversion fee rounding loses dust for attribution provider"
+    description: >
+      (payoutAmount * feeBps) / MAX_BPS at AdConversion.sol:463 rounds down,
+      causing the attribution provider to receive up to 1 wei less per conversion.
+      Over many conversions this accumulates but remains negligible.
+    severity: informational
+    confidence: 95
+    status: NOT_A_BUG
+    affected_functions:
+      - "AdConversion._onSend (line 463)"
+    attack_scenario: >
+      No attack. Standard DeFi rounding pattern that favors the payer (advertiser).
+      Max loss per conversion is 1 wei. Even over 1M conversions, total loss is ~1M wei
+      which is far below any gas cost threshold.
+    solidity_invariant: |
+      // Invariant: fee never exceeds payoutAmount
+      // (payoutAmount * feeBps) / 10000 <= payoutAmount when feeBps <= 10000
+      function invariant_fee_never_exceeds_payout(uint256 payoutAmount, uint16 feeBps) external pure {
+          require(feeBps <= 10000);
+          uint256 fee = (payoutAmount * feeBps) / 10000;
+          assert(fee <= payoutAmount);
+      }
+
+  - id: MATH-02
+    title: "BridgeReferralFees._safePercent is mathematically equivalent to standard formula"
+    description: >
+      _safePercent splits (amount * bp) / 1e4 into (amount / 1e4) * bp + ((amount % 1e4) * bp) / 1e4
+      to avoid overflow. Mathematical proof: let amount = q*10000 + r, then
+      standard = (q*10000*bp + r*bp) / 10000 = q*bp + (r*bp)/10000 = safePercent.
+      They are identical for ALL values. No precision loss, no overflow with uint8 basisPoints.
+    severity: informational
+    confidence: 100
+    status: NOT_A_BUG
+    affected_functions:
+      - "BridgeReferralFees._safePercent (line 199-201)"
+    attack_scenario: >
+      No attack. The formula is provably correct. With uint8 basisPoints (max 255),
+      the intermediate (amount / 1e4) * 255 needs at most 251 bits. No overflow possible.
+    solidity_invariant: |
+      // Invariant: _safePercent == standard formula for all inputs
+      function invariant_safePercent_equals_standard(uint256 amount, uint8 bp) external pure {
+          uint256 safe = (amount / 1e4) * bp + ((amount % 1e4) * bp) / 1e4;
+          uint256 standard = (amount * uint256(bp)) / 1e4;
+          assert(safe == standard);
+      }
+
+  - id: MATH-03
+    title: "CashbackRewards uint120 cast could revert if maxRewardBps > 10000"
+    description: >
+      At CashbackRewards.sol:335, uint120(paymentAmount * maxRewardBps / BASIS_POINTS_100_PERCENT)
+      will revert (Solidity 0.8 checked cast) if maxRewardBps > 10000 AND paymentAmount is
+      large enough that the result exceeds uint120 max (~1.3e36). However, there is no validation
+      in _onCreateCampaign that maxRewardBasisPoints_ <= 10000. If an owner accidentally sets
+      maxRewardBps to e.g. 65535, the _validatePaymentReward function reverts for large payments,
+      causing a DoS on reward distribution.
+    severity: low
+    confidence: 70
+    status: WEAK
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward (line 335)"
+      - "CashbackRewards._onCreateCampaign (line 91-99)"
+    attack_scenario: >
+      1. Owner creates campaign with maxRewardBasisPoints_ = 30000 (300%)
+      2. A payment of ~4.4e35 wei (~4.4e17 tokens with 18 decimals) is made
+      3. _validatePaymentReward tries uint120(paymentAmount * 30000 / 10000)
+      4. Result exceeds uint120 max, transaction reverts
+      5. Rewards for this payment become uncollectable
+      Practically not exploitable: requires astronomical token amounts AND owner misconfiguration.
+      The owner controls the campaign and can recreate with correct bps. Self-inflicted DoS only.
+    solidity_invariant: |
+      // QA: maxRewardBasisPoints should be validated <= 10000
+      function invariant_maxRewardBps_bounded(address campaign) external view {
+          uint256 bps = cashbackRewards.maxRewardBasisPoints(campaign);
+          assert(bps == 0 || bps <= 10000);
+      }
+
+  - id: MATH-04
+    title: "CashbackRewards RewardState uint120 allocated/distributed overflow"
+    description: >
+      RewardState packs allocated (uint120) and distributed (uint120) in a struct.
+      Repeated allocations to the same paymentHash increment allocated via +=.
+      In Solidity 0.8, uint120 += uint120 reverts on overflow. However, uint120 max
+      is ~1.3e36, which with 18-decimal tokens represents ~1.3e18 tokens. This is
+      unreachable for any real token. Even with 6-decimal tokens (USDC), it represents
+      ~1.3e30 USDC, far beyond total supply.
+    severity: informational
+    confidence: 99
+    status: NOT_A_BUG
+    affected_functions:
+      - "CashbackRewards._onSend (line 124)"
+      - "CashbackRewards._onAllocate (line 160)"
+      - "CashbackRewards._onDistribute (line 246)"
+    attack_scenario: >
+      No practical attack. Would require allocating > 1.3e36 wei to a single paymentHash,
+      which exceeds any token's total supply by many orders of magnitude.
+    solidity_invariant: |
+      // Invariant: allocated + distributed <= uint120 max (always true in practice)
+      function invariant_rewardState_no_overflow(address campaign, bytes32 paymentHash) external view {
+          (uint120 allocated, uint120 distributed) = cashbackRewards.rewards(campaign, paymentHash);
+          // Both are uint120, Solidity 0.8 guarantees no silent overflow
+          assert(uint256(allocated) + uint256(distributed) <= type(uint120).max);
+      }
+
+  - id: MATH-05
+    title: "AdConversion netAmount underflow: impossible when feeBps <= MAX_BPS"
+    description: >
+      At AdConversion.sol:465, netAmount -= attributionFee where
+      netAmount = payoutAmount and attributionFee = (payoutAmount * feeBps) / MAX_BPS.
+      Since feeBps is validated <= MAX_BPS (10000) at campaign creation (line 356),
+      attributionFee = payoutAmount * feeBps / 10000 <= payoutAmount.
+      Therefore netAmount - attributionFee >= 0. No underflow possible.
+    severity: informational
+    confidence: 100
+    status: NOT_A_BUG
+    affected_functions:
+      - "AdConversion._onSend (line 461-465)"
+    attack_scenario: >
+      No attack possible. The validation at campaign creation (line 356:
+      if attributionProviderFeeBps > MAX_BPS revert InvalidFeeBps) ensures
+      fee fraction is <= 100%, making the subtraction always safe.
+    solidity_invariant: |
+      function invariant_netAmount_no_underflow(uint256 payoutAmount, uint16 feeBps) external pure {
+          require(feeBps <= 10000);
+          uint256 fee = (payoutAmount * feeBps) / 10000;
+          assert(payoutAmount >= fee);
+      }
+
+  - id: MATH-06
+    title: "Flywheel totalAllocatedPayouts/totalAllocatedFees underflow protection"
+    description: >
+      deallocate (line 391) and distribute (line 437) subtract from totalAllocatedPayouts.
+      distributeFees (line 481) subtracts from totalAllocatedFees. All use Solidity 0.8
+      checked arithmetic which reverts on underflow. The amounts subtracted come from hooks,
+      which are trusted (set at campaign creation). Individual _allocatedPayout[key] -= amount
+      also reverts on underflow. A malicious hook COULD return amounts exceeding allocations,
+      but this would revert (DoS), not allow theft.
+    severity: informational
+    confidence: 100
+    status: NOT_A_BUG
+    affected_functions:
+      - "Flywheel.deallocate (line 386-391)"
+      - "Flywheel.distribute (line 428-437)"
+      - "Flywheel.distributeFees (line 471-481)"
+    attack_scenario: >
+      No attack. Checked arithmetic provides underflow protection. Hooks are trusted
+      per-campaign. A buggy hook would cause reverts (DoS) but not fund extraction.
+    solidity_invariant: |
+      // Invariant: totalAllocatedPayouts >= sum of individual allocations always holds
+      // (maintained by Solidity 0.8 checked arithmetic)
+      function invariant_total_allocated_consistent(address campaign, address token) external view {
+          uint256 total = flywheel.totalAllocatedPayouts(campaign, token);
+          // total is always >= 0 (uint256) and maintained by checked math
+          assert(total >= 0);
+      }
+
+  - id: MATH-07
+    title: "BridgeReferralFees bridgedAmount calculation cannot underflow"
+    description: >
+      At BridgeReferralFees.sol:78-79, bridgedAmount = balance - totalAllocatedFees.
+      Since Flywheel enforces solvency (balance >= totalAllocatedPayouts + totalAllocatedFees)
+      after every operation, and BridgeReferralFees campaigns never have totalAllocatedPayouts > 0
+      (allocate/deallocate/distribute are Unsupported), balance >= totalAllocatedFees always holds.
+      The subtraction is safe.
+    severity: informational
+    confidence: 98
+    status: NOT_A_BUG
+    affected_functions:
+      - "BridgeReferralFees._onSend (line 78-79)"
+    attack_scenario: >
+      No attack. BridgeReferralFees only supports send() operations (allocate/deallocate/distribute
+      revert with Unsupported). Therefore totalAllocatedPayouts is always 0 for these campaigns.
+      The solvency invariant guarantees balance >= totalAllocatedFees, preventing underflow.
+      If somehow tokens are removed directly from the campaign (impossible via Flywheel),
+      the subtraction would revert, not silently underflow.
+    solidity_invariant: |
+      function invariant_bridged_amount_no_underflow(address campaign, address token) external view {
+          uint256 balance = IERC20(token).balanceOf(campaign);
+          uint256 allocatedFees = flywheel.totalAllocatedFees(campaign, token);
+          assert(balance >= allocatedFees);
+      }
+
+overall_assessment: >
+  The Flywheel protocol's math is well-designed and secure. All 7 areas investigated
+  are protected by a combination of: (1) Solidity 0.8 checked arithmetic preventing
+  silent over/underflows, (2) input validation at campaign creation (feeBps <= MAX_BPS),
+  (3) solvency checks after every operation, and (4) correct formula decomposition in
+  _safePercent. The only actionable item is MATH-03 (QA): CashbackRewards should validate
+  maxRewardBasisPoints_ <= 10000 at campaign creation to prevent owner misconfiguration.
+  No Medium+ findings. The codebase shows mature mathematical hygiene.

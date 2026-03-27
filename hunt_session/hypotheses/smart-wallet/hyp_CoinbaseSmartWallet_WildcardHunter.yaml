@@ -1,0 +1,714 @@
+hunter: WildcardHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+hypotheses:
+
+  - id: CSW-W-01
+    title: "EIP-7702 delegation a la implementación: storage virgen permite que cualquiera inicialice la wallet y tome ownership"
+    severity: critical
+    confidence: 80
+    description: |
+      EIP-7702 (activo desde Pectra en Ethereum mainnet) permite que una EOA delegue su código
+      a una implementación existente. Si una EOA delega a la implementación de CoinbaseSmartWallet
+      (no al proxy, sino directamente al implementation contract), el storage de la EOA está virgen:
+      `nextOwnerIndex() == 0`.
+
+      La función `initialize(bytes[] calldata owners)` verifica:
+        `if (nextOwnerIndex() != 0) revert Initialized();`
+
+      Con storage virgen, esta verificación pasa, y CUALQUIER llamante puede invocar
+      `initialize([attackerAddr])` en la EOA-como-wallet, convirtiéndose en owner.
+
+      El constructor de la implementación llama `_initializeOwners([address(0)])` para bloquear la
+      re-inicialización EN EL IMPLEMENTATION CONTRACT, pero esto escribe en el storage del
+      implementation. La EOA que delega vía EIP-7702 usa SU PROPIO STORAGE, que está limpio.
+
+      Resultado: la EOA victima tiene dos caminos de control:
+      1. Transacciones normales firmadas por la clave privada de la EOA.
+      2. Operaciones vía EntryPoint donde el atacante (nuevo owner) es el firmante autorizado.
+
+      El atacante puede usar el path (2) para vaciar los fondos de la EOA.
+    attack_scenario: |
+      1. Alice tiene una EOA con 100 ETH.
+      2. Alice activa EIP-7702 delegation apuntando al CoinbaseSmartWallet implementation.
+         Su EOA ahora ejecuta el código de CoinbaseSmartWallet usando el storage de Alice.
+      3. Atacante observa la transacción de delegation en mempool o en la chain.
+      4. Atacante llama Alice.initialize([atacante_address]).
+         - nextOwnerIndex() lee storage de Alice = 0 → pasa el check.
+         - `_initializeOwners` escribe: isOwner[atacante] = true, ownerAtIndex[0] = atacante.
+         - nextOwnerIndex de Alice = 1.
+      5. Atacante firma un UserOp con ownerIndex=0 (sí mismo).
+      6. EntryPoint llama Alice.validateUserOp → _isValidSignature → ownerAtIndex(0) = atacante → ok.
+      7. UserOp ejecuta: Alice.execute(atacante_address, alice.balance, "") → 100 ETH drenados.
+      8. Alice no puede hacer nada — su clave privada sigue funcionando para txs normales pero
+         el atacante ya ejecutó el vaciado vía ERC-4337.
+    impact: |
+      Pérdida total de todos los fondos (ETH + tokens) de la EOA delegante. Cualquier EOA
+      que active EIP-7702 apuntando a CoinbaseSmartWallet implementation sin atomicamente
+      inicializar puede ser explotada. En práctica, si el frontend de Coinbase wallet hace
+      el setup en dos pasos (primero delegación, luego initialize), hay una ventana de front-run.
+      Impacto máximo: todos los fondos de la EOA victima.
+    solidity: |
+      // Property: si nextOwnerIndex == 0, initialize es callable por cualquiera → VULNERABLE
+      function invariant_eip7702_init_front_run_window() public view {
+          // Si la wallet fue delegada via EIP-7702 con storage virgen:
+          // cualquier llamante puede inicializarla ANTES que el dueño legítimo
+          if (wallet.nextOwnerIndex() == 0) {
+              // Esta condición no debe ocurrir en una wallet deployada via factory
+              // pero puede ocurrir en EIP-7702 delegation
+              t(false, "CSW-W-01: wallet unitialised — vulnerable to init front-run");
+          }
+      }
+    status: investigate
+
+  - id: CSW-W-02
+    title: "removeOwnerAtIndex cross-chain replay borra owner en índice incorrecto cuando el array diverge entre chains"
+    severity: high
+    confidence: 90
+    description: |
+      `removeOwnerAtIndex(index, owner)` está en la whitelist de `canSkipChainIdValidation`,
+      permitiendo que UserOps sean reproducidos en cualquier chain sin binding de chainId
+      (usando REPLAYABLE_NONCE_KEY=8453).
+
+      El array de owners es APPEND-ONLY con huecos en eliminaciones: owners se agregan
+      secuencialmente (nextOwnerIndex++) y las eliminaciones dejan el índice vacío (sin repack).
+
+      Si la secuencia de addOwner/removeOwner difiere entre chains (por ops con chainId
+      mezcladas con ops cross-chain), el ÍNDICE puede apuntar a owners DIFERENTES en distintas chains.
+
+      La protección `keccak256(owner_) != keccak256(owner)` en `_removeOwnerAtIndex` revierte
+      si los bytes no coinciden. PERO el attacker no necesita silenciosamente eliminar al owner
+      equivocado — puede manipular el estado en chain B para que el índice objetivo contenga el
+      owner que el attacker quiere eliminar, haciéndolo pasar el check y eliminarlo.
+
+      Más sutilmente: el nonce secuencial compartido (REPLAYABLE_NONCE_KEY) significa que los
+      ops cross-chain se ordenan por nonce, pero la ejecución puede llegar en momentos distintos
+      en cada chain. Si hay una op cross-chain "add Carol at index 2" y otra "remove index 2"
+      que llegan en orden distinto en chain B vs chain A, el resultado final difiere.
+
+      Confirmado como HIGH en audit previo (H-01 de Code4rena Coinbase).
+    attack_scenario: |
+      1. Wallet tiene owners: [Alice=idx0, Bob=idx1] en Ethereum y Base.
+      2. En Ethereum (solo), Alice añade Eve via execute() CON chainId (no cross-chain).
+         Eve queda en idx2 solo en Ethereum.
+      3. Alice emite UserOp cross-chain: addOwnerAddress(Carol) → idx2 en Base, idx3 en Ethereum.
+         (idx2 en Ethereum ya tiene Eve, así que Carol va a idx3)
+      4. Alice emite UserOp cross-chain: removeOwnerAtIndex(2, Carol_bytes).
+         - En Ethereum: idx2 tiene Eve, no Carol → WrongOwnerAtIndex → REVERT (op fallida).
+         - En Base: idx2 tiene Carol → eliminación exitosa.
+      5. El estado diverge permanentemente: Carol existe en Ethereum pero no en Base.
+      6. Un segundo attacker que sea co-owner puede manipular los índices en chain B para
+         que el target de una removeOwnerAtIndex sea específicamente el owner que quieren eliminar.
+    impact: |
+      Divergencia permanente de owners entre chains. En el peor caso, un owner adversarial
+      puede usar la mecánica cross-chain para eliminar owners legítimos de chains específicas,
+      dejando wallets con fondos sin control legítimo en esas chains. Pérdida potencial de
+      todos los fondos en la chain afectada.
+    solidity: |
+      // Property: ownerCount debe conservarse después de removeOwnerAtIndex cross-chain
+      function test_crosschain_remove_consistent(uint256 targetIndex) public {
+          uint256 ownerCountBefore = wallet.ownerCount();
+          bytes memory ownerAtTarget = wallet.ownerAtIndex(targetIndex);
+
+          if (ownerAtTarget.length > 0 && ownerCountBefore > 1) {
+              // Simular removeOwnerAtIndex cross-chain
+              vm.prank(address(entryPoint));
+              wallet.executeWithoutChainIdValidation(
+                  _encodeRemoveOwner(targetIndex, ownerAtTarget)
+              );
+              uint256 ownerCountAfter = wallet.ownerCount();
+              eq(ownerCountAfter, ownerCountBefore - 1, "CSW-W-02: owner count mismatch after cross-chain remove");
+          }
+      }
+    status: investigate
+
+  - id: CSW-W-03
+    title: "validateUserOp: code.length check en validateUserOp pero NO en executeWithoutChainIdValidation — upgrade a impl vacía si selfdestruct ocurre entre validation y execution"
+    severity: high
+    confidence: 65
+    description: |
+      En `validateUserOp`, cuando el calldata es `executeWithoutChainIdValidation` con un
+      `upgradeToAndCall`, el código verifica:
+        `if (newImplementation.code.length == 0) revert InvalidImplementation(newImplementation);`
+
+      Esta verificación ocurre DURANTE LA VALIDACIÓN, no durante la ejecución.
+
+      En ERC-4337 v0.6, hay un gap entre `validateUserOp` y la ejecución real. En el mismo
+      bundle, una tx ANTERIOR puede causar que `newImplementation` sea destruida DESPUÉS de
+      que `validateUserOp` pase el check pero ANTES de que `executeWithoutChainIdValidation`
+      se ejecute.
+
+      Concretamente, en chains pre-Cancun (o en cualquier chain donde la nueva impl es un
+      contrato deployado Y destruido en el mismo bloque via CREATE2+selfdestruct), el check
+      pasa en validación pero la ejecución escribe en el ERC-1967 slot una dirección sin código.
+
+      Post-Cancun (EIP-6780): selfdestruct solo borra el código si el contrato fue creado en
+      la MISMA transacción. En ERC-4337, el bundler procesa múltiples UserOps en una sola
+      transacción (`handleOps`). Si la implementation maliciosa es creada Y destruida dentro
+      de la misma llamada `handleOps` (por otro UserOp en el bundle), el selfdestruct funciona.
+
+      Secuencia dentro de `handleOps([userOpUpgrade, userOpDestroy])`:
+      1. validateUserOp(userOpUpgrade) → impl tiene código → ok.
+      2. No se ejecuta userOpUpgrade aún.
+      3. validateUserOp(userOpDestroy) → se ejecuta la validación de la segunda op.
+      4. Execution phase: userOpUpgrade ejecuta → upgradeToAndCall(impl) → el check de código
+         NO existe en `executeWithoutChainIdValidation` ni en Solady's `upgradeToAndCall`.
+      5. userOpDestroy ejecuta → selfdestruct(impl) (en la misma tx de handleOps).
+         En post-Cancun, selfdestruct no destruye si no fue creado en esta tx. PERO si impl
+         fue creado en una tx anterior y es un proxy simple con un `destroy()` callable, el
+         selfdestruct de EIP-6780 no aplica — el código SE BORRA porque fue creado antes.
+         WAIT: EIP-6780 dice que selfdestruct SIEMPRE elimina el balance, pero SOLO elimina
+         el código si fue creado en la MISMA tx. Si el contrato fue creado antes, el código
+         NO se borra en Cancun+. Entonces este vector requiere pre-Cancun o cadenas sin EIP-6780.
+    attack_scenario: |
+      En cadenas pre-Cancun o con selfdestruct funcional:
+      1. Atacante despliega impl maliciosa con función destroy().
+      2. Engaña a owner para que firme UserOp de upgrade a esa impl.
+      3. Bundle: [userOp_upgrade, userOp_destroy].
+      4. validateUserOp(upgrade): code.length > 0 → ok.
+      5. Execution: upgrade → proxy apunta a impl.
+      6. Execution: destroy → impl se auto-destruye.
+      7. Proxy apunta a dirección sin código → todos los calls retornan vacío.
+      8. Wallet permanentemente inutilizable.
+    impact: |
+      Wallet permanentemente inoperante. Todos los fondos (ETH + tokens) atrapados para siempre.
+      No hay forma de recovery ya que el proxy no puede upgradear — todas las calls al proxy
+      retornan success con datos vacíos (delegatecall a dirección sin código en EVM retorna
+      success con empty returndata).
+    solidity: |
+      // Invariant: la implementación del wallet siempre debe tener código
+      function invariant_implementation_has_code() public view {
+          address impl = wallet.implementation();
+          if (impl != address(0)) {
+              t(impl.code.length > 0, "CSW-W-03: wallet implementation has no code — proxy bricked");
+          }
+      }
+    status: investigate
+
+  - id: CSW-W-04
+    title: "MagicSpend multi-op bundle: postOp borra _withdrawable acumulado de todas las ops, el segundo postOp recibe 0 de excess"
+    severity: medium
+    confidence: 80
+    description: |
+      En `validatePaymasterUserOp`, se acumula:
+        `_withdrawable[userOp.sender] += withdrawAmount - maxCost`
+
+      Si el MISMO sender tiene MÚLTIPLES UserOps en un bundle (permitido por ERC-4337):
+      - validateOp1: `_withdrawable[sender] += excess1`
+      - validateOp2: `_withdrawable[sender] += excess2` → total: excess1 + excess2
+
+      En `postOp`, el PRIMER postOp del sender hace:
+        `uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost1)`
+        `delete _withdrawable[account]` → 0
+        `SafeTransferLib.forceSafeTransferETH(account, withdrawable, ...)`
+
+      El primer postOp envía (excess1 + excess2 + gasRefund1) al usuario.
+
+      El SEGUNDO postOp hace:
+        `uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost2)`
+        → `_withdrawable[account]` ya es 0 → withdrawable = gasRefund2
+        → envía solo gasRefund2.
+
+      El usuario recibe excess2 en el primer postOp (incluido en el total acumulado),
+      pero NO como resultado del segundo WithdrawRequest. El nonce del segundo withdraw
+      request fue consumido, pero el usuario ya recibió el excess asociado de forma "prematura".
+
+      El problema surge si el primer postOp FALLA (forceSafeTransferETH usa gas limitado
+      `GAS_STIPEND_NO_STORAGE_WRITES`): si la transferencia falla silenciosamente,
+      AMBOS excesos se pierden. Los nonces están consumidos, el usuario recibió 0.
+
+      Riesgo concreto: si la wallet fue upgra­deada a una impl con un `receive()` que usa
+      storage (>2300 gas), `forceSafeTransferETH` con `GAS_STIPEND_NO_STORAGE_WRITES` falla.
+    attack_scenario: |
+      1. Alice usa MagicSpend con dos UserOps en un bundle:
+         - UserOp1: withdraw 1 ETH, maxCost 0.1 ETH → excess1 = 0.9 ETH
+         - UserOp2: withdraw 1 ETH, maxCost 0.1 ETH → excess2 = 0.9 ETH
+      2. validatePaymasterUserOp x2: _withdrawable[alice] = 1.8 ETH
+      3. postOp1: forceSafeTransferETH(alice, 1.8 + gasRefund1) — falla silenciosamente
+         si alice.receive() usa storage.
+      4. _withdrawable[alice] = 0 (deleted even if transfer failed).
+      5. postOp2: forceSafeTransferETH(alice, gasRefund2 only).
+      6. Alice recibió solo gasRefund2 (~0.0001 ETH) en lugar de 1.8 ETH + gasRefunds.
+      7. 1.8 ETH de withdraw quedan bloqueados en MagicSpend, nonces consumidos.
+    impact: |
+      Pérdida de los fondos de withdraw excess para el usuario. El importe máximo perdido es
+      la suma de todos los withdrawAmount - maxCost de todos los UserOps del bundle menos el
+      primero. Los nonces están consumidos y no hay forma de reclamar los fondos.
+      En el caso de un bundle de N ops, la pérdida es sum(excess_i para i=1..N-1) si el
+      primer forceSafeTransferETH falla.
+    solidity: |
+      // Track: suma de todos los excess antes y después de un bundle multi-op
+      function invariant_user_receives_full_excess(address user) public view {
+          uint256 totalExcessExpected = ghost_totalExcessExpected[user];
+          uint256 actualReceived = ghost_totalReceived[user];
+          // El usuario debe recibir al menos el excess total comprometido
+          gte(actualReceived, totalExcessExpected, "CSW-W-04: user received less than promised excess");
+      }
+    status: investigate
+
+  - id: CSW-W-05
+    title: "ownerAtIndex de índice removido retorna bytes vacíos → revert InvalidOwnerBytesLength en validateUserOp en lugar de retornar sigfail=1"
+    severity: medium
+    confidence: 85
+    description: |
+      En `_isValidSignature`, se usa `sigWrapper.ownerIndex` para buscar el owner:
+        `bytes memory ownerBytes = ownerAtIndex(sigWrapper.ownerIndex);`
+
+      Si el índice fue eliminado (`delete $.ownerAtIndex[index]` en `_removeOwnerAtIndex`),
+      `ownerAtIndex` retorna `bytes("")` (longitud 0).
+
+      El código luego verifica:
+        `if (ownerBytes.length == 32)` → false
+        `if (ownerBytes.length == 64)` → false
+        → `revert InvalidOwnerBytesLength(ownerBytes)` ← REVERT
+
+      Este REVERT se propaga hasta `validateUserOp`. Según la spec ERC-4337:
+      - "Signature failure MUST return SIG_VALIDATION_FAILED (1), not revert"
+      - "May revert for other failures (e.g., invalid format)"
+
+      El código comenta explícitamente: "Reverts if the signature format is incorrect or
+      invalid for owner type." El debate es si "ownerIndex apuntando a slot vacío" es
+      "formato incorrecto" o "signature failure".
+
+      El impacto práctico: un co-owner adversarial puede griefear al otro co-owner:
+      1. Observa que la víctima tiene una firma pendiente con ownerIndex=2.
+      2. Frontrunea: llama removeOwnerAtIndex(2, owner2) (como co-owner legítimo).
+      3. La firma de la víctima ahora apunta a un slot vacío.
+      4. validateUserOp REVIERTE en lugar de retornar 1.
+      5. El bundler descarta el UserOp y puede penalizar la reputación del sender.
+      6. El griefing es repetible indefinidamente mientras el co-owner permanezca adversarial.
+    attack_scenario: |
+      1. Wallet tiene dos owners: Alice en idx0, Bob en idx1.
+      2. Alice firma UserOp con ownerIndex=1 (Bob es owner, Alice quiere que Bob valide).
+         Nota: el ownerIndex en la sig es quien FIRMÓ, no quien autorizó. Si Alice firmó
+         pero pone ownerIndex=1 (Bob), la sig fallaría normalmente. El caso real es:
+         Bob firma con ownerIndex=1 (sí mismo).
+      3. Alice (co-owner adversarial) frontrunea: removeOwnerAtIndex(1, Bob_bytes).
+      4. Bob's UserOp llega al bundler: validateUserOp → ownerAtIndex(1) = "" → REVERT.
+      5. Bundle completo revierte o el UserOp es descartado.
+      6. Bob no puede operar su wallet hasta que cambie su firma a otro ownerIndex válido.
+      7. Pero si Alice sigue eliminando owners antes de que Bob pueda usarlos, DoS permanente.
+    impact: |
+      DoS de UserOps del co-owner víctima. En contextos de co-ownership adversarial (ej:
+      custodios corporativos con un co-owner malicioso), el attacker puede bloquear
+      indefinidamente las operaciones del otro dueño. No hay pérdida directa de fondos
+      pero sí pérdida de usabilidad y posible daño de reputación del sender en el bundler.
+    solidity: |
+      // Verificar que validateUserOp con ownerIndex inválido retorna 1 (no revierte)
+      function test_removed_owner_index_returns_sigfail_not_revert() public {
+          // Remover owner en idx 1
+          vm.prank(address(wallet));
+          wallet.removeOwnerAtIndex(1, abi.encode(owner1));
+
+          // Intentar validar con ownerIndex=1 (removido)
+          bytes memory badSig = abi.encode(
+              CoinbaseSmartWallet.SignatureWrapper({ownerIndex: 1, signatureData: bytes("dummy")})
+          );
+          UserOperation memory op = _buildUserOp(badSig);
+
+          // Debería retornar 1 (sigfail), no revertir
+          bool didRevert = false;
+          uint256 result;
+          try wallet.validateUserOp(op, keccak256("hash"), 0) returns (uint256 r) {
+              result = r;
+          } catch {
+              didRevert = true;
+          }
+          t(!didRevert, "CSW-W-05: should return 1, not revert for missing owner index");
+          eq(result, 1, "CSW-W-05: should return sigfail=1");
+      }
+    status: investigate
+
+  - id: CSW-W-06
+    title: "executeBatch con values suma > balance: la lógica no valida que sum(values) <= balance + msg.value antes de iterar"
+    severity: low
+    confidence: 70
+    description: |
+      `executeBatch(Call[] calldata calls)` no verifica que la suma de todos los `calls[i].value`
+      sea <= el balance disponible del wallet antes de empezar las llamadas.
+
+      Las llamadas se ejecutan secuencialmente. Si los primeros calls transfieren ETH, el balance
+      puede ser insuficiente para los calls posteriores. `_call` revierte si el call falla, pero
+      esto solo revierte TODA la tx — no hay partial execution.
+
+      El vector no es de pérdida de fondos directa (los reverts protegen), sino de:
+
+      1. GRIEFING GAS: Un bundler incluye un UserOp con executeBatch donde el primer call
+         consume todo el ETH y el segundo call revierte. La tx completa revierte, pero el
+         bundler ya gastó gas en la validación. El bundler puede cobrar gas por reverts en
+         ERC-4337, pero hay reputación damage.
+
+      2. COMBINED ATTACK con MagicSpend: Si el wallet llama `withdrawGasExcess()` en el primer
+         slot del batch (obteniendo ETH de MagicSpend) y luego gasta ese ETH en el segundo slot,
+         todo parece bien. Pero si la intención del firmante era diferente (phishing del calldata),
+         los fondos del paymaster se mueven a un destino no intencionado.
+
+         Este es el escenario más relevante: el firmante creyó estar autorizando:
+           - Call 0: approve(spender, amount) — operación DeFi inocente
+           - Call 1: stake(amount) — otra op inocente
+         Pero el calldata real fue:
+           - Call 0: withdrawGasExcess() en MagicSpend → recibe X ETH en wallet
+           - Call 1: transfer(attacker, X ETH)
+         El firmante no puede distinguir sin leer el calldata byte a byte.
+    attack_scenario: |
+      1. Atacante prepara un UserOp con calldata = executeBatch([
+           {target: magicSpend, value: 0, data: withdrawGasExcess()},
+           {target: attacker, value: _withdrawable[wallet], data: ""}
+         ])
+      2. El UserOp tiene la firma válida del owner (obtenida via phishing).
+      3. El UserOp usa MagicSpend como paymaster con un WithdrawRequest de, ej, 5 ETH.
+      4. _withdrawable[wallet] = 5 ETH - maxCost durante validación.
+      5. Execution: wallet llama withdrawGasExcess() → recibe ~4.9 ETH.
+      6. wallet.call{value: 4.9 ETH}(attacker) → 4.9 ETH drenados.
+      7. postOp: _withdrawable[wallet] = 0 → solo gasRefund enviado.
+      8. Pérdida neta: ~4.9 ETH drenados al attacker.
+    impact: |
+      Drenado de fondos del usuario disponibles en MagicSpend (hasta el importe del
+      WithdrawRequest menos maxCost). Este ataque requiere que el owner firme el UserOp
+      malicioso — se basa en phishing del calldata, no en un bug de validación.
+      Documentar como riesgo de composabilidad, no como bug directo.
+    solidity: |
+      // Property: el balance del wallet no debe decrementar por más de lo explícitamente
+      // autorizado en el calldata del UserOp
+      function invariant_balance_decrease_authorized() public view {
+          // Difícil de testear directamente — el firmante debe revisar el calldata completo
+          // El invariante es de proceso (UX/social), no de código
+          t(true, "CSW-W-06: calldata review required before signing executeBatch");
+      }
+    status: investigate
+
+  - id: CSW-W-07
+    title: "CREATE2 pre-funding: ETH enviado a wallet pre-deploy con parámetros incorrectos queda permanentemente atrapado"
+    severity: low
+    confidence: 90
+    description: |
+      La factory usa CREATE2 con salt = `keccak256(abi.encode(owners, nonce))`. Un usuario
+      puede pre-calcular la dirección de su futura wallet y enviarle ETH antes del deploy.
+
+      Si el usuario calcula la dirección con parámetros incorrectos (owners equivocados, nonce
+      equivocado) o si hay un bug en el frontend que muestra una dirección errónea:
+      - El ETH llega a una dirección sin código.
+      - Esa dirección NO es una EOA controlada por nadie (nadie tiene la clave privada).
+      - El ETH queda permanentemente atrapado.
+
+      A diferencia de enviar ETH a una EOA aleatoria (donde alguien podría tener la clave),
+      una dirección determinística de CREATE2 que NUNCA es desplegada con los parámetros
+      correctos es efectivamente un "agujero negro" — la dirección es computacionalmente
+      predecible pero la clave privada no existe.
+
+      Este riesgo es especialmente relevante cuando:
+      1. El frontend calcula la dirección con un encoding diferente al que usa la factory.
+      2. El usuario cambia de owners antes del deploy (la dirección predicha cambiaría).
+      3. Un atacante engaña al usuario para que envíe ETH a una dirección predicha con
+         parámetros controlados por el atacante (social engineering).
+    attack_scenario: |
+      1. Frontend bugueado muestra al usuario la dirección de su wallet calculada con nonce=1.
+      2. Usuario envía 50 ETH al address predicho (confiando en el frontend).
+      3. El deploy real se hace con nonce=0 → dirección diferente → la wallet correcta se deploya
+         en una dirección diferente y el usuario no tiene los 50 ETH.
+      4. Los 50 ETH en la dirección de nonce=1 no pueden ser recuperados nunca.
+      5. No existe mecanismo de recuperación en la factory ni en el protocol.
+    impact: |
+      Pérdida permanente de ETH enviado a direcciones mal calculadas. No hay vector de ataque
+      directo (requiere error de UX o ingeniería social), pero el impacto es total e irreversible.
+    solidity: |
+      // Verificar que la dirección predicha y la dirección real coinciden
+      function test_predeployed_eth_is_not_trapped(bytes[] memory owners, uint256 nonce) public {
+          address predicted = factory.getAddress(owners, nonce);
+          vm.deal(predicted, 10 ether); // pre-fund
+
+          CoinbaseSmartWallet deployed = factory.createAccount{value: 0}(owners, nonce);
+
+          // El ETH pre-enviado debe estar en el wallet desplegado
+          eq(address(deployed), predicted, "CSW-W-07: address prediction must match");
+          gte(address(deployed).balance, 10 ether, "CSW-W-07: pre-sent ETH must be in wallet");
+      }
+    status: investigate
+
+  - id: CSW-W-08
+    title: "removeLastOwner permite wallet sin owners: estado irreversible con fondos atrapados"
+    severity: medium
+    confidence: 88
+    description: |
+      `removeLastOwner(index, owner)` permite eliminar al ÚLTIMO owner del wallet. Después
+      de esta llamada, `ownerCount() == 0`.
+
+      Con 0 owners:
+      - `_checkOwner()` siempre revierte (isOwnerAddress(msg.sender) = false para cualquier
+        msg.sender excepto address(this), pero incluso address(this) requiere una llamada
+        que pase la validación).
+      - `validateUserOp` llama `_isValidSignature`. Todos los índices están vacíos → revert.
+      - El EntryPoint no puede ejecutar ningún UserOp porque validateUserOp siempre revierte.
+      - No hay función de emergency recovery.
+
+      El wallet queda en un estado de "muerte funcional": el proxy existe, tiene fondos,
+      pero ningún código puede ejecutarse a través de él (excepto funciones sin auth como
+      `implementation()`, `isOwnerAddress()`, etc. — pero ninguna de las funciones útiles).
+
+      Situaciones donde esto ocurre:
+      1. Owner malicioso o comprometido llama removeLastOwner en sí mismo.
+      2. Bug en el frontend que ejecuta una operación incorrecta.
+      3. Operación de "transfer ownership" que primero elimina al owner y luego falla al agregar.
+         (En executeBatch, si remove+add se hace en orden, y add falla, el remove ya ocurrió).
+    attack_scenario: |
+      1. Wallet tiene 1 owner: Alice con 10 ETH.
+      2. Alice (comprometida o engañada) firma UserOp que ejecuta:
+         executeBatch([
+           {target: wallet, value: 0, data: removeLastOwner(0, alice_bytes)},
+           {target: someProtocol, value: 0, data: ...}  // op "inocente" como pretexto
+         ])
+      3. removeLastOwner(0, alice_bytes) ejecuta → ownerCount = 0.
+      4. La segunda op puede o no ejecutarse, pero el daño ya está hecho.
+      5. Los 10 ETH quedan atrapados permanentemente en el proxy.
+      6. No hay función de recovery ni admin key.
+    impact: |
+      Pérdida permanente de todos los fondos en el wallet. El proxy queda "zombi": existe
+      en la chain, tiene balance, pero no puede ejecutar ninguna operación con autorización.
+      Impacto máximo: balance total del wallet. No requiere atacante externo — puede ser
+      error del usuario o explotación de una firma obtenida fraudulentamente.
+    solidity: |
+      // Invariant crítico: ownerCount nunca debe llegar a 0
+      function invariant_always_has_owner() public view {
+          t(wallet.ownerCount() > 0, "CSW-W-08: wallet has no owners — permanently locked");
+      }
+    status: investigate
+
+  - id: CSW-W-09
+    title: "ERC-1271 replaySafeHash: hash de EIP-712 externo puede ser manipulado para obtener firma válida en contexto inesperado"
+    severity: medium
+    confidence: 60
+    description: |
+      `isValidSignature(hash, signature)` aplica `replaySafeHash(hash)` antes de validar.
+      La función construye:
+        `replaySafeHash(H) = keccak256("\x19\x01" || domainSeparator || keccak256(typeHash || H))`
+
+      Donde `typeHash = keccak256("CoinbaseSmartWalletMessage(bytes32 hash)")`.
+
+      VECTOR: Un protocolo externo (ej: OpenSea, Cowswap, Permit2) llama:
+        `wallet.isValidSignature(H_protocol, sig_user)`
+
+      El wallet valida que el owner firmó `replaySafeHash(H_protocol)`.
+
+      El owner debería haber firmado ese hash entendiendo que es una aprobación en el
+      contexto de ese protocolo. Pero si el owner fue engañado para firmar el hash que
+      resulta de `replaySafeHash(H_attack)` donde H_attack es un hash malicioso de otro
+      protocolo, la firma sirve para autenticar en ambos contextos.
+
+      La protección que da `replaySafeHash` es contra replay de la MISMA firma entre
+      diferentes wallets (el domainSeparator incluye address(this)). PERO no protege contra
+      phishing donde el owner firma un hash presentado como "verificación de wallet" que
+      en realidad es un hash de operación destructiva en un protocolo externo.
+
+      El usuario ve en su hardware wallet: `CoinbaseSmartWalletMessage { hash: 0x1234... }`
+      y no sabe que 0x1234... es el hash de "approve all NFTs to attacker" en OpenSea.
+    attack_scenario: |
+      1. OpenSea tiene una order hash H_drain = keccak256(orderData_that_drains_user).
+      2. Atacante necesita wallet.isValidSignature(H_drain, sig) → 0x1626ba7e.
+      3. Atacante presenta al usuario una UI de "verificación de wallet": firma este mensaje.
+      4. El mensaje mostrado es replaySafeHash(H_drain) — parece un hash genérico.
+      5. Usuario firma con hardware wallet (ve CoinbaseSmartWalletMessage pero no interpreta H_drain).
+      6. Atacante envía sig a OpenSea que llama wallet.isValidSignature(H_drain, sig).
+      7. Wallet computa replaySafeHash(H_drain) → coincide con lo firmado → retorna 0x1626ba7e.
+      8. OpenSea ejecuta la operación maliciosa autenticada por el wallet.
+    impact: |
+      Aprobación no autorizada de operaciones en protocolos externos. El impacto depende del
+      protocolo que use isValidSignature — puede incluir transferencia de NFTs, aprobaciones
+      de tokens, ejecución de órdenes. No es un bug en el contrato per se, sino un riesgo
+      de UX/phishing, pero el contrato podría mitigarlo con mejor contexto en el hash.
+    solidity: |
+      // Documentar que isValidSignature requiere que el usuario entienda el hash subyacente
+      function test_erc1271_signature_context_integrity() public {
+          // Un hash de una operación destructiva en protocolo externo NO debe ser
+          // validado como una acción inocente del wallet
+          // No testeable como invariant, pero documentar como riesgo de composabilidad
+          t(true, "CSW-W-09: ERC-1271 phishing risk — requires UX mitigations");
+      }
+    status: investigate
+
+  - id: CSW-W-10
+    title: "Upgrade a implementation maliciosa: _authorizeUpgrade solo verifica onlyOwner, no valida interface o comportamiento de la nueva impl"
+    severity: medium
+    confidence: 72
+    description: |
+      `_authorizeUpgrade(address)` en CoinbaseSmartWallet simplemente verifica `onlyOwner`:
+        `function _authorizeUpgrade(address) internal view virtual override(UUPSUpgradeable) onlyOwner {}`
+
+      No verifica que la nueva implementación:
+      1. Implemente las funciones requeridas (validateUserOp, execute, etc.).
+      2. Mantenga compatibilidad de storage (los slots ERC-7201 deben coincidir).
+      3. No tenga una backdoor que permita al deployer de la impl tomar control.
+
+      Un owner que es engañado (o comprometido) puede hacer upgrade a:
+      - Una impl que agrega una función `backdoor()` que transfiere todos los fondos.
+      - Una impl que cambia `entryPoint()` a un fake EntryPoint controlado por el atacante.
+      - Una impl que elimina `onlyOwner` en `execute()` haciéndolo callable por cualquiera.
+      - Una impl con storage layout incompatible que corrompe los datos de owners.
+
+      El caso más crítico es el STORAGE LAYOUT INCOMPATIBILITY:
+      - MultiOwnable usa ERC-7201 con slot: 0x97e2c6aad4ce5d562ebfaa00db6b9e0fb66ea5d8162ed5b243f51a2e03086f00
+      - Si una nueva implementación usa un nombre diferente para el storage namespace, el slot cambia.
+      - Los owners del slot antiguo ya no son leídos → todos los ownerAtIndex retornan vacío.
+      - El wallet queda con 0 owners efectivos pero la mapping de storage antigua aún existe.
+
+      Más sutilmente: un upgrade que "olvida" inicializar el nuevo namespace con los owners
+      existentes deja el wallet operativamente sin owners.
+    attack_scenario: |
+      1. Alice es owner de una wallet con 100 ETH.
+      2. Atacante A (proveedor de "upgrade de seguridad") convence a Alice de hacer upgrade.
+      3. La nueva impl tiene storage layout diferente (namespace cambiado).
+      4. Post-upgrade: ownerAtIndex(0) retorna "" (lee del nuevo namespace vacío).
+      5. Todas las llamadas a validateUserOp causan revert InvalidOwnerBytesLength.
+      6. La wallet queda inoperante con 100 ETH atrapados.
+      7. No hay recovery porque no hay owners reconocidos en el nuevo layout.
+    impact: |
+      Potencial pérdida de acceso al wallet (fondos atrapados) si la nueva implementación
+      tiene storage layout incompatible. Requiere que el owner apruebe el upgrade, por lo
+      que la probabilidad depende de la capacidad del atacante para engañar al owner.
+      Este riesgo es inherente al pattern UUPS y es bien conocido, pero documentarlo.
+    solidity: |
+      // Post-upgrade: verificar que los owners del pre-upgrade siguen siendo válidos
+      function invariant_owners_preserved_after_upgrade() public view {
+          // Todos los owners antes del upgrade deben seguir siendo reconocidos
+          for (uint256 i = 0; i < ghost_ownerCount; i++) {
+              bytes memory expectedOwner = ghost_ownerAtIndex[i];
+              if (expectedOwner.length > 0) {
+                  t(wallet.isOwnerBytes(expectedOwner), "CSW-W-10: owner lost after upgrade");
+              }
+          }
+      }
+    status: investigate
+
+  - id: CSW-W-11
+    title: "getUserOpHashWithoutChainId excluye chainId pero incluye entryPoint address: cross-chain replay posible si EntryPoint difiere"
+    severity: low
+    confidence: 65
+    description: |
+      `getUserOpHashWithoutChainId` calcula:
+        `keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))`
+
+      El hash excluye `block.chainid` (por diseño para cross-chain replay). Incluye la
+      dirección del EntryPoint como diferenciador.
+
+      El EntryPoint v0.6 está desplegado en la misma dirección en todas las chains EVM
+      (dirección determinística): `0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789`.
+
+      Si una chain tiene el EntryPoint v0.6 en la misma dirección (lo cual es el caso
+      estándar), el hash sin chainId es IDÉNTICO en todas las chains. Esto es INTENCIONAL
+      para el cross-chain replay de owner management.
+
+      PERO: el caso problemático es si una chain NO tiene el EntryPoint v0.6 en esa dirección
+      (chain no estándar o red de desarrollo), y se usa ese hash para replay. El hash sería
+      diferente (por el entryPoint address diferente), así que el replay no funciona.
+
+      El vector REAL es diferente: los UserOps cross-chain replayables con `REPLAYABLE_NONCE_KEY=8453`
+      DEBEN ser ejecutados en TODAS las chains donde el wallet existe, incluso si el owner
+      no quiere ese efecto en alguna chain específica. No hay manera de "aplicar solo a chain A".
+      Una vez firmado el UserOp sin chainId, cualquier bundler en cualquier chain puede ejecutarlo.
+
+      Si el owner firma "addOwner(attacker)" sin chainId (por error creyendo que es chain-específico),
+      el attacker puede replayed en todas las chains donde la wallet existe.
+    attack_scenario: |
+      1. Usuario tiene wallet en Ethereum, Base, Optimism.
+      2. En Ethereum, usuario firma UserOp de addOwner(carol) creyendo que es solo para Ethereum.
+      3. El UserOp usa REPLAYABLE_NONCE_KEY (ej: un frontend bugueado lo hace cross-chain).
+      4. El hash no incluye chainId → es válido en Base y Optimism también.
+      5. Atacante (o bundler automatizado) reproduce el UserOp en Base y Optimism.
+      6. Carol es ahora owner en las 3 chains, no solo en Ethereum.
+      7. Si Carol es un attacker (supply-chain attack del frontend), tiene acceso a todas las chains.
+    impact: |
+      Propagación no intencionada de ownership changes a chains donde el usuario no quería.
+      En el peor caso, un owner malicioso propagado a múltiples chains puede drenar wallets
+      en todas ellas. El riesgo es de UX/frontend más que de contrato, pero es documentable.
+    solidity: |
+      // Documentar: ops con REPLAYABLE_NONCE_KEY son cross-chain por diseño
+      // El invariant es que el usuario SEPA cuándo está firmando cross-chain
+      function test_replayable_nonce_key_detection() public {
+          // Si el nonce key es REPLAYABLE_NONCE_KEY, el hash no incluye chainId
+          uint256 key = userOp.nonce >> 64;
+          bool isCrossChain = (key == wallet.REPLAYABLE_NONCE_KEY());
+          // El frontend debe advertir al usuario cuando isCrossChain == true
+          t(true, "CSW-W-11: cross-chain intent must be verified by UX");
+      }
+    status: investigate
+
+  - id: CSW-W-12
+    title: "address(0) es owner registrado en la implementación — address(0) como owner efectivo si implementación se usa directamente"
+    severity: informational
+    confidence: 75
+    description: |
+      El constructor de `CoinbaseSmartWallet`:
+        ```solidity
+        bytes[] memory owners = new bytes[](1);
+        owners[0] = abi.encode(address(0));
+        _initializeOwners(owners);
+        ```
+
+      Esto hace que `isOwnerAddress(address(0)) == true` EN EL IMPLEMENTATION CONTRACT.
+      El propósito es bloquear re-inicialización de la implementación (nextOwnerIndex = 1).
+
+      Consecuencia no deseada: si alguien interactúa con la implementación directamente
+      (no vía proxy), `address(0)` es un owner reconocido.
+
+      En `_isValidSignature` con `ownerIndex=0`:
+      - `ownerAtIndex(0)` retorna `abi.encode(address(0))` → 32 bytes.
+      - `owner = address(0)`.
+      - `SignatureCheckerLib.isValidSignatureNow(address(0), hash, sig)`.
+
+      Solady's `SignatureCheckerLib.isValidSignatureNow` con `signer=address(0)`:
+      - Para ECDSA: ecrecover que retorna address(0) matchea — pero Solady añade
+        `if signer == address(0) { return false }` como protección. SAFE.
+      - Para ERC-1271: llama address(0).isValidSignature → call a dirección vacía → retorna
+        success con empty data → la comparación con magic value falla → SAFE.
+
+      Entonces el vector está mitigado por Solady, pero si la implementación es usada
+      vía EIP-7702 (la EOA activa delegation a esta implementación en lugar de a un proxy),
+      el address(0) owner podría causar confusión. EIP-7702 + address(0) owner es informacional.
+    attack_scenario: |
+      No hay attack path directo dado que SignatureCheckerLib protege contra address(0).
+      Solo es relevante si Solady tiene un bug en ese check, o si se usa EIP-7702 y
+      alguien puede craft un estado donde address(0) sea reconocido como firmante válido.
+    impact: |
+      Informacional. El address(0) como owner en la implementación directa es un anti-patrón
+      pero está mitigado por Solady. No hay pérdida de fondos esperada.
+    solidity: |
+      // En la implementación directa (no proxy), address(0) es owner
+      function test_impl_address_zero_owner() public {
+          bool zeroIsOwner = implContract.isOwnerAddress(address(0));
+          // Esto es TRUE en la implementación — pero las llamadas desde address(0) son
+          // imposibles en condiciones normales
+          t(!zeroIsOwner, "CSW-W-12: address(0) should not be owner on impl contract");
+      }
+    status: investigate
+
+false_positives:
+  - id: CSW-W-FP-01
+    title: "Factory front-running: CREATE2 con diferentes owners produce diferente address"
+    reason: |
+      El salt incluye `keccak256(abi.encode(owners, nonce))`. Un atacante no puede deployar
+      con owners diferentes en la misma dirección. Si deployea con los MISMOS owners (mismo
+      salt), la wallet correcta se deploya con los owners correctos — no hay ataque.
+    confirmed: true
+
+  - id: CSW-W-FP-02
+    title: "MagicSpend expiry bypass: el expiry ES verificado por el EntryPoint"
+    reason: |
+      El validationData retornado por validatePaymasterUserOp incluye el expiry en el formato
+      estándar ERC-4337. El EntryPoint verifica `block.timestamp <= validUntil` durante
+      `_validatePaymasterPrepayment`. No hay bypass.
+    confirmed: true
+
+  - id: CSW-W-FP-03
+    title: "withdrawGasExcess reentrancy: delete antes de transfer previene doble gasto"
+    reason: |
+      `withdrawGasExcess` hace `delete _withdrawable[msg.sender]` ANTES de llamar `_withdraw`.
+      Una llamada reentrante encontraría `_withdrawable = 0` → `NoExcess` revert. Safe.
+    confirmed: true
+
+  - id: CSW-W-FP-04
+    title: "payPrefund ejecuta body primero, pero el body de validateUserOp no transfiere ETH"
+    reason: |
+      `validateUserOp` solo valida la firma — no ejecuta el calldata del UserOp. El ETH
+      no es transferido durante la validación. El pattern `payPrefund` post-body es seguro
+      en la implementación actual. Solo sería riesgoso en subclasses que añadan transfers
+      en la validación (violación de spec ERC-4337).
+    confirmed: true

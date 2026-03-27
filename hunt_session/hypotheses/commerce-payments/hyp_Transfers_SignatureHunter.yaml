@@ -1,0 +1,283 @@
+# SignatureHunter Analysis — Transfers.sol
+# Contract: commerce-payments/contracts/transfers/Transfers.sol
+# Focus: signature replay, custom prefix abuse, ECDSA.recover, Permit2/EIP-2612 interaction, cross-chain replay
+# Analyst: SignatureHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: TR-SIG-01
+    title: "Custom prefix in validIntent bypasses EIP-191 domain separation"
+    description: |
+      When _intent.prefix is non-empty (L97-102), the signed message hash is computed as
+      keccak256(abi.encodePacked(_intent.prefix, hash)) instead of using ECDSA.toEthSignedMessageHash.
+      This means the operator can sign messages without the standard "\x19Ethereum Signed Message:\n32" prefix.
+      An operator could potentially craft a prefix that makes the signed hash collide with a hash from a
+      different protocol or context, since there is NO domain separator or length delimiter enforced on
+      the custom prefix. However, the signer == operator check means only the operator itself can exploit
+      this, and the operator is the party creating the intent. This is a self-harm vector only.
+      The real risk: if an operator's signing key is used across multiple protocols and the custom prefix
+      allows crafting a hash that matches another protocol's message format, a signature from protocol A
+      could be replayed into Transfers. This requires the operator to be negligent with key reuse AND
+      for the hash content to collide, which is infeasible due to the keccak256 inner hash including
+      sender + address(this) + chainid.
+    confidence: 25
+    severity: low
+    status: speculative
+    attack_scenario: |
+      1. Operator signs an intent with a custom prefix for wallet compatibility
+      2. Attacker obtains this signature
+      3. Attacker crafts a prefix P' such that keccak256(P' || hash') = keccak256(P || hash)
+      4. This requires a keccak256 preimage collision — computationally infeasible
+      VERDICT: The custom prefix is controlled by the intent creator (operator), and the inner hash
+      includes address(this) + chainid + sender, making cross-protocol replay infeasible.
+    solidity: |
+      // Invariant: custom prefix cannot produce same signedMessageHash as default EIP-191
+      function property_TR_SIG_01(
+        bytes calldata prefix,
+        bytes32 hash
+      ) public pure returns (bool) {
+        bytes32 customHash = keccak256(abi.encodePacked(prefix, hash));
+        bytes32 eip191Hash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        // If prefix != EIP-191 prefix, hashes MUST differ
+        if (keccak256(prefix) != keccak256(bytes("\x19Ethereum Signed Message:\n32"))) {
+          return customHash != eip191Hash;
+        }
+        return true;
+      }
+
+  - id: TR-SIG-02
+    title: "subsidizedTransferToken sender binding allows front-running of gasless permits"
+    description: |
+      In subsidizedTransferToken (L505-559), the validIntent modifier receives
+      _signatureTransferData.owner as the sender parameter instead of _msgSender().
+      This means the operator signs an intent for a specific token owner, and ANYONE can
+      call subsidizedTransferToken to execute the payment. This is by design for gasless
+      transactions. However, the EIP-2612 permit signature (L530-536) is also provided by
+      the user. An attacker who observes the pending tx in the mempool can front-run it:
+      1. Extract the permit signature from the mempool
+      2. Call permit() directly on the token contract with the same params
+      3. Then call subsidizedTransferToken with the same intent
+      The permit call in step 2 would set the allowance. The subsidizedTransferToken call
+      in step 3 would also call permit() which would either succeed (idempotent) or revert
+      depending on the token's permit implementation (nonce already used).
+      If the token's permit uses nonces, the front-run permit consumes the nonce, and the
+      subsidizedTransferToken's internal permit call reverts. This is a griefing/DoS vector.
+    confidence: 70
+    severity: medium
+    status: needs_poc
+    attack_scenario: |
+      1. User creates EIP-2612 permit signature for token T, authorizing Transfers contract
+      2. Relayer submits subsidizedTransferToken tx to mempool
+      3. Attacker sees pending tx, extracts permit params (owner, spender, value, deadline, sig)
+      4. Attacker calls T.permit(owner, spender, value, deadline, v, r, s) directly
+      5. Token nonce for owner increments
+      6. Relayer's subsidizedTransferToken tx executes, calls T.permit() internally
+      7. Token's permit() reverts because nonce is stale (already consumed by attacker)
+      8. Entire subsidizedTransferToken reverts — payment fails (DoS/griefing)
+      IMPACT: Attacker can grief/block any subsidized transfer by front-running the permit.
+      Cost: only gas for the front-run permit call.
+    solidity: |
+      // Invariant: subsidizedTransferToken should not be griefable via permit front-running
+      function property_TR_SIG_02(
+        address owner,
+        uint256 amount,
+        uint256 deadline
+      ) public returns (bool) {
+        // If attacker front-runs permit, subsidizedTransferToken must still succeed
+        // OR handle the permit failure gracefully (try/catch)
+        // Currently: no try/catch on permit call at L530 — reverts propagate
+        // This invariant checks that the contract handles pre-consumed permits
+        return true; // Manual verification needed — no try/catch on permit
+      }
+
+  - id: TR-SIG-03
+    title: "Cross-chain replay protection is correct — chainid in hash"
+    description: |
+      The validIntent modifier (L80-93) includes block.chainid in the keccak256 hash.
+      This prevents cross-chain replay attacks where a signature valid on chain A could be
+      reused on chain B. The hash also includes address(this) which prevents cross-contract
+      replay on the same chain. Both are correctly implemented.
+      Note: block.chainid is used (not a cached immutable), so this is safe even across
+      hard forks that change the chain ID.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — cross-chain replay is correctly prevented.
+      The hash includes: recipientAmount, deadline, recipient, recipientCurrency,
+      refundDestination, feeAmount, id, operator, block.chainid, sender, address(this).
+    solidity: |
+      // Invariant: same intent cannot be valid on two different chains
+      function property_TR_SIG_03() public view returns (bool) {
+        // block.chainid is included in hash — verified by code review
+        // address(this) is included in hash — verified by code review
+        return true;
+      }
+
+  - id: TR-SIG-04
+    title: "Replay protection via processedTransferIntents is scoped per operator"
+    description: |
+      Replay protection uses processedTransferIntents[operator][id] (L119-121).
+      This is scoped per operator, meaning two different operators can have the same intent ID.
+      This is correct — each operator manages their own ID namespace.
+      The ID is bytes16, giving 2^128 possible values — collision-resistant.
+      The processed flag is set in succeedPayment (L753) AFTER the transfer logic executes
+      in the modifier's _;. This ordering is safe because nonReentrant prevents re-entry.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — replay protection is correctly implemented.
+      The processedTransferIntents mapping is set to true in succeedPayment after execution.
+      nonReentrant modifier prevents re-entrancy between validation and state update.
+    solidity: |
+      // Invariant: processed intent cannot be replayed
+      function property_TR_SIG_04(
+        address operator,
+        bytes16 intentId
+      ) public view returns (bool) {
+        // After succeedPayment, processedTransferIntents[operator][intentId] == true
+        // Any subsequent call with same operator+id reverts with AlreadyProcessed
+        return true;
+      }
+
+  - id: TR-SIG-05
+    title: "ECDSA.recover signature malleability is mitigated by OZ + replay protection"
+    description: |
+      OpenZeppelin's ECDSA.recover (v4.x) normalizes the s-value to the lower half of the
+      curve, preventing signature malleability attacks. Even if a malleable signature existed,
+      the processedTransferIntents replay protection would prevent double-execution.
+      Both layers of defense are present and correctly applied.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — OZ ECDSA handles s-value normalization. Replay map provides second defense.
+    solidity: |
+      // Invariant: malleable signature cannot bypass replay protection
+      function property_TR_SIG_05() public pure returns (bool) {
+        // OZ ECDSA.recover normalizes s-value
+        // processedTransferIntents prevents replay even with malleable sigs
+        return true;
+      }
+
+  - id: TR-SIG-06
+    title: "abi.encodePacked hash collision risk with adjacent dynamic-size types"
+    description: |
+      The hash in validIntent uses abi.encodePacked with mixed types (L80-93):
+      uint256, uint256, address, address, address, uint256, bytes16, address, uint256, address, address.
+      All types are fixed-size (uint256=32B, address=20B, bytes16=16B). There are NO adjacent
+      dynamic-size types, so abi.encodePacked collision via variable-length concatenation ambiguity
+      is NOT possible here. The encoding is deterministic and unique for any distinct set of inputs.
+      However, there IS a subtle concern: address types are 20 bytes and bytes16 is 16 bytes.
+      In abi.encodePacked, these are tightly packed without padding. The sequence
+      [refundDestination(20B) | feeAmount(32B) | id(16B) | operator(20B)] is unambiguous because
+      uint256 feeAmount always occupies exactly 32 bytes, creating a fixed boundary.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — all types in the encodePacked are fixed-size. No collision risk.
+      Type sequence: uint256(32) + uint256(32) + address(20) + address(20) + address(20) +
+      uint256(32) + bytes16(16) + address(20) + uint256(32) + address(20) + address(20) = 264 bytes.
+      Each field boundary is deterministic.
+    solidity: |
+      // Invariant: no two distinct intents produce the same hash
+      function property_TR_SIG_06(
+        uint256 amountA, uint256 amountB,
+        address recipientA, address recipientB
+      ) public view returns (bool) {
+        // Different inputs must produce different hashes
+        if (amountA != amountB || recipientA != recipientB) {
+          bytes32 hashA = keccak256(abi.encodePacked(amountA, recipientA));
+          bytes32 hashB = keccak256(abi.encodePacked(amountB, recipientB));
+          return hashA != hashB;
+        }
+        return true;
+      }
+
+  - id: TR-SIG-07
+    title: "EIP-2612 permit in subsidizedTransferToken lacks try/catch — no fallback on failure"
+    description: |
+      At L530-536, subsidizedTransferToken calls IERC7597.permit() without try/catch.
+      If the permit call reverts for any reason (nonce already used, signature invalid,
+      token doesn't support ERC-7597), the entire transaction reverts.
+      This is coupled with TR-SIG-02: a front-run attacker consuming the permit nonce
+      causes permanent DoS for that specific intent. The operator would need to create
+      a new intent with a new ID and the user would need to sign a new permit.
+      A safer pattern would be try/catch around the permit call, then verify allowance
+      is sufficient regardless. DAI-style permits and some tokens have non-standard
+      behavior that could also cause unexpected reverts.
+    confidence: 75
+    severity: medium
+    status: needs_poc
+    attack_scenario: |
+      1. Token T uses standard ERC-2612 with nonce tracking
+      2. User signs permit(owner, Transfers, 100, deadline, sig) — nonce = N
+      3. Operator signs intent with sender = user's address
+      4. Relayer broadcasts subsidizedTransferToken(intent, {owner, permitSig})
+      5. Attacker front-runs: calls T.permit(owner, Transfers, 100, deadline, v, r, s)
+      6. Token increments user's nonce to N+1
+      7. Relayer's tx hits T.permit() internally — nonce N is stale, reverts
+      8. Payment blocked. User must re-sign permit AND operator must re-sign intent.
+      IMPACT: Griefing cost = gas for 1 permit call. Victim cost = coordination to re-sign.
+    solidity: |
+      // Invariant: subsidizedTransferToken should handle pre-consumed permits gracefully
+      // Currently FAILS — no try/catch at L530
+      function property_TR_SIG_07() public pure returns (bool) {
+        // The permit call at L530 is not wrapped in try/catch
+        // If permit reverts (nonce consumed, bad sig), entire tx reverts
+        // Recommendation: try/catch permit, then check allowance >= neededAmount
+        return false; // VIOLATION: missing try/catch on external permit call
+      }
+
+  - id: TR-SIG-08
+    title: "Custom prefix could mimic EIP-191 personal_sign for different hash length"
+    description: |
+      The default path uses ECDSA.toEthSignedMessageHash which prepends
+      "\x19Ethereum Signed Message:\n32" (for a 32-byte hash).
+      The custom prefix path does keccak256(abi.encodePacked(prefix, hash)).
+      An operator could set prefix = "\x19Ethereum Signed Message:\n32" to get the same
+      behavior as the default path. But they could also use any other prefix.
+      Key question: could an operator set prefix to "\x19Ethereum Signed Message:\n" (without "32")
+      and have the hash interpreted as a longer message by wallets?
+      Analysis: The prefix is used SERVER-SIDE by the operator to construct the hash before signing.
+      The wallet sees whatever the operator presents. Since the operator IS the signer, they control
+      both the prefix and the signing flow. This is a trust assumption: users trust operators.
+      No vulnerability if the trust model is "operators are honest".
+    confidence: 20
+    severity: informational
+    status: safe
+    attack_scenario: |
+      A malicious operator could use a custom prefix to make the signing request appear
+      as a benign personal_sign message to the user's wallet, while actually committing to
+      a payment intent. However, the operator already controls the intent parameters, so
+      this adds no new attack surface beyond "malicious operator creates bad intents."
+    solidity: |
+      // Invariant: trust model — operator controls prefix and is the signer
+      function property_TR_SIG_08() public pure returns (bool) {
+        // Operator is the signer. Custom prefix is an operator feature.
+        // No additional risk beyond malicious operator (already trusted party).
+        return true;
+      }
+
+summary:
+  total_hypotheses: 8
+  needs_poc:
+    - TR-SIG-02 — Permit front-running griefing in subsidizedTransferToken (Medium)
+    - TR-SIG-07 — No try/catch on permit call enables permanent DoS per intent (Medium)
+  safe:
+    - TR-SIG-01 — Custom prefix bypass is infeasible (keccak collision required)
+    - TR-SIG-03 — Cross-chain replay correctly prevented via block.chainid
+    - TR-SIG-04 — Replay protection per operator+id is correct
+    - TR-SIG-05 — Signature malleability mitigated by OZ ECDSA + replay map
+    - TR-SIG-06 — abi.encodePacked collision impossible (all fixed-size types)
+    - TR-SIG-08 — Custom prefix trust model is correct (operator = signer)
+  key_finding: |
+    TR-SIG-02 and TR-SIG-07 describe the same root cause: subsidizedTransferToken's
+    EIP-2612 permit call at L530-536 lacks try/catch. Any front-runner can consume the
+    permit nonce before the relayer's tx lands, causing a revert. This is a known pattern
+    (permit front-running griefing) documented in multiple audit reports. The fix is
+    wrapping permit() in try/catch and verifying allowance >= neededAmount after.
+    Severity: Medium (DoS/griefing, no fund loss).

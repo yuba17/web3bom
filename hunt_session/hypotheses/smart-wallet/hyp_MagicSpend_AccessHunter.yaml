@@ -1,0 +1,243 @@
+hunter: AccessHunter
+component: MagicSpend
+date: "2026-03-27"
+status: complete
+summary: >
+  MagicSpend access control is well-structured. EntryPoint-gated functions use hardcoded address.
+  Owner functions use Solady onlyOwner. Public functions (withdraw, withdrawGasExcess) require
+  valid owner signatures or prior credit. No unauthorized state changes found. Low-severity
+  findings around admin misconfiguration and nonce-burning edge cases.
+
+hypotheses:
+
+- id: MS-A-01
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "Owner can DoS all ETH withdrawals by setting maxWithdrawDenominator to 0"
+  severity: "Low"
+  confidence: 85
+  description: >
+    setMaxWithdrawDenominator(0) causes division by zero at line 347 in _validateRequest.
+    This would DoS both validatePaymasterUserOp (paymaster flow) and withdraw() (direct flow)
+    for ETH (asset == address(0)). The function has no input validation to prevent denominator=0.
+    Centralization risk is OUT OF SCOPE per bounty rules, but this is a missing input validation
+    that could cause accidental DoS even by a well-intentioned owner.
+  solidity: |
+    // MagicSpend.sol:329-333
+    function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+        maxWithdrawDenominator = newDenominator; // No check for newDenominator != 0
+        emit MaxWithdrawDenominatorSet(newDenominator);
+    }
+
+    // MagicSpend.sol:347 — will revert with division by zero
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+  attack_scenario: |
+    1. Owner calls setMaxWithdrawDenominator(0) — either maliciously or by accident
+    2. Any user tries to call withdraw() with asset=address(0) or goes through paymaster flow
+    3. _validateRequest hits line 347: address(this).balance / 0 → revert
+    4. All ETH withdrawals are permanently bricked until owner sets denominator > 0
+    5. ERC-20 withdrawals still work (asset != address(0) skips the check)
+  impact: "DoS of all ETH withdrawal functionality. Funds locked until owner fixes. Centralization risk = out of scope."
+  status: pending
+
+- id: MS-A-02
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "No access control on withdraw() — relies entirely on owner signature"
+  severity: "Info"
+  confidence: 95
+  description: >
+    withdraw() is public with no msg.sender restriction. Access control is enforced purely
+    by requiring a valid owner signature over (contract, account=msg.sender, chainid, asset,
+    amount, nonce, expiry). This is secure because the hash includes msg.sender (line 304),
+    so a signature for user A cannot be used by user B. The pattern is standard for
+    signature-gated withdrawals. No vulnerability found.
+  solidity: |
+    // MagicSpend.sol:190-203
+    function withdraw(WithdrawRequest memory withdrawRequest) external {
+        if (block.timestamp > withdrawRequest.expiry) {
+            revert Expired();
+        }
+        // msg.sender is used as 'account' — signature is bound to caller
+        if (!isValidWithdrawSignature(msg.sender, withdrawRequest)) {
+            revert InvalidSignature();
+        }
+        _validateRequest(msg.sender, withdrawRequest);
+        _withdraw(withdrawRequest.asset, msg.sender, withdrawRequest.amount);
+    }
+
+    // getHash binds to msg.sender via 'account' parameter
+    function getHash(address account, WithdrawRequest memory withdrawRequest) public view returns (bytes32) {
+        return SignatureCheckerLib.toEthSignedMessageHash(
+            abi.encode(
+                address(this),
+                account,       // <-- bound to msg.sender in withdraw()
+                block.chainid, // <-- cross-chain replay protection
+                withdrawRequest.asset,
+                withdrawRequest.amount,
+                withdrawRequest.nonce,
+                withdrawRequest.expiry
+            )
+        );
+    }
+  attack_scenario: |
+    1. Attacker obtains a valid WithdrawRequest signature meant for user A
+    2. Attacker calls withdraw(request) from attacker's address
+    3. isValidWithdrawSignature(attacker_address, request) → hash includes attacker_address
+    4. Hash differs from the hash signed by owner (which included user A's address)
+    5. Signature check fails → revert InvalidSignature()
+    6. Attack fails — design is secure
+  impact: "None. This is an informational confirmation that the signature-gated access control is correctly implemented."
+  status: rejected
+
+- id: MS-A-03
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "withdrawGasExcess() can be called by anyone but is bounded by _withdrawable credit"
+  severity: "Info"
+  confidence: 95
+  description: >
+    withdrawGasExcess() is fully public with no signature or ownership check. However, it can
+    only withdraw funds that were previously credited to msg.sender via validatePaymasterUserOp.
+    The _withdrawable mapping is keyed by address and only set during EntryPoint-gated validation.
+    No way for an unauthorized user to get credit. Secure by design.
+  solidity: |
+    // MagicSpend.sol:178-185
+    function withdrawGasExcess() external {
+        uint256 amount = _withdrawable[msg.sender]; // bounded by prior credit
+        if (amount == 0) revert NoExcess();
+        delete _withdrawable[msg.sender];
+        _withdraw(address(0), msg.sender, amount);
+    }
+  attack_scenario: |
+    1. Attacker calls withdrawGasExcess() without any prior paymaster interaction
+    2. _withdrawable[attacker] == 0
+    3. Reverts with NoExcess()
+    4. No funds at risk
+  impact: "None. Informational — access control is implicit via the credit system."
+  status: rejected
+
+- id: MS-A-04
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "Owner can drain all contract funds including those pending in _withdrawable"
+  severity: "Info"
+  confidence: 90
+  description: >
+    ownerWithdraw() allows the owner to withdraw any amount of any asset with no checks against
+    _withdrawable balances. If users have pending _withdrawable credit from validatePaymasterUserOp
+    (between validate and postOp), the owner could drain ETH, causing postOp to fail when trying
+    to send funds. However, this is a standard centralization/trust assumption — the owner is
+    Coinbase, and centralization risks are explicitly OUT OF SCOPE. The EntryPoint would also
+    need to call postOp in the same transaction, so the timing window is within a single bundle.
+  solidity: |
+    // MagicSpend.sol:212-214
+    function ownerWithdraw(address asset, address to, uint256 amount) external onlyOwner {
+        _withdraw(asset, to, amount); // No check against _withdrawable balances
+    }
+  attack_scenario: |
+    1. User submits UserOperation with WithdrawRequest for 10 ETH
+    2. validatePaymasterUserOp sets _withdrawable[user] = 10 ETH - maxCost
+    3. Owner calls ownerWithdraw(address(0), owner, address(this).balance)
+    4. postOp tries forceSafeTransferETH but contract has insufficient ETH
+    5. forceSafeTransferETH uses force transfer (won't revert), but user gets 0
+    NOTE: Owner action within same bundle is unrealistic. Centralization = out of scope.
+  impact: "Owner can steal pending withdrawable funds. Centralization risk — explicitly out of scope per bounty."
+  status: rejected
+
+- id: MS-A-05
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "ERC-20 withdraw bypasses maxWithdrawDenominator limit check"
+  severity: "Low"
+  confidence: 70
+  description: >
+    The maxWithdrawDenominator check in _validateRequest (line 348) only applies when
+    asset == address(0) (ETH). ERC-20 token withdrawals via withdraw() bypass this limit
+    entirely. While the owner must sign the request (so this is "by design"), it means the
+    rate-limiting mechanism that protects paymaster reputation does not extend to ERC-20 tokens.
+    A compromised signer key could drain all ERC-20 balances in a single transaction without
+    any rate limiting.
+  solidity: |
+    // MagicSpend.sol:347-349
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+        revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+    }
+    // ERC-20 tokens (asset != address(0)) skip this check entirely
+  attack_scenario: |
+    1. MagicSpend contract holds 1M USDC and maxWithdrawDenominator = 10
+    2. Compromised signer signs a WithdrawRequest for 1M USDC to attacker
+    3. Attacker calls withdraw(request) — expiry and signature are valid
+    4. _validateRequest checks: asset != address(0), skips denominator check
+    5. Full 1M USDC transferred in a single call — no rate limiting applied
+    NOTE: Requires compromised owner key. Denominator is designed for paymaster reputation
+    protection (ETH gas sponsorship), not general security. Low severity.
+  impact: "ERC-20 tokens have no per-withdrawal limit. Low practical impact since owner signs all requests."
+  status: pending
+
+- id: MS-A-06
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "Nonce burned in validatePaymasterUserOp even if EntryPoint rejects the UserOp later"
+  severity: "Info"
+  confidence: 60
+  description: >
+    In validatePaymasterUserOp, _validateRequest marks the nonce as used (line 352) and credits
+    _withdrawable BEFORE the signature validation result is returned. If the EntryPoint determines
+    the UserOp should be rejected (e.g., account validation fails after paymaster validation
+    succeeds), the question is whether state changes are reverted. Per ERC-4337 v0.6, the
+    EntryPoint runs validation in an inner call that is reverted if any component fails, so
+    state changes from validatePaymasterUserOp ARE reverted. This is safe by ERC-4337 design.
+    However, if there's an edge case where postOp runs but reverts (PostOpMode.postOpReverted),
+    the nonce is already burned. The contract explicitly reverts in this mode, which causes the
+    EntryPoint to retry without a paymaster — but the nonce is already used in the original
+    (non-reverted) validation frame.
+  solidity: |
+    // validatePaymasterUserOp:137 — nonce burned here
+    _validateRequest(userOp.sender, withdrawRequest);
+    // validatePaymasterUserOp:139 — sig check result returned, not enforced inline
+    bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest);
+    validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160);
+    // _withdrawable credited:143
+    _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+  attack_scenario: |
+    1. This is an informational analysis of the ERC-4337 state management
+    2. In normal operation, EntryPoint reverts inner validation on failure → safe
+    3. In PostOpMode.postOpReverted, contract reverts → EntryPoint handles
+    4. No practical exploit identified — ERC-4337 design handles this correctly
+  impact: "None identified. ERC-4337 EntryPoint properly manages state reversions."
+  status: rejected
+
+- id: MS-A-07
+  hunter: AccessHunter
+  component: MagicSpend
+  title: "Solady Ownable allows ownership transfer — new owner inherits signing authority"
+  severity: "Info"
+  confidence: 90
+  description: >
+    Solady's Ownable includes transferOwnership() and renounceOwnership(). If ownership is
+    transferred, the new owner becomes the signer for all future WithdrawRequests. Any
+    previously signed but unused WithdrawRequests (signed by old owner) become invalid because
+    isValidWithdrawSignature checks against the current owner(). This is standard behavior but
+    worth noting: ownership transfer invalidates all pending withdrawal signatures. Also,
+    renounceOwnership() would permanently brick the signing capability and all admin functions.
+  solidity: |
+    // isValidWithdrawSignature checks current owner()
+    function isValidWithdrawSignature(address account, WithdrawRequest memory withdrawRequest)
+        public view returns (bool)
+    {
+        return SignatureCheckerLib.isValidSignatureNow(
+            owner(), // <-- current owner, changes on transferOwnership
+            getHash(account, withdrawRequest),
+            withdrawRequest.signature
+        );
+    }
+  attack_scenario: |
+    1. Owner signs 100 WithdrawRequests for various users
+    2. Ownership is transferred to newOwner via transferOwnership()
+    3. All 100 pending signatures become invalid (owner() changed)
+    4. Users cannot withdraw until newOwner signs new requests
+    5. If renounceOwnership() is called, all signing capability is lost permanently
+  impact: "Informational. Standard Ownable behavior. No vulnerability — just an operational consideration."
+  status: rejected

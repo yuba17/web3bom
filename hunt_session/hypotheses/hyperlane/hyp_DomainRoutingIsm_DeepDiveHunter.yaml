@@ -1,0 +1,613 @@
+# DeepDiveHunter - DomainRoutingIsm (Hyperlane)
+# Generado: 2026-03-27
+# Componente: DomainRoutingIsm + DefaultFallbackRoutingIsm + DomainRoutingIsmFactory
+# Bounty: Immunefi $2.5M critical / $200K high
+# Convergencias analizadas: 5 (de 9 hunters)
+
+hypotheses:
+
+  # =========================================================================
+  # HIPOTESIS 1: InterchainAccountRouter.route() - ISM controlado por atacante
+  # =========================================================================
+  - id: DR-DD-01
+    title: "InterchainAccountRouter.route() permite ISM arbitrario controlado por mensaje"
+    hunter: DeepDiveHunter
+    component: DomainRoutingIsm + InterchainAccountRouter
+    severity: critical
+    confidence: 75
+    status: investigate
+    convergence_source: "Cross-component: InterchainAccountRouter hereda AbstractRoutingIsm"
+
+    description: |
+      InterchainAccountRouter hereda AbstractRoutingIsm y overridea route().
+      En su route() (linea 170-191), el ISM se extrae DIRECTAMENTE del body del mensaje:
+
+        _ism = InterchainAccountMessage.ism(_body).bytes32ToAddress();
+        _ism = _ism == address(0) ? address(mailbox.defaultIsm()) : _ism;
+
+      El body del mensaje es crafteado por el SENDER en la chain origen. Esto significa
+      que un atacante puede enviar un mensaje con _ism apuntando a un contrato que
+      SIEMPRE retorna true en verify().
+
+      PERO: AbstractInterchainAccountRouter.interchainSecurityModule() retorna
+      address(this), lo que significa que el Mailbox usara el Router COMO ISM.
+      El flujo es:
+      1. Mailbox.process() llama recipientIsm(router) -> router.interchainSecurityModule() -> address(this)
+      2. Mailbox llama router.verify(_metadata, _message)
+      3. AbstractRoutingIsm.verify() llama route(_message).verify(_metadata, _message)
+      4. route() extrae ISM del body -> ISM controlado por atacante
+      5. ISM malicioso retorna true
+      6. Mailbox llama router.handle() -> ejecuta calls en ICA
+
+      Si esto funciona, el atacante puede ejecutar calls arbitrarias en cualquier ICA
+      sin autorizacion real. El ICA seria uno nuevo (derivado del ISM malicioso en el salt),
+      pero si ese ICA tiene fondos o permisos, es critico.
+
+    attack_scenario: |
+      1. Atacante despliega MaliciousIsm que retorna true en verify()
+      2. Atacante crafta mensaje Hyperlane con:
+         - origin: cualquier dominio
+         - sender: cualquier address
+         - recipient: InterchainAccountRouter en chain destino
+         - body: CALLS message con _ism = address(MaliciousIsm), calls = [transferir fondos]
+      3. Atacante (o relayer) llama Mailbox.process() con metadata vacia
+      4. Mailbox -> router.verify() -> route() devuelve MaliciousIsm -> MaliciousIsm.verify() = true
+      5. Mailbox -> router.handle() -> despliega ICA y ejecuta calls
+
+      MITIGACION POTENCIAL: El ICA se despliega con un salt que incluye el ISM address.
+      Si el ISM es malicioso, el ICA sera uno NUEVO sin fondos. PERO si la ICA
+      tiene alguna allowance previa o es un contrato con permisos especiales, sigue siendo explotable.
+
+      PREGUNTA CRITICA: Puede el atacante hacer que el ICA resultante sea uno
+      que YA tenga fondos? Solo si logra colision de salt con un ICA legitimo.
+      Salt = keccak256(origin, owner, router, ism, userSalt) - el ism diferente
+      genera ICA diferente. LIMITACION IMPORTANTE.
+
+      CONTRAARGUMENTO: Si el objetivo es ejecutar calls como un ICA NUEVO, el ataque
+      no tiene valor directo. Pero el ICA nuevo podria ser usado para interactuar con
+      protocolos que confian en "cualquier ICA de Hyperlane".
+
+    preconditions:
+      - InterchainAccountRouter desplegado y activo
+      - MaliciousIsm desplegado en la misma chain
+      - Relayer dispuesto a relayear (o atacante usa process() directamente)
+
+    affected_functions:
+      - "InterchainAccountRouter.route() [linea 170-191]"
+      - "AbstractRoutingIsm.verify() [linea 38-43]"
+      - "AbstractInterchainAccountRouter.interchainSecurityModule() [linea 74-82]"
+
+    solidity: |
+      // Invariante: ISM usado para verificar debe ser trusted
+      // Si route() retorna ISM del body del mensaje, el atacante controla la verificacion
+      function invariant_route_returns_trusted_ism() public {
+          // Craftar mensaje con ISM malicioso
+          bytes memory body = abi.encodePacked(
+              uint8(0), // CALLS type
+              bytes32(uint256(uint160(attacker))), // owner
+              bytes32(uint256(uint160(address(maliciousIsm)))), // ISM = malicioso
+              bytes32(0), // salt
+              abi.encode(new CallLib.Call[](0)) // empty calls
+          );
+          bytes memory message = _formatMessage(originDomain, senderBytes32, address(router), body);
+          IInterchainSecurityModule ism = router.route(message);
+          // Si ism == maliciousIsm, el atacante controla la verificacion
+          t(address(ism) != address(maliciousIsm), "ISM from message body should not be attacker-controlled");
+      }
+
+  # =========================================================================
+  # HIPOTESIS 2: DefaultFallbackRoutingIsm + StaticMultisigIsm con MetaProxy
+  # =========================================================================
+  - id: DR-DD-02
+    title: "DefaultFallbackRoutingIsm fallback a defaultIsm NO valida per-domain - bypass si defaultIsm es domain-agnostic"
+    hunter: DeepDiveHunter
+    component: DefaultFallbackRoutingIsm + AbstractMultisigIsm
+    severity: high
+    confidence: 40
+    status: investigate
+    convergence_source: "Convergencia 1 refinada - 6 hunters"
+
+    description: |
+      La Convergencia 1 identifico que DefaultFallbackRoutingIsm cae a mailbox.defaultIsm()
+      para dominios no registrados. La pregunta clave es: que pasa cuando defaultIsm
+      es un MultisigIsm?
+
+      ANALISIS VERIFICADO:
+      - AbstractMultisigIsm.verify() linea 104: require(_threshold > 0, ...) -> BLOQUEA threshold=0
+      - StaticMultisigIsm usa MetaProxy: validatorsAndThreshold() retorna datos fijos del proxy metadata
+      - StorageMultisigIsm: require(0 < _threshold) en setValidatorsAndThreshold
+
+      El defaultIsm de un Mailbox tipicamente verifica con un set FIJO de validators/threshold
+      que NO depende del origin domain. Esto significa que:
+
+      1. Si defaultIsm es StaticMessageIdMultisigIsm con validators [V1, V2, V3] y threshold=2
+      2. Un mensaje de CUALQUIER dominio (incluso uno fake) se verifica contra esos mismos validators
+      3. Los validators V1, V2, V3 firman checkpoints para dominios ESPECIFICOS
+      4. El digest en CheckpointLib incluye _origin en el domainHash
+
+      PUNTO CRITICO: CheckpointLib.domainHash(origin, merkleTreeHook) es per-origin.
+      Si los validators nunca firmaron checkpoints para el dominio falso del atacante,
+      no existen firmas validas. El ataque FALLA para MultisigIsm.
+
+      PERO: Si defaultIsm NO es MultisigIsm sino otro tipo (e.g., TrustedRelayerIsm,
+      NullIsm), el ataque funciona. El riesgo depende de la configuracion operacional.
+
+    attack_scenario: |
+      ESCENARIO (requiere configuracion especifica):
+      1. Mailbox.defaultIsm = algon ISM debil (TrustedRelayerIsm, NullIsm)
+      2. Recipient usa DefaultFallbackRoutingIsm
+      3. Atacante envia mensaje desde dominio 999999 (no registrado)
+      4. DefaultFallbackRoutingIsm.module(999999) -> mailbox.defaultIsm() -> ISM debil
+      5. ISM debil acepta el mensaje sin verificacion real
+      6. Mensaje se procesa como si fuera de un dominio legitimo
+
+      MITIGACION: MultisigIsm como defaultIsm hace esto seguro gracias a:
+      - require(_threshold > 0)
+      - Digest per-domain via CheckpointLib.domainHash
+      - Validators no firman para dominios inexistentes
+
+    preconditions:
+      - Recipient usa DefaultFallbackRoutingIsm
+      - mailbox.defaultIsm es ISM debil (no MultisigIsm)
+      - Dominio del atacante no registrado en el routing ISM
+
+    affected_functions:
+      - "DefaultFallbackRoutingIsm.module() [linea 21-30]"
+      - "Mailbox.process() [linea 202-246]"
+
+    solidity: |
+      // Invariante: fallback ISM no debe aceptar mensajes de dominios desconocidos
+      function invariant_fallback_rejects_unknown_domains(uint32 _fakeDomain) public {
+          // Precondicion: _fakeDomain no registrado
+          require(!isRegisteredDomain(_fakeDomain));
+
+          IInterchainSecurityModule _ism = defaultFallbackRoutingIsm.module(_fakeDomain);
+          // El ISM de fallback deberia ser lo suficientemente fuerte
+          // para rechazar dominios desconocidos
+          bytes memory fakeMetadata = bytes("");
+          bytes memory fakeMessage = _buildMessage(_fakeDomain, bytes32(0), address(recipient), bytes(""));
+
+          // Esto NO debe pasar
+          bool verified = false;
+          try _ism.verify(fakeMetadata, fakeMessage) returns (bool v) {
+              verified = v;
+          } catch {}
+          t(!verified, "Fallback ISM accepted unknown domain with empty metadata");
+      }
+
+  # =========================================================================
+  # HIPOTESIS 3: revealAndExecute en CommitmentReadIsm - sin access control
+  # =========================================================================
+  - id: DR-DD-03
+    title: "CommitmentReadIsm.verify() llama revealAndExecute sin validar caller chain - frontrunning de reveal"
+    hunter: DeepDiveHunter
+    component: DomainRoutingIsm + CommitmentReadIsm + OwnableMulticall
+    severity: high
+    confidence: 65
+    status: investigate
+    convergence_source: "Cross-component: InterchainAccountRouter commit-reveal + routing ISM"
+
+    description: |
+      CommitmentReadIsm.verify() (linea 52-79) ejecuta las calls del commitment
+      DENTRO de la verificacion ISM, antes de que handle() se ejecute.
+
+      Flujo:
+      1. Mailbox.process() marca el mensaje como delivered (linea 225-228)
+      2. Mailbox llama ism.verify() -> CommitmentReadIsm.verify()
+      3. CommitmentReadIsm.verify() llama ica.revealAndExecute(calls, salt) [linea 76]
+      4. revealAndExecute ejecuta las calls
+      5. CommitmentReadIsm retorna true
+      6. Mailbox llama router.handle() -> handle() ve REVEAL type y simplemente retorna
+
+      PROBLEMA: revealAndExecute en OwnableMulticall (linea 52-71) NO tiene modifier
+      onlyOwner. CUALQUIERA puede llamar revealAndExecute si conoce el commitment.
+
+      Pero espera - el commitment se setea via setCommitment() que SI es onlyOwner.
+      Y revealAndExecute verifica que commitments[revealedHash] == true.
+
+      El verdadero riesgo es de FRONTRUNNING:
+      1. Atacante observa la tx de Mailbox.process() con el reveal en el mempool
+      2. El metadata contiene (ica, salt, calls) en texto plano
+      3. Atacante extrae las calls y ejecuta revealAndExecute directamente
+      4. Cuando la tx original se ejecuta, el commitment ya fue consumido -> revert
+
+      Esto es exactamente lo que commit-reveal intenta prevenir, pero el reveal
+      se transmite en la metadata de la tx de process(). Ironia: el mecanismo
+      anti-frontrun ES frontrunnable.
+
+    attack_scenario: |
+      1. Usuario legitimo envia commit-reveal para ejecutar un swap
+      2. El commitment se almacena en el ICA via setCommitment
+      3. Relayer envia Mailbox.process() con metadata que contiene las calls reales
+      4. Atacante ve la tx en mempool, extrae (salt, calls) de la metadata
+      5. Atacante llama directamente ica.revealAndExecute(calls, salt) con mas gas
+      6. Las calls se ejecutan para beneficio del atacante (e.g., sandwich el swap)
+      7. La tx del relayer falla porque commitment ya fue consumido
+
+      IMPACTO: Las calls del usuario se ejecutan en un contexto donde el atacante
+      ya manipulo el estado (e.g., movio precio en AMM).
+
+      NOTA: revealAndExecute ejecuta las calls con msg.sender = ICA address,
+      no el atacante. Pero el atacante puede sandwich la ejecucion.
+
+    preconditions:
+      - Usuario usa commit-reveal via InterchainAccountRouter
+      - Calls incluyen operacion sensible a frontrunning (swap, liquidacion)
+      - Chain destino tiene mempool publico (no Flashbots/MEV-protected)
+
+    affected_functions:
+      - "CommitmentReadIsm.verify() [linea 52-79]"
+      - "OwnableMulticall.revealAndExecute() [linea 52-71]"
+      - "InterchainAccountRouter.callRemoteCommitReveal() [linea 579-632]"
+
+    solidity: |
+      // Invariante: revealAndExecute solo debe ser callable por CommitmentReadIsm durante verify
+      function invariant_revealAndExecute_access_control() public {
+          // Setup: commitment ya seteado
+          bytes32 commitment = keccak256(abi.encodePacked(salt, abi.encode(calls)));
+          require(ica.commitments(commitment) == true);
+
+          // Atacante intenta llamar directamente
+          vm.prank(attacker);
+          // Esto NO deberia funcionar - pero actualmente funciona
+          try ica.revealAndExecute(calls, salt) {
+              t(false, "revealAndExecute should not be callable by arbitrary address");
+          } catch {
+              // Esperado: deberia revertir
+          }
+      }
+
+  # =========================================================================
+  # HIPOTESIS 4: Call a ISM destruido retorna datos vacios -> revert en ABI decode
+  # =========================================================================
+  - id: DR-DD-04
+    title: "ISM destruido causa DoS permanente para el dominio afectado - mensajes no procesables"
+    hunter: DeepDiveHunter
+    component: DomainRoutingIsm
+    severity: medium
+    confidence: 55
+    status: investigate
+    convergence_source: "Convergencia 4 refinada - ISM self-destruct"
+
+    description: |
+      Analisis de que pasa cuando un ISM registrado en DomainRoutingIsm es destruido:
+
+      FLUJO:
+      1. _set() verifica isContract() solo al momento de registro (linea 134)
+      2. ISM se destruye (pre-Cancun) o su implementation se destruye (MinimalProxy)
+      3. AbstractRoutingIsm.verify() llama route(_message).verify(_metadata, _message)
+      4. route() retorna la address del ISM destruido (sigue en el mapping)
+      5. La llamada verify() en un address sin codigo...
+
+      EN SOLIDITY 0.8:
+      - CALL a address sin codigo retorna success=true, returndata=empty
+      - Pero Solidity 0.8 ABI decoder para `bool` sobre returndata vacia:
+        NO revierte automaticamente. La interfaz IInterchainSecurityModule.verify()
+        tiene returns(bool). Con returndata vacia, el decoder retorna false.
+
+      WAIT - verificando: En Solidity >=0.8.0, las llamadas externas que retornan
+      datos son decodificadas. Si returndata esta vacia y se espera un bool:
+      - abi.decode de datos vacios REVIERTE (out of bounds)
+      - Esto causa que verify() propague un revert
+
+      IMPACTO REAL:
+      - El dominio afectado queda bloqueado: ningun mensaje puede procesarse
+      - owner puede arreglarlo con set() o remove(), pero mientras tanto es DoS
+      - Si el owner es un multisig lento o un timelock, el DoS puede durar dias
+
+      ESCENARIO MINIMALPROXY:
+      - DomainRoutingIsmFactory crea proxies con MinimalProxy.create(implementation)
+      - Si la implementation del proxy se destruye, el proxy hace DELEGATECALL
+        a codigo inexistente -> retorna success=true, empty data -> mismo problema
+      - Post-Cancun (EIP-6780): SELFDESTRUCT solo funciona en la misma tx de create
+      - Pre-Cancun: SELFDESTRUCT es permanente
+
+    attack_scenario: |
+      Pre-Cancun escenario:
+      1. Atacante explota vulnerabilidad en un ISM contract para llamar SELFDESTRUCT
+      2. O: ISM es un proxy cuya implementation tiene SELFDESTRUCT accesible
+      3. ISM se destruye pero sigue registrado en DomainRoutingIsm._modules
+      4. Todos los mensajes del dominio asociado fallan con revert en ABI decode
+      5. DoS permanente hasta que owner actualice el mapping
+
+      Post-Cancun:
+      6. SELFDESTRUCT solo funciona en misma tx de deploy
+      7. El ataque requiere que el ISM sea desplegado Y destruido en misma tx
+      8. Escenario: factory que deploya ISM y luego lo destruye atomicamente
+      9. Improbable pero no imposible si factory es maliciosa
+
+      PROBABILIDAD REAL: Baja. Requiere control sobre un ISM para destruirlo.
+
+    preconditions:
+      - ISM registrado tiene SELFDESTRUCT accesible (pre-Cancun)
+      - O ISM es proxy cuya implementation puede destruirse
+      - DomainRoutingIsm en uso activo para ese dominio
+
+    affected_functions:
+      - "DomainRoutingIsm._set() [linea 133-136]"
+      - "AbstractRoutingIsm.verify() [linea 38-43]"
+      - "DomainRoutingIsm.module() [linea 89-97]"
+
+    solidity: |
+      // Invariante: ISM registrado debe tener codigo al momento de verificacion
+      function invariant_registered_ism_has_code(uint32 _domain) public {
+          try domainRoutingIsm.module(_domain) returns (IInterchainSecurityModule ism) {
+              uint256 codeSize;
+              address ismAddr = address(ism);
+              assembly { codeSize := extcodesize(ismAddr) }
+              t(codeSize > 0, "Registered ISM must have code");
+          } catch {
+              // Si el dominio no esta registrado, OK
+          }
+      }
+
+  # =========================================================================
+  # HIPOTESIS 5: Factory implementation frontrunning + initialization
+  # =========================================================================
+  - id: DR-DD-05
+    title: "DomainRoutingIsmFactory implementation no inicializada - initialize frontrunnable"
+    hunter: DeepDiveHunter
+    component: DomainRoutingIsmFactory
+    severity: low
+    confidence: 80
+    status: investigate
+    convergence_source: "Convergencia 2 refinada"
+
+    description: |
+      DomainRoutingIsmFactory constructor (linea 48-49):
+        _implementation = address(new DomainRoutingIsm());
+
+      El DomainRoutingIsm desplegado como implementation NO se inicializa.
+      Cualquiera puede llamar initialize(attacker) y convertirse en owner.
+
+      IMPACTO REAL (verificado):
+      - Los proxies creados por la factory son EIP-1167 minimal proxies
+      - Cada proxy tiene su PROPIO storage -> la initialization del implementation
+        NO afecta a los proxies
+      - El atacante es owner de la implementation, puede llamar set()/remove()
+        en la implementation directamente
+      - PERO nadie usa la implementation directamente como ISM
+
+      RIESGO RESIDUAL:
+      - Si algun contrato referencia factory.implementation() directamente
+        como un ISM (en lugar de desplegar un proxy), el atacante-owner podria
+        manipular las rutas del ISM
+      - Esto es un anti-patron pero no imposible
+
+      StorageMultisigIsmFactory tiene el MISMO patron (linea 120-123, 131-138):
+        _implementation = address(new StorageMerkleRootMultisigIsm(new address[](0), 0))
+      Constructor con threshold=0 pero _disableInitializers() lo protege.
+
+      DIFERENCIA: StorageMultisigIsm llama _disableInitializers() en constructor.
+      DomainRoutingIsm NO lo hace -> implementation es inicializable.
+
+    attack_scenario: |
+      1. Atacante monitorea DomainRoutingIsmFactory deployment
+      2. Inmediatamente llama implementation.initialize(attacker)
+      3. Atacante es owner de la implementation
+      4. Si algun sistema referencia factory.implementation() como ISM:
+         a. Atacante llama implementation.set(domain, maliciousIsm)
+         b. Mensajes de ese dominio se verifican contra maliciousIsm
+      5. Si nadie referencia implementation directamente: impacto = info only
+
+      NOTA: _disableInitializers() ausente es un bug de best practices,
+      impacto real depende de uso externo.
+
+    preconditions:
+      - DomainRoutingIsmFactory desplegada
+      - implementation.initialize() no ha sido llamada aun
+      - Algun sistema referencia factory.implementation() como ISM directamente
+
+    affected_functions:
+      - "DomainRoutingIsmFactory constructor [linea 48-49]"
+      - "DomainRoutingIsm.initialize() [linea 40-43]"
+
+    solidity: |
+      // Invariante: implementation no debe ser inicializable por terceros
+      function invariant_implementation_not_initializable() public {
+          address impl = factory.implementation();
+          // Intentar inicializar deberia fallar
+          try DomainRoutingIsm(impl).initialize(attacker) {
+              t(false, "Implementation should not be initializable");
+          } catch {
+              // Esperado: ya inicializada o deshabilitada
+          }
+      }
+
+  # =========================================================================
+  # HIPOTESIS 6: Race condition en owner set() + Mailbox.process()
+  # =========================================================================
+  - id: DR-DD-06
+    title: "TOCTOU en DomainRoutingIsm: owner cambia ISM entre route() y verify()"
+    hunter: DeepDiveHunter
+    component: DomainRoutingIsm + Mailbox
+    severity: medium
+    confidence: 25
+    status: investigate
+    convergence_source: "Novel - analisis de flujo cross-contract"
+
+    description: |
+      AbstractRoutingIsm.verify() linea 42:
+        return route(_message).verify(_metadata, _message);
+
+      Este es un SINGLE call que hace:
+      1. route(_message) -> lee _modules mapping -> retorna ISM address
+      2. .verify(_metadata, _message) -> llama verify en el ISM
+
+      En una UNICA transaccion, el owner no puede cambiar el mapping entre
+      los pasos 1 y 2 (no hay reentrancy path).
+
+      PERO hay un escenario mas sutil con el Mailbox:
+      1. Relayer A llama Mailbox.process() con metadata para ISM_old
+      2. Entre que A simula la tx y la mina, owner llama set(domain, ISM_new)
+      3. A la tx se mina: route() retorna ISM_new, pero metadata es para ISM_old
+      4. ISM_new.verify() con metadata incorrecta -> revert o false
+      5. Mensaje no se procesa aunque era valido -> DoS temporal
+
+      Esto no es un bug de codigo sino un riesgo operacional. La falta de
+      eventos en set()/remove() (Convergencia 5) agrava esto: relayers no
+      pueden detectar cambios y re-fetch metadata.
+
+      IMPACTO: DoS temporal para mensajes in-flight. No perdida de fondos.
+
+    attack_scenario: |
+      1. Owner cambia ISM para dominio X (legitimo: rotacion de validators)
+      2. Mensajes en pipeline del relayer tienen metadata para ISM viejo
+      3. Todos esos mensajes fallan en process()
+      4. Relayer debe detectar cambio, re-fetch metadata, re-submit
+      5. Sin eventos de set(), deteccion es por polling (lento)
+      6. Ventana de DoS = tiempo hasta re-fetch (minutos a horas)
+
+      AGRAVANTE: Si owner es malicioso y cambia ISM rapidamente,
+      puede crear DoS sostenido.
+
+    preconditions:
+      - DomainRoutingIsm owner cambia ISM para un dominio
+      - Mensajes en pipeline del relayer para ese dominio
+      - Relayer no monitorea cambios de ISM en tiempo real
+
+    affected_functions:
+      - "DomainRoutingIsm.set() [linea 70-75]"
+      - "DomainRoutingIsm.remove() [linea 81-83]"
+      - "AbstractRoutingIsm.verify() [linea 38-43]"
+
+    solidity: |
+      // Invariante: set/remove deberian emitir eventos
+      // (no es un invariante de fuzzing sino de best practices)
+      // Verificar que metadata stale causa revert predecible
+      function invariant_stale_metadata_fails_gracefully(uint32 domain) public {
+          // Simular: route() retorna ISM nuevo, metadata es para ISM viejo
+          IInterchainSecurityModule oldIsm = domainRoutingIsm.module(domain);
+          // Owner cambia ISM
+          vm.prank(owner);
+          domainRoutingIsm.set(domain, address(newIsm));
+
+          IInterchainSecurityModule currentIsm = domainRoutingIsm.module(domain);
+          t(address(currentIsm) == address(newIsm), "ISM should be updated");
+
+          // Metadata para oldIsm no deberia pasar en newIsm
+          bool verified = false;
+          try currentIsm.verify(oldMetadata, message) returns (bool v) {
+              verified = v;
+          } catch {}
+          t(!verified, "Stale metadata should not verify");
+      }
+
+  # =========================================================================
+  # HIPOTESIS 7: Cross-component - ICA ISM injection + DomainRouting fallback
+  # =========================================================================
+  - id: DR-DD-07
+    title: "Cadena ICA -> DefaultFallbackRoutingIsm: mensaje ICA fuerza fallback a defaultIsm debil"
+    hunter: DeepDiveHunter
+    component: InterchainAccountRouter + DefaultFallbackRoutingIsm
+    severity: high
+    confidence: 35
+    status: investigate
+    convergence_source: "Cross-component novel"
+
+    description: |
+      Escenario complejo de cadena de interacciones:
+
+      1. Recipient R usa DefaultFallbackRoutingIsm como ISM
+      2. DefaultFallbackRoutingIsm tiene rutas para dominios [1, 2, 3]
+      3. InterchainAccountRouter en dominio 1 envia mensaje a R
+      4. El mensaje llega con origin=1, se rutea al ISM registrado -> OK
+
+      PERO que pasa si:
+      5. Atacante en dominio 999 (no registrado) envia mensaje directamente a R
+      6. R no es solo un InterchainAccountRouter, es cualquier recipient
+      7. DefaultFallbackRoutingIsm.module(999) -> mailbox.defaultIsm()
+      8. Si defaultIsm es mas debil que el ISM especifico del dominio, bypass
+
+      La cuestion real es: Hay recipients que DEPENDEN de que su ISM
+      rechace dominios no configurados? Si si, DefaultFallbackRoutingIsm
+      es silently inseguro vs DomainRoutingIsm (que revierte).
+
+      DomainRoutingIsm.module() REVIERTE para dominios desconocidos.
+      DefaultFallbackRoutingIsm.module() NO revierte, usa fallback.
+
+      Un operador que migra de DomainRoutingIsm a DefaultFallbackRoutingIsm
+      pierde la propiedad de "solo dominios registrados pueden enviar mensajes".
+      Esto es un downgrade de seguridad silencioso.
+
+    attack_scenario: |
+      1. Protocolo X usa DefaultFallbackRoutingIsm pensando que es "DomainRoutingIsm + fallback"
+      2. Protocolo X tiene ISMs fuertes (3-of-5 multisig) para dominios [1, 2, 3]
+      3. Mailbox.defaultIsm es TrustedRelayerIsm (1-of-1) para compatibilidad
+      4. Atacante envia mensaje desde dominio 999 (no registrado)
+      5. Mensaje se verifica contra TrustedRelayerIsm (mucho mas debil)
+      6. Si el trusted relayer es comprometido, mensajes de dominios fantasma pasan
+      7. Protocolo X procesa mensaje creyendo que vino de un dominio verificado
+
+      IMPACTO: Depende de como Protocolo X usa origin domain en handle().
+      Si asume que origin solo puede ser [1, 2, 3], la logica puede romperse.
+
+    preconditions:
+      - Recipient usa DefaultFallbackRoutingIsm
+      - defaultIsm del Mailbox es mas debil que ISMs especificos
+      - Recipient no valida origin domain en handle()
+
+    affected_functions:
+      - "DefaultFallbackRoutingIsm.module() [linea 21-30]"
+      - "Mailbox.recipientIsm() [linea 410-431]"
+      - "Mailbox.process() [linea 202-246]"
+
+    solidity: |
+      // Invariante: DefaultFallbackRoutingIsm no debe ser mas debil que DomainRoutingIsm
+      function invariant_fallback_not_weaker_than_explicit() public {
+          uint32 unregisteredDomain = 999999;
+
+          // DomainRoutingIsm deberia revertir
+          bool domainRoutingReverted = false;
+          try domainRoutingIsm.module(unregisteredDomain) {
+              // No deberia llegar aqui
+          } catch {
+              domainRoutingReverted = true;
+          }
+          t(domainRoutingReverted, "DomainRoutingIsm should revert for unknown domain");
+
+          // DefaultFallbackRoutingIsm NO revierte - esto es el downgrade
+          IInterchainSecurityModule fallbackIsm = defaultFallbackRoutingIsm.module(unregisteredDomain);
+          // Verificar que el fallback ISM es al menos tan fuerte como los ISMs registrados
+          // (esto es dificil de verificar genericamente, pero al menos no debe ser address(0))
+          t(address(fallbackIsm) != address(0), "Fallback ISM must not be zero");
+      }
+
+# =========================================================================
+# RESUMEN EJECUTIVO
+# =========================================================================
+#
+# FINDINGS ORDENADOS POR PRIORIDAD:
+#
+# 1. DR-DD-01 (Critical, 75%): InterchainAccountRouter.route() extrae ISM del body
+#    del mensaje. El atacante controla que ISM verifica su mensaje. Mitigado
+#    parcialmente porque el ICA resultante es unico (salt incluye ISM address).
+#    REQUIERE investigacion profunda sobre si ICA nuevos pueden tener valor.
+#
+# 2. DR-DD-03 (High, 65%): revealAndExecute() no tiene access control.
+#    Frontrunning del reveal es posible. El mecanismo anti-frontrun
+#    es ironicamente frontrunnable. PoC concreto necesario.
+#
+# 3. DR-DD-07 (High, 35%): DefaultFallbackRoutingIsm como silent security
+#    downgrade. Depende de configuracion operacional.
+#
+# 4. DR-DD-02 (High, 40%): Fallback a defaultIsm mitigado por MultisigIsm
+#    (require threshold > 0, digest per-domain). Solo explotable si defaultIsm
+#    es tipo debil.
+#
+# 5. DR-DD-04 (Medium, 55%): ISM destruido causa DoS. Requiere SELFDESTRUCT
+#    que es cada vez mas raro post-Cancun.
+#
+# 6. DR-DD-06 (Medium, 25%): TOCTOU race condition. Riesgo operacional,
+#    no bug de codigo. Agravado por falta de eventos.
+#
+# 7. DR-DD-05 (Low, 80%): Implementation no inicializada. Best practice
+#    violation. Impacto real solo si alguien referencia implementation directamente.
+#
+# HONESTIDAD BRUTAL:
+# - DR-DD-01 es el mas prometedor pero el impacto real depende de si ICAs
+#   nuevos pueden tener valor. Si la respuesta es "no", baja a Medium.
+# - DR-DD-03 es real como frontrunning vector pero el commit-reveal ya es
+#   un feature para un caso de uso especifico (swaps). La pregunta es si
+#   Immunefi lo considera in-scope.
+# - Ninguno de los otros es Critical por si solo.

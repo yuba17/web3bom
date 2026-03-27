@@ -1,0 +1,600 @@
+hunter: DoSHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+hypotheses:
+
+  # ============================================================
+  # CSW-DOS-01: executeBatch all-or-nothing — reverting target blocks entire batch
+  # ============================================================
+  - id: CSW-DOS-01
+    title: "executeBatch reverts entirely if any single call fails — cross-chain sync risk"
+    severity: medium
+    confidence: 88
+    tier: 1
+    description: |
+      executeBatch() and executeWithoutChainIdValidation() propagate reverts from any
+      sub-call without try/catch via _call(). If any single call in a batch reverts,
+      the entire batch reverts — including previously-successful calls (full rollback).
+
+      The high-severity scenario is in executeWithoutChainIdValidation: cross-chain
+      owner sync operations are designed to replay across all chains atomically. If a
+      batch includes [removeOwnerAtIndex(indexA), addOwnerPublicKey(x,y)] and the second
+      call reverts for any reason, neither call executes on any chain — BUT the nonce
+      (REPLAYABLE_NONCE_KEY sequential) is NOT consumed (revert rolls back EntryPoint
+      state). So the user must re-sign.
+
+      More importantly: if an attacker controls a target address in the user's intended
+      batch (e.g., a callback address), they can force revert at will, causing gas loss
+      and operational delays for time-sensitive operations (owner rotation during compromise).
+    attack_scenario: |
+      1. Wallet owner is rotating keys due to suspected compromise
+      2. They construct batch: [addOwnerPublicKey(newKey), removeOwnerAtIndex(0, oldKey)]
+      3. They add a 3rd call to notify a contract of the key change
+      4. That notification contract is controlled by the attacker (malicious DeFi protocol)
+      5. Attacker makes the contract revert, blocking the entire owner rotation batch
+      6. Old compromised key remains active during the delay
+      7. Attacker (who holds old key) exploits the wallet before key rotation completes
+    impact: |
+      - Time-sensitive key rotation can be delayed by griefing a batch target
+      - Cross-chain sync operations fail if any target in the batch is adversarial
+      - Gas wasted on failed batches; user must re-craft and re-sign operations
+      - In compromise scenarios, delay can be fatal (funds drained during window)
+    solidity: |
+      address revertTarget = address(new RevertOnReceive());
+      CoinbaseSmartWallet.Call[] memory calls = new CoinbaseSmartWallet.Call[](2);
+      calls[0] = CoinbaseSmartWallet.Call({
+          target: address(wallet),
+          value: 0,
+          data: abi.encodeWithSelector(MultiOwnable.addOwnerAddress.selector, address(0xBEEF))
+      });
+      calls[1] = CoinbaseSmartWallet.Call({
+          target: revertTarget,
+          value: 1 wei,
+          data: ""
+      });
+      bool addOwnerSucceeded = false;
+      try wallet.executeBatch(calls) {
+          addOwnerSucceeded = true;
+      } catch {}
+      // The batch reverted — addOwner also failed (atomic rollback)
+      t(!wallet.isOwnerAddress(address(0xBEEF)), "CSW-DOS-01: add owner rolled back due to revert in later call");
+      t(!addOwnerSucceeded, "CSW-DOS-01: batch should have reverted");
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-02: removeLastOwner — permanent wallet brick with zero owners
+  # ============================================================
+  - id: CSW-DOS-02
+    title: "removeLastOwner creates permanent zero-owner state — wallet permanently locked"
+    severity: high
+    confidence: 85
+    tier: 1
+    description: |
+      removeLastOwner() explicitly allows removing the only remaining owner (reverts only if
+      ownerCount > 1). After this call, ownerCount() == 0. In this state:
+      - _checkOwner(): isOwnerAddress(anyone) = false, msg.sender == address(this) requires
+        an executor which also needs owner auth → circular deadlock
+      - validateUserOp: _isValidSignature → ownerAtIndex(any) = [] → revert
+        InvalidOwnerBytesLength → UserOp always fails
+      - initialize(): reverts with Initialized() since nextOwnerIndex > 0
+
+      There is NO recovery mechanism. The wallet and all its funds are permanently locked.
+
+      Critical cross-chain vector: executeWithoutChainIdValidation with removeLastOwner
+      replays on ALL chains. If the user intends to remove the last owner on ONE chain
+      and add a new one, but the batch order is [removeLastOwner, addOwnerPublicKey] and
+      removeLastOwner succeeds but addOwner fails (or vice versa), one chain ends up
+      with zero owners permanently.
+
+      The C4 H-01 report covered cross-chain replay causing wrong owner removal at different
+      indices. This vector covers the permanent zero-owner brick specifically.
+    attack_scenario: |
+      Scenario A (accidental): Owner with 2 owners, one of which is compromised. Legitimate
+      owner tries to remove compromised key (now only owner left). removeLastOwner succeeds.
+      Wallet bricked. ETH/tokens permanently locked.
+
+      Scenario B (cross-chain batch error): Owner uses executeWithoutChainIdValidation
+      with batch [removeLastOwner(0, ownerA), addOwnerAddress(ownerB)]. On chain A this
+      works. On chain B, addOwnerAddress fails (ownerB already exists there via previous
+      tx). removeLastOwner already executed → zero-owner state on chain B.
+
+      Scenario C (malicious co-owner): In a 2-of-N multi-owner setup (though this contract
+      has no threshold — any single owner can act), a malicious owner who is about to be
+      removed front-runs the removal by calling removeLastOwner on themselves when they are
+      NOT the last owner — but this fails (NotLastOwner check). However, if they remove the
+      OTHER owner first (making themselves last), then call removeLastOwner on themselves,
+      they brick the wallet.
+    impact: |
+      - Permanent irreversible loss of wallet control
+      - All ETH and ERC-20/721/1155 tokens permanently locked in the wallet
+      - No admin override, no guardian, no timelock recovery
+      - Affects all chains where the wallet is deployed if cross-chain replayed
+    solidity: |
+      // Verify: after removeLastOwner, wallet is permanently bricked
+      uint256 singleOwnerIndex = 0;
+      address singleOwner = address(0xALICE);
+      bytes memory ownerBytes = abi.encode(singleOwner);
+      eq(wallet.ownerCount(), 1, "CSW-DOS-02: setup — wallet has exactly 1 owner");
+
+      vm.prank(singleOwner);
+      wallet.removeLastOwner(singleOwnerIndex, ownerBytes);
+
+      eq(wallet.ownerCount(), 0, "CSW-DOS-02: owner count is now 0");
+
+      // All owner operations now impossible
+      vm.prank(singleOwner);
+      try wallet.execute(address(0), 0, "") {
+          t(false, "CSW-DOS-02: execute should be inaccessible with zero owners");
+      } catch {}
+
+      // Re-initialize impossible
+      bytes[] memory newOwners = new bytes[](1);
+      newOwners[0] = abi.encode(address(0xNEW));
+      try wallet.initialize(newOwners) {
+          t(false, "CSW-DOS-02: initialize should revert — already initialized");
+      } catch {}
+
+      // Wallet is permanently bricked
+      t(wallet.ownerCount() == 0, "CSW-DOS-02: CONFIRMED — zero-owner state, wallet bricked");
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-03: validateUserOp revert instead of return 1 for empty ownerAtIndex
+  # ============================================================
+  - id: CSW-DOS-03
+    title: "validateUserOp reverts (not returns 1) when ownerAtIndex is empty — ERC-4337 violation + bundler griefing"
+    severity: medium
+    confidence: 90
+    tier: 1
+    description: |
+      ERC-4337 spec requires: "Signature failure MUST be reported by returning 1, NOT
+      reverting, to allow simulation calls without a valid signature."
+
+      CoinbaseSmartWallet.validateUserOp() calls _isValidSignature() which calls
+      ownerAtIndex(sigWrapper.ownerIndex). If the owner at that index was removed
+      (or the index was never populated), ownerAtIndex returns empty bytes [].
+
+      _isValidSignature checks:
+        if (ownerBytes.length == 32) { ... }
+        if (ownerBytes.length == 64) { ... }
+        revert InvalidOwnerBytesLength(ownerBytes); ← triggered when length == 0
+
+      This revert propagates through validateUserOp instead of returning validationData=1.
+
+      This means any UserOperation with an ownerIndex pointing to a removed or nonexistent
+      owner causes a REVERT in validateUserOp — violating ERC-4337 spec and causing bundlers
+      to experience unexpected reverts during simulation/execution.
+
+      Attack: Attacker (or race condition) removes an owner between UserOp submission and
+      execution. The pending UserOp now causes a revert instead of soft failure, potentially
+      causing bundler to be penalized for including a "reverting" UserOp.
+    attack_scenario: |
+      1. Alice submits UserOperation signed by ownerIndex=1 (Bob) to the mempool
+      2. Attacker (or Alice's other device) broadcasts removeOwnerAtIndex(1, Bob) with
+         higher gas price — it lands first
+      3. Bundler picks up Alice's UserOp and simulates it — validateUserOp REVERTS
+         (InvalidOwnerBytesLength) instead of returning 1
+      4. Bundler already included the op in a bundle and broadcast it — now the bundle
+         has an unexpected revert in validation phase
+      5. EntryPoint charges the wallet for the failed simulation
+      6. Bundler's reputation is damaged by the unexpected revert
+
+      Alternative: Attacker repeatedly submits UserOps with high ownerIndex (e.g., 99999,
+      pointing to empty slot), causing bundlers to simulate expensive reverts. This is
+      cheap spam but costly for bundlers to handle.
+    impact: |
+      - ERC-4337 spec violation: revert instead of return 1 for invalid owner index
+      - Bundler griefing: repeated reverts damage bundler economics and reputation
+      - Legitimate pending UserOps fail with revert instead of soft failure when owner removed
+      - Race condition between owner removal and pending op execution causes revert
+    solidity: |
+      // Demonstrate: ownerAtIndex for removed/empty index causes revert in _isValidSignature
+      uint256 emptyIndex = 999;
+      bytes memory emptyOwner = wallet.ownerAtIndex(emptyIndex);
+      eq(emptyOwner.length, 0, "CSW-DOS-03: setup — index 999 is empty");
+
+      // Craft signature pointing to empty index
+      CoinbaseSmartWallet.SignatureWrapper memory sw = CoinbaseSmartWallet.SignatureWrapper({
+          ownerIndex: emptyIndex,
+          signatureData: new bytes(0)
+      });
+      bytes memory sig = abi.encode(sw);
+
+      // isValidSignature (ERC-1271) will revert — same code path as validateUserOp
+      try wallet.isValidSignature(bytes32(0), sig) returns (bytes4) {
+          t(false, "CSW-DOS-03: should have reverted with InvalidOwnerBytesLength");
+      } catch {
+          // Revert confirmed — validateUserOp has the same code path
+          // Per ERC-4337 spec, this should return 1 (sig failure), not revert
+          t(true, "CSW-DOS-03: CONFIRMED — empty ownerIndex causes revert not return-1");
+      }
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-04: MagicSpend maxWithdrawDenominator = 0 — division by zero DoS
+  # ============================================================
+  - id: CSW-DOS-04
+    title: "MagicSpend: setMaxWithdrawDenominator(0) causes division-by-zero, permanently DoS-ing all paymaster operations"
+    severity: high
+    confidence: 95
+    tier: 1
+    description: |
+      MagicSpend._validateRequest() computes:
+        uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+
+      If maxWithdrawDenominator == 0, this is a division by zero in Solidity 0.8+
+      → Panic(0x12) revert. This line executes in BOTH validatePaymasterUserOp() AND
+      withdraw() paths.
+
+      The owner can call setMaxWithdrawDenominator(0) with NO input validation.
+      There is no require(newDenominator > 0) check in _setMaxWithdrawDenominator().
+
+      Once set to 0:
+      - validatePaymasterUserOp() always reverts (division by zero in _validateRequest)
+      - withdraw() always reverts (same path)
+      - ALL users who rely on MagicSpend for gas sponsorship are permanently DoS'd
+      - The only fix is the owner calling setMaxWithdrawDenominator(nonZero)
+
+      If the owner key is compromised or lost, this becomes PERMANENT DoS.
+    attack_scenario: |
+      1. MagicSpend owner key is compromised (private key leak, phishing)
+      2. Attacker calls setMaxWithdrawDenominator(0) — single transaction
+      3. All subsequent validatePaymasterUserOp calls: Panic division by zero
+      4. All CoinbaseSmartWallet users using MagicSpend as paymaster cannot execute
+         any UserOperation — they have no gas to pay fees
+      5. Until owner fixes it (if they can), entire MagicSpend infrastructure is DoS'd
+
+      Alternative: honest owner accidentally sets denominator to 0 thinking it means
+      "no limit" (the semantic is counterintuitive: larger denominator = smaller max
+      withdraw). Simple mistake causes complete service outage.
+    impact: |
+      - Complete DoS of MagicSpend paymaster for ALL users simultaneously
+      - Systemic impact: not just one wallet but every wallet using MagicSpend
+      - If owner key is lost/compromised, permanent DoS with no recovery
+      - Users cannot execute any UserOp without alternative gas source
+    solidity: |
+      // Demonstrate: denominator=0 causes division by zero in _validateRequest
+      // Only owner can set this, but no validation prevents 0
+      uint256 currentDenom = magicSpend.maxWithdrawDenominator();
+      t(currentDenom > 0, "CSW-DOS-04: denominator must be > 0 to avoid div-by-zero");
+
+      // Simulate what happens when denominator is 0:
+      // address(this).balance / 0 → Panic(0x12) in Solidity 0.8
+      // This would brick validatePaymasterUserOp AND withdraw()
+
+      // Test the invariant: denominator should never be 0
+      // The missing check in _setMaxWithdrawDenominator:
+      // require(newDenominator > 0, "denominator cannot be zero");
+      if (magicSpend.maxWithdrawDenominator() == 0) {
+          // Attempt withdrawal — should panic
+          try magicSpend.withdraw(withdrawRequest) {
+              t(false, "CSW-DOS-04: should have panicked with div-by-zero");
+          } catch {
+              t(false, "CSW-DOS-04: CONFIRMED — denominator=0 causes complete paymaster DoS");
+          }
+      }
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-05: Owner malicious front-run — preventing own removal by removing the remover
+  # ============================================================
+  - id: CSW-DOS-05
+    title: "Malicious co-owner front-runs their own removal by first removing the owner trying to remove them"
+    severity: high
+    confidence: 78
+    tier: 1
+    description: |
+      MultiOwnable has no threshold mechanism — any single owner can remove any other owner
+      (removeOwnerAtIndex requires only onlyOwner, not M-of-N). This creates a race condition
+      in multi-owner wallets where a malicious or compromised owner can protect themselves.
+
+      In a 3-owner wallet [Alice=0, Bob=1, Carol=2]:
+      - Alice decides to remove Bob (compromised key)
+      - Alice broadcasts removeOwnerAtIndex(1, Bob)
+      - Bob (attacker) sees this in the mempool
+      - Bob front-runs: removeOwnerAtIndex(0, Alice) with higher gas
+      - Bob's tx lands first: Alice is removed, Bob remains
+      - Alice's tx fails: msg.sender (Alice) is no longer an owner → Unauthorized
+      - Bob is now in control; Carol can remove Bob, but Carol may not be aware
+
+      Note: This is partially addressed for UserOp paths via private bundlers (ops don't
+      hit public mempool). But direct transactions ARE visible in the mempool.
+    attack_scenario: |
+      1. Bob's key is compromised; Alice submits removeOwnerAtIndex(1, Bob) via direct tx
+         (not UserOp — e.g., from a hardware wallet for added security)
+      2. Attacker controlling Bob's key sees the pending tx in the mempool
+      3. Attacker front-runs with removeOwnerAtIndex(0, Alice)
+      4. Alice is removed, Bob remains, wallet is under attacker control
+      5. Attacker immediately calls execute() to drain wallet funds
+
+      Cost: 1 front-run transaction. Impact: full wallet compromise.
+    impact: |
+      - Complete wallet takeover via front-run during owner rotation
+      - Total fund loss from wallet
+      - No protection for direct-tx owner management (only UserOp via bundler is safer)
+    solidity: |
+      // 3-owner wallet: Alice=0, Bob=1, Carol=2
+      address alice = address(0xA);
+      address bob = address(0xB);
+      bytes memory aliceBytes = abi.encode(alice);
+      bytes memory bobBytes = abi.encode(bob);
+
+      // Bob front-runs: removes Alice at index 0
+      vm.prank(bob);
+      wallet.removeOwnerAtIndex(0, aliceBytes);
+      t(!wallet.isOwnerAddress(alice), "CSW-DOS-05: Alice removed by Bob's front-run");
+
+      // Alice's intended removal of Bob now fails (Alice is no longer owner)
+      vm.prank(alice);
+      try wallet.removeOwnerAtIndex(1, bobBytes) {
+          t(false, "CSW-DOS-05: Alice's removal of Bob should fail — Alice not owner");
+      } catch (bytes memory reason) {
+          bytes4 sig = bytes4(reason);
+          t(sig == MultiOwnable.Unauthorized.selector, "CSW-DOS-05: Unauthorized as expected");
+      }
+      // Bob is still owner — attacker succeeded
+      t(wallet.isOwnerAddress(bob), "CSW-DOS-05: CONFIRMED — Bob still owner after front-run");
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-06: MagicSpend nonce consumed before sig verification in validatePaymasterUserOp
+  # ============================================================
+  - id: CSW-DOS-06
+    title: "MagicSpend validatePaymasterUserOp marks nonce used before signature verification resolves — nonce grief via bundler"
+    severity: medium
+    confidence: 65
+    tier: 2
+    description: |
+      In MagicSpend.validatePaymasterUserOp():
+        _validateRequest(userOp.sender, withdrawRequest);  // marks nonce used
+        bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest);
+        validationData = (sigFailed ? 1 : 0) | ...;
+
+      _validateRequest() marks the nonce as used (line 352: _nonceUsed[nonce][account] = true)
+      BEFORE the signature failure is determined. validationData is returned with sigFailed=1
+      if the sig is invalid, but the nonce is already consumed.
+
+      In EntryPoint v0.6: When validatePaymasterUserOp returns validationData with sigFailed=1,
+      the EntryPoint marks the op as "sig failed" but the side effects of validatePaymasterUserOp
+      (nonce marking) PERSIST because the validation runs in a context that does not revert on
+      sig failure.
+
+      This means: A bundler that includes a UserOp with an INVALID MagicSpend signature will
+      cause the nonce to be permanently burned, even though the user never received funds.
+      The owner of MagicSpend signs the nonces, so the attacker needs a pre-signed request.
+      But if the MagicSpend owner's signing service is compromised, this becomes critical.
+
+      Note: This is partially by design and the EntryPoint may revert the entire context.
+      Needs empirical verification with actual EntryPoint v0.6 behavior.
+    attack_scenario: |
+      1. Attacker obtains a valid WithdrawRequest (signed by MagicSpend owner) for user Alice
+      2. Attacker crafts a UserOp where paymasterAndData contains this WithdrawRequest
+         but the UserOp signature (for the wallet) is intentionally invalid
+      3. Bundler simulates: validatePaymasterUserOp runs, marks nonce used, returns sigFailed=1
+      4. If EntryPoint v0.6 keeps these side effects, nonce is burned
+      5. Alice's legitimate UserOp with the same nonce later fails with InvalidNonce
+      6. Alice must obtain a new WithdrawRequest from MagicSpend owner (delay, friction)
+    impact: |
+      - MagicSpend withdraw request nonces burned without user receiving funds
+      - Denial of service for users trying to use MagicSpend gas sponsorship
+      - Requires compromised signing service or leaked signed requests to exploit
+    solidity: |
+      // Check: nonce state after validatePaymasterUserOp with invalid wallet sig
+      uint256 testNonce = 42;
+      t(!magicSpend.nonceUsed(address(wallet), testNonce), "CSW-DOS-06: nonce unused initially");
+
+      // Simulate EntryPoint calling validatePaymasterUserOp
+      // With a WithdrawRequest that has valid MagicSpend sig but wallet userOp sig is invalid
+      // The _validateRequest will mark nonce=42 as used
+      // Then sigFailed will be true (wallet sig invalid)
+      // validationData returned = 1 (sig failed) BUT nonce already burned
+
+      // Verify nonce state post-call:
+      // If nonce IS consumed (t=true below), the bug is confirmed
+      // If nonce is NOT consumed (revert propagated), this is a false positive
+      bool nonceConsumed = magicSpend.nonceUsed(address(wallet), testNonce);
+      // This assertion determines if the bug is real:
+      t(!nonceConsumed, "CSW-DOS-06: nonce should NOT be consumed if sig validation failed");
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-07: nextOwnerIndex unbounded growth — no cap, eventual overflow DoS
+  # ============================================================
+  - id: CSW-DOS-07
+    title: "nextOwnerIndex has no upper bound — repeated add/remove cycles permanently exhaust index space"
+    severity: low
+    confidence: 60
+    tier: 2
+    description: |
+      addOwnerAddress() and addOwnerPublicKey() both do: nextOwnerIndex++
+      There is NO maximum cap on nextOwnerIndex.
+
+      In Solidity 0.8+, integer overflow reverts. If nextOwnerIndex reaches
+      type(uint256).max, the NEXT call to addOwner* will overflow → permanent revert.
+      No more owners can ever be added.
+
+      Additionally, ownerCount() = nextOwnerIndex - removedOwnersCount. If through
+      repeated add/remove cycles nextOwnerIndex reaches uint256.max and there are still
+      owners present, ownerCount() itself could underflow if removedOwnersCount somehow
+      exceeds nextOwnerIndex (mathematically impossible given design, but worth noting
+      the arithmetic dependency).
+
+      Practical concern: Extremely high cost to reach overflow (2^256 - 1 add operations).
+      However, this is a missing invariant that should be documented.
+    attack_scenario: |
+      Theoretical: A script adding 10^18 owners per second would take 10^58 seconds.
+      Not a practical attack.
+
+      More realistic concern: If a future upgrade or bug causes nextOwnerIndex to increment
+      faster than expected (e.g., a loop that adds many owners in one tx), the overflow
+      boundary becomes relevant.
+    impact: |
+      - Permanent DoS of addOwner* if nextOwnerIndex overflows
+      - Low practical risk due to cost, but represents an uncapped counter
+    solidity: |
+      // Invariant: nextOwnerIndex should never approach overflow
+      t(wallet.nextOwnerIndex() < type(uint256).max,
+        "CSW-DOS-07: nextOwnerIndex at max — addOwner permanently DoS'd");
+      // ownerCount should always equal nextOwnerIndex - removedOwnersCount
+      uint256 computed = wallet.nextOwnerIndex() - wallet.removedOwnersCount();
+      eq(computed, wallet.ownerCount(), "CSW-DOS-07: ownerCount invariant broken");
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-08: executeWithoutChainIdValidation canSkipChainIdValidation — validation-execution mismatch
+  # ============================================================
+  - id: CSW-DOS-08
+    title: "validateUserOp accepts batches with disallowed selectors that execute() will later reject — gas wasted, nonce consumed"
+    severity: low
+    confidence: 72
+    tier: 2
+    description: |
+      validateUserOp only checks upgradeToAndCall entries in the calls array for the
+      implementation code.length check. It does NOT verify that every selector in the
+      batch passes canSkipChainIdValidation().
+
+      executeWithoutChainIdValidation() checks this at execution time: if any call has
+      a selector not in canSkipChainIdValidation(), it reverts with SelectorNotAllowed.
+
+      This creates a validation-execution mismatch: a UserOp with REPLAYABLE_NONCE_KEY
+      containing a disallowed selector will:
+      1. Pass validateUserOp (validation phase) — no revert
+      2. Fail executeWithoutChainIdValidation (execution phase) — SelectorNotAllowed revert
+      3. The sequential REPLAYABLE nonce is consumed (EntryPoint advances nonce even for
+         failed executions when validation passed)
+      4. Gas is charged to the wallet's deposit
+      5. The intended operation never executed
+
+      This is not a security bug but a DoS vector for users who make mistakes OR for
+      an attacker with legitimate owner access who wants to grief the wallet's nonce sequence.
+    attack_scenario: |
+      1. Malicious co-owner in a multi-owner wallet crafts a UserOp with
+         REPLAYABLE_NONCE_KEY containing a batch with a disallowed selector
+      2. validateUserOp passes, bundler includes the op
+      3. executeWithoutChainIdValidation reverts with SelectorNotAllowed
+      4. The REPLAYABLE nonce sequence is advanced
+      5. All other owners' pending cross-chain ops with that nonce are invalidated
+      6. They must re-sign with new nonces (if the nonce sequence matters)
+    impact: |
+      - REPLAYABLE nonce consumed without any useful operation
+      - Gas charged to wallet for failed execution
+      - Cross-chain pending ops may need re-signing
+    solidity: |
+      // Verify: disallowed selector in batch causes revert in execution but not validation
+      bytes4 disallowedSelector = bytes4(keccak256("someFunction()"));
+      t(!wallet.canSkipChainIdValidation(disallowedSelector),
+        "CSW-DOS-08: selector should NOT be in allowed list");
+
+      // validateUserOp would accept this (only checks upgradeToAndCall for code check)
+      // executeWithoutChainIdValidation would reject this
+      bytes[] memory calls = new bytes[](1);
+      calls[0] = abi.encodeWithSelector(disallowedSelector);
+      try wallet.executeWithoutChainIdValidation(calls) {
+          t(false, "CSW-DOS-08: should revert with SelectorNotAllowed");
+      } catch (bytes memory reason) {
+          bytes4 errSig = bytes4(reason);
+          t(errSig == CoinbaseSmartWallet.SelectorNotAllowed.selector,
+            "CSW-DOS-08: SelectorNotAllowed as expected");
+      }
+    status: investigate
+
+  # ============================================================
+  # CSW-DOS-09: MagicSpend postOp — ETH transfer with GAS_STIPEND_NO_STORAGE_WRITES
+  # ============================================================
+  - id: CSW-DOS-09
+    title: "MagicSpend postOp uses forceSafeTransferETH with limited gas stipend — upgraded wallet receive() can fail silently"
+    severity: low
+    confidence: 55
+    tier: 2
+    description: |
+      MagicSpend.postOp() sends the gas excess back to the user's account:
+        SafeTransferLib.forceSafeTransferETH(account, withdrawable, GAS_STIPEND_NO_STORAGE_WRITES)
+
+      GAS_STIPEND_NO_STORAGE_WRITES is a constant in Solady (~2300 gas) that prevents
+      expensive callbacks. CoinbaseSmartWallet currently inherits Solady's Receiver which
+      accepts ETH with minimal logic.
+
+      However, CoinbaseSmartWallet is upgradeable (UUPSUpgradeable). A future upgrade that
+      adds storage-write logic to the receive() fallback would silently fail the postOp ETH
+      transfer. When postOp's forceSafeTransfer fails, the EntryPoint calls postOp again
+      with mode=postOpReverted, causing MagicSpend to revert with UnexpectedPostOpRevertedMode.
+      This damages MagicSpend's reputation as a paymaster.
+
+      The current implementation is safe, but the upgradeability creates a future risk
+      surface that is not adequately documented.
+    attack_scenario: |
+      1. CoinbaseSmartWallet is upgraded to a version with storage-writing receive()
+         (e.g., to track incoming ETH for accounting purposes)
+      2. User uses MagicSpend as paymaster
+      3. postOp() calls forceSafeTransferETH with limited gas stipend
+      4. Upgraded receive() runs out of gas or fails
+      5. forceSafeTransferETH failure → EntryPoint calls postOp with postOpReverted
+      6. MagicSpend reverts UnexpectedPostOpRevertedMode
+      7. Entire bundle fails; MagicSpend reputation damaged
+    impact: |
+      - Silent ETH transfer failure in postOp after wallet upgrade
+      - MagicSpend bundler reputation damage
+      - User loses gas excess refund
+    solidity: |
+      // Invariant: postOp ETH transfer must succeed for current wallet implementation
+      uint256 walletBalanceBefore = address(wallet).balance;
+      uint256 excess = 0.1 ether;
+
+      // Simulate postOp call from EntryPoint
+      vm.prank(magicSpend.entryPoint());
+      magicSpend.postOp(
+          IPaymaster.PostOpMode.opSucceeded,
+          abi.encode(uint256(0.1 ether), address(wallet)),
+          0.05 ether  // actualGasCost < maxGasCost, so 0.05 ETH excess
+      );
+
+      // Wallet should have received the gas excess
+      uint256 walletBalanceAfter = address(wallet).balance;
+      gte(walletBalanceAfter, walletBalanceBefore, "CSW-DOS-09: wallet should receive ETH in postOp");
+    status: investigate
+
+false_positives:
+  - id: CSW-FP-01
+    title: "Factory front-running via CREATE2"
+    reason: |
+      CoinbaseSmartWalletFactory.createAccount uses LibClone.createDeterministicERC1967
+      which is idempotent. If the wallet is already deployed, it returns the existing
+      address without re-initializing. An attacker front-running with the SAME owners+nonce
+      produces the same wallet for the same user. With DIFFERENT owners+nonce, the CREATE2
+      salt changes → different address → no collision. No DoS vector.
+    investigated_at: '2026-03-27'
+
+  - id: CSW-FP-02
+    title: "MagicSpend withdraw() nonce burned on revert"
+    reason: |
+      In withdraw(), the order is: (1) expiry check, (2) sig check, (3) _validateRequest
+      (marks nonce), (4) _withdraw (transfer ETH). If _withdraw reverts due to ETH transfer
+      failure, the ENTIRE transaction reverts including the nonce marking. Solidity atomicity
+      protects the nonce. No grief possible here via reverting receiver.
+    investigated_at: '2026-03-27'
+
+  - id: CSW-FP-03
+    title: "maxWithdrawDenominator multiple-bundle race condition"
+    reason: |
+      The code comment explicitly documents this: "This should only really occur if there
+      are > maxWithdrawDenominator withdraws in the same transaction." The denominator is
+      the explicit mitigation. Bundlers also limit UserOps per sender per bundle. This is
+      a known, documented, and mitigated design trade-off. Not reportable.
+    investigated_at: '2026-03-27'
+
+  - id: CSW-FP-04
+    title: "WebAuthn passkey validation gas cost"
+    reason: |
+      High gas cost for secp256r1 verification on L1 is a known cost, partially mitigated
+      by RIP-7212 precompile on Base and Optimism (primary Coinbase targets). This is an
+      informational gas optimization note, not a DoS vector. Not reportable as a security finding.
+    investigated_at: '2026-03-27'
+
+  - id: CSW-FP-05
+    title: "executeBatch all-or-nothing atomicity"
+    reason: |
+      Batch atomicity is by design in ERC-4337 smart wallets and explicitly matches
+      expected behavior. Users are responsible for only batching calls to trusted targets.
+      The cross-chain sync risk noted in CSW-DOS-01 is the real concern but only applies
+      when a batch target is adversarially controlled.
+    investigated_at: '2026-03-27'

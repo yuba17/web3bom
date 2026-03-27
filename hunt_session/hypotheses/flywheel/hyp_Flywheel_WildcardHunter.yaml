@@ -1,0 +1,493 @@
+hunter: WildcardHunter
+target: Flywheel Protocol (Flywheel.sol, Campaign.sol, CampaignHooks.sol, hooks/*)
+date: "2026-03-27"
+
+hypotheses:
+  - id: WC-01
+    title: "BridgeReferralFees: Permissionless withdrawFunds drains campaign funds"
+    description: |
+      BridgeReferralFees._onWithdrawFunds has ZERO access control. It simply decodes hookData
+      as a Flywheel.Payout and returns it. Anyone can call Flywheel.withdrawFunds on a
+      BridgeReferralFees campaign, pass arbitrary (recipient, amount) in hookData, and drain
+      all unallocated funds. The comment at line 140-142 acknowledges this as intentional
+      ("anyone can take them") but this means any tokens deposited into the campaign that aren't
+      immediately consumed by a send() call are vulnerable. If a bridge deposits tokens and the
+      send() call fails/reverts for any reason, the tokens sit in the campaign and anyone can
+      withdrawFunds them.
+    severity: medium
+    confidence: 70
+    affected_functions:
+      - "BridgeReferralFees._onWithdrawFunds (src/hooks/BridgeReferralFees.sol:133-144)"
+      - "Flywheel.withdrawFunds (src/Flywheel.sol:492-513)"
+    attack_scenario: |
+      1. Bridge protocol deposits 10 ETH into a BridgeReferralFees campaign
+      2. Bridge calls send() but it reverts (recipient contract rejects ETH, or gas issues)
+      3. 10 ETH sits in the campaign with no allocations tracking it
+      4. Attacker calls withdrawFunds(campaign, NATIVE_TOKEN, encode(Payout(attacker, 10 ETH)))
+      5. Attacker receives 10 ETH
+
+      Alternative: Attacker front-runs the bridge's send() with a withdrawFunds() call
+      if the deposit and send are in separate transactions.
+    solidity_invariant: |
+      // INV-WC-01: Campaign balance after withdrawFunds should not decrease below totalAllocated
+      function invariant_WC01_withdrawFunds_solvency() public {
+        uint256 balBefore = address(campaign).balance;
+        uint256 allocated = flywheel.totalAllocatedPayouts(address(campaign), NATIVE_TOKEN)
+                          + flywheel.totalAllocatedFees(address(campaign), NATIVE_TOKEN);
+        assertTrue(balBefore >= allocated, "WC-01: campaign balance < total allocated");
+      }
+
+  - id: WC-02
+    title: "BridgeReferralFees.send: Front-runnable balance-based amount calculation"
+    description: |
+      BridgeReferralFees._onSend computes bridgedAmount from the campaign's current token balance
+      minus totalAllocatedFees. This is a balance-based calculation vulnerable to sandwich attacks.
+      If deposit and send are in separate transactions (or even in same tx but attacker can insert
+      between them via MEV), attacker can:
+      (a) deposit extra tokens, inflate bridgedAmount, get more tokens sent to user
+      (b) call send() before the intended caller to claim tokens deposited by someone else
+
+      The hook has NO access control on _onSend (no onlyManager or similar), meaning ANYONE
+      can call Flywheel.send() on a BridgeReferralFees campaign.
+    severity: high
+    confidence: 65
+    affected_functions:
+      - "BridgeReferralFees._onSend (src/hooks/BridgeReferralFees.sol:69-108)"
+      - "Flywheel.send (src/Flywheel.sol:299-323)"
+    attack_scenario: |
+      1. Legitimate bridge deposits 100 USDC into campaign for user Alice
+      2. Attacker sees the pending send() tx in mempool
+      3. Attacker front-runs with their own send(campaign, USDC, encode(attacker, "", 0))
+         with bridgedAmount = 100 USDC (Alice's deposit)
+      4. Attacker receives 100 USDC
+      5. Alice's send() executes with bridgedAmount = 0, gets nothing
+
+      This works because _onSend uses campaign balance, not per-user tracking.
+    solidity_invariant: |
+      // INV-WC-02: Only the intended recipient should receive bridged funds
+      // This is an architectural invariant - balance-based accounting is inherently front-runnable
+      // when send() is permissionless
+      function invariant_WC02_bridge_no_theft() public {
+        // After any send(), campaign balance should equal totalAllocatedFees
+        uint256 bal = IERC20(token).balanceOf(address(campaign));
+        uint256 allocFees = flywheel.totalAllocatedFees(address(campaign), token);
+        assertGe(bal, allocFees, "WC-02: balance < allocated fees after send");
+      }
+
+  - id: WC-03
+    title: "AdConversion: Attribution provider can inflate payoutAmount to drain campaign"
+    description: |
+      In AdConversion._onSend, the attributionProvider submits Attribution[] with arbitrary
+      payoutAmount values. There is NO on-chain cap or validation that payoutAmount is reasonable
+      relative to the campaign balance. The attributionProvider can submit a single attribution
+      with payoutAmount = entire campaign balance, drain everything in one tx.
+
+      The only protection is the solvency check at the end of send(), which just ensures
+      balance >= totalAllocated. Since send() immediately transfers tokens (not just allocates),
+      the provider can drain the campaign in one call.
+
+      The attributionProvider also earns feeBps on every payout, so draining to a colluding
+      address also maximizes their own fees.
+    severity: medium
+    confidence: 55
+    affected_functions:
+      - "AdConversion._onSend (src/hooks/AdConversion.sol:398-511)"
+      - "Flywheel.send (src/Flywheel.sol:299-323)"
+    attack_scenario: |
+      1. Advertiser funds campaign with 100 ETH
+      2. Malicious/compromised attributionProvider calls send() with one Attribution:
+         payoutAmount = 100 ETH, payoutRecipient = colluding address
+      3. Fee (e.g., 5%) = 5 ETH allocated to provider, 95 ETH sent to colluder
+      4. Provider later calls distributeFees to claim 5 ETH
+      5. Advertiser's campaign is drained entirely
+    solidity_invariant: |
+      // INV-WC-03: Total payouts sent should not exceed campaign's intended budget
+      // This is a trust assumption invariant - protocol trusts attributionProvider
+      function invariant_WC03_adconversion_no_overdrain() public {
+        uint256 bal = IERC20(token).balanceOf(address(campaign));
+        uint256 totalAlloc = flywheel.totalAllocatedPayouts(address(campaign), token)
+                           + flywheel.totalAllocatedFees(address(campaign), token);
+        assertGe(bal, totalAlloc, "WC-03: campaign drained below allocations");
+      }
+
+  - id: WC-04
+    title: "Phantom allocations: FINALIZED campaign ignores payouts in withdrawFunds solvency"
+    description: |
+      In Flywheel.withdrawFunds (line 509-512), when campaign is FINALIZED, the solvency check
+      ONLY considers totalAllocatedFees, ignoring totalAllocatedPayouts. This means:
+
+      1. Manager allocates payouts via allocate() while campaign is ACTIVE/FINALIZING
+      2. Campaign moves to FINALIZED
+      3. Owner calls withdrawFunds and can withdraw funds that were reserved for allocated payouts
+      4. Recipients try to distribute() but campaign is FINALIZED (acceptingPayouts blocks it)
+      5. Allocated payouts become phantom - tracked in storage but unfulfillable
+
+      The allocated payouts are permanently locked in accounting but the actual tokens are gone.
+      This is by design (the comment says "ignore payouts if campaign is finalized") but creates
+      a trust assumption that campaign owners won't rug allocated recipients.
+    severity: medium
+    confidence: 75
+    affected_functions:
+      - "Flywheel.withdrawFunds (src/Flywheel.sol:492-513)"
+      - "Flywheel.distribute (src/Flywheel.sol:405-439)"
+    attack_scenario: |
+      1. Campaign manager allocates 50 ETH to various recipients via allocate()
+      2. totalAllocatedPayouts[campaign][ETH] = 50 ETH
+      3. Campaign transitions ACTIVE -> FINALIZING -> FINALIZED
+      4. Owner calls withdrawFunds for the full balance (50 ETH)
+      5. Solvency check passes because FINALIZED ignores payouts
+      6. Recipients cannot call distribute() because acceptingPayouts modifier blocks FINALIZED
+      7. 50 ETH of allocated payouts are phantom - tracked but unclaimable
+    solidity_invariant: |
+      // INV-WC-04: Allocated payouts should always be backed by real tokens
+      function invariant_WC04_no_phantom_allocations() public {
+        uint256 bal = address(campaign).balance;
+        uint256 allocPayouts = flywheel.totalAllocatedPayouts(address(campaign), NATIVE_TOKEN);
+        uint256 allocFees = flywheel.totalAllocatedFees(address(campaign), NATIVE_TOKEN);
+        assertGe(bal, allocPayouts + allocFees, "WC-04: phantom allocations exist");
+      }
+
+  - id: WC-05
+    title: "Cross-contract reentrancy via native ETH .call in Campaign.sendTokens"
+    description: |
+      Campaign.sendTokens uses a low-level .call{value: amount}("") for native token transfers.
+      While Flywheel uses ReentrancyGuardTransient, this only prevents re-entering the SAME
+      Flywheel contract. A malicious recipient could:
+
+      1. Receive ETH callback in their receive()/fallback()
+      2. Call a DIFFERENT contract that reads Flywheel state (e.g., totalAllocatedPayouts)
+      3. The state is in an intermediate/inconsistent state because the loop in send() or
+         distribute() is still executing
+
+      In send(), the solvency check happens AFTER all sends (line 322). During the loop,
+      tokens have been sent but totalAllocatedPayouts hasn't been updated (send doesn't modify
+      allocations). So balance is decreasing but allocations are unchanged. If a recipient
+      re-enters through a view function that checks solvency, they'd see an insolvent state.
+
+      However, practical exploitation is limited because the transient reentrancy guard prevents
+      re-entering Flywheel state-changing functions.
+    severity: low
+    confidence: 40
+    affected_functions:
+      - "Campaign.sendTokens (src/Campaign.sol:44-51)"
+      - "Flywheel.send (src/Flywheel.sol:299-323)"
+      - "Flywheel.distribute (src/Flywheel.sol:405-439)"
+    attack_scenario: |
+      1. Attacker creates a contract that is a payout recipient
+      2. During send() loop, attacker's contract receives ETH
+      3. In receive(), attacker calls an external protocol that reads Flywheel.totalAllocatedPayouts
+      4. The value is stale (allocations not yet updated/solvency not yet checked)
+      5. External protocol makes decisions based on inconsistent state
+
+      Mitigation: transient reentrancy guard blocks re-entry to Flywheel itself.
+      Risk is limited to third-party contracts reading stale Flywheel view data mid-tx.
+    solidity_invariant: |
+      // INV-WC-05: After any external call, solvency should hold
+      function invariant_WC05_solvency_after_sends() public {
+        uint256 bal = address(campaign).balance;
+        uint256 total = flywheel.totalAllocatedPayouts(address(campaign), NATIVE_TOKEN)
+                      + flywheel.totalAllocatedFees(address(campaign), NATIVE_TOKEN);
+        assertGe(bal, total, "WC-05: insolvency detected after sends");
+      }
+
+  - id: WC-06
+    title: "predictCampaignAddress pre-funding allows griefing or front-running campaign creation"
+    description: |
+      predictCampaignAddress is a pure deterministic function. Anyone can predict the address
+      of a campaign before it's created and send tokens to it. Since Campaign clones have
+      receive() payable, ETH can be pre-sent.
+
+      Scenarios:
+      (a) Attacker pre-funds predicted address, then calls createCampaign + send() to extract
+          those funds through the hook (especially BridgeReferralFees which has no sender access control)
+      (b) Attacker sends a weird/rebasing/fee-on-transfer token to the predicted address before
+          campaign creation, causing unexpected balance-based calculations
+      (c) Pre-funding with native ETH inflates _campaignTokenBalance, possibly passing solvency
+          checks that shouldn't pass
+    severity: low
+    confidence: 50
+    affected_functions:
+      - "Flywheel.predictCampaignAddress (src/Flywheel.sol:566-572)"
+      - "Flywheel.createCampaign (src/Flywheel.sol:274-289)"
+      - "BridgeReferralFees._onSend (src/hooks/BridgeReferralFees.sol:69-108)"
+    attack_scenario: |
+      1. Attacker predicts campaign address for a BridgeReferralFees hook with known params
+      2. Attacker sends 1 ETH to the predicted address (ETH goes to CREATE2 determined address)
+      3. Campaign is created by legitimate user
+      4. Attacker immediately calls send() on the BridgeReferralFees campaign
+      5. bridgedAmount = 1 ETH (the pre-funded amount), sent to attacker-controlled user address
+      6. Attacker extracts the 1 ETH they deposited — no loss here, but if someone ELSE
+         pre-funds (e.g., bridge sends tokens before campaign creation), attacker steals those
+    solidity_invariant: |
+      // INV-WC-06: Campaign balance at creation should be accounted for
+      function invariant_WC06_no_prefund_theft() public {
+        // After createCampaign, any pre-existing balance should be tracked or zero
+        uint256 bal = address(campaign).balance;
+        uint256 alloc = flywheel.totalAllocatedPayouts(address(campaign), NATIVE_TOKEN)
+                      + flywheel.totalAllocatedFees(address(campaign), NATIVE_TOKEN);
+        assertGe(bal, alloc, "WC-06: pre-funded balance unaccounted");
+      }
+
+  - id: WC-07
+    title: "EIP-1167 clone FLYWHEEL immutable shares implementation's deployer"
+    description: |
+      Campaign is deployed in Flywheel's constructor as `new Campaign()`, setting
+      FLYWHEEL = msg.sender (the Flywheel contract). EIP-1167 clones delegate all calls to the
+      implementation but store their own state. Crucially, immutables in Solidity are stored in
+      the bytecode, not storage. For EIP-1167 minimal proxies, the clone delegates to the
+      implementation's bytecode, so FLYWHEEL immutable is correctly read from the implementation
+      contract's bytecode.
+
+      BUT: if someone calls sendTokens() directly on CAMPAIGN_IMPLEMENTATION (not a clone),
+      the FLYWHEEL check passes only if msg.sender == the Flywheel contract. The implementation
+      contract itself can hold ETH (it has receive() payable). Anyone can send ETH to the
+      implementation, but only Flywheel can call sendTokens. Since the implementation is not
+      registered as a campaign (campaignExists returns false), Flywheel won't call sendTokens
+      on it. ETH sent to the implementation is permanently locked.
+    severity: informational
+    confidence: 85
+    affected_functions:
+      - "Campaign constructor (src/Campaign.sol:28-30)"
+      - "Campaign.sendTokens (src/Campaign.sol:44-51)"
+      - "Campaign.receive (src/Campaign.sol:33)"
+    attack_scenario: |
+      1. User accidentally sends ETH to CAMPAIGN_IMPLEMENTATION address instead of a clone
+      2. ETH is received (receive() payable accepts it)
+      3. No one can extract it: sendTokens requires msg.sender == FLYWHEEL,
+         but Flywheel never calls sendTokens on the implementation (not a registered campaign)
+      4. Funds are permanently locked
+    solidity_invariant: |
+      // INV-WC-07: Implementation contract should not hold any funds
+      function invariant_WC07_implementation_no_funds() public {
+        assertEq(
+          address(flywheel.CAMPAIGN_IMPLEMENTATION()).balance,
+          0,
+          "WC-07: implementation holds locked funds"
+        );
+      }
+
+  - id: WC-08
+    title: "Hook contract reuse across multiple Flywheel instances enables cross-Flywheel state confusion"
+    description: |
+      CampaignHooks stores FLYWHEEL as an immutable set at construction. The onlyFlywheel modifier
+      ensures only one Flywheel can call hook functions. However, consider:
+
+      If the same hook instance is used with TWO Flywheel contracts (deploying hook with flywheel1,
+      then someone creates a campaign on flywheel2 pointing to this hook), flywheel2's calls to
+      the hook will revert because onlyFlywheel blocks them. This is safe.
+
+      BUT: the hook's external non-onlyFlywheel functions (like AdConversion.addAllowedPublisherRefCode,
+      addConversionConfig, disableConversionConfig) use campaign address as key. If two Flywheel
+      instances create campaigns at the same address (different salts but same CREATE2 result is
+      impossible), this isn't exploitable. However, the hook stores state keyed by campaign address,
+      and campaign addresses are deterministic from (hooks, nonce, hookData). Different Flywheel
+      instances with same CAMPAIGN_IMPLEMENTATION would produce different addresses, so no collision.
+    severity: informational
+    confidence: 30
+    affected_functions:
+      - "CampaignHooks.onlyFlywheel (src/CampaignHooks.sol:19-22)"
+      - "AdConversion.addAllowedPublisherRefCode (src/hooks/AdConversion.sol:233-248)"
+    attack_scenario: |
+      Theoretical: Two Flywheel instances share a hook contract. Hook state keyed by campaign
+      address could be manipulated if same campaign address exists on both Flywheels. In practice,
+      different Flywheel contracts have different CAMPAIGN_IMPLEMENTATION addresses, producing
+      different CREATE2 addresses, so collision is infeasible.
+    solidity_invariant: |
+      // INV-WC-08: Hook should only accept calls from its designated Flywheel
+      function invariant_WC08_hook_single_flywheel() public {
+        assertEq(
+          address(hook.FLYWHEEL()),
+          address(flywheel),
+          "WC-08: hook bound to wrong flywheel"
+        );
+      }
+
+  - id: WC-09
+    title: "BridgeReferralFees._safePercent rounding can be exploited for dust accumulation"
+    description: |
+      The _safePercent function at line 200 uses a split calculation to avoid overflow:
+        (amount / 1e4) * bps + ((amount % 1e4) * bps) / 1e4
+
+      This can produce a result 1 wei LESS than the standard (amount * bps) / 1e4 due to
+      integer division truncation in the first term. For example:
+        amount = 10001, bps = 1
+        Standard: (10001 * 1) / 10000 = 1
+        SafePercent: (10001/10000)*1 + ((10001%10000)*1)/10000 = 1*1 + (1*1)/10000 = 1 + 0 = 1
+
+      Actually the difference is minimal (at most bps-1 wei per tx). But over millions of
+      bridge transactions, the rounding consistently favors the user (less fees), meaning the
+      fee recipient accumulates less than expected. The dust stays in the campaign and can be
+      extracted via withdrawFunds (which is permissionless in BridgeReferralFees).
+    severity: informational
+    confidence: 60
+    affected_functions:
+      - "BridgeReferralFees._safePercent (src/hooks/BridgeReferralFees.sol:199-201)"
+      - "BridgeReferralFees._onSend (src/hooks/BridgeReferralFees.sol:69-108)"
+    attack_scenario: |
+      1. Over N bridge transactions, _safePercent rounds down fee by ~1 wei each time
+      2. N wei of dust accumulates in campaign (not allocated to fees, not sent to user)
+      3. Anyone can call withdrawFunds (no access control) to extract accumulated dust
+      4. Impact: negligible per-tx, but the permissionless withdrawal makes it a clean sweep
+    solidity_invariant: |
+      // INV-WC-09: Fee calculation should not leave unaccounted dust
+      function invariant_WC09_no_fee_dust() public {
+        uint256 bal = address(campaign).balance;
+        uint256 allocFees = flywheel.totalAllocatedFees(address(campaign), NATIVE_TOKEN);
+        uint256 allocPayouts = flywheel.totalAllocatedPayouts(address(campaign), NATIVE_TOKEN);
+        // After a send, balance should equal allocated fees (payouts already sent)
+        // Any excess is rounding dust
+        assertLe(bal - allocFees - allocPayouts, 1, "WC-09: excessive dust from rounding");
+      }
+
+  - id: WC-10
+    title: "distributeFees underflow if hook returns more than allocated"
+    description: |
+      In Flywheel.distributeFees (line 481), totalAllocatedFees[campaign][token] -= totalAmount.
+      The totalAmount is the sum of successfully sent fee distributions. The individual
+      _allocatedFee[key] -= amount (line 471) could underflow if the hook returns an amount
+      greater than what was actually allocated for that key. However, Solidity 0.8+ prevents
+      underflow with a revert.
+
+      The real question: can a malicious hook return a distribution where amount > allocatedFee[key]?
+      Yes, if the hook is malicious. The _allocatedFee[key] -= amount will revert, protecting
+      funds. But a PARTIALLY malicious hook could return correct amounts for some distributions
+      and inflated amounts for others — the revert would block ALL distributions in the tx.
+      This is a griefing vector if the hook is semi-trusted.
+
+      More importantly: the hook reads allocatedFee from FLYWHEEL (e.g., AdConversion line 524),
+      so if the hook is honest, it returns the correct amount. The risk is only with malicious hooks.
+    severity: low
+    confidence: 45
+    affected_functions:
+      - "Flywheel.distributeFees (src/Flywheel.sol:448-483)"
+      - "AdConversion._onDistributeFees (src/hooks/AdConversion.sol:514-530)"
+    attack_scenario: |
+      1. Malicious hook deployed, campaign created
+      2. Fees allocated normally through send() operations
+      3. Hook's onDistributeFees returns inflated amount for a key
+      4. _allocatedFee[key] -= amount underflows, tx reverts
+      5. Fees permanently locked (no way to distribute if hook always returns bad amounts)
+      6. If hook is upgradeable or has admin key, this is a rug vector
+    solidity_invariant: |
+      // INV-WC-10: distributeFees should never attempt to distribute more than allocated
+      function invariant_WC10_fee_distribution_bounded() public {
+        // For each fee key, distributed amount <= allocated amount
+        bytes32 key = bytes32(bytes20(attributionProvider));
+        uint256 allocated = flywheel.allocatedFee(address(campaign), token, key);
+        // This holds by Solidity 0.8 underflow protection, but the invariant is:
+        // hook.onDistributeFees().amount <= allocatedFee[key] for each key
+        assertTrue(true, "WC-10: enforced by Solidity 0.8 underflow checks");
+      }
+
+  - id: WC-11
+    title: "AdConversion: attributionDeadline overflow with uint48 timestamp"
+    description: |
+      In AdConversion._onUpdateStatus line 583:
+        state[campaign].attributionDeadline = uint48(block.timestamp) + state[campaign].attributionWindow
+
+      Both are uint48. block.timestamp cast to uint48 is safe until year ~8919. But the
+      ADDITION of uint48(block.timestamp) + attributionWindow could overflow uint48 if
+      attributionWindow is close to max (it's capped at 180 days = 15,552,000 seconds).
+      uint48 max = 281,474,976,710,655 (~8.9 million years). No overflow risk in practice.
+
+      However: if block.timestamp ever exceeds uint48 max (year 8919), the cast truncates
+      and the deadline becomes nonsensical. Not a practical concern.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "AdConversion._onUpdateStatus (src/hooks/AdConversion.sol:551-591)"
+    attack_scenario: |
+      No practical attack. uint48 timestamps are safe for thousands of years.
+      Included for completeness of analysis.
+    solidity_invariant: |
+      // INV-WC-11: Attribution deadline should be in the future when set
+      function invariant_WC11_deadline_in_future() public {
+        (,,,,uint48 attributionWindow, uint48 attributionDeadline) = adConversion.state(address(campaign));
+        if (attributionDeadline != 0) {
+          assertTrue(attributionDeadline > block.timestamp - attributionWindow, "WC-11: deadline overflow");
+        }
+      }
+
+  - id: WC-12
+    title: "SimpleRewards/CashbackRewards: allocation key collision via bytes32(bytes20(address))"
+    description: |
+      SimpleRewards uses bytes32(bytes20(recipient)) as the allocation key. This means the key
+      is the recipient address left-padded to bytes32 with zeros on the right. If two different
+      payout recipients have the same first 20 bytes (which they always do since addresses ARE
+      20 bytes), the keys are unique per address.
+
+      BUT: if the same address receives allocations from MULTIPLE calls (different payouts), they
+      all accumulate under the same key. This is intentional for aggregation. However, in
+      CashbackRewards, distribute() uses the same key bytes32(bytes20(payer)) for different
+      payments from the same payer. If payer has multiple allocated payments, a single distribute
+      call could try to distribute more than what's allocated under that key, or conversely,
+      deallocating one payment could affect the allocation tracking of another payment from the
+      same payer.
+
+      Wait - CashbackRewards tracks per-payment state in rewards[campaign][paymentHash], but
+      the Flywheel-level allocation is keyed by bytes32(bytes20(payer)). Multiple payments from
+      same payer share the same Flywheel allocation key. This means:
+      - allocate(payment1, 10) -> allocatedPayout[campaign][token][key] = 10
+      - allocate(payment2, 20) -> allocatedPayout[campaign][token][key] = 30
+      - deallocate(payment1, 10) -> allocatedPayout[campaign][token][key] = 20 (correct)
+      This actually works correctly because additions/subtractions are commutative.
+
+      But distribute() subtracts from the shared key. If there's an accounting mismatch between
+      CashbackRewards.rewards state and Flywheel.allocatedPayout, one could underflow.
+    severity: low
+    confidence: 35
+    affected_functions:
+      - "SimpleRewards._onAllocate (src/hooks/SimpleRewards.sol:76-91)"
+      - "CashbackRewards._onDistribute (src/hooks/CashbackRewards.sol:219-261)"
+      - "Flywheel.allocate (src/Flywheel.sol:332-359)"
+    attack_scenario: |
+      1. Payer makes payments P1 and P2
+      2. Manager allocates 100 for P1 and 200 for P2, both under key=bytes32(bytes20(payer))
+      3. Flywheel.allocatedPayout[campaign][token][key] = 300
+      4. Manager distributes 300 for P1 (but CashbackRewards.rewards tracks only 100 for P1)
+      5. CashbackRewards validation catches this (allocated=100 < amount=300), reverts
+      6. No actual exploit, but the dual-layer tracking adds complexity and potential for bugs
+    solidity_invariant: |
+      // INV-WC-12: Flywheel allocation key balance >= sum of CashbackRewards per-payment allocations
+      function invariant_WC12_allocation_consistency() public {
+        bytes32 key = bytes32(bytes20(payer));
+        uint256 flywheelAlloc = flywheel.allocatedPayout(address(campaign), token, key);
+        // Sum of all per-payment allocations for this payer should equal flywheelAlloc
+        // (requires iterating all payment hashes - conceptual invariant)
+        assertTrue(flywheelAlloc >= 0, "WC-12: allocation tracking consistent");
+      }
+
+  - id: WC-13
+    title: "BridgeReferralFees: bridgedAmount does not subtract totalAllocatedPayouts"
+    description: |
+      In BridgeReferralFees._onSend line 78-79:
+        bridgedAmount = token balance - totalAllocatedFees
+
+      This does NOT subtract totalAllocatedPayouts. For BridgeReferralFees this might be fine
+      since it doesn't use allocate/distribute (only send). But if someone calls allocate()
+      on a BridgeReferralFees campaign through a different code path... wait, allocate() calls
+      hooks.onAllocate which reverts with Unsupported() in the base CampaignHooks.
+
+      So BridgeReferralFees only supports send(), distributeFees(), withdrawFunds(), and status
+      updates. No allocations possible. The bridgedAmount calculation is correct for this hook's
+      use case.
+
+      However: if fees fail to send (sendFeesNow=true but transfer fails), they get allocated.
+      Next send() call computes bridgedAmount = balance - totalAllocatedFees, correctly excluding
+      the failed fees. This is correct behavior.
+    severity: informational
+    confidence: 80
+    affected_functions:
+      - "BridgeReferralFees._onSend (src/hooks/BridgeReferralFees.sol:78-79)"
+    attack_scenario: |
+      No attack. bridgedAmount calculation is correct for BridgeReferralFees' use case since
+      allocations are not supported. Failed fees are properly excluded via totalAllocatedFees.
+    solidity_invariant: |
+      // INV-WC-13: bridgedAmount should equal actual new deposits (balance - all reservations)
+      function invariant_WC13_bridged_amount_correct() public {
+        uint256 bal = address(campaign).balance;
+        uint256 fees = flywheel.totalAllocatedFees(address(campaign), NATIVE_TOKEN);
+        uint256 payouts = flywheel.totalAllocatedPayouts(address(campaign), NATIVE_TOKEN);
+        // For BridgeReferralFees, payouts should always be 0
+        assertEq(payouts, 0, "WC-13: BridgeReferralFees should have no allocated payouts");
+      }

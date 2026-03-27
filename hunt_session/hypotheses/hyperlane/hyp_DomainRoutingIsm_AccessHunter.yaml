@@ -1,0 +1,226 @@
+hunter: AccessHunter
+component: DomainRoutingIsm
+date: "2026-03-27"
+contracts_analyzed:
+  - DomainRoutingIsm.sol
+  - AbstractRoutingIsm.sol
+  - DefaultFallbackRoutingIsm.sol
+  - DomainRoutingIsmFactory.sol
+  - IncrementalDomainRoutingIsm.sol
+  - Mailbox.sol
+
+hypotheses:
+  - id: DRI-AC-01
+    title: "Uninitialized implementation contract in DomainRoutingIsmFactory allows owner takeover"
+    description: |
+      DomainRoutingIsmFactory constructor creates a bare DomainRoutingIsm as implementation.
+      This implementation contract is never initialized — initialize() is only called on clones.
+      Anyone can call initialize(attacker) on the implementation directly, becoming its owner.
+      While the implementation itself is not used for routing (clones are), if any system
+      references the implementation address directly (e.g., via implementation() getter which is
+      public), the attacker-owned implementation could be set as an ISM somewhere.
+      However, the implementation only serves as a delegatecall target for proxies — storage
+      changes on it don't affect proxies. The real risk is if the implementation address is
+      mistakenly used as an ISM directly.
+    confidence: 25
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. DomainRoutingIsmFactory deployed, creates implementation at address X
+      2. Attacker calls X.initialize(attacker) — succeeds, attacker is now owner of implementation
+      3. Attacker calls X.set(domain, maliciousISM) — sets routing to a pass-through ISM
+      4. IF any recipient sets X (the implementation) as their ISM, attacker controls verification
+      5. Attacker crafts message from that domain → malicious ISM returns true → message delivered
+      Risk is LOW because the implementation address is not intended to be used directly as ISM,
+      and set() on implementation doesn't affect clones. But it's a hygiene issue — best practice
+      is to call _disableInitializers() in the implementation constructor.
+    solidity: |
+      // INVARIANT: Implementation contract should not be initializable by anyone
+      function invariant_implementation_not_ownable() public view returns (bool) {
+          DomainRoutingIsmFactory factory = DomainRoutingIsmFactory(FACTORY);
+          address impl = factory.implementation();
+          // If implementation has an owner that is not address(0) and not the factory,
+          // someone has taken ownership
+          try OwnableUpgradeable(impl).owner() returns (address owner) {
+              return owner == address(0);
+          } catch {
+              return true;
+          }
+      }
+
+  - id: DRI-AC-02
+    title: "Factory deploy() front-running — attacker can pre-initialize clone with malicious ISMs"
+    description: |
+      Factory.deploy() uses MinimalProxy.create() (CREATE opcode) which has a deterministic
+      address based on factory nonce. An attacker cannot predict the exact address without
+      knowing the factory's nonce, making classic front-running harder.
+      However, the real concern: deploy() is permissionless — anyone can call it.
+      This is by design (anyone should be able to create routing ISMs). The caller specifies
+      the owner, so a legitimate user calls deploy(theirAddress, domains, modules) and gets
+      back an ISM owned by them. There's no front-running vector here because:
+      (a) The caller chooses the owner, (b) initialize can only be called once (initializer modifier),
+      (c) CREATE address depends on factory nonce which increments atomically.
+      SAFE — no real vulnerability.
+    confidence: 10
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. User submits tx: factory.deploy(user, [1,2], [ismA, ismB])
+      2. Attacker front-runs with: factory.deploy(attacker, [1,2], [maliciousIsm, maliciousIsm])
+      3. But this creates a DIFFERENT clone (factory nonce incremented), not the user's
+      4. User's tx still succeeds and creates their own properly-configured ISM
+      5. No impact — each deploy creates a fresh, independently-owned clone
+    solidity: |
+      // INVARIANT: Each factory.deploy() returns a uniquely-owned ISM
+      function invariant_deploy_unique_ownership() public {
+          address owner1 = address(0x1);
+          address owner2 = address(0x2);
+          uint32[] memory domains = new uint32[](0);
+          IInterchainSecurityModule[] memory modules = new IInterchainSecurityModule[](0);
+          DomainRoutingIsm ism1 = factory.deploy(owner1, domains, modules);
+          DomainRoutingIsm ism2 = factory.deploy(owner2, domains, modules);
+          t(address(ism1) != address(ism2), "ISMs should be different addresses");
+          t(ism1.owner() == owner1, "ISM1 owner correct");
+          t(ism2.owner() == owner2, "ISM2 owner correct");
+      }
+
+  - id: DRI-AC-03
+    title: "Owner can swap ISM for a domain mid-flight, bypassing verification for in-transit messages"
+    description: |
+      DomainRoutingIsm.set() allows the owner to change which ISM verifies messages from a given
+      domain at any time. If a message is already in the relayer pipeline with metadata signed
+      for ISM_A, the owner can swap the domain to ISM_B before process() is called.
+      This is a DESIGN FEATURE (owner controls security policy), not a bug — the owner is trusted.
+      However, there's a subtle trust assumption: the owner of a DomainRoutingIsm has FULL control
+      over which messages pass verification. They can set a domain's ISM to a contract that always
+      returns true, effectively disabling verification for that origin.
+      This is equivalent to the owner being able to approve ANY message from any configured domain.
+      For DefaultFallbackRoutingIsm, even unconfigured domains fall back to mailbox.defaultIsm()
+      which is controlled by the Mailbox owner (different trust boundary).
+      DESIGN — the trust model is: "whoever owns the DomainRoutingIsm controls verification policy."
+      Recipients choosing this ISM are trusting its owner implicitly.
+    confidence: 15
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. Recipient sets DomainRoutingIsm (owned by protocol team) as their ISM
+      2. Protocol team (or compromised owner key) calls set(domain, alwaysTrueISM)
+      3. Attacker crafts fake message from that domain
+      4. Relayer submits process() → DomainRoutingIsm routes to alwaysTrueISM → returns true
+      5. Mailbox delivers fake message to recipient
+      This is owner-privilege abuse, not a code vulnerability. Documented trust assumption.
+    solidity: |
+      // INVARIANT: Only owner can modify domain routing
+      function invariant_only_owner_modifies_routing(uint32 domain) public {
+          address ismBefore = address(domainRoutingIsm.module(domain));
+          // Non-owner attempt should revert
+          vm.prank(address(0xdead));
+          vm.expectRevert("Ownable: caller is not the owner");
+          domainRoutingIsm.set(domain, IInterchainSecurityModule(address(0xbeef)));
+          // Verify unchanged
+          address ismAfter = address(domainRoutingIsm.module(domain));
+          t(ismBefore == ismAfter, "ISM should not change from non-owner call");
+      }
+
+  - id: DRI-AC-04
+    title: "DefaultFallbackRoutingIsm falls back to mailbox.defaultIsm which is a DIFFERENT trust boundary"
+    description: |
+      DefaultFallbackRoutingIsm.module() falls back to mailbox.defaultIsm() for unconfigured
+      domains. This creates a trust boundary mismatch:
+      - The DomainRoutingIsm owner controls configured domains
+      - The Mailbox owner controls the fallback (defaultIsm) for unconfigured domains
+      If a recipient uses DefaultFallbackRoutingIsm expecting the DomainRoutingIsm owner to
+      control ALL verification, they may not realize that unconfigured domains are verified by
+      a completely different ISM controlled by a different entity (Mailbox owner).
+      Scenario: DomainRoutingIsm owner configures ISMs for domains 1-10 (strict multisig).
+      Domain 11 is added to the protocol. Messages from domain 11 silently fall through to
+      mailbox.defaultIsm() which might be a weaker ISM.
+      This is a DESIGN consideration — the fallback behavior is intentional and documented in
+      the contract name ("DefaultFallback"). But the trust boundary split is worth noting.
+    confidence: 35
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Protocol deploys DefaultFallbackRoutingIsm, configures strict MultisigISM for domains 1-10
+      2. Mailbox.defaultIsm is a lightweight ISM with lower security threshold
+      3. New domain 11 goes live, messages start flowing
+      4. DomainRoutingIsm owner hasn't configured domain 11 yet
+      5. Messages from domain 11 silently verified by weaker defaultIsm
+      6. Attacker exploits weaker defaultIsm to forge a message from domain 11
+      7. Recipient processes forged message thinking it was verified by strict multisig
+      Impact: verification bypass for new/unconfigured domains.
+      Mitigation: DomainRoutingIsm owner must proactively configure all domains.
+    solidity: |
+      // INVARIANT: DefaultFallbackRoutingIsm should use defaultIsm only for truly unconfigured domains
+      function invariant_fallback_trust_boundary() public view returns (bool) {
+          // For every domain that has sent messages to this recipient,
+          // the DomainRoutingIsm should have an explicit configuration
+          // (not relying on fallback)
+          DefaultFallbackRoutingIsm ism = DefaultFallbackRoutingIsm(ISM_ADDR);
+          uint256[] memory configuredDomains = ism.domains();
+          // This is a monitoring invariant — flag if active domains are unconfigured
+          // In practice: check that module(activeDomain) != mailbox.defaultIsm()
+          for (uint256 i = 0; i < activeDomains.length; i++) {
+              IInterchainSecurityModule domainIsm = ism.module(activeDomains[i]);
+              if (address(domainIsm) == address(mailbox.defaultIsm())) {
+                  return false; // Active domain using fallback = potential trust issue
+              }
+          }
+          return true;
+      }
+
+  - id: DRI-AC-05
+    title: "isContract check in _set() can be bypassed via CREATE2 deploy-selfdestruct-redeploy"
+    description: |
+      DomainRoutingIsm._set() validates `_module.isContract()` to ensure the ISM address contains
+      code. However, with CREATE2, an attacker who is the owner could:
+      1. Deploy a legitimate ISM at a predictable address via CREATE2
+      2. Call set(domain, legitimateISM) — passes isContract check
+      3. Selfdestruct the legitimate ISM
+      4. Redeploy malicious code at the same address via CREATE2 (different initcode → different address, so this doesn't actually work with same address unless same initcode)
+
+      Actually, CREATE2 address = keccak256(0xff, sender, salt, keccak256(initcode)).
+      To get the same address, you need the same initcode. With a proxy pattern or metamorphic
+      contract, the initcode can be the same while delegating to different implementation.
+
+      BUT: the owner already has set() access, so they don't need this trick — they can just
+      call set(domain, maliciousISM) directly with any contract address. The isContract check
+      only prevents setting to an EOA, not a malicious contract.
+
+      The isContract check is a sanity check, not a security boundary. Owner trust is the real
+      boundary. SAFE — no escalation beyond owner privileges.
+    confidence: 10
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. Owner calls set(domain, maliciousISM) where maliciousISM.verify() always returns true
+      2. isContract() passes because maliciousISM has code
+      3. All messages from that domain are now "verified" without real checks
+      No CREATE2 trick needed — owner can directly set any contract as ISM.
+      The isContract check prevents accidental misconfiguration (setting to EOA), not malice.
+    solidity: |
+      // INVARIANT: _set should reject EOA addresses
+      function invariant_set_rejects_eoa() public {
+          address eoa = address(0x1234);
+          vm.prank(domainRoutingIsm.owner());
+          vm.expectRevert("ISM must be a contract");
+          domainRoutingIsm.set(42, IInterchainSecurityModule(eoa));
+      }
+
+summary: |
+  El componente DomainRoutingIsm tiene un modelo de access control sencillo y correcto:
+  - Owner (OwnableUpgradeable) controla toda la configuración de routing
+  - initialize() protegido por modifier `initializer` (single-use)
+  - set()/remove() protegidos por `onlyOwner`
+  - Factory crea clones independientes, cada uno con su owner
+
+  Dos áreas merecen investigación adicional:
+  1. DRI-AC-01 (Low): Implementation contract del factory no tiene _disableInitializers().
+     Alguien puede tomar ownership del implementation, pero el impacto es bajo porque no
+     afecta a los clones y nadie debería usar el implementation directamente como ISM.
+  2. DRI-AC-04 (Medium): DefaultFallbackRoutingIsm crea un split de trust boundary entre
+     el owner del ISM y el owner del Mailbox. Dominios no configurados caen silenciosamente
+     al defaultIsm, que puede tener un umbral de seguridad más débil.
+
+  No se encontraron vulnerabilidades críticas de access control. El patrón owner-trust
+  es consistente y bien implementado.

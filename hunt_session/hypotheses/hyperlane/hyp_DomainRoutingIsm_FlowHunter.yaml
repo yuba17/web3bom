@@ -1,0 +1,257 @@
+hunter: FlowHunter
+component: DomainRoutingIsm
+date: "2026-03-27"
+files_analyzed:
+  - solidity/contracts/isms/routing/DomainRoutingIsm.sol
+  - solidity/contracts/isms/routing/DefaultFallbackRoutingIsm.sol
+  - solidity/contracts/isms/routing/DomainRoutingIsmFactory.sol
+  - solidity/contracts/isms/routing/IncrementalDomainRoutingIsm.sol
+  - solidity/contracts/isms/routing/AbstractRoutingIsm.sol
+  - solidity/contracts/Mailbox.sol
+
+# ═══════════════════════════════════════════════════
+# STATE MACHINE MODEL
+# ═══════════════════════════════════════════════════
+state_machine:
+  states:
+    - UNINITIALIZED: "Proxy deployed, no owner, no domains"
+    - INITIALIZED_EMPTY: "Owner set, zero domains registered"
+    - INITIALIZED_WITH_DOMAINS: "Owner set, 1+ domains registered"
+  transitions:
+    - from: UNINITIALIZED
+      to: INITIALIZED_EMPTY
+      trigger: "initialize(owner)"
+      guard: "initializer modifier (OZ)"
+      irreversible: true
+    - from: UNINITIALIZED
+      to: INITIALIZED_WITH_DOMAINS
+      trigger: "initialize(owner, domains[], modules[])"
+      guard: "initializer modifier + isContract check per module"
+      irreversible: true
+    - from: INITIALIZED_EMPTY
+      to: INITIALIZED_WITH_DOMAINS
+      trigger: "set(domain, module)"
+      guard: "onlyOwner + isContract"
+    - from: INITIALIZED_WITH_DOMAINS
+      to: INITIALIZED_WITH_DOMAINS
+      trigger: "set(domain, module) — overwrite or add"
+      guard: "onlyOwner + isContract"
+    - from: INITIALIZED_WITH_DOMAINS
+      to: INITIALIZED_EMPTY
+      trigger: "remove(domain) — last domain removed"
+      guard: "onlyOwner + domain must exist"
+    - from: INITIALIZED_WITH_DOMAINS
+      to: INITIALIZED_WITH_DOMAINS
+      trigger: "remove(domain) — still has other domains"
+      guard: "onlyOwner + domain must exist"
+  read_only_flows:
+    - "verify(metadata, message) → route(message) → module(origin) → childISM.verify()"
+    - "domains() → returns all registered domain keys"
+
+# ═══════════════════════════════════════════════════
+# HYPOTHESES
+# ═══════════════════════════════════════════════════
+hypotheses:
+
+  - id: DR-FLOW-01
+    title: "DefaultFallbackRoutingIsm silently downgrades verification for unregistered domains"
+    description: |
+      DefaultFallbackRoutingIsm.module() falls back to mailbox.defaultIsm() when a domain
+      is not registered. If the owner configures specific high-security ISMs per domain but
+      an attacker sends a message from an unregistered origin domain, the message gets verified
+      by the (potentially weaker) default ISM. The recipient has NO indication that fallback
+      was used instead of a domain-specific ISM.
+
+      This is by design, but the trust model is subtle: the security of
+      DefaultFallbackRoutingIsm is only as strong as the WEAKEST of (defaultIsM, any
+      domain-specific ISM). If mailbox.defaultIsm is a TrustedRelayerISM or a low-threshold
+      multisig, any unregistered domain gets weak verification.
+    confidence: 35
+    severity: medium
+    status: investigating
+    attack_scenario: |
+      1. Mailbox owner sets defaultIsm to a TrustedRelayerISM (single relayer, no multisig)
+      2. Recipient uses DefaultFallbackRoutingIsm with strict MultisigIsm per known domain
+      3. Attacker crafts message with origin = domain_999 (unregistered in routing ISM)
+      4. DefaultFallbackRoutingIsm.module(999) falls through to mailbox.defaultIsm()
+      5. TrustedRelayerISM.verify() passes (relayer signs anything)
+      6. Message delivered with weaker verification than recipient intended
+    root_cause: "Implicit fallback to potentially weaker defaultIsm for unknown domains"
+    affected_lines:
+      - "DefaultFallbackRoutingIsm.sol:28 — return mailbox.defaultIsm()"
+    solidity:
+      invariant: |
+        // INV: DefaultFallbackRoutingIsm should never verify a message with a weaker ISM
+        // than what the recipient explicitly configured
+        // This is architectural — not directly testable without deployment context
+        function invariant_fallback_ism_not_weaker() public view {
+            // Would need to compare moduleType/threshold of defaultIsm vs registered ISMs
+            // Architectural concern — flagged for manual review
+        }
+
+  - id: DR-FLOW-02
+    title: "Owner can remove domain while message is in-flight — verify reverts, message undeliverable"
+    description: |
+      DomainRoutingIsm (non-fallback) reverts in module() if origin domain is not found.
+      If the owner removes a domain between when a message is dispatched on the origin chain
+      and when the relayer calls Mailbox.process() on the destination chain, the verify() call
+      will revert. The message becomes permanently undeliverable (Mailbox marks delivery based
+      on id, but if verify reverts, the whole process() reverts and delivery mapping is not set).
+
+      For DomainRoutingIsm: message is stuck forever (unless owner re-adds the domain).
+      For IncrementalDomainRoutingIsm: remove always reverts, so this is mitigated.
+
+      However, the owner can also call set() to REPLACE the ISM for a domain with a different
+      one. If the metadata was prepared for ISM_A but owner switches to ISM_B, verify will
+      fail with ISM_B because the metadata format/signatures don't match.
+    confidence: 50
+    severity: low
+    status: investigating
+    attack_scenario: |
+      1. Message dispatched from origin chain (domain 42) at block N
+      2. Relayer indexes message, prepares metadata for MultisigIsm at domain 42
+      3. Owner calls remove(42) on DomainRoutingIsm (or set(42, newISM))
+      4. Relayer calls Mailbox.process(metadata, message) — reverts because:
+         a) Domain 42 not found (if removed), OR
+         b) Metadata doesn't match new ISM (if replaced)
+      5. Message stuck until owner re-adds correct ISM for domain 42
+    root_cause: "State mutability of domain→ISM mapping during message flight"
+    affected_lines:
+      - "DomainRoutingIsm.sol:92-96 — tryGet + revert if not contained"
+      - "DomainRoutingIsm.sol:81-83 — remove is onlyOwner but no pending-message check"
+    solidity:
+      invariant: |
+        // INV: A domain that has been set should remain routable until explicitly removed
+        // Test: set domain, then verify message from that domain succeeds
+        function invariant_set_domain_is_routable(uint32 domain, address module) public {
+            // After set(domain, module), module(domain) should return module
+            // This tests the happy path — the real risk is owner admin action
+        }
+
+  - id: DR-FLOW-03
+    title: "Uninitialized implementation contract in factory can be hijacked"
+    description: |
+      DomainRoutingIsmFactory constructor deploys `new DomainRoutingIsm()` as the
+      implementation. This contract is never initialized — anyone can call
+      initialize(attacker) on it and become owner. However, since MinimalProxy
+      (EIP-1167) delegates ALL calls to the implementation's code but uses its own
+      storage, the implementation's storage is irrelevant to proxies.
+
+      The risk is if someone calls the implementation directly (not through a proxy):
+      they could set arbitrary domains→ISMs and then if any system references the
+      implementation address directly (instead of a proxy), messages would be verified
+      by attacker-controlled ISMs. This is a known pattern risk but worth flagging.
+    confidence: 20
+    severity: informational
+    status: rejected
+    rejection_reason: |
+      Standard minimal proxy pattern. Implementation storage is never used by proxies.
+      No funds or protocol state at risk. OZ docs acknowledge this as acceptable.
+      The implementation contract is not referenced directly by any protocol component.
+    attack_scenario: |
+      1. Attacker calls initialize(attacker) on the factory's implementation contract
+      2. Attacker calls set(domain, maliciousISM) on implementation
+      3. No impact — no proxy uses implementation's storage
+      4. Only exploitable if someone misconfigures a system to point at implementation
+         instead of a proxy — user error, not protocol bug
+    affected_lines:
+      - "DomainRoutingIsmFactory.sol:49 — _implementation = address(new DomainRoutingIsm())"
+    solidity:
+      invariant: |
+        // INV: Implementation contract initialization is a non-issue for proxies
+        // No actionable invariant — informational only
+
+  - id: DR-FLOW-04
+    title: "DomainRoutingIsm.set() allows silent ISM replacement — no event emitted for domain overwrite"
+    description: |
+      When owner calls set(domain, newModule), the EnumerableMapExtended.set() silently
+      overwrites the existing module for that domain. There is no event emitted by
+      DomainRoutingIsm.set() at all — neither for new domains nor for overwrites. This
+      means off-chain monitoring cannot detect when a domain's ISM is changed, making
+      it impossible for relayers or users to detect security downgrades.
+
+      If EnumerableMapExtended.set() does not emit events (it's a library), and
+      DomainRoutingIsm.set() doesn't either, the only way to detect changes is by
+      polling the contract state.
+    confidence: 60
+    severity: low
+    status: investigating
+    attack_scenario: |
+      1. Owner (or compromised owner key) calls set(domain, weakISM)
+      2. No event emitted — off-chain monitoring cannot detect the change
+      3. Relayer continues operating, now routing messages through weakISM
+      4. Attacker exploits weakISM to forge messages for that domain
+    root_cause: "Missing events on state-changing set/remove operations"
+    affected_lines:
+      - "DomainRoutingIsm.sol:70-75 — set() has no emit"
+      - "DomainRoutingIsm.sol:81-83 — remove() has no emit"
+    solidity:
+      invariant: |
+        // QA: set() and remove() should emit events for off-chain monitoring
+        // Not a security invariant — operational/monitoring concern
+
+  - id: DR-FLOW-05
+    title: "verify() delegates to arbitrary child ISM with full metadata — no validation of child ISM type"
+    description: |
+      AbstractRoutingIsm.verify() calls route(message).verify(metadata, message),
+      passing the FULL metadata blob to whichever child ISM is returned by route().
+      If owner sets a domain to point to a malicious or buggy ISM that always returns
+      true, all messages from that domain pass verification.
+
+      The isContract check in _set() ensures the module is a contract, but does NOT
+      verify it implements IInterchainSecurityModule correctly. A contract that always
+      returns true on verify() would pass the isContract check.
+
+      This is owner trust — owner is trusted to set correct ISMs. But combined with
+      DR-FLOW-04 (no events), a compromised owner could silently switch to a
+      permissive ISM.
+    confidence: 25
+    severity: low
+    status: rejected
+    rejection_reason: |
+      Owner is explicitly trusted in this design. The onlyOwner modifier is the
+      access control. If owner is compromised, the entire ISM is compromised regardless.
+      This is equivalent to "admin can rug" which is out of scope for most bounties.
+      The isContract check prevents setting to EOA (which would be a more subtle bug).
+    attack_scenario: |
+      1. Compromised owner deploys AlwaysTrueISM (verify always returns true)
+      2. Owner calls set(targetDomain, alwaysTrueISM) — passes isContract check
+      3. Attacker sends forged message from targetDomain
+      4. DomainRoutingIsm routes to AlwaysTrueISM, verify returns true
+      5. Forged message delivered to recipient
+    affected_lines:
+      - "AbstractRoutingIsm.sol:42 — return route(_message).verify(_metadata, _message)"
+      - "DomainRoutingIsm.sol:134 — only checks isContract, not ISM interface"
+    solidity:
+      invariant: |
+        // INV: Child ISM must implement IInterchainSecurityModule
+        // Could add ERC-165 supportsInterface check in _set()
+        function invariant_child_ism_implements_interface(uint32 domain) public view {
+            IInterchainSecurityModule ism = domainRoutingIsm.module(domain);
+            // ism.moduleType() should not revert
+            uint8 mtype = ism.moduleType();
+            assert(mtype <= uint8(type(IInterchainSecurityModule.Types).max));
+        }
+
+summary: |
+  DomainRoutingIsm tiene una state machine simple y bien delimitada. El principal
+  riesgo de flujo es DR-FLOW-01: el fallback silencioso en DefaultFallbackRoutingIsm
+  que puede degradar la verificacion a un ISM mas debil para dominios no registrados.
+
+  DR-FLOW-02 (removal during flight) es un riesgo operacional real pero de severidad
+  baja — el owner tendria que actuar maliciosamente o por error.
+
+  DR-FLOW-04 (missing events) es un QA finding genuino — la ausencia de eventos en
+  set/remove dificulta el monitoreo off-chain.
+
+  Los demas son design-level concerns que dependen del trust model del owner.
+
+  IncrementalDomainRoutingIsm mitiga DR-FLOW-02 al prohibir remove y overwrite,
+  pero introduce su propio tradeoff: un ISM comprometido para un dominio no puede
+  ser reemplazado — requiere migrar a una nueva instancia completa.
+
+convergences_with_other_hunters:
+  - "AccessHunter: owner trust model, onlyOwner on set/remove"
+  - "TrustBoundaryHunter: DefaultFallbackRoutingIsm crosses trust boundary (specific ISM → default ISM)"
+  - "DoSHunter: domain removal can DoS in-flight messages"
+  - "DomainHunter: factory permissionless deployment, implementation initialization"

@@ -1,0 +1,459 @@
+# SignatureHunter Analysis — BridgeValidator.sol + VerificationLib.sol
+# Contract: base/src/BridgeValidator.sol, base/src/libraries/VerificationLib.sol
+# Focus: signature verification, replay attacks, malleability, domain separation, double-counting
+# Analyst: SignatureHunter
+# Date: 2026-03-27
+# Bounty: Coinbase Base↔Solana Bridge ($5M)
+
+hypotheses:
+
+  - id: BR-SIG-01
+    title: "Validator double-counting: address in both base AND partner sets counts toward both thresholds"
+    description: |
+      In BridgeValidator._validateSigs (line 223-235), recovered signers are checked independently:
+        1. _countBaseSigners iterates all recovered signers, counts those in VerificationLib.validators mapping
+        2. _countPartnerSigners iterates all recovered signers, counts those matching IPartner.Signer entries
+
+      There is NO exclusion between the two sets. If address X is registered as BOTH a base validator
+      (via VerificationLib.initialize/addValidator) AND as a partner signer (via IPartner.getSigners),
+      then a single signature from X counts toward BOTH baseThreshold AND partnerValidatorThreshold.
+
+      Example: baseThreshold=2, partnerThreshold=1. If signer A is in both sets, then 2 total
+      signatures (A + one more base validator) satisfy BOTH thresholds. Without overlap, 3 would be needed.
+
+      Security impact depends on operational setup: if Coinbase controls base validators and a separate
+      entity controls partner validators, having overlap defeats the purpose of dual-threshold (N-of-M + K-of-L).
+      The security model degrades from "base AND partner must agree" to "base alone can satisfy both".
+    confidence: 72
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Coinbase registers address X as base validator
+      2. Partner entity also registers X (or X's rotation address) as partner signer
+      3. Attacker compromises N base validator keys including X
+      4. X's signature counts for both base (1/2) and partner (1/1) thresholds
+      5. Only 2 compromised keys needed instead of 3 (base_threshold + partner_threshold)
+      6. Attacker can register arbitrary message hashes, bridging funds from Solana fraudulently
+    preconditions: |
+      - An address must exist in both base validator set AND partner signer set
+      - This is an operational/configuration issue — the code does NOT prevent it
+      - VerificationLib.addValidator has no check against partner set
+      - IPartner contract is external and independently managed
+    impact: |
+      Reduces effective multisig security. If base_threshold=3, partner_threshold=2, and 2 addresses
+      overlap, only 3 unique keys needed instead of 5. For a $5M bridge, this could allow fraudulent
+      message registration leading to unauthorized token minting/transfers.
+    mitigation: |
+      Add explicit check that recovered signers counted as base validators are excluded from
+      partner count (or vice versa). Or enforce at initialization that no address can be in both sets.
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [_validateSigs, _countBaseSigners, _countPartnerSigners]
+      lines: [223-235, 266-278, 280-305]
+    solidity: |
+      // Invariant: a signer counted as base must NOT also count as partner
+      function property_BR_SIG_01_no_double_count() public returns (bool) {
+        // Setup: register address that's in both sets
+        // Call registerMessages with signatures including the overlapping address
+        // Verify: effective unique signers >= baseThreshold + partnerThreshold
+        // This invariant breaks if overlap exists
+        return true; // placeholder — needs concrete PoC with overlapping validator sets
+      }
+
+  - id: BR-SIG-02
+    title: "Signature malleability mitigated by Solady ECDSA + sorted signer requirement"
+    description: |
+      BridgeValidator._getSignersFromSigs (line 237-264) uses:
+        1. ECDSA.toEthSignedMessageHash (EIP-191 prefix)
+        2. signedHash.recover(v, r, s) — Solady's ECDSA.recover
+        3. Strict ascending order: require(currentValidator > lastValidator)
+
+      Solady's ECDSA.recover (since v0.0.8) enforces s <= secp256k1n/2 (the lower-s canonical form)
+      and rejects v values other than 27/28. This prevents the classic (r, s) → (r, n-s) malleability.
+
+      Even if malleability were possible, the sorted signer check would catch it: a malleated signature
+      would recover to a DIFFERENT address, which either (a) isn't a validator → doesn't count, or
+      (b) IS a different validator → but would need to be in the right sort position.
+
+      The combination of Solady's canonical s enforcement + strict ascending order makes signature
+      malleability a non-issue here.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Attacker takes valid signature (v, r, s) and creates (v', r, n-s).
+      Solady rejects n-s because s > secp256k1n/2.
+      Even if accepted, recovered address differs → fails validator check or sort order.
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [_getSignersFromSigs]
+      lines: [237-264]
+    solidity: |
+      // Invariant: Solady ECDSA.recover rejects malleable signatures
+      function property_BR_SIG_02_no_malleability() public pure returns (bool) {
+        // Solady enforces s in lower half of curve order
+        // No action needed — library-level protection
+        return true;
+      }
+
+  - id: BR-SIG-03
+    title: "No chain ID in message hash — cross-deployment replay risk"
+    description: |
+      MessageLib.getMessageHash (line 42-48) computes:
+        hash(nonce, outgoingMessagePubkey, innerMessageHash)
+
+      There is NO chain ID, NO contract address, NO domain separator in this hash.
+
+      If the same BridgeValidator contract is deployed on two different chains (e.g., Base mainnet
+      and Base testnet, or Base and another L2), with the same validator keys and same nonce state,
+      a message signed for one deployment could be replayed on the other.
+
+      HOWEVER: the nonce is sequential and globally shared. Once nonce N is consumed on chain A, it
+      cannot be re-used on chain A. But on chain B (different deployment), nonce N might not have been
+      consumed yet. The outgoingMessagePubkey from Solana is also deployment-specific in practice.
+
+      Real risk depends on:
+      - Whether the same validator keys sign for multiple deployments
+      - Whether nonce states diverge between deployments
+      - Whether outgoingMessagePubkey values are unique per deployment
+
+      The bridge is designed as Base↔Solana only (Stage 0). The BRIDGE immutable is set per deployment.
+      In practice, cross-chain replay requires identical validator sets on different chains, which is
+      an operational constraint but NOT enforced by the code.
+    confidence: 45
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. BridgeValidator deployed on Base mainnet (chain A) and Base testnet (chain B)
+      2. Same validator keys used for both (operational misconfiguration)
+      3. Validators sign message batch for chain A with nonce range [0, 5]
+      4. Attacker replays the same signatures + signedMessages on chain B (where nonce is also 0)
+      5. Messages are registered as valid on chain B without validators' intent
+      6. Attacker calls relayMessages with crafted IncomingMessages matching those hashes
+    preconditions: |
+      - Same validator keys on multiple deployments
+      - Nonce states aligned (both starting from 0, or attacker can force alignment)
+      - outgoingMessagePubkey values are the same (unlikely for different Solana programs)
+    impact: |
+      Fraudulent message registration on secondary deployment. If testnet/staging uses real assets,
+      loss of funds. On mainnet-to-mainnet (different L2s), could enable unauthorized bridge operations.
+    mitigation: |
+      Include block.chainid and address(this) in the messageHash computation, similar to EIP-712
+      domain separator. E.g.: hash(chainid, bridgeValidator, nonce, pubkey, innerHash).
+    location:
+      file: base/src/libraries/MessageLib.sol
+      functions: [getMessageHash]
+      lines: [42-48]
+    solidity: |
+      // Invariant: message hash should be unique per chain + deployment
+      function property_BR_SIG_03_domain_separation() public view returns (bool) {
+        // getMessageHash(nonce, pubkey, innerHash) has no chain ID
+        // Two deployments with same params produce same hash
+        // This is a design concern, not a runtime invariant
+        return true;
+      }
+
+  - id: BR-SIG-04
+    title: "Partner key rotation allows same entity to double-count via evmAddress + newEvmAddress"
+    description: |
+      IPartner.Signer has two fields: evmAddress and newEvmAddress.
+      BridgeValidator._indexOf (line 308-315) matches against BOTH:
+        if (addr == addrs[i].evmAddress || addr == addrs[i].newEvmAddress) return i;
+
+      During key rotation, a single partner entity has TWO valid EVM addresses. If both addresses
+      sign the message, _countPartnerSigners will try to count both. HOWEVER, the signedBitMap
+      check (line 294) uses the partner INDEX (not the address). Since both evmAddress and
+      newEvmAddress map to the SAME index i, the second signature triggers:
+        signedBitMap & (_BIT << partnerIndex) != 0 → revert DuplicateSigner()
+
+      This means the bitmap correctly prevents a single entity from double-counting during rotation.
+      The test test_registerMessages_revertsOnDuplicatePartnerEntitySigners confirms this.
+
+      HOWEVER: there's a subtle issue. If evmAddress of partner[0] equals newEvmAddress of partner[1],
+      _indexOf returns whichever index it finds FIRST (linear search). This means:
+      - The address maps to partner[0]'s index
+      - partner[1]'s rotation address is effectively "stolen" by partner[0]
+      - This is an IPartner implementation concern, not BridgeValidator's fault
+    confidence: 92
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Partner entity has evmAddress=A and newEvmAddress=B (during rotation)
+      2. Entity signs with both A and B
+      3. _indexOf(A) returns index 0, _indexOf(B) returns index 0
+      4. Second signature triggers DuplicateSigner revert
+      5. Entity cannot double-count — bitmap protection works correctly
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [_indexOf, _countPartnerSigners]
+      lines: [280-315]
+    solidity: |
+      // Invariant: same partner entity cannot count twice via rotation addresses
+      function property_BR_SIG_04_no_rotation_double_count() public pure returns (bool) {
+        // _indexOf returns same index for both evmAddress and newEvmAddress
+        // signedBitMap catches duplicate index → revert DuplicateSigner
+        return true;
+      }
+
+  - id: BR-SIG-05
+    title: "Sequential nonce enforces strict ordering — out-of-order registration blocked (DoS vector)"
+    description: |
+      BridgeValidator.registerMessages (line 172-196) increments nonce monotonically:
+        uint256 currentNonce = nextNonce;
+        for (i) { messageHashes[i] = getMessageHash(currentNonce++, ...) }
+        nextNonce = currentNonce;
+
+      The nonce is embedded in the messageHash. Validators MUST sign messages in exact nonce order.
+      If validators sign batch [nonce=5, nonce=6] but nonce 4 hasn't been registered yet, the
+      batch cannot be submitted (messageHashes would be computed with currentNonce=4, producing
+      different hashes than what validators signed for nonce=5,6).
+
+      This creates a strict ordering dependency:
+      - If one message is delayed or disputed, ALL subsequent messages are blocked
+      - A single stuck message can halt the entire bridge (Solana → Base direction)
+
+      Mitigations in the design:
+      - Validators sign in batches, not individual messages
+      - The orchestrator (RelayerOrchestrator) can atomically validate + relay
+      - This is "Stage 0" — will be replaced by CrossL2Inbox from OP Stack
+
+      This is a known design tradeoff for simplicity in Stage 0. The sequential nonce prevents
+      replay but creates a single point of ordering. Not a vulnerability per se, but a liveness risk.
+    confidence: 85
+    severity: low
+    status: accepted_risk
+    attack_scenario: |
+      1. Validators sign message batch with nonces [0, 1, 2]
+      2. Batch submitted and registered successfully, nextNonce = 3
+      3. Validators sign batch for nonces [3, 4, 5]
+      4. Relayer transaction reverts (gas issue, temporary revert in relay)
+      5. registerMessages itself succeeds (nonce 3-5 registered), but relay of message 3 fails
+      6. Message 3 is stuck in "failures" mapping
+      7. All subsequent messages (4, 5, ...) can still be relayed — relay uses messageHash lookup, not nonce
+
+      Actually: the nonce blocking is only on REGISTRATION, not relay. Once registered, messages
+      can be relayed in any order. The real DoS is: validators refuse to sign the next batch.
+      But that requires validator collusion, not an external attack.
+    impact: |
+      Liveness risk: if validators cannot agree on the next batch, bridge halts in Solana→Base direction.
+      Funds are not at risk (can't be stolen), but can be frozen until validators resume signing.
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [registerMessages]
+      lines: [172-196]
+    solidity: |
+      // Invariant: nonce must be strictly sequential
+      function property_BR_SIG_05_sequential_nonce() public returns (bool) {
+        uint256 nonceBefore = bridgeValidator.nextNonce();
+        // registerMessages with N messages → nextNonce += N
+        // Cannot skip nonces
+        return bridgeValidator.nextNonce() >= nonceBefore;
+      }
+
+  - id: BR-SIG-06
+    title: "signatureSplit assembly — no bounds check on calldataload beyond sigData.length"
+    description: |
+      VerificationLib.signatureSplit (line 189-200) uses inline assembly:
+        r := calldataload(add(signaturesCalldataOffset, signaturePos))
+        s := calldataload(add(signaturesCalldataOffset, add(signaturePos, 0x20)))
+        v := and(calldataload(add(signaturesCalldataOffset, add(signaturePos, 0x21))), 0xff)
+
+      The caller (_getSignersFromSigs) checks sigData.length % 65 == 0 and computes
+      sigCount = sigData.length / 65. The loop runs i from 0 to sigCount-1.
+
+      For the last signature (i = sigCount-1):
+        signaturePos = 65 * (sigCount-1)
+        Last byte read: signaturePos + 0x40 = 65*sigCount - 65 + 64 = 65*sigCount - 1
+        This is exactly within bounds (sigData.length = 65*sigCount, indices 0 to 65*sigCount-1).
+
+      calldataload always reads 32 bytes from the specified offset. For the last signature:
+        - r read: offset + signaturePos → reads 32 bytes starting at offset + 65*(n-1)
+        - s read: offset + signaturePos + 32 → reads 32 bytes starting at offset + 65*(n-1) + 32
+        - v read: offset + signaturePos + 33 → reads 32 bytes starting at offset + 65*(n-1) + 33
+
+      The s and v reads extend PAST the end of sigData calldata. calldataload pads with zeros
+      for out-of-bounds reads. But this is fine because:
+        - s needs bytes [signaturePos+32 .. signaturePos+63] — all within sigData
+        - v = byte at signaturePos+64, extracted via `and(..., 0xff)` — within sigData
+        - The extra zero-padded bytes from calldataload are ignored
+
+      This is the standard Safe-style signature splitting pattern. No bounds vulnerability.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      No attack. calldataload zero-pads beyond calldata, and only relevant bytes are used.
+      The length check (sigData.length % 65 == 0) ensures exact alignment.
+    location:
+      file: base/src/libraries/VerificationLib.sol
+      functions: [signatureSplit]
+      lines: [189-200]
+    solidity: |
+      // Invariant: signatureSplit correctly extracts v, r, s for valid index
+      function property_BR_SIG_06_signature_split_bounds() public pure returns (bool) {
+        // Standard pattern from Gnosis Safe
+        // calldataload zero-pads, and only the needed bytes are used
+        return true;
+      }
+
+  - id: BR-SIG-07
+    title: "Batch signature covers ALL message hashes — single signature set validates entire batch"
+    description: |
+      In registerMessages, the validators sign over abi.encode(messageHashes) — the ENTIRE array
+      of derived hashes for the batch. This means:
+        1. One set of signatures validates ALL messages in the batch atomically
+        2. You cannot add or remove messages from a signed batch
+        3. You cannot reorder messages (nonces are sequential and embedded in hashes)
+
+      This is a strong design: validators explicitly approve each message in the batch.
+      An attacker cannot cherry-pick messages or inject additional ones.
+
+      The EIP-191 prefix (toEthSignedMessageHash) also prevents the signed data from being
+      mistaken for a transaction or other EIP-191 structured data.
+    confidence: 97
+    severity: informational
+    status: safe
+    attack_scenario: |
+      No attack. The batch is signed atomically. Modifying any message changes the hash
+      of abi.encode(messageHashes), invalidating all signatures.
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [_getSignersFromSigs, registerMessages]
+      lines: [172-196, 237-264]
+    solidity: |
+      // Invariant: batch integrity — all messages validated by same signature set
+      function property_BR_SIG_07_batch_integrity() public pure returns (bool) {
+        return true;
+      }
+
+  - id: BR-SIG-08
+    title: "signedBitMap partner limit: max 256 partner validators before bitmap overflow"
+    description: |
+      _countPartnerSigners uses a uint256 signedBitMap where bit i represents partner index i.
+      If IPartner.getSigners() returns more than 256 signers, _BIT << partnerIndex would overflow
+      (for index >= 256, the shift wraps modulo 256 on EVM).
+
+      For index 256: _BIT << 256 = _BIT << 0 = 1 (same as index 0).
+      This means partner[256] and partner[0] share the same bitmap bit, creating a collision.
+      If partner[0] signs, partner[256] would trigger DuplicateSigner erroneously (false positive).
+      Or worse: partner[0] and partner[256] could be treated as the same entity.
+
+      HOWEVER: MAX_PARTNER_VALIDATOR_THRESHOLD = 5, and the partner validator set is managed by
+      an external IPartner contract. The bitmap only needs to track which partners have signed,
+      and the threshold is capped at 5. Even if the partner set has >256 entries, at most 5
+      would need to sign, making collisions extremely unlikely in practice.
+
+      Still, if a malicious IPartner contract returns >256 signers, the bitmap collision could
+      allow bypassing the DuplicateSigner check in theory.
+    confidence: 35
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. IPartner.getSigners() returns 257+ signers
+      2. Partner[0] and partner[256] have the same bitmap bit
+      3. If partner[0] signs, partner[256] is falsely flagged as duplicate
+      4. Or: partner[256] can sign, consuming bit 0, then partner[0] is blocked
+      5. Practical impact: minimal because threshold <= 5 and partner set is trusted
+    preconditions: |
+      - IPartner contract returns >256 signers (extremely unlikely in practice)
+      - MAX_PARTNER_VALIDATOR_THRESHOLD is only 5
+    impact: |
+      Theoretical bitmap collision. In practice, negligible risk given operational constraints.
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [_countPartnerSigners]
+      lines: [280-305]
+    solidity: |
+      // Invariant: bitmap does not overflow for partner count <= 256
+      function property_BR_SIG_08_bitmap_no_overflow() public view returns (bool) {
+        IPartner.Signer[] memory signers = IPartner(PARTNER_VALIDATORS).getSigners();
+        return signers.length <= 256;
+      }
+
+  - id: BR-SIG-09
+    title: "EIP-191 eth_sign prefix — no EIP-712 structured data, validators sign opaque hash"
+    description: |
+      The bridge uses ECDSA.toEthSignedMessageHash (EIP-191 version 0x45) which prepends
+      "\x19Ethereum Signed Message:\n32" to the hash. This is the eth_sign method.
+
+      Compared to EIP-712, this provides weaker user-facing guarantees (validators sign an
+      opaque bytes32, not human-readable structured data). However for a validator multisig
+      where signing is automated (not user-facing), this is acceptable.
+
+      The eth_sign prefix DOES provide domain separation from raw transactions and EIP-712
+      typed data, preventing cross-protocol replay.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      No direct attack. The EIP-191 prefix prevents the signed hash from being replayed
+      as a raw transaction or EIP-712 typed data signature.
+    location:
+      file: base/src/BridgeValidator.sol
+      functions: [_getSignersFromSigs]
+      lines: [246]
+    solidity: |
+      // Invariant: EIP-191 prefix applied to all validator signatures
+      function property_BR_SIG_09_eip191_prefix() public pure returns (bool) {
+        return true;
+      }
+
+  - id: BR-SIG-10
+    title: "Replay of registered messages is prevented by successes mapping in Bridge"
+    description: |
+      Once a messageHash is registered in BridgeValidator.validMessages, anyone can call
+      Bridge.relayMessages with the corresponding IncomingMessage. The Bridge._validateAndRelay
+      checks:
+        1. successes[messageHash] → if true, skip (no re-execution)
+        2. validMessages(messageHash) → must be true
+        3. Execute message
+        4. On success: successes[messageHash] = true
+
+      This prevents re-execution of the same message. The messageHash includes the nonce,
+      outgoingMessagePubkey, and inner message content, making it unique per message.
+
+      Note: validMessages mapping is write-only (set to true, never deleted). This means
+      registered but never-executed messages remain valid forever. If a message fails
+      (failures[messageHash] = true), it can be re-tried. Only successful execution
+      prevents re-execution.
+    confidence: 97
+    severity: informational
+    status: safe
+    attack_scenario: |
+      No replay attack. successes mapping prevents double-execution.
+      Failed messages can be retried — this is intentional for robustness.
+    location:
+      file: base/src/Bridge.sol
+      functions: [_validateAndRelay]
+      lines: [348-368]
+    solidity: |
+      // Invariant: each message can only be successfully executed once
+      function property_BR_SIG_10_no_replay() public view returns (bool) {
+        // successes[hash] = true after first successful relay
+        // Second call with same hash → early return (line 352-354)
+        return true;
+      }
+
+summary:
+  total_hypotheses: 10
+  critical_findings: 0
+  investigate:
+    - BR-SIG-01 — Validator double-counting across base/partner sets (Medium, 72% confidence)
+    - BR-SIG-03 — No chain ID in message hash (Low, 45% confidence)
+    - BR-SIG-08 — Partner bitmap overflow >256 signers (Low, 35% confidence)
+  safe:
+    - BR-SIG-02 — Signature malleability mitigated by Solady + sort order
+    - BR-SIG-04 — Partner rotation double-count prevented by bitmap index
+    - BR-SIG-06 — signatureSplit assembly bounds are correct
+    - BR-SIG-07 — Batch signature integrity is sound
+    - BR-SIG-09 — EIP-191 prefix provides adequate domain separation
+    - BR-SIG-10 — Replay prevention via successes mapping is solid
+  accepted_risk:
+    - BR-SIG-05 — Sequential nonce ordering is design choice for Stage 0
+
+  priority_for_deep_dive:
+    - BR-SIG-01 is the highest-value hypothesis. Needs concrete PoC: deploy with overlapping
+      validator sets and demonstrate that fewer unique signatures satisfy both thresholds.
+      Check if Coinbase's operational setup actually allows overlap.
+    - BR-SIG-03 is worth investigating if multiple deployments share validator keys.
+      The outgoingMessagePubkey being Solana-program-specific may naturally prevent cross-deployment replay.

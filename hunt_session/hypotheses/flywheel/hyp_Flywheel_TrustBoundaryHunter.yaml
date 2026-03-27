@@ -1,0 +1,367 @@
+hunter: TrustBoundaryHunter
+target: Flywheel Protocol
+date: "2026-03-27"
+hypotheses:
+
+  - id: TB-FW-01
+    title: "BridgeReferralFees open send() allows frontrunning to steal bridged funds"
+    description: |
+      BridgeReferralFees._onSend has NO access control — anyone can call Flywheel.send() targeting a
+      BridgeReferralFees campaign. The bridgedAmount is calculated as the campaign's current token balance
+      minus totalAllocatedFees. If a legitimate bridge deposits tokens into the campaign, an attacker can
+      frontrun the intended send() call with their own send() specifying themselves as the `user` recipient.
+      The attacker receives the full bridgedAmount minus fees. The legitimate call then executes with a
+      near-zero balance or reverts on solvency.
+    severity: high
+    confidence: 85
+    affected_functions:
+      - "BridgeReferralFees._onSend"
+      - "Flywheel.send"
+    attack_scenario: |
+      1. Attacker monitors mempool for bridge deposits to a BridgeReferralFees campaign.
+      2. After deposit tx is included (or in same block), attacker calls Flywheel.send(campaign, token, hookData)
+         where hookData encodes (attackerAddress, "", 0) — user=attacker, empty code, 0 fee.
+      3. bridgedAmount = campaign.balance - totalAllocatedFees = full deposit amount.
+      4. Attacker receives the entire bridged amount as the payout.
+      5. Legitimate user's send() either gets 0 or reverts.
+    solidity_invariant: |
+      // INV: Only the intended bridge recipient should receive bridged funds
+      // This is architectural — BridgeReferralFees trusts the caller to be honest about the user param
+      // No invariant can be written without an external authorization mechanism
+
+  - id: TB-FW-02
+    title: "BridgeReferralFees._onSend includes previously allocated fees in bridgedAmount calculation"
+    description: |
+      BridgeReferralFees._onSend calculates bridgedAmount as balance - totalAllocatedFees. But
+      totalAllocatedPayouts is NOT subtracted. If there are pending allocated payouts from a previous
+      allocate() call on the same campaign (though BridgeReferralFees itself doesn't support allocate,
+      nothing prevents another hook from being set for the same campaign address — wait, campaigns are
+      bound to a single hook). However, _assertCampaignSolvency checks balance >= totalAllocatedPayouts +
+      totalAllocatedFees. If fees were allocated but not yet distributed, a new send() would compute
+      bridgedAmount that includes funds needed for those fees, but then _assertCampaignSolvency would
+      catch it. The subtraction of totalAllocatedFees prevents double-counting fees. This appears safe
+      but the trust assumption is fragile: bridgedAmount represents "unallocated balance" only if no
+      payouts are allocated, which is true because BridgeReferralFees uses send (not allocate).
+    severity: low
+    confidence: 40
+    affected_functions:
+      - "BridgeReferralFees._onSend"
+    attack_scenario: |
+      Likely safe due to _assertCampaignSolvency. The solvency check at the end of Flywheel.send()
+      would revert if more is sent than available. But the bridgedAmount calculation does not account
+      for totalAllocatedPayouts — only fees. If somehow payouts were allocated on this campaign
+      (impossible with BridgeReferralFees hook since allocate reverts Unsupported), funds could be
+      double-spent. No viable attack path with current hook.
+    solidity_invariant: |
+      // INV: bridgedAmount should never exceed unallocated campaign balance
+      // assert(bridgedAmount <= balance - totalAllocatedFees - totalAllocatedPayouts)
+
+  - id: TB-FW-03
+    title: "Campaign.FLYWHEEL immutable is safe across EIP-1167 clones — but clones share implementation's immutable"
+    description: |
+      Campaign.sol sets FLYWHEEL = msg.sender in the constructor. EIP-1167 minimal proxies do NOT
+      execute the constructor of the implementation — they delegatecall the runtime bytecode. However,
+      Solidity immutables are embedded directly in the runtime bytecode (not in storage), so EIP-1167
+      clones inherit the same FLYWHEEL value as the implementation. Since the implementation is deployed
+      inside Flywheel's constructor (CAMPAIGN_IMPLEMENTATION = address(new Campaign())), msg.sender
+      during Campaign construction IS the Flywheel contract. Therefore all clones correctly have
+      FLYWHEEL = address(flywheel). This is SAFE. The trust boundary holds because immutable values
+      are part of the bytecode that gets delegatecalled.
+    severity: info
+    confidence: 95
+    affected_functions:
+      - "Campaign.constructor"
+      - "Campaign.sendTokens"
+      - "Flywheel.constructor"
+    attack_scenario: |
+      No attack. Confirmed safe. EIP-1167 clones share the runtime bytecode including embedded
+      immutable values. All Campaign clones will have FLYWHEEL pointing to the correct Flywheel instance.
+    solidity_invariant: |
+      // INV: All campaign clones must have FLYWHEEL == address(flywheel)
+      // assert(Campaign(campaign).FLYWHEEL() == address(this))
+
+  - id: TB-FW-04
+    title: "CampaignHooks.onlyFlywheel cannot be bypassed — hooks are not proxied"
+    description: |
+      CampaignHooks stores FLYWHEEL as an immutable set in constructor. Hook contracts (AdConversion,
+      SimpleRewards, CashbackRewards, BridgeReferralFees) are deployed as regular contracts (NOT clones).
+      The onlyFlywheel modifier checks msg.sender == address(FLYWHEEL). Since hooks are not proxied and
+      their bytecode contains the correct FLYWHEEL address, this check cannot be bypassed. The only way
+      to bypass would be if someone deployed a malicious Flywheel that creates campaigns pointing to a
+      legitimate hook — but the hook's FLYWHEEL would reject calls from the malicious Flywheel.
+    severity: info
+    confidence: 95
+    affected_functions:
+      - "CampaignHooks.onlyFlywheel"
+      - "CampaignHooks.onSend"
+      - "CampaignHooks.onAllocate"
+    attack_scenario: |
+      No bypass possible. A malicious contract calling hook.onSend() directly would fail the
+      onlyFlywheel check. A malicious Flywheel deploying campaigns that reference a legitimate hook
+      would fail because the hook's FLYWHEEL immutable points to the legitimate Flywheel.
+    solidity_invariant: |
+      // INV: All hook external functions must only be callable by FLYWHEEL
+      // This is enforced by the onlyFlywheel modifier on all external functions in CampaignHooks
+
+  - id: TB-FW-05
+    title: "Native token payout via .call{value} enables reentrancy — but transient reentrancy guard blocks it"
+    description: |
+      Campaign.sendTokens uses payable(recipient).call{value: amount} for native token transfers, giving
+      the recipient a callback. Flywheel uses ReentrancyGuardTransient on all external functions (send,
+      allocate, distribute, etc.). The _useTransientReentrancyGuardOnlyOnMainnet override returns false,
+      meaning transient storage reentrancy guard is used on ALL chains. This blocks reentrancy into any
+      Flywheel function during a payout. However, the callback CAN reenter Campaign.sendTokens if someone
+      calls it directly — but sendTokens checks msg.sender == FLYWHEEL, so only Flywheel can call it.
+      The transient guard on Flywheel + the FLYWHEEL check on Campaign together prevent reentrancy.
+    severity: low
+    confidence: 90
+    affected_functions:
+      - "Campaign.sendTokens"
+      - "Flywheel.send"
+      - "Flywheel.distribute"
+      - "Flywheel.distributeFees"
+    attack_scenario: |
+      1. Attacker sets up a contract as payout recipient.
+      2. During native token payout, attacker's receive() is triggered.
+      3. Attacker tries to reenter Flywheel.send() or any other function.
+      4. ReentrancyGuardTransient reverts the reentrant call.
+      Safe. No viable attack due to transient reentrancy guard.
+    solidity_invariant: |
+      // INV: No Flywheel function should be callable during a payout callback
+      // Enforced by ReentrancyGuardTransient
+
+  - id: TB-FW-06
+    title: "AdConversion trusts BuilderCodes.payoutAddress — malicious registry update redirects payouts"
+    description: |
+      In AdConversion._onSend, when payoutRecipient is address(0) (publisher payout), the code calls
+      BUILDER_CODES.payoutAddress(publisherRefCode) to resolve the recipient. BuilderCodes is immutable
+      (set at construction), so the registry contract itself cannot be swapped. However, if the
+      BuilderCodes contract allows the code owner to update their payoutAddress, then between the time
+      an attribution is submitted and processed, the publisher could change their payout address. This
+      is a trust assumption on BuilderCodes governance — if the owner of a builder code can change
+      payoutAddress, they could redirect payouts. This is likely by-design (publishers control their
+      own payout address), but could affect advertisers if a publisher changes address after conversions
+      are attributed but before payout.
+    severity: low
+    confidence: 50
+    affected_functions:
+      - "AdConversion._onSend"
+      - "BuilderCodes.payoutAddress"
+    attack_scenario: |
+      1. Publisher registers code "PUBX" with payoutAddress = legitimateAddress.
+      2. Attributions accumulate for "PUBX".
+      3. Before attributionProvider calls send(), publisher changes payoutAddress to attackerAddress.
+      4. Payouts go to attackerAddress instead of legitimateAddress.
+      This is arguably by-design (publisher owns their code), but a griefing vector if the publisher
+      is a compromised account.
+    solidity_invariant: |
+      // INV: payoutAddress should be resolved at attribution time, not at payout time
+      // Currently resolved at payout time — no invariant violation, but a design consideration
+
+  - id: TB-FW-07
+    title: "SimpleRewards manager can drain entire campaign via hookData-controlled payouts"
+    description: |
+      SimpleRewards._onSend directly decodes hookData into Flywheel.Payout[] and returns them as payouts.
+      The manager has FULL control over recipient and amount. The only protection is
+      _assertCampaignSolvency which checks balance >= totalAllocatedPayouts + totalAllocatedFees.
+      A malicious manager can drain all unallocated funds in a single send() call. This is by-design
+      (manager is trusted), but the trust boundary is important: the owner funds the campaign, the
+      manager distributes. If manager is compromised, all unallocated funds are at risk.
+    severity: medium
+    confidence: 70
+    affected_functions:
+      - "SimpleRewards._onSend"
+      - "Flywheel.send"
+    attack_scenario: |
+      1. Owner funds campaign with 100 ETH, 20 ETH allocated to pending payouts.
+      2. Compromised manager calls send() with hookData encoding a single payout: (attacker, 80 ETH).
+      3. 80 ETH sent to attacker. Solvency check passes (0 balance >= 20 allocated... wait, this would
+         fail). Actually: balance after sending = 0, totalAllocated = 20, so 0 < 20 reverts.
+      4. Manager can only drain unallocated portion: send(attacker, 80 ETH) leaves 20 ETH for allocated.
+      Correction: manager can drain balance - totalAllocated. This is by-design trust in manager.
+    solidity_invariant: |
+      // INV: Manager can never send more than campaign balance minus total allocations
+      // function invariant_managerCannotDrainAllocated() external {
+      //   uint256 maxSendable = campaign.balance - flywheel.totalAllocatedPayouts(campaign, token)
+      //                         - flywheel.totalAllocatedFees(campaign, token);
+      //   // After any send(), balance >= totalAllocated
+      // }
+
+  - id: TB-FW-08
+    title: "Cross-campaign isolation is enforced by Flywheel's per-campaign mappings"
+    description: |
+      Each campaign is a separate minimal proxy with its own address and balance. Flywheel stores
+      allocatedPayout[campaign][token][key] and totalAllocatedPayouts[campaign][token] with the campaign
+      address as the first key. Campaign.sendTokens checks msg.sender == FLYWHEEL and sends from its
+      own balance. One campaign cannot access another campaign's funds because:
+      (a) sendTokens only sends from the Campaign clone's own balance,
+      (b) Flywheel's solvency check is per-campaign,
+      (c) hooks are associated per-campaign in _campaigns mapping.
+      The only cross-campaign risk is if two campaigns share the same hook contract and the hook has
+      shared mutable state — but hook state is always keyed by campaign address.
+    severity: info
+    confidence: 95
+    affected_functions:
+      - "Flywheel.send"
+      - "Flywheel.allocate"
+      - "Campaign.sendTokens"
+    attack_scenario: |
+      No viable cross-campaign attack. Each campaign clone holds its own funds. The Flywheel accounting
+      is fully segregated by campaign address. A hook processing campaign A cannot cause Campaign B to
+      send tokens because sendTokens is called on the specific campaign address.
+    solidity_invariant: |
+      // INV: campaign A's operations never modify campaign B's balance or allocations
+      // assert(balanceBefore[campaignB] == balanceAfter[campaignB]) after any operation on campaignA
+
+  - id: TB-FW-09
+    title: "Malformed hookData causes revert but no fund loss — abi.decode reverts on bad data"
+    description: |
+      All hooks use abi.decode to parse hookData. If hookData is malformed (wrong types, too short,
+      etc.), abi.decode will revert with a generic error. This is safe — the transaction reverts
+      entirely, no state changes occur. However, in BridgeReferralFees where anyone can call send(),
+      an attacker could grief by supplying hookData that decodes successfully but with malicious values
+      (e.g., user=attacker). This is covered by TB-FW-01. For other hooks with access control (manager
+      or attributionProvider), malformed hookData is a self-grief only.
+    severity: info
+    confidence: 90
+    affected_functions:
+      - "All hook _onSend, _onAllocate, _onDistribute functions"
+    attack_scenario: |
+      1. Attacker calls Flywheel.send(campaign, token, malformedData).
+      2. Hook's abi.decode fails, transaction reverts.
+      3. No state change, no fund loss. Gas griefing only.
+    solidity_invariant: |
+      // INV: Malformed hookData must always revert without state changes
+      // This is guaranteed by Solidity's abi.decode revert behavior
+
+  - id: TB-FW-10
+    title: "BridgeReferralFees._onWithdrawFunds has no access control — anyone can withdraw campaign funds"
+    description: |
+      BridgeReferralFees._onWithdrawFunds is implemented as a pure function that simply decodes hookData
+      into a Flywheel.Payout. There is NO authorization check — no onlyManager, no owner check, nothing.
+      The comment explicitly states: "If tokens are sent into the campaign outside of this scope on
+      accident, anyone can take them (no access control for onSend hook)". This means ANYONE can call
+      Flywheel.withdrawFunds() on a BridgeReferralFees campaign and withdraw all unallocated funds.
+      Combined with TB-FW-01 (open send), the entire campaign balance minus allocated fees is extractable
+      by anyone at any time.
+    severity: high
+    confidence: 90
+    affected_functions:
+      - "BridgeReferralFees._onWithdrawFunds"
+      - "Flywheel.withdrawFunds"
+    attack_scenario: |
+      1. BridgeReferralFees campaign has residual balance (from failed fee sends, accumulated dust, or
+         tokens sent directly to campaign by mistake).
+      2. Attacker encodes hookData as Flywheel.Payout({recipient: attacker, amount: residualBalance, extraData: ""}).
+      3. Attacker calls Flywheel.withdrawFunds(campaign, token, hookData).
+      4. Flywheel calls hook._onWithdrawFunds which returns the attacker-controlled payout with no checks.
+      5. Campaign.sendTokens sends funds to attacker.
+      6. Solvency check passes because only totalAllocatedFees matters (if campaign is finalized,
+         only fees; if active, fees+payouts — but BridgeReferralFees uses send not allocate so
+         totalAllocatedPayouts = 0).
+      Note: The dev comments indicate this is BY DESIGN for BridgeReferralFees specifically. The campaign
+      is meant to be funded and immediately drained via send() atomically. Residual funds are intentionally
+      claimable by anyone.
+    solidity_invariant: |
+      // INV: withdrawFunds should only succeed for authorized users (violated by-design in BridgeReferralFees)
+      // For BridgeReferralFees: assert that after any send(), campaign balance == totalAllocatedFees
+      // Any balance above totalAllocatedFees is fair game for anyone
+
+  - id: TB-FW-11
+    title: "CashbackRewards trusts ESCROW.paymentState but does not verify escrow is honest"
+    description: |
+      CashbackRewards._validatePaymentReward calls ESCROW.paymentState(paymentInfoHash) to check if a
+      payment has been collected and to get capturableAmount/refundableAmount. The ESCROW is immutable,
+      set at deployment. If the ESCROW contract has a bug or is upgradeable and gets corrupted, false
+      payment states could enable unauthorized rewards. The trust boundary is:
+      CashbackRewards fully trusts ESCROW to return accurate payment states. Also, ESCROW.getHash()
+      computes the payment hash — if getHash is manipulable, different PaymentInfo could map to the
+      same hash, enabling reward theft.
+    severity: medium
+    confidence: 45
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward"
+      - "AuthCaptureEscrow.paymentState"
+      - "AuthCaptureEscrow.getHash"
+    attack_scenario: |
+      1. If ESCROW is upgradeable: admin upgrades ESCROW to return hasCollectedPayment=true for any hash.
+      2. Attacker creates fake PaymentInfo, gets hash from ESCROW.getHash().
+      3. Calls manager to process rewards for non-existent payments.
+      4. Campaign funds drained as cashback for phantom payments.
+      Requires ESCROW compromise — external dependency trust boundary.
+    solidity_invariant: |
+      // INV: rewards[campaign][hash].distributed <= actual payment amount for that hash
+      // function invariant_rewardsNotExceedPayments(address campaign, bytes32 hash) external {
+      //   (,, uint120 refundable) = ESCROW.paymentState(hash);
+      //   assert(rewards[campaign][hash].distributed <= refundable);
+      // }
+
+  - id: TB-FW-12
+    title: "AdConversion._onDistributeFees lets attributionProvider redirect fees to arbitrary address"
+    description: |
+      AdConversion._onDistributeFees checks that sender == attributionProvider, then reads the full
+      allocated fee amount for that provider's key, but lets the provider specify an arbitrary recipient
+      via hookData. The fee recipient is abi.decode(hookData, (address)) — the provider can send their
+      accumulated fees to any address. This is by-design (provider controls where their fees go), but
+      means a compromised attributionProvider can redirect all accumulated fees.
+    severity: low
+    confidence: 75
+    affected_functions:
+      - "AdConversion._onDistributeFees"
+      - "Flywheel.distributeFees"
+    attack_scenario: |
+      1. AttributionProvider accumulates fees across many send() calls.
+      2. Provider calls distributeFees with hookData encoding attacker's address.
+      3. All accumulated fees sent to attacker.
+      This is by-design — the provider earned these fees and can direct them anywhere.
+    solidity_invariant: |
+      // INV: Only attributionProvider can distribute their own fees
+      // assert(sender == state[campaign].attributionProvider) -- already enforced
+
+  - id: TB-FW-13
+    title: "Fee transfer failure in _processFees silently converts send to allocation — fee accounting mismatch"
+    description: |
+      In Flywheel._processFees, when sendFeesNow is true but the transfer fails, the fee is NOT sent
+      but is instead allocated (totalAllocatedFees incremented, allocatedFee mapping updated). The
+      variable is named sendSucceess (typo with double 'e'). The logic: if (!sendFeesNow || !sendSucceess)
+      allocate. This means: (a) if sendFeesNow=false, always allocate (correct), (b) if sendFeesNow=true
+      and send fails, allocate as fallback (intended behavior per comments). The solvency check at the
+      end of send/distribute will verify. However, in BridgeReferralFees, the bridgedAmount calculation
+      subtracts totalAllocatedFees — so if a fee send fails and gets allocated, the next send() call
+      will see a reduced bridgedAmount. This is correct accounting but could surprise users.
+    severity: info
+    confidence: 80
+    affected_functions:
+      - "Flywheel._processFees"
+      - "BridgeReferralFees._onSend"
+    attack_scenario: |
+      1. BridgeReferralFees campaign: first send() with fee, fee recipient is a contract that reverts.
+      2. Fee send fails, fee gets allocated instead. totalAllocatedFees increases.
+      3. Next send() calculates bridgedAmount = balance - totalAllocatedFees (reduced by stuck fee).
+      4. User receives less than expected because stuck fees reduce available balance.
+      Not a theft vector but a UX issue / griefing vector if fee recipient intentionally reverts.
+    solidity_invariant: |
+      // INV: After _processFees, balance >= totalAllocatedPayouts + totalAllocatedFees
+      // This is already checked by _assertCampaignSolvency
+
+  - id: TB-FW-14
+    title: "AdConversion does not validate conversionConfig disabled status for configId=0"
+    description: |
+      In AdConversion._onSend, if configId != 0, the code validates the config exists and checks
+      isActive status. But if configId == 0, NO validation is performed — 0 means "no config/unregistered"
+      per the comment. This means the attributionProvider can always process conversions with configId=0
+      regardless of any campaign configuration restrictions. If an advertiser disables all their configs
+      expecting to pause conversions, the provider can still submit conversions with configId=0.
+    severity: low
+    confidence: 65
+    affected_functions:
+      - "AdConversion._onSend"
+    attack_scenario: |
+      1. Advertiser creates campaign with 3 conversion configs, all tied to specific onchain events.
+      2. Advertiser disables all 3 configs to pause the campaign.
+      3. Attribution provider submits conversions with configId=0, bypassing all config restrictions.
+      4. Payouts continue even though advertiser expected them to stop.
+      Mitigation: advertiser should transition to FINALIZING status instead of relying on config disable.
+    solidity_invariant: |
+      // INV: If all conversion configs are disabled, no conversions should be processable
+      // Currently violated because configId=0 bypasses config validation entirely

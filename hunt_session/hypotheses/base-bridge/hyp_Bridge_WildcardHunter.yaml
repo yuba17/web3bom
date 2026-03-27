@@ -1,0 +1,560 @@
+# WildcardHunter Analysis — Base<>Solana Bridge
+# Contracts: src/Bridge.sol, src/Twin.sol, src/CrossChainERC20Factory.sol, src/CrossChainERC20.sol,
+#            src/BridgeValidator.sol, src/libraries/*.sol, src/periphery/RelayerOrchestrator.sol
+# Focus: Creative/unconventional attack vectors, edge cases, composability exploits
+# Analyst: WildcardHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: BR-W-01
+    title: "Twin delegatecall can overwrite ERC-1967 beacon slot, bricking the proxy"
+    description: |
+      Twin.execute supports CallType.DelegateCall, which executes arbitrary code in the Twin's
+      storage context. The Twin is an ERC-1967 beacon proxy — its implementation address is stored
+      at slot 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc (ERC-1967 impl)
+      or the beacon slot at 0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50.
+      A Solana user can craft a delegatecall to a malicious contract that writes to the beacon storage
+      slot, changing the implementation pointer. After this, ALL calls to the Twin route to the attacker's
+      contract. However, this is self-inflicted: the Solana user controls their own Twin. The real
+      risk is if a Solana user is tricked into executing a malicious TransferAndCall that includes a
+      delegatecall payload. This could brick the Twin permanently.
+
+      Impact assessment: The attacker only harms their own Twin. No cross-user impact unless a protocol
+      has assets in a Twin it doesn't control (unlikely but possible if a DeFi protocol uses a Twin
+      as a component). Severity is Low because it's self-inflicted.
+    confidence: 70
+    severity: low
+    status: investigate
+    attack_scenario: |
+      1. Attacker deploys MaliciousImpl on Base that writes to ERC-1967 beacon slot in constructor
+         or fallback
+      2. Attacker sends Solana message: MessageType.Call with CallType.DelegateCall targeting MaliciousImpl
+      3. Twin.execute delegatecalls MaliciousImpl, which overwrites the beacon slot
+      4. Twin is now bricked or points to attacker-controlled implementation
+      5. All future relay messages for this Solana pubkey fail or execute attacker code
+
+      Self-inflicted variant: social engineering a Solana user into signing a TransferAndCall with
+      embedded delegatecall payload.
+    solidity: |
+      // Invariant: Twin beacon slot cannot be modified via delegatecall
+      function property_BR_W_01_twin_beacon_immutable() public returns (bool) {
+        bytes32 BEACON_SLOT = 0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50;
+        bytes32 beaconBefore;
+        assembly { beaconBefore := sload(BEACON_SLOT) }
+        // execute delegatecall to arbitrary contract
+        // ...
+        bytes32 beaconAfter;
+        assembly { beaconAfter := sload(BEACON_SLOT) }
+        return beaconBefore == beaconAfter;
+      }
+
+  - id: BR-W-02
+    title: "Twin as re-entrant attack proxy during TransferAndCall — reentrancy guard analysis"
+    description: |
+      During TransferAndCall, the flow is:
+        relayMessages (nonReentrant)
+          → this.__relayMessage (external call, NO nonReentrant modifier)
+            → TokenLib.finalizeTransfer (mints/transfers tokens)
+            → Twin.execute (arbitrary call)
+
+      The Twin's arbitrary call executes WHILE the transient reentrancy lock from relayMessages
+      is held. Any call back to Bridge.bridgeToken, Bridge.bridgeCall, or Bridge.relayMessages
+      would hit the nonReentrant modifier and revert.
+
+      HOWEVER: __relayMessage is called via `this.__relayMessage{gas: message.gasLimit}(message)`.
+      This is an external call to self. The ReentrancyGuardTransient uses transient storage
+      (EIP-1153, available on Base). The lock is set in relayMessages. The external call to
+      __relayMessage preserves the transient storage lock. Twin.execute then makes another external
+      call. The lock is still set. Any attempt to re-enter a nonReentrant function reverts.
+
+      VERIFIED SAFE. The transient reentrancy guard covers all paths. The _useTransientReentrancyGuardOnlyOnMainnet()
+      returns false, meaning transient guard is used on all chains including Base.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Attacker sends TransferAndCall from Solana
+      2. finalizeTransfer mints tokens to attacker's address
+      3. Twin.execute calls Bridge.bridgeToken to try to bridge minted tokens back
+      4. Bridge.bridgeToken has nonReentrant — REVERTS because lock is held
+      5. The try/catch in _validateAndRelay catches the revert, marks as failure
+
+      No funds at risk. Reentrancy guard is effective.
+    solidity: |
+      // Invariant: Reentrancy into Bridge during Twin execution always reverts
+      function property_BR_W_02_no_reentrant_bridge() public returns (bool) {
+        // During __relayMessage execution via Twin, any call to
+        // bridgeToken/bridgeCall/relayMessages must revert
+        // The transient reentrancy lock from relayMessages covers all paths
+        return true; // Verified by code analysis
+      }
+
+  - id: BR-W-03
+    title: "Commutative hashing in MMR _hashInternalNode enables second-preimage forgery"
+    description: |
+      _hashInternalNode sorts inputs before hashing: if left < right, H(left, right), else H(right, left).
+      This means H(A,B) == H(B,A) for ALL internal nodes within a mountain.
+
+      For MMR proof verification (on Solana side), a verifier needs to reconstruct the root from
+      a leaf + proof. With commutative hashing, the verifier doesn't need to know whether the
+      proven node is a left or right child — it just sorts and hashes. This is a common optimization.
+
+      ATTACK VECTOR: If an attacker can find two DIFFERENT leaf values L1, L2 such that they produce
+      the same parent hash regardless of position, they could potentially forge a proof for a message
+      that was never sent. However, this requires a hash collision (2^128 work for keccak256), which
+      is infeasible.
+
+      SUBTLER ATTACK: The commutative property means that swapping two sibling leaves does NOT
+      change any ancestor hash. If the Solana verifier doesn't bind the leaf index to the proof,
+      an attacker could replay a proof for leaf at position i as a proof for its sibling at position
+      i^1 (XOR with 1). The question is: does the Solana verifier check the leaf index?
+
+      For peak bagging, _hashOrderedPair is used (non-commutative), which is correct.
+
+      NEEDS SOLANA-SIDE VERIFICATION: Cannot fully assess without seeing the Solana verifier.
+      If the Solana verifier doesn't enforce leaf position, this is a CRITICAL finding.
+    confidence: 40
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Honest user sends message M1 at leaf index 0, message M2 at leaf index 1
+      2. Both are siblings in the MMR. Parent = H(sort(M1, M2))
+      3. Attacker obtains the proof for M1 at index 0
+      4. Attacker submits the SAME proof claiming it proves M2 at index 0
+         (or M1 at index 1)
+      5. If Solana verifier uses commutative hashing and doesn't bind index to leaf,
+         the proof verifies for the wrong message
+      6. Attacker can replay/reorder messages
+
+      Precondition: Solana verifier must not independently verify leaf index against
+      the message nonce.
+    solidity: |
+      // Invariant: Commutative hashing must not allow proof forgery
+      function property_BR_W_03_commutative_no_forgery() public returns (bool) {
+        // For any two siblings A, B where A < B:
+        // _hashInternalNode(A, B) == _hashInternalNode(B, A) == hash(A, B)
+        // This is BY DESIGN for intra-mountain nodes
+        // But verifier MUST bind leaf index to prevent sibling swap
+        bytes32 a = keccak256("msg1");
+        bytes32 b = keccak256("msg2");
+        bytes32 h1 = _hashInternalNode(a, b);
+        bytes32 h2 = _hashInternalNode(b, a);
+        return h1 == h2; // Expected: true. Risk if verifier doesn't bind index.
+      }
+
+  - id: BR-W-04
+    title: "bytes32-to-address truncation in finalizeTransfer — high vs low byte alignment"
+    description: |
+      TokenLib.finalizeTransfer does: `address to = address(bytes20(transfer.to))`
+
+      bytes20(bytes32) in Solidity takes the HIGH (leftmost) 20 bytes.
+      Example: 0x000000000000000000000000AABBCCDD...1122334455667788
+               → bytes20 = 0x000000000000000000000000AABBCCDD (NOT the address)
+
+      EVM addresses must be stored LEFT-ALIGNED (high bytes) in the bytes32 field:
+      0xABCDEF1234567890ABCDEF1234567890ABCDEF12000000000000000000000000
+      → bytes20 = 0xABCDEF1234567890ABCDEF1234567890ABCDEF12 (correct)
+
+      If the Solana side stores EVM addresses RIGHT-ALIGNED (Ethereum's canonical abi.encode format
+      pads addresses to 32 bytes left-padded with zeros, i.e., RIGHT-aligned):
+      0x000000000000000000000000ABCDEF1234567890ABCDEF1234567890ABCDEF12
+      → bytes20 = 0x000000000000000000000000ABCDEF12 = address(0x0000...ABCDEF12)
+
+      This would send tokens to the WRONG address (effectively burning them) for every single
+      transfer from Solana to Base.
+
+      CRITICAL IF: Solana stores EVM addresses right-aligned (as abi.encode would).
+      SAFE IF: Solana stores EVM addresses left-aligned in the bytes32 field.
+
+      The Transfer struct uses `bytes32 to` (not `address`), suggesting cross-chain compatibility.
+      Solana PDAs and pubkeys are 32 bytes. When the target is an EVM address, the Solana program
+      must encode it correctly. If there's any mismatch, ALL transfers to Base lose funds.
+
+      NEEDS SOLANA-SIDE VERIFICATION.
+    confidence: 35
+    severity: critical
+    status: investigate
+    attack_scenario: |
+      1. Solana user initiates transfer to EVM address 0xABCD...EF12
+      2. Solana program stores this as right-aligned bytes32:
+         0x000000000000000000000000ABCDEF1234567890ABCDEF1234567890ABCDEF12
+      3. Bridge relays message, finalizeTransfer extracts:
+         address(bytes20(transfer.to)) = address(0x000000000000000000000000ABCDEF12)
+         = 0x0000000000000000000000000000ABCDEF12 (WRONG — truncated address)
+      4. Tokens minted/transferred to wrong address, effectively burned
+
+      NOTE: If this were the case, it would have been caught in basic testing. The fact
+      that the bridge works in production means Solana likely stores EVM addresses left-aligned.
+      But any edge case where a user manually provides an address could be vulnerable.
+    solidity: |
+      // Invariant: bytes32 to address conversion preserves the intended recipient
+      function property_BR_W_04_address_alignment(bytes32 to, address expected) public pure returns (bool) {
+        address extracted = address(bytes20(to));
+        return extracted == expected;
+        // This passes IFF `to` has the address in the HIGH 20 bytes
+        // Fails if address is in LOW 20 bytes (right-aligned)
+      }
+
+  - id: BR-W-05
+    title: "CREATE2 address collision in CrossChainERC20Factory is computationally infeasible"
+    description: |
+      CrossChainERC20Factory uses salt = keccak256(abi.encode(remoteToken, name, symbol, decimals))
+      for deterministic deployment via LibClone.deployDeterministicERC1967BeaconProxy.
+
+      To find a collision, an attacker would need two different (remoteToken, name, symbol, decimals)
+      tuples that produce the same CREATE2 address. This requires ~2^80 work (birthday attack on
+      160-bit addresses), which is computationally infeasible with current technology.
+
+      Additionally, even if a collision were found, the second deployment would revert because
+      CREATE2 reverts if code already exists at the target address. So the "deploy over existing"
+      attack is not possible.
+
+      The only remaining vector: deploy a CrossChainERC20 at an address that collides with an
+      existing non-factory contract. This is the "metamorphic contract" pattern but requires the
+      target to have been self-destructed first (post-Cancun, SELFDESTRUCT only sends ETH).
+
+      VERIFIED SAFE.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — CREATE2 collision requires ~2^80 hash computations, infeasible.
+      Even if found, CREATE2 reverts on existing code at target address.
+    solidity: |
+      // Invariant: Each unique (remoteToken, name, symbol, decimals) produces a unique address
+      function property_BR_W_05_no_create2_collision() public pure returns (bool) {
+        // keccak256 is collision-resistant; birthday attack requires ~2^80 work
+        return true;
+      }
+
+  - id: BR-W-06
+    title: "encodePacked in _hashMessage is safe — fixed-length prefix prevents collision"
+    description: |
+      MessageStorageLib._hashMessage uses:
+        keccak256(abi.encodePacked(message.nonce, message.sender, message.data))
+
+      nonce is uint64 (8 bytes, fixed length)
+      sender is address (20 bytes, fixed length)
+      data is bytes (variable length)
+
+      The classic abi.encodePacked collision occurs when MULTIPLE variable-length fields are packed,
+      allowing boundary shifting (e.g., encodePacked("ab", "cd") == encodePacked("abc", "d")).
+
+      Here, only `data` is variable-length, and it's the LAST field. The 28-byte fixed prefix
+      (nonce + sender) is unambiguous. Two messages with different (nonce, sender) pairs cannot
+      collide because the prefix differs. Two messages with the same (nonce, sender) but different
+      data cannot collide because keccak256 is collision-resistant.
+
+      VERIFIED SAFE.
+    confidence: 98
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — abi.encodePacked with a single trailing dynamic field and fixed-length prefix
+      is safe from collision attacks.
+    solidity: |
+      // Invariant: Different messages always produce different hashes
+      function property_BR_W_06_no_hash_collision(
+        uint64 n1, address s1, bytes memory d1,
+        uint64 n2, address s2, bytes memory d2
+      ) public pure returns (bool) {
+        if (n1 != n2 || s1 != s2 || keccak256(d1) != keccak256(d2)) {
+          return keccak256(abi.encodePacked(n1, s1, d1)) != keccak256(abi.encodePacked(n2, s2, d2));
+        }
+        return true;
+      }
+
+  - id: BR-W-07
+    title: "Twin can bridge tokens it holds from prior TransferAndCall — by design but exploitable in composability"
+    description: |
+      A TransferAndCall message first mints/transfers tokens to address(bytes20(transfer.to)),
+      then executes Twin.execute with an arbitrary Call. If transfer.to is set to the Twin's address
+      (left-aligned), the Twin receives tokens. The Twin's call could then:
+
+      1. Approve tokens to a third party
+      2. Transfer tokens to any address
+      3. Interact with DeFi protocols (Uniswap, Aave, etc.)
+
+      This is BY DESIGN — the Twin is the Solana user's agent on Base. However, it creates a
+      composability risk: if the Twin holds leftover tokens from a prior operation (dust, rewards,
+      airdrops), a subsequent Call message could sweep them.
+
+      The interesting edge case: the Twin's address is deterministic (based on Solana pubkey).
+      Anyone can send tokens to a Twin before it's deployed. When the Twin IS deployed via
+      the first Cross-chain message, those pre-sent tokens become accessible to the Solana user.
+
+      RISK: If a protocol airdrops/distributes tokens to the Twin address (e.g., because the
+      Twin interacted with a DeFi protocol), anyone who can send a message as that Solana pubkey
+      can claim those tokens. This is expected behavior but worth documenting.
+    confidence: 80
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Solana user's Twin at 0xTWIN interacts with Uniswap via TransferAndCall
+      2. Uniswap airdrop sends 1000 UNI to 0xTWIN
+      3. Solana user sends Call message: Twin.execute → ERC20.transfer(attacker, 1000 UNI)
+      4. By design — the Solana user controls their Twin
+
+      Edge case: If the Solana private key is compromised, attacker sweeps ALL Twin assets.
+    solidity: |
+      // Invariant: Twin can only be controlled by its Solana owner (via Bridge)
+      function property_BR_W_07_twin_auth() public view returns (bool) {
+        // Twin.execute requires msg.sender == BRIDGE || msg.sender == address(this)
+        // Only Bridge calls Twin.execute, and only for messages from the owner's pubkey
+        return true;
+      }
+
+  - id: BR-W-08
+    title: "Gas limit manipulation in __relayMessage can selectively fail TransferAndCall"
+    description: |
+      _validateAndRelay calls `this.__relayMessage{gas: message.gasLimit}(message)`.
+      The gasLimit is part of the IncomingMessage struct and is set by the Solana sender.
+
+      For TransferAndCall, the execution does TWO things:
+      1. TokenLib.finalizeTransfer (mint/transfer tokens)
+      2. Twin.execute (arbitrary call)
+
+      If gasLimit is set to JUST enough for finalizeTransfer but NOT enough for Twin.execute,
+      the entire __relayMessage reverts (both operations are in the same call context), and
+      the message is marked as failed. Tokens are NOT transferred.
+
+      However, the message can be retried with proper gas (the message hash is in failures, not
+      successes). But the SENDER controls the gasLimit in the message. If the validators sign
+      the message with the low gasLimit, it's permanently stuck with that gasLimit.
+
+      Wait — looking more carefully: the gasLimit is part of the IncomingMessage which is part of
+      the signed message hash. To change the gasLimit, you'd need a new message with a new hash
+      and new validator signatures.
+
+      RISK: A Solana user who sets gasLimit too low makes their own message permanently stuck.
+      The message can be retried infinite times but always fails with the same gas limit.
+      For Transfer (simple) messages, the gas needed is predictable. For TransferAndCall, the
+      gas depends on the arbitrary call, which the user must estimate correctly.
+
+      If gasLimit is insufficient, the message permanently fails — funds that should have been
+      minted/transferred on Base remain locked on Solana side. The Solana program would need a
+      refund mechanism, which is outside this scope.
+    confidence: 60
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Solana user sends TransferAndCall bridging 100 SOL to Base
+      2. gasLimit is set to 50,000 (enough for mint but not for Twin.execute)
+      3. Validators sign and register the message
+      4. relayMessages called — __relayMessage runs with 50K gas
+      5. finalizeTransfer starts, but entire call runs out of gas and reverts
+      6. Message marked as failure, can be retried
+      7. Every retry fails with the same 50K gas limit (embedded in signed message)
+      8. 100 SOL locked on Solana side, never minted on Base
+
+      Griefing variant: If a relayer/oracle can influence gasLimit before signing,
+      they could DoS specific transfers.
+    solidity: |
+      // Invariant: Messages with insufficient gasLimit are permanently stuck
+      function property_BR_W_08_gas_limit_stuck() public returns (bool) {
+        // If message.gasLimit < gas_needed_for_execution, message always fails
+        // And cannot be modified (gasLimit is part of signed hash)
+        // This is a liveness issue, not a safety issue
+        return true;
+      }
+
+  - id: BR-W-09
+    title: "Twin.execute with CallType.Create/Create2 deploys contracts from Twin address — front-running"
+    description: |
+      Twin.execute supports CallType.Create and CallType.Create2. Contracts deployed via CREATE
+      have addresses based on (Twin.address, Twin.nonce). Contracts deployed via CREATE2 have
+      addresses based on (Twin.address, salt, initCode).
+
+      For CREATE2, the address is deterministic. An attacker could:
+      1. Predict the address of a contract to be deployed by a Twin via CREATE2
+      2. Front-run the relayMessages transaction with their own deployment at that address
+
+      But wait — the attacker would need to deploy from the Twin's address, which they can't.
+      CREATE2 addresses are bound to the deployer. So this is safe.
+
+      For CREATE, the nonce is predictable (Twins are fresh proxies, nonce starts at 0/1).
+      The address is deterministic but also bound to the Twin's address.
+
+      VERIFIED SAFE — CREATE/CREATE2 addresses are deployer-bound.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — Contract deployment addresses are bound to the deployer (Twin address).
+      An attacker cannot deploy at the same address from a different deployer.
+    solidity: |
+      // Invariant: CREATE2 from Twin produces address bound to Twin
+      function property_BR_W_09_create2_bound() public pure returns (bool) {
+        // address = keccak256(0xff, deployer, salt, keccak256(initCode))[12:]
+        // deployer = Twin address, which attacker cannot impersonate
+        return true;
+      }
+
+  - id: BR-W-10
+    title: "registerRemoteToken callable only via REMOTE_BRIDGE message — no access control on scalar"
+    description: |
+      TokenLib.registerRemoteToken sets the scalar for a (localToken, remoteToken) pair:
+        $.scalars[localToken][remoteToken] = 10 ** scalarExponent
+
+      This is called in __relayMessage when message.sender == REMOTE_BRIDGE. The REMOTE_BRIDGE
+      is an immutable Solana pubkey. Only the Solana bridge program itself can send these messages.
+
+      HOWEVER: registerRemoteToken can be called MULTIPLE TIMES for the same (localToken, remoteToken)
+      pair, overwriting the scalar. If the Solana bridge program sends a new registration message
+      with a different scalarExponent, the scalar changes.
+
+      Impact: If scalar changes from 10^9 to 10^18 (9 to 18), all pending deposits would have
+      their local amounts recalculated. But deposits are stored in local units and withdrawals
+      use `transfer.remoteAmount * scalar`. If scalar INCREASES, withdrawals drain more than
+      deposited. If scalar DECREASES, funds are locked.
+
+      This is a Solana-side governance risk. On the EVM side, there's no protection against
+      scalar re-registration. The `deposits` mapping tracks cumulative deposits in local units
+      and subtracts on finalize. Changing the scalar mid-flight would desynchronize.
+
+      NEEDS SOLANA-SIDE VERIFICATION: Can the Solana bridge program re-register with different scalar?
+    confidence: 45
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Token pair (USDC, solUSDC) registered with scalarExponent=12 → scalar=10^12
+      2. User deposits 1000 USDC → deposits[USDC][solUSDC] += 1000 * 10^12
+      3. Solana bridge re-registers with scalarExponent=6 → scalar=10^6
+      4. User bridges back 1000 remoteAmount → localAmount = 1000 * 10^6 = 10^9
+      5. deposits -= 10^9 (succeeds, deposits still has 999999 * 10^12 - 10^9)
+      6. User receives 10^9 instead of 10^18 local units — massive loss
+
+      Reverse: if scalar increases, withdrawals extract more than deposited.
+    solidity: |
+      // Invariant: Scalar for a token pair should not change after deposits exist
+      function property_BR_W_10_scalar_immutable_after_deposits(
+        address localToken, Pubkey remoteToken
+      ) public view returns (bool) {
+        uint256 deposits = TokenLib.getTokenLibStorage().deposits[localToken][remoteToken];
+        // If deposits > 0, scalar should not have changed since first deposit
+        // Cannot enforce on-chain without historical tracking
+        return true;
+      }
+
+  - id: BR-W-11
+    title: "Nonce overflow in MessageStorageLib — unchecked increment of uint64 nextNonce"
+    description: |
+      MessageStorageLib.sendMessage increments nextNonce in unchecked block:
+        unchecked { ++$.nextNonce; }
+
+      nextNonce is uint64, max value 2^64 - 1 = 18,446,744,073,709,551,615.
+
+      If nextNonce overflows to 0, messages would reuse nonces. The _hashMessage uses the nonce
+      as part of the hash, so a reused nonce with different (sender, data) would produce a different
+      hash. The risk is low because reaching 2^64 messages would take astronomical time even at
+      maximum throughput.
+
+      At 1 message per block (2 second blocks): 2^64 / (365.25 * 24 * 3600 / 2) ≈ 1.17 * 10^12 years.
+
+      VERIFIED SAFE — overflow is practically impossible.
+    confidence: 98
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — 2^64 messages would take over a trillion years at maximum throughput.
+    solidity: |
+      // Invariant: Nonce never overflows in practice
+      function property_BR_W_11_no_nonce_overflow() public pure returns (bool) {
+        // uint64 max = 18,446,744,073,709,551,615
+        // At 1 msg/block (2s blocks) = ~584 billion years to overflow
+        return true;
+      }
+
+  - id: BR-W-12
+    title: "Twin deployment front-running — attacker cannot influence Twin address"
+    description: |
+      Twins are deployed via LibClone.deployDeterministicERC1967BeaconProxy with
+      salt = Pubkey.unwrap(message.sender). The address is deterministic based on
+      (TWIN_BEACON, salt, deployer=Bridge).
+
+      An attacker cannot front-run Twin deployment to change the address because:
+      1. The salt is the Solana pubkey — attacker cannot choose it
+      2. The deployer is the Bridge contract — attacker cannot deploy from Bridge
+      3. The beacon is immutable
+
+      However, if someone calls a CREATE2 opcode with the same salt/initcode from the Bridge
+      address before the Bridge deploys the Twin, the deployment would fail. But only the Bridge
+      can call deployDeterministicERC1967BeaconProxy (it's internal to __relayMessage).
+
+      VERIFIED SAFE.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — Twin address is deterministic and can only be deployed by Bridge.
+    solidity: |
+      // Invariant: Twin deployment is deterministic and cannot be front-run
+      function property_BR_W_12_twin_deterministic() public view returns (bool) {
+        // predictDeterministicAddressERC1967BeaconProxy == actual deployed address
+        return true;
+      }
+
+  - id: BR-W-13
+    title: "Message replay between different Bridge deployments — no chain ID in hash"
+    description: |
+      MessageLib.getMessageHash computes:
+        EfficientHashLib.hash(bytes32(nonce), Pubkey.unwrap(outgoingMessagePubkey), innerMessageHash)
+
+      There is NO chain ID in the hash. If the same Bridge contract is deployed on multiple chains
+      (e.g., Base and Optimism) with the same BridgeValidator setup, a message signed for one chain
+      could be replayed on another.
+
+      The outgoingMessagePubkey provides some uniqueness (it's a Solana account address), but if
+      the same Solana message account is referenced on both chains, the hash would be identical.
+
+      MITIGATION: The BridgeValidator tracks nextNonce sequentially. If both chains share the same
+      validator set, the nonce sequence would diverge after the first message, preventing replay.
+      But if the bridge is deployed fresh on a new chain with nextNonce=0, historical messages
+      from another chain could be replayed.
+
+      RISK: Cross-chain replay if the bridge is deployed on multiple EVM chains with the same
+      validator set. Severity depends on deployment architecture.
+    confidence: 50
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Bridge deployed on Base (chain A) with validator set V
+      2. Bridge deployed on Optimism (chain B) with SAME validator set V
+      3. Attacker captures signed message M on chain A (nonce=5, pubkey=P, hash=H)
+      4. On chain B, if nextNonce hasn't reached 5 yet, attacker waits
+      5. When chain B's nextNonce reaches 5, attacker submits message M
+      6. If the outgoingMessagePubkey P and innerMessageHash match, message replays
+
+      Precondition: Same validator set, same nonce sequence, same outgoing pubkey.
+    solidity: |
+      // Invariant: Message hash should include chain ID to prevent cross-chain replay
+      function property_BR_W_13_no_cross_chain_replay() public view returns (bool) {
+        // Currently: hash = H(nonce, pubkey, innerHash)
+        // Should include: block.chainid
+        // Risk only if same validators sign for multiple chains
+        return true;
+      }
+
+summary:
+  total_hypotheses: 13
+  investigate:
+    - BR-W-01 — Twin delegatecall can overwrite beacon slot (Low, self-inflicted)
+    - BR-W-03 — Commutative MMR hashing may allow proof forgery (High, needs Solana verification)
+    - BR-W-04 — bytes32-to-address truncation may burn funds (Critical, needs Solana verification)
+    - BR-W-08 — Insufficient gasLimit makes messages permanently stuck (Medium, liveness issue)
+    - BR-W-10 — Scalar re-registration desynchronizes deposits (High, needs Solana verification)
+    - BR-W-13 — No chain ID in message hash enables cross-chain replay (Medium, deployment-dependent)
+  safe:
+    - BR-W-02 — Transient reentrancy guard covers all Twin re-entry paths
+    - BR-W-05 — CREATE2 collision infeasible (~2^80 work)
+    - BR-W-06 — encodePacked with single trailing dynamic field is collision-free
+    - BR-W-07 — Twin token sweeping is by design (owner controls Twin)
+    - BR-W-09 — CREATE/CREATE2 from Twin are deployer-bound
+    - BR-W-11 — uint64 nonce overflow takes >10^12 years
+    - BR-W-12 — Twin deployment is deterministic and front-run resistant
+  priority_for_deepdive:
+    - BR-W-03 (commutative hashing) — HIGHEST PRIORITY, need Solana verifier code
+    - BR-W-04 (address alignment) — HIGH PRIORITY, need Solana encoding confirmation
+    - BR-W-10 (scalar re-registration) — HIGH PRIORITY, need Solana bridge program analysis
+    - BR-W-13 (cross-chain replay) — MEDIUM PRIORITY, need deployment architecture confirmation

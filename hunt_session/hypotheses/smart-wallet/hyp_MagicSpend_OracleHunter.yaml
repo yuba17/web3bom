@@ -1,0 +1,186 @@
+hunter: OracleHunter
+component: MagicSpend
+date: "2026-03-27"
+contract: MagicSpend.sol
+loc: 373
+
+hypotheses:
+
+  - id: MS-O-01
+    title: "Forced ETH via selfdestruct inflates maxAllowed, enabling oversized withdrawals"
+    severity: Low
+    confidence: 25
+    status: pending
+    solidity: |
+      // _validateRequest uses address(this).balance as oracle for max withdraw cap
+      // Line 347:
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+          revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+      }
+    attack_scenario: |
+      1. MagicSpend holds 100 ETH, maxWithdrawDenominator = 10, so maxAllowed = 10 ETH.
+      2. Attacker deploys a contract with 900 ETH and calls selfdestruct(magicSpend).
+      3. MagicSpend now has 1000 ETH balance, maxAllowed = 100 ETH.
+      4. Attacker uses a valid WithdrawRequest (signed by owner) for 100 ETH instead of the
+         intended cap of 10 ETH.
+      5. The maxAllowed check passes because balance was inflated.
+    impact: |
+      Limited. The attacker needs a valid owner-signed WithdrawRequest for the inflated amount,
+      so they cannot withdraw more than what the owner authorized per-request. The
+      maxWithdrawDenominator is a reputation-protection mechanism (prevents draining in one
+      bundled tx), not a hard security boundary. The owner signs the exact amount, so the
+      attacker would need an owner-signed request for the larger amount anyway.
+      Net cost to attacker: 900 ETH donated permanently. Benefit: bypass a soft rate limit
+      that the owner already authorized them to exceed via signature.
+      Realistically this is informational — the owner signature is the true access control,
+      not the balance-based cap.
+    why_low_confidence: |
+      The balance-based check is a secondary defense for paymaster reputation, not a fund
+      security invariant. The owner signature already authorizes the exact amount. An attacker
+      who can get a signature for X ETH was already authorized to withdraw X ETH. Forcing
+      balance up costs the attacker real ETH with no profit path.
+
+  - id: MS-O-02
+    title: "block.timestamp manipulation by sequencer to extend/shorten WithdrawRequest expiry"
+    severity: Informational
+    confidence: 15
+    status: pending
+    solidity: |
+      // withdraw() line 191:
+      if (block.timestamp > withdrawRequest.expiry) {
+          revert Expired();
+      }
+      // validatePaymasterUserOp() line 140 — expiry passed to EntryPoint via validationData:
+      validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160);
+      // EntryPoint enforces expiry check on-chain using block.timestamp
+    attack_scenario: |
+      On an L2 (Base, where MagicSpend is deployed), the sequencer controls block.timestamp
+      within certain bounds. A malicious sequencer could:
+      1. Set block.timestamp slightly in the past to allow an expired WithdrawRequest to pass.
+      2. Or set block.timestamp far in the future to prematurely expire valid requests.
+      Typical L2 sequencer drift: up to ~15 minutes from real time.
+    impact: |
+      Minimal. The expiry window is typically set with hours/days of margin, not seconds.
+      A 15-minute drift is negligible relative to typical expiry windows.
+      For the validatePaymasterUserOp path, the EntryPoint itself also validates the expiry
+      from validationData, providing a double-check. The sequencer is a trusted entity on
+      Base (Coinbase-operated), and this is a Coinbase contract — same trust assumption.
+    why_low_confidence: |
+      Sequencer timestamp manipulation is a known L2 property, not a contract bug.
+      The trust model already assumes the sequencer is honest. On Base, the sequencer IS
+      Coinbase, who also operates MagicSpend. No adversarial relationship exists.
+
+  - id: MS-O-03
+    title: "No external price oracle dependency — no oracle manipulation surface"
+    severity: Informational
+    confidence: 95
+    status: pending
+    solidity: |
+      // MagicSpend deals only in ETH (native asset) and ERC20 tokens at face value.
+      // No price feeds, no Chainlink, no TWAP, no AMM spot price.
+      // The only "price reference" is address(this).balance for rate limiting (line 347).
+      // WithdrawRequest.amount is the exact amount in wei, not derived from any oracle.
+    attack_scenario: |
+      N/A — This is a negative finding confirming the absence of oracle attack surface.
+      MagicSpend does not convert between assets, does not reference external price data,
+      and does not compute exchange rates. Each WithdrawRequest specifies an exact amount
+      in a specific asset, signed by the owner.
+    impact: |
+      No oracle manipulation attack surface exists. This is a positive security property.
+    why_high_confidence: |
+      Complete code review confirms zero external oracle dependencies. The contract is
+      a simple custodial paymaster with owner-signed withdrawal authorization.
+
+  - id: MS-O-04
+    title: "maxWithdrawDenominator=0 causes division by zero in _validateRequest"
+    severity: Medium
+    confidence: 60
+    status: pending
+    solidity: |
+      // _setMaxWithdrawDenominator has no validation:
+      function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+          maxWithdrawDenominator = newDenominator;  // Can be set to 0
+          emit MaxWithdrawDenominatorSet(newDenominator);
+      }
+      // _validateRequest line 347:
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      // Division by zero reverts, blocking ALL ETH withdrawals
+    attack_scenario: |
+      1. Owner (accidentally or maliciously) calls setMaxWithdrawDenominator(0).
+      2. Every subsequent call to _validateRequest for ETH (asset == address(0)) reverts
+         with a panic due to division by zero.
+      3. Both withdraw() and validatePaymasterUserOp() are bricked for ETH requests.
+      4. ERC20 withdrawals still work (the check is gated on asset == address(0)).
+      5. Owner can fix by calling setMaxWithdrawDenominator again, but during the window
+         all ETH withdrawals and paymaster operations are DoS'd.
+    impact: |
+      Owner-only DoS on all ETH withdrawal paths. Since owner is trusted (Coinbase),
+      this is primarily an operational risk, not an exploitable vulnerability.
+      However, if owner key is compromised or multisig has a bug, this could permanently
+      brick the paymaster. Users with pending _withdrawable balances cannot claim.
+      Severity depends on trust model — if owner is fully trusted, this is Low/QA.
+      If owner key compromise is in threat model, this is Medium (permanent fund lock).
+    why_medium_confidence: |
+      The bug is real (no zero-check on denominator), but exploitability requires owner
+      action. The question is whether "owner shoots themselves in the foot" is in scope.
+      Many bounty programs consider admin-only issues as out of scope or QA-only.
+
+  - id: MS-O-05
+    title: "address(this).balance is read BEFORE nonce is marked, enabling multi-withdraw in same tx"
+    severity: Low
+    confidence: 30
+    status: pending
+    solidity: |
+      // _validateRequest flow:
+      function _validateRequest(address account, WithdrawRequest memory withdrawRequest) internal {
+          if (_nonceUsed[withdrawRequest.nonce][account]) {
+              revert InvalidNonce(withdrawRequest.nonce);
+          }
+          // Balance read BEFORE any ETH leaves the contract:
+          uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+          if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+              revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+          }
+          _nonceUsed[withdrawRequest.nonce][account] = true;
+          // ...
+      }
+    attack_scenario: |
+      1. MagicSpend has 100 ETH, denominator = 10, maxAllowed = 10 ETH.
+      2. User has 10 valid signed WithdrawRequests for 10 ETH each (different nonces).
+      3. User calls withdraw() 10 times in a single transaction (via a batch contract).
+      4. Each call reads address(this).balance BEFORE the previous withdrawal reduces it:
+         - Call 1: balance=100, maxAllowed=10, withdraws 10. Balance now 90.
+         - Call 2: balance=90, maxAllowed=9, still under 10 if amount is 9...
+         Actually, balance DOES decrease after each _withdraw (safeTransferETH),
+         so subsequent calls see the reduced balance.
+      5. The maxAllowed decreases with each withdrawal: 10, 9, 8, 7...
+         So the user CAN drain ~65 ETH in 10 calls (10+9+8+7+6+5+4+3+2+1=55 ETH).
+      6. But the user needed 10 valid owner-signed requests, so the owner authorized
+         all 100 ETH worth of withdrawals anyway.
+    impact: |
+      The denominator creates a softer limit than intended — an attacker with N valid
+      signed requests can withdraw more than balance/denominator in a single tx by
+      batching. However, each request requires an owner signature for the specific amount,
+      so the total withdrawn cannot exceed what the owner authorized. The denominator
+      is a reputation defense (anti-revert in bundles), not a hard security cap.
+      This is by-design behavior, not a vulnerability.
+    why_low_confidence: |
+      After deeper analysis, each withdrawal DOES reduce balance for subsequent calls.
+      The denominator works as intended per-call. The "attack" requires owner-signed
+      requests which means the owner authorized the total amount. Not exploitable.
+
+summary: |
+  MagicSpend has minimal oracle/external data attack surface. The contract is a simple
+  custodial paymaster that relies on owner signatures as the primary access control.
+
+  Key findings:
+  - MS-O-01 (Low): Forced ETH inflation via selfdestruct can bypass maxAllowed check,
+    but requires owner-signed request for the inflated amount — not practically exploitable.
+  - MS-O-02 (Info): L2 sequencer timestamp manipulation is within trust model (Coinbase).
+  - MS-O-03 (Info): No external oracle dependencies confirmed — positive security property.
+  - MS-O-04 (Medium): Division by zero if denominator set to 0 — owner-only DoS risk.
+  - MS-O-05 (Low): Balance reads per-call in batch scenario — works as designed.
+
+  Most promising lead for escalation: MS-O-04 (denominator=0 DoS). However, likely
+  out of scope as admin-only issue on a Coinbase-operated contract.

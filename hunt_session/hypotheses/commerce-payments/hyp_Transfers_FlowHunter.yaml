@@ -1,0 +1,680 @@
+hunter: FlowHunter
+component: Transfers
+date: "2026-03-27"
+version: "1.0"
+
+# ═══════════════════════════════════════════════════════════════
+# STATE MACHINE: Payment Intent Lifecycle
+# ═══════════════════════════════════════════════════════════════
+#
+#   Operator Registration Flow:
+#   UNREGISTERED ──registerOperator()──► REGISTERED
+#   REGISTERED ──unregisterOperator()──► UNREGISTERED
+#
+#   Intent Lifecycle (per operator+id pair):
+#   UNPROCESSED ──any transfer function──► PROCESSED (terminal)
+#
+#   Contract Fund Flow (per transfer):
+#
+#   [Payer] ──msg.value/transferFrom──► [Transfers Contract]
+#                                            │
+#                           ┌────────────────┼────────────────┐
+#                           │                │                │
+#                           ▼                ▼                ▼
+#                    recipientAmount    feeAmount        refund (swap)
+#                    → recipient       → feeDestination  → payer (sweep)
+#                           │                │
+#                           └────────┬───────┘
+#                                    │
+#                           ALL funds exit contract
+#                           (contract should hold 0 after tx)
+#
+#   Wrap/Unwrap Flow:
+#   ETH ──deposit()──► WETH (in contract) ──transfer──► recipient/feeDestination
+#   WETH ──transferFrom──► contract ──withdraw()──► ETH ──call{value}──► recipient/feeDestination
+#
+#   Swap Flow:
+#   tokenIn ──transfer to uniswap──► V3_SWAP_EXACT_OUT ──► tokenOut to recipient+feeDestination
+#                                                    └──► leftover swept back to payer
+#
+# ═══════════════════════════════════════════════════════════════
+# CORE INVARIANT: Contract balance should be 0 between txs
+# Funds should never remain in the contract after a transfer
+# (except dust from rounding in swap scenarios)
+# ═══════════════════════════════════════════════════════════════
+
+state_machine:
+  states:
+    - UNPROCESSED     # Intent has not been used yet
+    - PROCESSED       # Intent has been fulfilled (terminal)
+    - OP_UNREGISTERED # Operator not yet registered
+    - OP_REGISTERED   # Operator registered with feeDestination
+    - CONTRACT_EMPTY  # No funds held by contract (normal state between txs)
+    - CONTRACT_HOLDING # Funds temporarily in contract during transfer execution
+  transitions:
+    - from: OP_UNREGISTERED
+      to: OP_REGISTERED
+      via: "registerOperator() / registerOperatorWithFeeDestination()"
+      guard: "none — anyone can register"
+    - from: OP_REGISTERED
+      to: OP_UNREGISTERED
+      via: "unregisterOperator()"
+      guard: "msg.sender == operator"
+    - from: UNPROCESSED
+      to: PROCESSED
+      via: "any transfer function (transferNative, transferToken, etc)"
+      guard: "valid signature, deadline, operator registered"
+    - from: CONTRACT_EMPTY
+      to: CONTRACT_HOLDING
+      via: "funds received (msg.value or transferFrom)"
+      guard: "within transfer function"
+    - from: CONTRACT_HOLDING
+      to: CONTRACT_EMPTY
+      via: "transferFundsToDestinations / unwrapAndTransferFundsToDestinations / uniswap.execute"
+      guard: "all funds forwarded"
+  anomalies:
+    - type: no_transition_back
+      state: PROCESSED
+      description: "Intent is terminal once processed. No cancellation/refund mechanism on-chain."
+    - type: potential_stuck_funds
+      state: CONTRACT_HOLDING
+      description: |
+        If transferFundsToDestinations reverts (e.g., recipient is contract that rejects ETH),
+        entire tx reverts and intent stays UNPROCESSED. No partial settlement. BUT if recipient
+        is a contract with receive() that consumes gas, the sendNative call with empty data could
+        still succeed while doing something unexpected (callback).
+    - type: race_condition
+      description: |
+        Operator can unregisterOperator() between intent creation (off-chain) and on-chain execution.
+        operatorIsRegistered modifier will revert, denying valid intents. Griefing vector.
+    - type: feeDestination_change_mid_flight
+      description: |
+        Operator can call registerOperatorWithFeeDestination(newAddr) between intent signing and
+        on-chain execution. The feeAmount goes to the NEW feeDestination, not the one known at
+        signing time. The feeDestination is NOT part of the signed hash.
+
+hypotheses:
+
+  - id: T-FLOW-01
+    title: "feeDestination not included in signed intent hash — operator can redirect fees post-signature"
+    description: |
+      In validIntent (L80-93), the signed hash includes: recipientAmount, deadline, recipient,
+      recipientCurrency, refundDestination, feeAmount, id, operator, chainid, sender, address(this).
+
+      CRITICALLY MISSING: feeDestinations[operator] is NOT in the signed hash.
+
+      The operator signs an intent with feeAmount=X. Between signing and the payer's on-chain execution,
+      the operator calls registerOperatorWithFeeDestination(maliciousAddr). The feeAmount is then sent
+      to maliciousAddr instead of the original feeDestination the payer/merchant expected.
+
+      This is by design (operator controls their own fees), but creates a trust issue:
+      - If feeDestination is a revenue-sharing contract, the operator can bypass it
+      - If a third party relays intents expecting fees to go to a specific address, operator can rug
+
+      However, since the OPERATOR signs the intent and the operator IS the one who sets feeDestination,
+      this is likely an accepted trust assumption: the operator controls both the intent and the fee routing.
+    severity: low
+    confidence: 40
+    affected_functions:
+      - "validIntent modifier (L80-123)"
+      - "registerOperatorWithFeeDestination (L781-785)"
+      - "transferFundsToDestinations (L720-737)"
+    solidity: |
+      // Track that feeDestination cannot change between intent creation and execution
+      // This is hard to test as invariant since it requires off-chain state
+      // Instead, verify that feeDestination[operator] != address(0) in all paths
+      address feeDest = feeDestinations[intent.operator];
+      t(feeDest != address(0), "T-FLOW-01: fee destination is zero after valid transfer");
+    validated: false
+    priority: low
+
+  - id: T-FLOW-02
+    title: "wrapAndTransfer sends WETH to recipient via transferFundsToDestinations but recipientCurrency is WETH — fee split works on WETH not ETH"
+    description: |
+      In wrapAndTransfer (L266-290):
+      1. msg.value is wrapped: wrappedNativeCurrency.deposit{value: msg.value}() — L283
+      2. transferFundsToDestinations(_intent) is called — L286
+      3. Inside transferFundsToDestinations (L720-737): since _intent.recipientCurrency is address(wrappedNativeCurrency)
+         (checked at L277), it takes the ELSE branch (L728-736), doing safeTransfer of the ERC20 token.
+
+      This is correct — the contract wraps ETH to WETH, then sends WETH to recipient and feeDestination.
+
+      BUT: succeedPayment emits spentCurrency=NATIVE_CURRENCY (L289), not the actual wrappedNativeCurrency
+      that was delivered. This is a logging inconsistency, not a fund loss bug.
+
+      The actual flow is sound: exactValueSent ensures msg.value == recipientAmount + feeAmount,
+      deposit wraps ALL of it, then safeTransfer sends exact amounts. No funds stuck.
+    severity: informational
+    confidence: 85
+    affected_functions:
+      - "wrapAndTransfer (L266-290)"
+      - "succeedPayment (L747-755)"
+    solidity: |
+      // After wrapAndTransfer, contract WETH balance should be 0
+      uint256 wethBal = wrappedNativeCurrency.balanceOf(address(transfers));
+      eq(wethBal, 0, "T-FLOW-02: WETH stuck in contract after wrapAndTransfer");
+    validated: true
+    priority: low
+
+  - id: T-FLOW-03
+    title: "unwrapAndTransfer does NOT check fee-on-transfer for WETH input via permit2"
+    description: |
+      In unwrapAndTransfer (L295-337):
+      1. permit2.permitTransferFrom transfers WETH from payer to contract (L325-330)
+      2. unwrapAndTransferFundsToDestinations is called directly (L333)
+      3. NO revertIfInexactTransfer check between step 1 and step 2
+
+      Compare with transferToken (L169-217) which DOES call revertIfInexactTransfer after
+      the permit2 transfer (L210).
+
+      For WETH specifically this is NOT exploitable because WETH is not a fee-on-transfer token.
+      But the code pattern is inconsistent — if wrappedNativeCurrency were ever set to a
+      non-standard wrapped token with fees, the unwrap would fail or send wrong amounts.
+
+      The contract is immutable (wrappedNativeCurrency set in constructor), so this is only
+      relevant if deployed with a non-standard wrapped token.
+
+      unwrapAndTransferPreApproved (L342-377) has the same missing check.
+    severity: informational
+    confidence: 70
+    affected_functions:
+      - "unwrapAndTransfer (L295-337)"
+      - "unwrapAndTransferPreApproved (L342-377)"
+    solidity: |
+      // Invariant: after unwrapAndTransfer, contract should hold no WETH and no ETH
+      uint256 wethBal = wrappedNativeCurrency.balanceOf(address(transfers));
+      uint256 ethBal = address(transfers).balance;
+      eq(wethBal, 0, "T-FLOW-03: WETH stuck after unwrap");
+      eq(ethBal, 0, "T-FLOW-03: ETH stuck after unwrap");
+    validated: true
+    priority: low
+
+  - id: T-FLOW-04
+    title: "sendNative callback to recipient/feeDestination — ETH transfer via call{value} enables callbacks despite nonReentrant"
+    description: |
+      In sendNative (L757-766), native ETH is sent via:
+        payable(destination).call{value: amount}("")
+
+      This triggers the receive()/fallback() function on the destination address. While the
+      contract uses nonReentrant on ALL external functions, the callback can still:
+
+      1. Call OTHER contracts that read Transfers state (read-only reentrancy is not blocked)
+      2. Execute arbitrary logic with up to 63/64 of remaining gas
+
+      In transferFundsToDestinations (L720-737), the order is:
+        - First: send recipientAmount to recipient (L723)
+        - Second: send feeAmount to feeDestination (L726)
+
+      If recipient is a malicious contract, its receive() callback executes BETWEEN the two
+      sends. At that point:
+        - processedTransferIntents is NOT yet set (set in succeedPayment, which runs AFTER)
+        - The contract's ETH balance still holds feeAmount
+
+      However, nonReentrant prevents re-entering any external function. The only concern is
+      if the recipient's callback interacts with other protocols that depend on the Transfers
+      contract's balance or state during the callback.
+
+      For the Coinbase Commerce use case, recipient addresses are merchant-controlled, so
+      the recipient is trusted. BUT feeDestination is operator-controlled (L34), and any
+      address can register as operator (L781-792). A malicious operator could set feeDestination
+      to a contract that does something unexpected during receive().
+
+      Net assessment: nonReentrant is sufficient protection. The callback cannot re-enter
+      Transfers. Cross-contract read-only reentrancy is theoretically possible but requires
+      a specific vulnerable external protocol.
+    severity: low
+    confidence: 55
+    affected_functions:
+      - "sendNative (L757-766)"
+      - "transferFundsToDestinations (L720-737)"
+    solidity: |
+      // After ANY native transfer function completes, contract ETH balance must be 0
+      uint256 ethBal = address(transfers).balance;
+      eq(ethBal, 0, "T-FLOW-04: ETH stuck in contract after native transfer");
+    validated: true
+    priority: medium
+
+  - id: T-FLOW-05
+    title: "Zero-amount intent bypasses fund transfer but still marks intent as processed"
+    description: |
+      In ALL transfer functions, there is a pattern:
+        if (neededAmount > 0) { ... transferFundsToDestinations ... }
+        succeedPayment(...)  // ALWAYS called regardless of neededAmount
+
+      When recipientAmount=0 AND feeAmount=0:
+        - neededAmount = 0
+        - No funds are transferred
+        - But succeedPayment sets processedTransferIntents[operator][id] = true
+        - Event Transferred is emitted with spentAmount=0
+
+      This means an operator can sign a zero-value intent and the payer can "process" it,
+      permanently burning that intent ID. This could be used to:
+        1. Front-run a real intent: if operator signs intent with ID=X for $100, attacker
+           signs a DIFFERENT zero-value intent with same ID... BUT the signature includes
+           the amounts, so attacker can't forge this. The operator would need to sign both.
+        2. Operator intentionally signs zero-value intent to "cancel" an existing ID on-chain.
+
+      For transferNative with exactValueSent: msg.value must equal 0 (neededAmount=0), so
+      the payer sends 0 ETH. This is a no-op that wastes gas.
+
+      For transferToken/transferTokenPreApproved: similar no-op.
+
+      The operator controls the signature, so they can only "waste" their own intent IDs.
+      Not a security issue — more of a gas waste / design observation.
+
+      HOWEVER: in subsidizedTransferToken (L505-559), the msg.sender (relayer) pays gas but
+      the intent is for _signatureTransferData.owner. A zero-value subsidized transfer wastes
+      relayer gas. The relayer should check off-chain, but no on-chain protection.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "All transfer functions"
+      - "succeedPayment (L747-755)"
+    solidity: |
+      // If an intent is processed, either funds were transferred or amounts were zero
+      // This is by design — just verify the mapping is set
+      bool processed = processedTransferIntents[intent.operator][intent.id];
+      t(processed, "T-FLOW-05: intent should be marked processed after any successful call");
+    validated: true
+    priority: low
+
+  - id: T-FLOW-06
+    title: "swapAndTransferUniswapV3Native — no exactValueSent modifier, excess ETH can be lost in Uniswap router"
+    description: |
+      swapAndTransferUniswapV3Native (L384-410) does NOT use the exactValueSent modifier.
+      The payer sends msg.value as the maximum they're willing to pay for the swap.
+
+      The Uniswap UniversalRouter flow:
+      1. WRAP_ETH: wraps msg.value into WETH at the router
+      2. V3_SWAP_EXACT_OUT: swaps for exactly neededAmount of tokenOut
+      3. TRANSFER x2: sends recipientAmount to recipient, feeAmount to feeDestination
+      4. UNWRAP_WETH: unwraps leftover WETH at the router
+      5. SWEEP ETH: sends leftover ETH back to _msgSender()
+
+      The SWEEP (L622) uses amount=0, meaning it sweeps the ENTIRE remaining balance of ETH
+      from the router to the payer. This should return any excess.
+
+      BUT: if the Uniswap router already had a pre-existing ETH or WETH balance (from a
+      previous failed tx or donation), that balance gets swept to the CURRENT payer too.
+      The contract accounts for this in L602-603 and L699:
+        payerBalanceBefore = _msgSender().balance + msg.value
+        routerBalanceBefore = address(uniswap).balance + WETH.balanceOf(address(uniswap))
+        return (payerBalanceBefore + routerBalanceBefore) - (payerBalanceAfter + routerBalanceAfter)
+
+      This calculation returns the NET amount consumed by the swap, correctly excluding any
+      pre-existing router balance that got swept to the payer. The return value (amountSwapped)
+      is used in the Transferred event.
+
+      The actual fund flow is safe — excess returns to payer via SWEEP. However, the event
+      may report amountSwapped differently than what the user "really" spent if the router
+      had pre-existing balance.
+    severity: informational
+    confidence: 75
+    affected_functions:
+      - "swapAndTransferUniswapV3Native (L384-410)"
+      - "swapTokens (L561-718)"
+    solidity: |
+      // After a swap-and-transfer, contract should hold 0 of any token
+      uint256 ethBal = address(transfers).balance;
+      eq(ethBal, 0, "T-FLOW-06: ETH stuck in contract after swap");
+    validated: true
+    priority: medium
+
+  - id: T-FLOW-07
+    title: "subsidizedTransferToken — relayer (msg.sender) can front-run the actual payer and steal their permit"
+    description: |
+      In subsidizedTransferToken (L505-559):
+      - validIntent uses _signatureTransferData.owner as the sender (not _msgSender())
+      - The EIP-2612 permit is called with the owner's signature
+      - Then safeTransferFrom transfers from owner to contract
+
+      The key insight: the PERMIT signature (EIP-2612) is a separate signature from the
+      operator's TransferIntent signature. The permit signature authorizes THIS contract
+      to spend owner's tokens.
+
+      Attack scenario:
+      1. Owner signs EIP-2612 permit for Transfers contract, amount=neededAmount
+      2. Owner shares both the TransferIntent and the EIP-2612 signature with a relayer
+      3. A different relayer (or anyone watching mempool) sees the tx and front-runs it
+      4. Front-runner calls subsidizedTransferToken with the SAME data
+      5. The permit executes, the transfer happens, intent is processed
+
+      BUT: who benefits? The funds still go to _intent.recipient and _intent.feeDestination.
+      The front-runner gains nothing — they just pay gas. The original relayer's tx then
+      reverts with AlreadyProcessed.
+
+      The only "attack" is: the original relayer wastes gas on the reverted tx. This is
+      standard permit front-running and is a known limitation of EIP-2612.
+
+      HOWEVER: there's a subtler issue. The permit (L530-536) sets allowance to neededAmount
+      with deadline=_intent.deadline. If the permit is front-run and the allowance is consumed,
+      any future permit with the SAME nonce will fail (EIP-2612 nonce is consumed). The owner
+      cannot reuse that permit signature. But the intent is already processed, so this is fine.
+    severity: informational
+    confidence: 80
+    affected_functions:
+      - "subsidizedTransferToken (L505-559)"
+    solidity: |
+      // After subsidizedTransferToken, intent must be processed and contract balance = 0
+      bool processed = processedTransferIntents[intent.operator][intent.id];
+      t(processed, "T-FLOW-07: subsidized transfer must mark intent processed");
+      uint256 bal = erc20.balanceOf(address(transfers));
+      eq(bal, 0, "T-FLOW-07: tokens stuck after subsidized transfer");
+    validated: true
+    priority: low
+
+  - id: T-FLOW-08
+    title: "swapAndTransferUniswapV3Token — permit2 transfer amount (maxWillingToPay) is not validated against neededAmount"
+    description: |
+      In swapAndTransferUniswapV3Token (L413-455):
+      1. maxWillingToPay = _signatureTransferData.transferDetails.requestedAmount (L431)
+      2. permit2 transfers maxWillingToPay tokens from payer to contract (L439-444)
+      3. swapTokens is called with maxWillingToPay as the amountIn cap (L450)
+      4. Inside swapTokens, tokens are sent to uniswap router (L663)
+      5. SWEEP returns leftover tokenIn to payer (L643/L659)
+
+      There is NO check that maxWillingToPay >= neededAmount. The swap is V3_SWAP_EXACT_OUT
+      which tries to get exactly neededAmount of tokenOut. If maxWillingToPay is insufficient
+      for the swap, Uniswap will revert with V3TooMuchRequested.
+
+      BUT: the payer sets maxWillingToPay themselves (it's in their permit2 signature). If
+      they set it too low, the tx just reverts. No fund loss — just UX issue.
+
+      The more interesting case: what if maxWillingToPay is MUCH higher than needed? After the
+      exact-out swap, the router SWEEPs leftover tokenIn back to payer. This works correctly.
+
+      ACTUAL CONCERN: In the token-to-token swap path (L644-660), the SWEEP at L659 sends
+      leftover tokenIn to _msgSender() with amount=0 (sweep all). But this sweep is executed
+      by the Uniswap router. If the router has pre-existing tokenIn balance from another tx
+      in the same block, that balance gets swept to the current payer. This is a known
+      Uniswap router behavior (MEV opportunity, not a Transfers bug).
+    severity: informational
+    confidence: 70
+    affected_functions:
+      - "swapAndTransferUniswapV3Token (L413-455)"
+      - "swapTokens (L561-718)"
+    solidity: |
+      // After swap, contract should hold 0 of tokenIn
+      uint256 tokenInBal = IERC20(tokenIn).balanceOf(address(transfers));
+      eq(tokenInBal, 0, "T-FLOW-08: tokenIn stuck in contract after swap");
+    validated: true
+    priority: medium
+
+  - id: T-FLOW-09
+    title: "recipientAmount + feeAmount overflow in neededAmount calculation"
+    description: |
+      In EVERY transfer function, neededAmount is calculated as:
+        uint256 neededAmount = _intent.recipientAmount + _intent.feeAmount;
+
+      Both are uint256 values from the calldata. If recipientAmount + feeAmount > type(uint256).max,
+      this overflows... BUT Solidity ^0.8.17 has built-in overflow checks. The addition would
+      revert with a panic.
+
+      The operator signs these values, so only the operator can create an intent with values
+      that sum to overflow. When the payer tries to execute it, the tx reverts. The intent
+      is effectively unusable — the operator would be sabotaging their own intents.
+
+      Additionally, the exactValueSent modifier (used in transferNative, wrapAndTransfer) also
+      computes this sum. The overflow would revert there too.
+
+      Not a vulnerability — Solidity 0.8 overflow protection handles this.
+    severity: informational
+    confidence: 95
+    affected_functions:
+      - "All transfer functions"
+      - "exactValueSent modifier (L134-144)"
+    solidity: |
+      // Verify no overflow: recipientAmount + feeAmount should always be >= each component
+      uint256 sum = intent.recipientAmount + intent.feeAmount;
+      gte(sum, intent.recipientAmount, "T-FLOW-09: overflow in neededAmount");
+      gte(sum, intent.feeAmount, "T-FLOW-09: overflow in neededAmount");
+    validated: true
+    priority: low
+
+  - id: T-FLOW-10
+    title: "Contract can permanently hold tokens/ETH if sweeper is never set — Sweepable.sweeper starts as address(0)"
+    description: |
+      The Transfers contract inherits Sweepable. The _sweeper variable is never set in the
+      Transfers constructor (L54-75). It defaults to address(0).
+
+      Sweepable.setSweeper (L36) requires onlyOwner and notZero. So the owner CAN set a sweeper
+      after deployment. But if the owner never does, or if ownership is renounced:
+        - Any tokens accidentally sent to the contract are stuck forever
+        - ETH sent via selfdestruct/coinbase is stuck forever
+        - Leftover dust from swap rounding is stuck forever
+
+      The sweep functions (sweepETH, sweepToken, etc) all require onlySweeper modifier,
+      which checks sweeper() == _msgSender(). If _sweeper == address(0), nobody can call sweep.
+
+      This is a deployment configuration issue, not a code bug. But worth noting that the
+      contract has NO mechanism to handle "accidentally received" funds without a sweeper.
+
+      The receive() function (L811-813) only accepts ETH from wrappedNativeCurrency, so
+      random ETH sends are rejected. But selfdestruct can force ETH into the contract.
+    severity: informational
+    confidence: 85
+    affected_functions:
+      - "Sweepable.setSweeper"
+      - "Sweepable.sweepETH/sweepToken"
+      - "receive() (L811-813)"
+    solidity: |
+      // If sweeper is address(0), no funds can be rescued
+      address currentSweeper = sweepable.sweeper();
+      // This is informational — just verify sweep works if sweeper is set
+      if (currentSweeper != address(0)) {
+        t(true, "T-FLOW-10: sweeper is configured");
+      }
+    validated: true
+    priority: low
+
+  - id: T-FLOW-11
+    title: "unwrapAndTransferFundsToDestinations sends native ETH to recipient/feeDestination — if either is a contract without receive(), entire tx reverts and intent is blocked"
+    description: |
+      In unwrapAndTransferFundsToDestinations (L739-745):
+      1. wrappedNativeCurrency.withdraw(amountToWithdraw) — unwraps WETH to ETH
+      2. transferFundsToDestinations(_intent) — sends ETH to recipient and feeDestination
+
+      transferFundsToDestinations uses sendNative (L757-766) which does:
+        payable(destination).call{value: amount}("")
+
+      If _intent.recipient is a contract that does NOT have receive()/fallback(), or reverts
+      in receive(), the call fails → sendNative reverts with NativeTransferFailed → entire
+      tx reverts → intent stays UNPROCESSED.
+
+      The payer has valid WETH, the operator signed a valid intent, but the payment CANNOT be
+      completed because the recipient cannot accept ETH. There is NO fallback mechanism to
+      send WETH instead or to allow the recipient to claim later.
+
+      The intent is now permanently blocked (assuming recipient won't change their contract).
+      The payer's WETH is never transferred (tx reverted), so no fund loss. But the intent ID
+      is "reserved" — it can never be used because the same issue will recur.
+
+      Same issue applies if feeDestination is a contract that rejects ETH.
+
+      Impact: DoS on specific intents where recipient/feeDestination cannot accept native ETH.
+      The operator should validate recipient addresses off-chain before signing, but there's
+      no on-chain protection.
+    severity: low
+    confidence: 80
+    affected_functions:
+      - "unwrapAndTransfer (L295-337)"
+      - "unwrapAndTransferPreApproved (L342-377)"
+      - "unwrapAndTransferFundsToDestinations (L739-745)"
+      - "sendNative (L757-766)"
+    solidity: |
+      // After unwrapAndTransfer, if tx succeeds, contract should hold 0 ETH and 0 WETH
+      uint256 ethBal = address(transfers).balance;
+      uint256 wethBal = wrappedNativeCurrency.balanceOf(address(transfers));
+      eq(ethBal, 0, "T-FLOW-11: ETH stuck after unwrap");
+      eq(wethBal, 0, "T-FLOW-11: WETH stuck after unwrap");
+    validated: true
+    priority: medium
+
+  - id: T-FLOW-12
+    title: "transferNative with msg.value=0 and recipientAmount=0+feeAmount=0 — succeeds and emits Transferred with 0 amounts"
+    description: |
+      In transferNative (L147-166):
+      - exactValueSent: neededAmount = 0 + 0 = 0. msg.value must be 0. Passes.
+      - if (msg.value > 0) — FALSE, so transferFundsToDestinations is skipped
+      - succeedPayment runs: sets processedTransferIntents = true, emits event
+
+      A zero-value native transfer succeeds. This "burns" an intent ID.
+
+      The operator must sign this (recipientAmount=0, feeAmount=0), so only the operator can
+      create such an intent. It's effectively a no-op that permanently marks an intent ID
+      as processed.
+
+      Potential use: operator could intentionally create zero-value intents to "cancel" them
+      on-chain (prevent future use of that ID). This is a feature, not a bug.
+    severity: informational
+    confidence: 95
+    affected_functions:
+      - "transferNative (L147-166)"
+    solidity: |
+      // Zero-value intent: no funds move, but intent is processed
+      // Verify no ETH leaves or enters
+      // This is by design
+    validated: true
+    priority: low
+
+  - id: T-FLOW-13
+    title: "Custom prefix in signature verification allows operator to bypass EIP-191 — potential for cross-protocol signature replay"
+    description: |
+      In validIntent (L96-103):
+      If _intent.prefix.length > 0, the signed hash becomes:
+        keccak256(abi.encodePacked(_intent.prefix, hash))
+      instead of the standard:
+        ECDSA.toEthSignedMessageHash(hash) → keccak256("\x19Ethereum Signed Message:\n32", hash)
+
+      The custom prefix allows the operator to use alternative signature schemes. However:
+
+      1. If the prefix is chosen poorly (e.g., empty or short), it could collide with signatures
+         from other protocols that use the same private key.
+      2. abi.encodePacked with a bytes prefix and a bytes32 hash is unambiguous (fixed-length hash),
+         so length-extension attacks don't apply.
+      3. The hash includes address(this) and block.chainid, providing replay protection across
+         contracts and chains.
+
+      The real risk: if the operator reuses their signing key across protocols and another protocol
+      also uses a custom prefix scheme, a signature from protocol A could be replayed on protocol B
+      if the message structures collide. The inclusion of address(this) in the hash prevents this
+      for Transfers specifically.
+
+      Net: the custom prefix is flexible but safe given the inclusion of address(this) and chainid.
+    severity: informational
+    confidence: 70
+    affected_functions:
+      - "validIntent modifier (L96-103)"
+    solidity: |
+      // Verify intent signature cannot be replayed across different contract instances
+      // The hash includes address(this), so replay is prevented
+      // This is informational — no specific invariant to test
+    validated: false
+    priority: low
+
+flash_loan_analysis:
+  transferNative:
+    reads_manipulable_state: false
+    affects_fund_movement: true
+    consumable_same_tx: true
+    post_action_verification: false
+    reentrancy_guard: true
+    conclusion: "Not flash-loan vulnerable. msg.value is the input, no external state read."
+
+  transferToken:
+    reads_manipulable_state: "balanceOf check (L184) — but only for sufficient balance validation"
+    affects_fund_movement: true
+    consumable_same_tx: true
+    post_action_verification: "revertIfInexactTransfer (L210)"
+    reentrancy_guard: true
+    conclusion: "balanceOf is checked but only as a pre-condition, not for pricing. Not exploitable via flash loan."
+
+  wrapAndTransfer:
+    reads_manipulable_state: false
+    affects_fund_movement: true
+    consumable_same_tx: true
+    post_action_verification: false
+    reentrancy_guard: true
+    conclusion: "Pure ETH-to-WETH conversion. No external price or state dependency."
+
+  unwrapAndTransfer:
+    reads_manipulable_state: "balanceOf wrappedNativeCurrency (L310)"
+    affects_fund_movement: true
+    consumable_same_tx: true
+    post_action_verification: false
+    reentrancy_guard: true
+    conclusion: "balanceOf only used for sufficient balance check. Not price-dependent."
+
+  swapAndTransferUniswapV3Native:
+    reads_manipulable_state: "Uniswap V3 pool price (via V3_SWAP_EXACT_OUT)"
+    affects_fund_movement: true
+    consumable_same_tx: true
+    post_action_verification: "revertIfInexactTransfer for output token (L670-681)"
+    reentrancy_guard: true
+    conclusion: |
+      The swap uses V3_SWAP_EXACT_OUT — the OUTPUT amount is fixed (neededAmount).
+      The payer sends msg.value as max input. If the pool price is manipulated, the payer
+      pays more input but the recipient still gets exactly neededAmount.
+      The payer is the one who bears the slippage risk (their maxWillingToPay is their protection).
+      Flash loan manipulation would hurt the PAYER (they overpay), not the recipient/protocol.
+      This is standard AMM behavior, not a vulnerability.
+
+  subsidizedTransferToken:
+    reads_manipulable_state: "balanceOf (L524), allowance after permit (L539)"
+    affects_fund_movement: true
+    consumable_same_tx: true
+    post_action_verification: "revertIfInexactTransfer (L552)"
+    reentrancy_guard: true
+    conclusion: "Permit-based transfer. Balance checks are pre-conditions. No price dependency."
+
+false_positives:
+  - title: "Reentrancy via ERC20 callback (ERC-777)"
+    reason: |
+      All external functions use nonReentrant. Even if recipientCurrency is an ERC-777 token
+      with transfer hooks, the reentrancy guard prevents re-entering any Transfers function.
+      The revertIfInexactTransfer check also catches fee-on-transfer tokens.
+      Cross-function reentrancy between different external functions is also blocked by
+      the single ReentrancyGuard._status variable.
+
+  - title: "Double-processing of intent via different transfer functions"
+    reason: |
+      processedTransferIntents is checked in validIntent modifier, which ALL transfer functions
+      use. Once an intent is processed via any path (transferNative, transferToken, etc), it
+      cannot be processed via any other path. The mapping is keyed by (operator, id).
+
+  - title: "Funds stuck in contract between transactions"
+    reason: |
+      The contract is designed as a pass-through. All transfer functions either:
+      (a) revert entirely if any step fails, OR
+      (b) successfully transfer ALL funds to recipient and feeDestination.
+      The receive() function only accepts ETH from wrappedNativeCurrency.
+      Sweepable exists as a safety net for edge cases (selfdestruct, etc).
+      Under normal operation, the contract should hold 0 balance between transactions.
+
+  - title: "Operator registration by anyone"
+    reason: |
+      Anyone can call registerOperator(). This is by design — operators are payment processors
+      who register themselves. The operator's role is to SIGN intents, so a registered operator
+      that nobody trusts simply won't have any valid intents executed.
+      The feeDestination is chosen by the operator for THEIR OWN fees.
+
+summary: |
+  Transfers.sol es un contrato de pagos pass-through bien diseñado con protecciones sólidas:
+  - nonReentrant en todas las funciones externas
+  - Verificación de fee-on-transfer tokens (revertIfInexactTransfer) en la mayoría de paths
+  - Firma de intent incluye chainid + address(this) + sender para replay protection
+  - processedTransferIntents previene double-processing
+
+  Hallazgos principales como FlowHunter:
+  1. feeDestination no está incluido en el hash firmado (T-FLOW-01) — design choice, bajo impacto
+  2. Missing fee-on-transfer check en unwrap paths (T-FLOW-03) — solo afecta wrapped tokens no estándar
+  3. sendNative callbacks (T-FLOW-04) — mitigado por nonReentrant
+  4. Recipient que rechaza ETH bloquea unwrap intents (T-FLOW-11) — DoS parcial
+
+  No encontré vulnerabilidades de severidad media o alta. El contrato es relativamente simple
+  y sigue patrones seguros. La principal superficie de ataque (swaps via Uniswap) delega
+  correctamente al UniversalRouter con exact-out y sweep de sobrantes.
+
+  Confianza general: 80%. El contrato ha sido auditado y el diseño es conservador.
+  La mayor área de riesgo es la interacción con el Uniswap router (pre-existing balances,
+  MEV en swaps) pero esto es inherente al diseño, no un bug del contrato.

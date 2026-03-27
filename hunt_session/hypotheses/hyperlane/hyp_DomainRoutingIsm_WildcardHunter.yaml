@@ -1,0 +1,347 @@
+protocol: hyperlane
+component: DomainRoutingIsm
+file: solidity/contracts/isms/routing/DomainRoutingIsm.sol
+domain: cross-chain-messaging
+hunter: WildcardHunter
+generated_at: '2026-03-27T00:00:00Z'
+invariants:
+
+- id: DRI-W-01
+  tier: 1
+  type: property
+  title: "ISM self-destruct bypasses verify — call to destroyed contract returns success"
+  description: >
+    DomainRoutingIsm verifica isContract() SOLO en _set() (linea 134), pero NO en verify().
+    Si un ISM registrado es SELFDESTRUCT'ed despues de ser configurado, la llamada
+    route(message).verify(metadata, message) en AbstractRoutingIsm.sol:42 hace un external
+    call a una direccion sin codigo. En Solidity >=0.8, un call a una direccion sin codigo
+    con ABI-encoded data NO revierte — retorna success=true con returndata vacia.
+    Sin embargo, AbstractRoutingIsm.verify() espera un bool return. El ABI decoder de
+    Solidity SI revierte si returndata es vacia cuando espera un tipo concreto.
+    PERO: si el ISM es un MinimalProxy (EIP-1167) y la IMPLEMENTATION es destruida,
+    el proxy sigue existiendo (isContract=true) pero delegatecall a address(0) retorna
+    success con datos vacios. El comportamiento exacto depende de la version del EVM.
+    Post-Cancun, SELFDESTRUCT no destruye codigo en la misma tx, pero si en txs posteriores
+    (si fue creado en la misma tx — EIP-6780). En chains pre-Cancun esto es explotable.
+  confidence: 35
+  severity_final: null
+  impact: "Si verify() retorna true sin verificacion real, cualquier mensaje cross-chain
+    seria aceptado como valido, permitiendo robo de fondos en el protocolo destino."
+  impact_rating: Critical
+  likelihood: Low
+  attack_scenario: >
+    1. Owner configura domain 42 -> ISM_A (contrato valido, pasa isContract check)
+    2. ISM_A es un MinimalProxy cuya implementation es destruida (o ISM_A directamente
+       es destruido en chains pre-Cancun)
+    3. Atacante envia mensaje con origin=42
+    4. DomainRoutingIsm.route() retorna ISM_A (address en el mapping, sin re-check)
+    5. AbstractRoutingIsm.verify() llama ISM_A.verify(metadata, message)
+    6. Si la call retorna sin revert y el ABI decoder no falla, verify() retorna true
+    7. Mailbox.process() acepta el mensaje como verificado
+    8. Fondos robados del recipient contract
+  solidity: |
+    // Property: route() must ALWAYS return a contract with code
+    address ism = address(routingIsm.route(message));
+    uint256 codeSize;
+    assembly { codeSize := extcodesize(ism) }
+    t(codeSize > 0, "DRI-W-01: route() returned address without code");
+  ghost_vars: []
+  validated: false
+  priority: high
+  notes: >
+    La probabilidad real depende de: (a) si ISMs desplegados son upgradeable/destructible,
+    (b) la chain target (pre vs post Cancun), (c) si el ABI decoder de Solidity 0.8
+    revierte con empty returndata para bool. Testear empiricamente con forge.
+    En la practica, SELFDESTRUCT post-Cancun (EIP-6780) solo funciona si el contrato fue
+    creado en la misma transaccion, lo que reduce drasticamente el riesgo en Ethereum.
+    Pero Hyperlane es multi-chain — chains L2 pueden no haber implementado EIP-6780.
+  poc_sketch: |
+    // FOUNDRY PoC
+    function test_DRI_W_01_selfDestruct() public {
+        // Deploy destructible ISM
+        SelfDestructableIsm ism = new SelfDestructableIsm();
+        routingIsm.set(42, IInterchainSecurityModule(address(ism)));
+
+        // Destroy it
+        ism.destroy();
+
+        // Try to verify — what happens?
+        bytes memory metadata = "";
+        bytes memory message = MessageUtils.build(42);
+        // This should revert but might not depending on EVM version
+        bool result = routingIsm.verify(metadata, message);
+        // If we get here without revert, critical bug
+        assertFalse(result, "Destroyed ISM should not validate");
+    }
+  call_stack: >
+    Mailbox.process() -> recipientIsm() -> DomainRoutingIsm(=ism) ->
+    AbstractRoutingIsm.verify() -> route(message) [returns dead address] ->
+    IInterchainSecurityModule(dead).verify(metadata, message) [call to no code]
+
+- id: DRI-W-02
+  tier: 1
+  type: property
+  title: "Uninitialized implementation — anyone can own the factory's DomainRoutingIsm implementation"
+  description: >
+    DomainRoutingIsmFactory.constructor() (linea 48-49) hace `new DomainRoutingIsm()` para
+    crear la implementation del MinimalProxy. Esta implementation NUNCA es inicializada —
+    initialize() no se llama. Cualquiera puede llamar initialize(attacker_address) en la
+    implementation y convertirse en owner. Normalmente esto es inofensivo porque nadie usa
+    la implementation directamente. PERO: si alguien configura su recipientIsm para apuntar
+    a la implementation directamente (en vez de a un proxy), el atacante que inicializo la
+    implementation podria llamar set() y reemplazar los ISMs de todos los dominios.
+    Ademas, si la implementation es usada como ISM por DefaultFallbackRoutingIsm (que tiene
+    un fallback a mailbox.defaultIsm()), y el defaultIsm ES la implementation, el atacante
+    controla la seguridad de todo el Mailbox.
+  confidence: 25
+  severity_final: null
+  impact: "Si la implementation es usada directamente como ISM, el atacante controla
+    que ISM verifica mensajes de cada dominio — bypass total de seguridad cross-chain."
+  impact_rating: Critical
+  likelihood: Low
+  attack_scenario: >
+    1. DomainRoutingIsmFactory es desplegada — implementation creada sin initialize()
+    2. Atacante llama implementation.initialize(attacker) — ahora es owner
+    3. Si algun protocolo configura su recipientIsm = implementation address (error de config)
+    4. Atacante llama implementation.set(domain, maliciousIsm) para cada dominio
+    5. maliciousIsm.verify() siempre retorna true
+    6. Todos los mensajes a ese recipient son aceptados sin verificacion
+  solidity: |
+    // Property: implementation should not be callable directly
+    DomainRoutingIsmFactory factory = new DomainRoutingIsmFactory();
+    address impl = factory.implementation();
+    // Try to initialize — should this work?
+    DomainRoutingIsm(impl).initialize(address(this));
+    // If we get here, the implementation is unprotected
+    t(false, "DRI-W-02: implementation is initializable by anyone");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: >
+    Este es un patron conocido (uninitialized implementation) que normalmente se mitiga
+    con _disableInitializers() en el constructor. DomainRoutingIsm NO tiene esta proteccion.
+    El riesgo real depende de si alguien usa la implementation directamente — improbable
+    pero no imposible, especialmente en configuraciones automatizadas o por error humano.
+    Verificar si Hyperlane tiene guias que adviertan contra esto.
+  poc_sketch: |
+    function test_DRI_W_02_uninitializedImpl() public {
+        DomainRoutingIsmFactory factory = new DomainRoutingIsmFactory();
+        address impl = factory.implementation();
+
+        // Anyone can initialize
+        vm.prank(attacker);
+        DomainRoutingIsm(impl).initialize(attacker);
+        assertEq(DomainRoutingIsm(impl).owner(), attacker);
+
+        // Attacker can now set arbitrary ISMs
+        vm.prank(attacker);
+        DomainRoutingIsm(impl).set(1, IInterchainSecurityModule(address(alwaysTrueIsm)));
+    }
+  call_stack: >
+    attacker -> DomainRoutingIsm(implementation).initialize(attacker) ->
+    OwnableUpgradeable.__Ownable_init() -> _transferOwnership(attacker) [SUCCESS] ->
+    attacker -> DomainRoutingIsm(implementation).set(domain, maliciousIsm) [onlyOwner passes]
+
+- id: DRI-W-03
+  tier: 2
+  type: property
+  title: "Upgradeable child ISM — security downgrade sin conocimiento del DomainRoutingIsm owner"
+  description: >
+    DomainRoutingIsm._set() verifica isContract() pero no verifica que el ISM sea
+    inmutable. Si el owner configura domain X -> ProxyISM, y ProxyISM es un
+    TransparentUpgradeableProxy o UUPS proxy, el admin del proxy puede cambiar la
+    implementacion del ISM a una que siempre retorne true en verify().
+    DomainRoutingIsm no tiene forma de detectar este cambio — la address en el mapping
+    sigue siendo la misma. El owner de DomainRoutingIsm cree que domain X esta protegido
+    por MultisigIsm con 5/7 threshold, pero en realidad el ISM fue upgradeado a un
+    NullIsm que acepta todo.
+  confidence: 45
+  severity_final: null
+  impact: "Bypass completo de verificacion para un dominio especifico. Atacante puede
+    fabricar mensajes cross-chain arbitrarios que seran aceptados."
+  impact_rating: High
+  likelihood: Medium
+  attack_scenario: >
+    1. Owner configura domain 1 -> MultisigIsm (deployed as UUPS proxy)
+    2. MultisigIsm proxy admin (puede ser una entidad diferente al owner del routing ISM)
+       upgradea la implementation a AlwaysTrueIsm
+    3. DomainRoutingIsm.module(1) sigue retornando la misma address — sin alerta
+    4. Atacante fabrica mensaje con origin=1 y metadata vacia
+    5. verify() retorna true via el ISM upgradeado
+    6. Mensaje malicioso procesado por Mailbox
+  solidity: |
+    // Property: module for a domain should have consistent moduleType
+    IInterchainSecurityModule ism = routingIsm.module(origin);
+    uint8 currentType = ism.moduleType();
+    // Compare with expected type stored at setup time
+    eq(currentType, ghost_expectedModuleType[origin],
+       "DRI-W-03: ISM moduleType changed — possible upgrade");
+  ghost_vars:
+  - "mapping(uint32 => uint8) internal ghost_expectedModuleType;"
+  validated: false
+  priority: high
+  notes: >
+    Este no es un bug en DomainRoutingIsm per se, sino un riesgo arquitectural.
+    La pregunta es si Hyperlane deberia tener protecciones contra ISMs upgradeables.
+    El IncrementalDomainRoutingIsm es una variante append-only que mitiga parcialmente
+    el riesgo de re-configuracion, pero NO el riesgo de upgrade del ISM subyacente.
+    Revisar si hay ISMs desplegados como proxies en produccion.
+  poc_sketch: ""
+  call_stack: >
+    Mailbox.process() -> recipientIsm() -> DomainRoutingIsm.verify() ->
+    route(message) [returns proxy address] -> proxy.verify() ->
+    delegatecall to NEW implementation -> AlwaysTrueIsm.verify() returns true
+
+- id: DRI-W-04
+  tier: 2
+  type: property
+  title: "DefaultFallbackRoutingIsm — domain removal exposes to weaker default ISM"
+  description: >
+    DefaultFallbackRoutingIsm.module() (linea 21-29) retorna mailbox.defaultIsm() si el
+    dominio NO esta en el mapping. El owner puede llamar remove(domain) para eliminar un
+    dominio. Despues del remove, los mensajes de ese dominio se verifican con el defaultIsm
+    del Mailbox, que puede ser significativamente mas debil que el ISM especifico que se
+    habia configurado (ej: defaultIsm = 3/5 multisig, ISM removido = 7/10 multisig).
+    Esto crea un path de downgrade sutil: en vez de fallar con "No ISM found", el mensaje
+    simplemente usa un ISM mas debil.
+  confidence: 50
+  severity_final: null
+  impact: "Mensajes de un dominio especifico verificados con un ISM mas debil del
+    esperado, reduciendo las garantias de seguridad cross-chain."
+  impact_rating: Medium
+  likelihood: Medium
+  attack_scenario: >
+    1. DefaultFallbackRoutingIsm tiene domain 5 -> StrongMultisigIsm (7/10)
+    2. Mailbox.defaultIsm = WeakMultisigIsm (2/5)
+    3. Owner (o atacante que compromete al owner) llama remove(5)
+    4. Ahora mensajes de domain 5 son verificados por WeakMultisigIsm
+    5. Atacante solo necesita comprometer 2 de 5 validadores en vez de 7 de 10
+    6. Fabrica firma valida con los 2 validadores comprometidos
+    7. Mensaje malicioso aceptado
+  solidity: |
+    // Property: fallback should not be weaker than explicit config
+    // This is an architectural check, not easily fuzzable
+    // Verify that after remove(), the domain still has strong verification
+    (bool contained, ) = routingIsm._modules().tryGet(origin);
+    if (!contained) {
+        // Domain uses fallback — log for manual review
+        t(false, "DRI-W-04: domain using fallback ISM — verify strength");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  notes: >
+    Este es un riesgo de configuracion mas que un bug de codigo. Pero la arquitectura
+    lo facilita al hacer el fallback silencioso — no hay evento ni warning cuando un
+    dominio usa el fallback en vez de un ISM explicito. Comparar con DomainRoutingIsm
+    que SI revierte si el dominio no tiene ISM configurado (mas seguro en este aspecto).
+  poc_sketch: ""
+  call_stack: >
+    Mailbox.process() -> recipientIsm() -> DefaultFallbackRoutingIsm.verify() ->
+    route(message) -> module(origin) [not contained] -> mailbox.defaultIsm() [weak ISM] ->
+    WeakIsm.verify() returns true with fewer validators
+
+- id: DRI-W-05
+  tier: 2
+  type: property
+  title: "Metadata replay cross-domain — metadata valida para domain A reusada en domain B"
+  description: >
+    AbstractRoutingIsm.verify() en linea 42 pasa _metadata y _message al child ISM:
+    route(_message).verify(_metadata, _message). El routing se basa en _message.origin().
+    Si dos dominios (A y B) usan ISMs con el mismo conjunto de validadores y threshold,
+    metadata generada para un mensaje de A podria ser valida para un mensaje de B con
+    el mismo contenido. El ataque requiere que el atacante pueda controlar el origin field
+    del mensaje, lo cual normalmente es seteado por el Mailbox de la chain origen.
+    Sin embargo, si un relayer malicioso retransmite con metadata incorrecta, o si el
+    mensaje es crafteado directamente, el origin determina que ISM verifica.
+  confidence: 20
+  severity_final: null
+  impact: "Bypass parcial de verificacion cross-domain si ISMs comparten validadores."
+  impact_rating: Medium
+  likelihood: Low
+  attack_scenario: >
+    1. Domain A y Domain B ambos configurados con MultisigIsm usando validadores {V1,V2,V3}
+    2. Mensaje legitimo M_A enviado desde domain A, con metadata (firmas de V1,V2)
+    3. Atacante crea mensaje M_B con origin=B, mismo body que M_A
+    4. Atacante usa metadata de M_A para verificar M_B
+    5. Si MultisigIsm no incluye el origin domain en el digest firmado, las firmas son validas
+    6. Pero: Hyperlane MultisigIsm tipicamente firma (origin, merkleRoot, messageId)
+       donde messageId incluye el origin — esto DEBERIA prevenir el replay
+  solidity: |
+    // Property: verify should fail when metadata from domain A is used for domain B
+    // Requires specific test setup with shared validators
+    bytes memory metadataA = generateMetadata(domainA, messageA);
+    bytes memory messageB = MessageUtils.buildWithOrigin(domainB, messageA.body());
+    // This should fail
+    bool result = routingIsm.verify(metadataA, messageB);
+    t(!result, "DRI-W-05: cross-domain metadata replay succeeded");
+  ghost_vars: []
+  validated: false
+  priority: low
+  notes: >
+    Confianza baja porque Hyperlane MultisigIsm firma el messageId que incluye el origin.
+    Pero vale la pena verificar para ISMs custom que puedan no incluir el origin en el
+    digest. El vector es mas relevante para ISMs tipo NullIsm o custom ISMs mal implementados.
+    Verificar la estructura del digest en MultisigIsm y MerkleRootMultisigIsm.
+  poc_sketch: ""
+  call_stack: >
+    Mailbox.process(metadataA, messageB) -> recipientIsm() -> DomainRoutingIsm ->
+    route(messageB) [origin=B] -> ISM_B.verify(metadataA, messageB) ->
+    ecrecover using messageB.id() != messageA.id() -> SHOULD FAIL
+
+- id: DRI-W-06
+  tier: 2
+  type: property
+  title: "Gas griefing via child ISM — DoS en message processing para dominio especifico"
+  description: >
+    AbstractRoutingIsm.verify() (linea 42) hace una external call sin limite de gas
+    explicito: route(_message).verify(_metadata, _message). Si el child ISM para un
+    dominio consume gas excesivo (ej: loop grande en verificacion, o ISM malicioso
+    configurado por owner comprometido), el relayer que intenta procesar mensajes de
+    ese dominio gastara todo su gas y la tx revertira. Esto bloquea el procesamiento
+    de mensajes para ese dominio especifico sin afectar otros dominios.
+  confidence: 40
+  severity_final: null
+  impact: "DoS temporal de mensajes cross-chain para un dominio especifico. Relayers
+    pierden gas fees en transacciones fallidas."
+  impact_rating: Low
+  likelihood: Medium
+  attack_scenario: >
+    1. Owner (comprometido o malicioso) configura domain 7 -> GasEaterIsm
+    2. GasEaterIsm.verify() consume 30M gas en un loop antes de retornar true
+    3. Relayer intenta procesar mensaje de domain 7
+    4. Tx excede gas limit del bloque o consume todo el gas del relayer
+    5. Mensajes de domain 7 quedan sin procesar
+    6. Usuarios de domain 7 no pueden enviar mensajes al destination chain
+  solidity: |
+    // Property: verify should complete within reasonable gas
+    uint256 gasBefore = gasleft();
+    routingIsm.verify(metadata, message);
+    uint256 gasUsed = gasBefore - gasleft();
+    t(gasUsed < 1_000_000, "DRI-W-06: verify consumed excessive gas");
+  ghost_vars: []
+  validated: false
+  priority: low
+  notes: >
+    Este es un riesgo operacional mas que un bug de seguridad directa. Los relayers
+    pueden mitigar estimando gas antes de enviar la tx. Pero si el gas consumption
+    del ISM cambia entre estimacion y ejecucion (ej: ISM con storage writes), la
+    estimacion puede ser incorrecta. Severidad baja porque requiere owner comprometido.
+  poc_sketch: ""
+  call_stack: >
+    Relayer.submitTx() -> Mailbox.process() -> ism.verify() ->
+    DomainRoutingIsm.verify() -> route(message) -> GasEaterIsm.verify() [30M gas] -> OOG
+
+false_positives:
+- hunter: WildcardHunter
+  id: DRI-WFP-01
+  reason: >
+    CREATE address prediction para pre-deploy en MinimalProxy address: descartado.
+    MinimalProxy.create() usa CREATE (no CREATE2), que depende del nonce del factory.
+    Para predecir la address, el atacante necesitaria saber el nonce exacto del factory
+    al momento del deploy, lo cual es impractico en un entorno competitivo multi-tx.
+    Ademas, incluso si se predice la address, deploying algo ahi antes requeriria
+    CREATE2 con el salt correcto, y el MinimalProxy.create() sobreescribiria cualquier
+    codigo existente. No es un vector viable.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update: null

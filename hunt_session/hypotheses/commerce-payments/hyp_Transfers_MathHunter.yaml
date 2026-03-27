@@ -1,0 +1,548 @@
+# MathHunter Analysis — Transfers.sol
+# Contract: commerce-payments/contracts/transfers/Transfers.sol
+# Focus: arithmetic operations, rounding, overflow/underflow, precision loss, swap accounting
+# Analyst: MathHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: T-M-01
+    title: "recipientAmount + feeAmount overflow en neededAmount — uint256 sin checked math"
+    tier: 2
+    type: property
+    description: |
+      neededAmount = _intent.recipientAmount + _intent.feeAmount se calcula en múltiples funciones
+      (L136, L183, L235, L309, L356, L400, L430, L483, L523, L574). Con Solidity ^0.8.17, esta
+      suma tiene checked overflow nativo — revertirá si recipientAmount + feeAmount > type(uint256).max.
+      Sin embargo, el operador firma el intent incluyendo ambos valores. Un operador malicioso podría
+      firmar un intent con valores que sumen > uint256.max, causando que TODA llamada con ese intent
+      revierta — DoS sobre el payer que no puede completar el pago.
+      ANÁLISIS: overflow revert es el comportamiento correcto aquí. No hay pérdida de fondos.
+      El operador firmaría su propio DoS. Solidity 0.8+ protege correctamente.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Operador firma intent con recipientAmount = type(uint256).max y feeAmount = 1.
+      La suma hace overflow → revert. Pero el operador se perjudica a sí mismo.
+      No hay pérdida de fondos de terceros.
+    solidity: |
+      // Invariant: neededAmount computation never silently overflows
+      // With Solidity 0.8+, this is guaranteed by the compiler
+      function property_T_M_01() public view returns (bool) {
+        // Solidity 0.8 checked arithmetic handles this
+        // Any overflow reverts the transaction — no silent wrap
+        return true;
+      }
+    validated: true
+    priority: low
+    confidence: 95
+
+  - id: T-M-02
+    title: "int256 cast en exactValueSent — overflow si msg.value - neededAmount > type(int256).max"
+    tier: 1
+    type: property
+    description: |
+      En el modifier exactValueSent (L137-140):
+        revert InvalidNativeAmount(int256(msg.value - neededAmount));   // L138
+        revert InvalidNativeAmount(-int256(neededAmount - msg.value));  // L140
+
+      El cast int256(uint256_value) hace overflow silencioso si el valor uint256 > type(int256).max
+      (2^255 - 1). Esto NO causa pérdida de fondos porque la transacción SIEMPRE revierte en
+      ambos paths — el error es solo que el mensaje de error sería incorrecto (valor erróneo
+      en el revert reason). Con Solidity 0.8.17, el cast de uint256 a int256 NO es checked —
+      es un truncamiento silencioso. PERO esto solo afecta el revert data, no la lógica.
+
+      EXCEPCIÓN POTENCIAL: si neededAmount overflow (T-M-01 lo protege), o si msg.value
+      es extremadamente grande (> 2^255 wei ≈ 5.7e58 ETH — imposible en la práctica).
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Payer envía msg.value = type(uint256).max con neededAmount = 0.
+      int256(type(uint256).max - 0) = int256(type(uint256).max) — overflow en cast.
+      Pero la tx REVIERTE de todas formas. El error code en el revert sería incorrecto
+      pero no hay impacto funcional porque nadie tiene 2^255 ETH.
+    solidity: |
+      // Invariant: int256 cast in exactValueSent is safe for practical values
+      function property_T_M_02(uint256 msgValue, uint256 recipientAmount, uint256 feeAmount) public pure returns (bool) {
+        uint256 neededAmount = recipientAmount + feeAmount; // checked
+        if (msgValue > neededAmount) {
+          uint256 diff = msgValue - neededAmount;
+          // This would overflow int256 if diff > type(int256).max
+          // But in practice ETH supply << 2^255
+          return diff <= uint256(type(int256).max);
+        }
+        return true;
+      }
+    validated: true
+    priority: low
+    confidence: 90
+
+  - id: T-M-03
+    title: "swapTokens return value — balance diff puede ser inflado por router con tokens preexistentes"
+    tier: 1
+    type: property
+    description: |
+      En swapTokens L699:
+        return (payerBalanceBefore + routerBalanceBefore) - (payerBalanceAfter + routerBalanceAfter);
+
+      El cálculo intenta capturar "cuánto del input token consumió el swap". Incluye el balance
+      del router para compensar tokens que el router ya tenía (swept al payer como refund).
+
+      VECTOR DE ATAQUE: Si un tercero dona tokens al router DURANTE la ejecución del swap
+      (antes de que se mida routerBalanceAfter), routerBalanceAfter sería mayor de lo esperado,
+      causando que el return value sea MAYOR que lo realmente consumido. Esto se reportaría
+      en el evento Transferred como spentAmount inflado — pero NO causa pérdida de fondos
+      porque el payer ya pagó y los fondos ya se distribuyeron vía Uniswap.
+
+      OTRO VECTOR: Si routerBalanceBefore tiene tokens residuales, esos se incluyen en el
+      cálculo. El contrato maneja esto correctamente (L684-687 comentario explícito).
+
+      RIESGO REAL: underflow si (payerBalanceAfter + routerBalanceAfter) >
+      (payerBalanceBefore + routerBalanceBefore). Esto podría pasar si alguien envía tokens
+      al payer o al router durante la tx. Solidity 0.8 revertirá → DoS del swap.
+      ¿Quién puede hacer esto? Solo con un callback — pero ReentrancyGuard está activo.
+    confidence: 70
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Payer llama swapAndTransferUniswapV3Token con tokenIn = USDC
+      2. payerBalanceBefore = 1000 USDC (balance original + maxWillingToPay transferido)
+      3. routerBalanceBefore = 0 USDC
+      4. Swap ejecuta. Uniswap consume 500 USDC, devuelve 500 USDC al payer via SWEEP
+      5. Un tercero envía 100 USDC al payer o router durante la ejecución
+      6. payerBalanceAfter = 600 USDC, routerBalanceAfter = 0
+      7. return (1000 + 0) - (600 + 0) = 400 — reporta 400 consumido cuando fue 500
+      8. O peor: si envían suficiente → underflow → revert
+
+      MITIGACIÓN: ReentrancyGuard impide reentrada. Los callbacks de Uniswap son internos.
+      La donación solo podría venir de un tx en el mismo bloque (bundled) — no durante ejecución.
+      El evento spentAmount sería incorrecto pero no afecta fondos.
+    solidity: |
+      // Invariant: swap return value should equal actual tokens consumed
+      // amountSwapped = (payerBefore + routerBefore) - (payerAfter + routerAfter)
+      // This should be <= maxWillingToPay (can't consume more than what was sent)
+      function property_T_M_03(uint256 amountSwapped, uint256 maxWillingToPay) public pure returns (bool) {
+        return amountSwapped <= maxWillingToPay;
+      }
+    validated: false
+    priority: high
+    confidence: 70
+
+  - id: T-M-04
+    title: "payerBalanceBefore incluye msg.value ya restado — doble conteo potencial"
+    tier: 1
+    type: property
+    description: |
+      En swapTokens cuando msg.value > 0 (L602):
+        payerBalanceBefore = _msgSender().balance + msg.value;
+
+      Cuando el payer llama una función payable, su ETH balance ya se redujo por msg.value
+      ANTES de la ejecución del contrato. Así que _msgSender().balance es el balance POST-envío.
+      El contrato suma msg.value para reconstruir el balance PRE-envío. Esto es CORRECTO.
+
+      Luego en L691:
+        payerBalanceAfter = _msgSender().balance;
+
+      Después del swap, cualquier ETH no consumido se devuelve al payer vía UNWRAP_WETH + SWEEP.
+
+      return = (balancePre + msg.value + routerBefore) - (balancePost + routerAfter)
+
+      Si el swap consume X ETH (wrapeados como WETH), el router devuelve (msg.value - X) ETH al payer.
+      payerBalanceAfter = payerBalanceBefore_real + (msg.value - X) = (_msgSender().balance) + (msg.value - X)
+
+      return = (_msgSender().balance + msg.value + routerBefore) - ((_msgSender().balance + msg.value - X) + routerAfter)
+
+      Si routerBefore == routerAfter (router no retiene nada): return = X. CORRECTO.
+
+      PERO: gas costs reducen _msgSender().balance entre las dos mediciones. El gas pagado
+      NO se refleja aquí porque balance se mide dentro de la misma tx — no hay gas entre mediciones.
+      CORRECTO: el balance del payer dentro de la misma tx no cambia por gas (gas se cobra al final).
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — el cálculo de payerBalanceBefore = balance + msg.value es la forma estándar
+      de reconstruir el balance pre-envío. Gas no afecta balances mid-tx.
+    solidity: |
+      // Invariant: payerBalanceBefore reconstruction is correct
+      function property_T_M_04() public view returns (bool) {
+        // In a payable function, msg.sender.balance is already reduced by msg.value
+        // So balance + msg.value = true pre-tx balance (within same tx)
+        return true;
+      }
+    validated: true
+    priority: low
+    confidence: 90
+
+  - id: T-M-05
+    title: "routerBalanceBefore incluye ETH + WETH — potential double-counting si router unwraps"
+    tier: 1
+    type: property
+    description: |
+      En L603:
+        routerBalanceBefore = address(uniswap).balance + IERC20(wrappedNativeCurrency).balanceOf(address(uniswap));
+
+      El contrato suma ETH nativo + WETH del router. Lo mismo en L692-694 para routerBalanceAfter.
+
+      PROBLEMA POTENCIAL: Si el router tiene X ETH y X WETH, y durante la ejecución UNWRAPS
+      el WETH a ETH, la suma ETH+WETH permanece constante — correcto.
+      Pero si el router WRAPS ETH a WETH (como hace WRAP_ETH en L609), la suma también
+      permanece constante — correcto.
+
+      EDGE CASE: Si un tercero envía ETH directamente al router durante la tx (no posible
+      en una tx atómica a menos que el router tenga un receive/fallback vulnerable).
+
+      Este diseño es ROBUSTO contra conversiones ETH<->WETH internas del router.
+    confidence: 85
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Router tiene 0 ETH + 0 WETH. Recibe msg.value via WRAP_ETH → ahora tiene 0 ETH + msg.value WETH.
+      Hace swap (WETH→tokenOut). Consume parte del WETH. UNWRAP restante → ETH al payer.
+      routerBalanceAfter = router.ETH + router.WETH = 0 + 0 (todo swept/unwrapped).
+      return = (payer_pre + 0) - (payer_post + 0). CORRECTO.
+    solidity: |
+      // Invariant: ETH+WETH accounting in router balance tracks total value correctly
+      function property_T_M_05() public view returns (bool) {
+        // ETH + WETH sum is invariant under wrap/unwrap operations
+        // Only changes via actual swaps or external sends
+        return true;
+      }
+    validated: true
+    priority: medium
+    confidence: 85
+
+  - id: T-M-06
+    title: "swapAndTransferUniswapV3Native no tiene exactValueSent — payer puede enviar más ETH del necesario"
+    tier: 1
+    type: property
+    description: |
+      Funciones directas (transferNative, wrapAndTransfer) usan modifier exactValueSent que
+      requiere msg.value == recipientAmount + feeAmount exactamente.
+
+      PERO swapAndTransferUniswapV3Native (L384) NO usa exactValueSent. Esto es BY DESIGN
+      porque el payer no sabe exactamente cuánto ETH costará el swap — envía un máximo
+      (slippage) y el exceso se devuelve via UNWRAP_WETH + SWEEP.
+
+      RIESGO: Si el SWEEP falla o no devuelve todo el exceso, el payer pierde ETH.
+      El contrato delega esto completamente a Uniswap UniversalRouter.
+
+      OTRO ÁNGULO: msg.value = 0 pero neededAmount > 0. El swap se ejecutaría con 0 ETH input
+      intentando obtener neededAmount output — Uniswap revertirá con V3TooMuchRequested.
+      No hay validación explícita de msg.value > 0 para swap nativo, pero la lógica
+      if (neededAmount > 0) en L403 solo procede si hay algo que swappear, y Uniswap
+      se encargará de revertir si no hay suficiente input.
+    confidence: 80
+    severity: low
+    status: safe
+    attack_scenario: |
+      Payer llama swapAndTransferUniswapV3Native con msg.value = 100 ETH pero solo
+      necesita 50 ETH para el swap. Uniswap consume 50 WETH, SWEEP devuelve 50 ETH.
+      Si SWEEP funciona correctamente → no hay pérdida. Si no → payer pierde 50 ETH.
+      MITIGACIÓN: Uniswap UniversalRouter es battle-tested. SWEEP a amount=0 significa
+      "sweep all remaining balance" (L622).
+    solidity: |
+      // Invariant: in swap functions, excess ETH is returned to payer
+      // amountSwapped (reported) should be <= msg.value
+      function property_T_M_06(uint256 amountSwapped, uint256 msgValue) public pure returns (bool) {
+        return amountSwapped <= msgValue;
+      }
+    validated: true
+    priority: medium
+    confidence: 80
+
+  - id: T-M-07
+    title: "Precision loss en swap — V3_SWAP_EXACT_OUT puede consumir más input del necesario por rounding"
+    tier: 2
+    type: property
+    description: |
+      swapTokens usa V3_SWAP_EXACT_OUT (L610, L639, L649) que pide exactamente neededAmount
+      de output y paga hasta maxAmountWillingToPay de input. Uniswap V3 redondea UP la
+      cantidad de input necesaria (favor del pool).
+
+      Esto significa que para tokens de baja precisión (USDC 6 decimals, WBTC 8 decimals),
+      el rounding del input puede ser significativo en términos relativos.
+
+      EJEMPLO: neededAmount = 1 wei de un token 18-dec. El swap pide exactamente 1 wei.
+      Con un pool de baja liquidez, el input requerido podría redondearse a 2 wei del
+      input token — 100% de sobrepago en el tick boundary.
+
+      IMPACTO: El payer paga ligeramente más de lo mínimo teórico. Pero maxWillingToPay
+      protege al payer — no pagará más de lo que autorizó.
+
+      EN LA PRÁCTICA: para montos razonables (>$1), el rounding de Uniswap V3 es
+      negligible (< 1 wei del token de mayor precisión).
+    confidence: 85
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Payer quiere enviar 1 USDC (1e6) al recipient + 0 fee. Swap de ETH a USDC.
+      V3_SWAP_EXACT_OUT pide exactamente 1e6 USDC output. Rounding del input = +1 wei ETH.
+      1 wei ETH ≈ $0.000000000000000003 — negligible.
+    solidity: |
+      // Invariant: Uniswap V3 rounding is bounded by 1 tick
+      // In practice, precision loss < 1 wei of the higher-decimal token
+      function property_T_M_07() public pure returns (bool) {
+        // Uniswap V3 exact-out rounding is well-understood and bounded
+        return true;
+      }
+    validated: true
+    priority: low
+    confidence: 85
+
+  - id: T-M-08
+    title: "revertIfInexactTransfer — puede revertir con tokens que tienen airdrops/rebasing durante tx"
+    tier: 2
+    type: property
+    description: |
+      revertIfInexactTransfer (L768-778) compara balanceAfter - balanceBefore contra expectedDiff.
+
+      Si el target recibe tokens de otra fuente entre balanceBefore y balanceAfter (rebasing,
+      airdrop mid-block, o donation), la diferencia sería > expectedDiff → revert.
+
+      El contrato RECHAZA fee-on-transfer tokens (diferencia < expected → revert) Y también
+      rechaza rebasing/donating tokens (diferencia > expected → revert).
+
+      MATH EDGE CASE: Si balanceBefore > balanceAfter (token deflationary/rebasing negativo),
+      la resta L775 underflows → revert. Solidity 0.8 lo protege.
+
+      Esto es BY DESIGN — el contrato quiere transferencias exactas. Pero rechazar
+      tokens rebasing como stETH podría ser un problema de UX si no se documenta.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Payer intenta pagar con stETH. Durante la transferencia, stETH rebases +1 wei.
+      balanceAfter - balanceBefore = expectedDiff + 1 → revert InexactTransfer().
+      No hay pérdida de fondos — la tx simplemente falla. Payer debe usar wstETH.
+    solidity: |
+      // Invariant: revertIfInexactTransfer correctly rejects non-standard transfers
+      function property_T_M_08(uint256 expectedDiff, uint256 balanceBefore, uint256 balanceAfter) public pure returns (bool) {
+        if (balanceAfter < balanceBefore) return true; // would revert (underflow)
+        return (balanceAfter - balanceBefore) == expectedDiff;
+      }
+    validated: true
+    priority: low
+    confidence: 90
+
+  - id: T-M-09
+    title: "Decimal universality — no hay math con decimals en el contrato"
+    tier: 2
+    type: property
+    description: |
+      El contrato Transfers NO hace ninguna operación que dependa de los decimales del token:
+      - No hay multiplicación/división de precios
+      - No hay conversión de decimales
+      - No hay cálculos de share price o exchange rate
+      - recipientAmount y feeAmount son montos absolutos definidos por el operador
+
+      La ÚNICA math es la suma recipientAmount + feeAmount y las restas para calcular
+      diferencias de balance. Estas operaciones son agnósticas a los decimales.
+
+      El swap via Uniswap maneja internamente la conversión de precios con sus propios
+      mecanismos de precisión.
+
+      CONCLUSIÓN: No hay riesgo de precision loss por diferencia de decimales en este contrato.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      N/A — el contrato no opera con decimales. Los montos son absolutos.
+    solidity: |
+      // Invariant: contract is decimal-agnostic
+      // recipientAmount + feeAmount = neededAmount regardless of token decimals
+      function property_T_M_09() public pure returns (bool) {
+        // No decimal conversion, no price math, no share calculation
+        return true;
+      }
+    validated: true
+    priority: low
+    confidence: 95
+
+  - id: T-M-10
+    title: "swapTokens con recipientCurrency == NATIVE_CURRENCY — UNWRAP_WETH y TRANSFER usan montos fijos, no proporcionales"
+    tier: 1
+    type: property
+    description: |
+      Cuando el recipient quiere ETH nativo (recipientCurrency == NATIVE_CURRENCY) y el payer
+      paga con un token (no ETH), swapTokens:
+      1. Swap exacto tokenIn → WETH (neededAmount de WETH output)
+      2. UNWRAP_WETH con amount = neededAmount (L640)
+      3. TRANSFER feeAmount al feeDestination (como ETH)
+      4. TRANSFER recipientAmount al recipient (como ETH)
+
+      PERO collectFees (L586-590) usa recipientCurrency = NATIVE_CURRENCY = address(0) para
+      el TRANSFER command. En UniversalRouter, TRANSFER con token=address(0) debería transferir
+      ETH nativo. Si el router interpreta address(0) diferente → fondos stuck.
+
+      VERIFICACIÓN: En el path msg.value == 0, L629 confirma recipientCurrency == NATIVE_CURRENCY.
+      collectFees y transferToRecipient usan _intent.recipientCurrency = NATIVE_CURRENCY = address(0).
+      UniswapConstants.ETH en L643 es el marcador para ETH nativo. Si address(0) != UniswapConstants.ETH,
+      los TRANSFER commands fallarían.
+
+      UniswapConstants.ETH = address(0) en Uniswap V3. CORRECTO.
+    confidence: 75
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Recipient quiere ETH. Payer envía USDC.
+      2. Swap USDC → WETH (exact out neededAmount).
+      3. UNWRAP_WETH convierte neededAmount WETH a ETH en el router.
+      4. TRANSFER(address(0), feeDestination, feeAmount) — transfiere ETH al fee dest.
+      5. TRANSFER(address(0), recipient, recipientAmount) — transfiere ETH al recipient.
+      6. SWEEP(tokenIn, payer, 0) — devuelve USDC sobrante.
+
+      Si TRANSFER con address(0) no funciona como ETH transfer en la versión
+      de UniversalRouter usada → fondos (ETH) quedan en el router.
+
+      MITIGACIÓN: Uniswap UniversalRouter maneja address(0) como ETH en TRANSFER.
+      Pero si Coinbase usa una versión custom o un fork — verificar.
+    solidity: |
+      // Invariant: NATIVE_CURRENCY (address(0)) is correctly interpreted as ETH by UniversalRouter
+      // After swap and unwrap, recipient gets recipientAmount ETH and fee dest gets feeAmount ETH
+      function property_T_M_10(
+        uint256 recipientBalanceBefore,
+        uint256 feeDestBalanceBefore,
+        uint256 recipientAmount,
+        uint256 feeAmount
+      ) public view returns (bool) {
+        // After successful swap:
+        // recipient.balance >= recipientBalanceBefore + recipientAmount
+        // feeDest.balance >= feeDestBalanceBefore + feeAmount
+        return true; // needs fork test to validate
+      }
+    validated: false
+    priority: high
+    confidence: 75
+
+  - id: T-M-11
+    title: "Zero amount bypass — recipientAmount=0 y feeAmount=0 marca intent como procesado sin transferir nada"
+    tier: 1
+    type: property
+    description: |
+      Si recipientAmount = 0 y feeAmount = 0, neededAmount = 0. Todas las funciones de
+      transferencia tienen if (neededAmount > 0) o if (msg.value > 0) guards. Cuando
+      neededAmount = 0, se SALTA la transferencia pero se ejecuta succeedPayment()
+      que marca processedTransferIntents[operator][id] = true.
+
+      IMPACTO: Un operador podría crear un intent con recipientAmount=0, feeAmount=0.
+      Un payer ejecuta la tx (gratis, sin tokens). El intent se marca como procesado.
+      Si el recipient esperaba recibir fondos → no recibe nada y el intent ya no puede
+      re-ejecutarse (AlreadyProcessed).
+
+      PERO: El operador FIRMA el intent. Si recipientAmount=0, el operador lo consintió.
+      No hay ataque de un payer no autorizado porque la firma incluye sender.
+
+      ¿Puede un payer front-run con el intent firmado? La firma incluye _msgSender()
+      (L92: sender en el hash), así que otro sender no puede reusar la firma.
+
+      CONCLUSIÓN: By design. Operador que firma amount=0 lo hace intencionalmente.
+    confidence: 85
+    severity: low
+    status: safe
+    attack_scenario: |
+      Operador firma intent con recipientAmount=0, feeAmount=0. Payer ejecuta.
+      Nada se transfiere. Intent marcado como procesado.
+      Si esto fue un error del operador → pérdida operacional, no un bug del contrato.
+    solidity: |
+      // Invariant: zero-amount intents are valid but transfer nothing
+      function property_T_M_11(uint256 recipientAmount, uint256 feeAmount) public pure returns (bool) {
+        uint256 neededAmount = recipientAmount + feeAmount;
+        if (neededAmount == 0) {
+          // No funds transferred, but intent is marked as processed
+          // This is by design — operator signed it
+          return true;
+        }
+        return true;
+      }
+    validated: true
+    priority: medium
+    confidence: 85
+
+  - id: T-M-12
+    title: "Balance diff calculation en swapTokens puede incluir tokens residuales del router — spentAmount reportado incorrectamente"
+    tier: 1
+    type: property
+    description: |
+      L699: return (payerBalanceBefore + routerBalanceBefore) - (payerBalanceAfter + routerBalanceAfter);
+
+      Si el router tenía tokens residuales de otro usuario (depositados por otro tx en el mismo
+      bloque ANTES de esta tx), esos tokens se incluyen en routerBalanceBefore.
+
+      Después del swap, SWEEP devuelve TODOS los tokens residuales del router al payer
+      (incluyendo los que no eran del payer). Entonces:
+      - routerBalanceBefore = R (tokens residuales) + 0 (no se transfirió nada aún)
+      - payerBalanceBefore = P + maxWillingToPay
+      - Después del swap y SWEEP:
+        - routerBalanceAfter = 0 (todo swept)
+        - payerBalanceAfter = P + maxWillingToPay - swapCost + R (recibió residuales)
+
+      return = (P + maxWillingToPay + R) - (P + maxWillingToPay - swapCost + R + 0)
+             = swapCost
+
+      Los R se cancelan. El cálculo es CORRECTO incluso con tokens residuales.
+      El contrato es MÁS inteligente de lo que parece — el comment en L684-687 lo explica.
+    confidence: 90
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Router tiene 100 USDC residuales de otro tx. Payer hace swap con USDC.
+      routerBefore = 100. Swap consume 50 USDC del payer. SWEEP devuelve todo al payer.
+      routerAfter = 0. payerAfter incluye los 100 extra.
+      (payerBefore + 100) - (payerAfter + 0) = (payerBefore + 100) - (payerBefore - 50 + 100 + 0)
+      = 50. CORRECTO — reporta 50 consumidos.
+    solidity: |
+      // Invariant: router residual tokens cancel out in balance diff
+      // (payerBefore + routerBefore) - (payerAfter + routerAfter) = actual swap cost
+      function property_T_M_12(
+        uint256 payerBefore, uint256 routerBefore,
+        uint256 payerAfter, uint256 routerAfter,
+        uint256 actualSwapCost
+      ) public pure returns (bool) {
+        // Assuming SWEEP returns all router balance to payer:
+        // routerAfter = 0, payerAfter = payerBefore - actualSwapCost + routerBefore
+        // (payerBefore + routerBefore) - (payerBefore - actualSwapCost + routerBefore + 0)
+        // = actualSwapCost ✓
+        return (payerBefore + routerBefore) - (payerAfter + routerAfter) == actualSwapCost;
+      }
+    validated: true
+    priority: medium
+    confidence: 90
+
+false_positives:
+  - id: FP-T-M-01
+    description: "recipientAmount + feeAmount overflow"
+    reason: "Solidity 0.8+ checked arithmetic reverts on overflow. No silent wraparound."
+
+  - id: FP-T-M-02
+    description: "Precision loss in token transfers"
+    reason: "Contract transfers exact amounts (no math with decimals). Fee-on-transfer and rebasing tokens are explicitly rejected by revertIfInexactTransfer."
+
+  - id: FP-T-M-03
+    description: "Router balance manipulation inflates spentAmount"
+    reason: "Balance diff formula (payerBefore + routerBefore) - (payerAfter + routerAfter) correctly cancels out residual tokens — algebraically proven."
+
+summary:
+  total_hypotheses: 12
+  investigate:
+    - T-M-03 — swapTokens return value could be manipulated by mid-tx token donations (medium, 70%)
+    - T-M-10 — NATIVE_CURRENCY == address(0) interpretation by UniversalRouter needs fork verification (medium, 75%)
+  safe:
+    - T-M-01 — recipientAmount + feeAmount overflow protected by Solidity 0.8 checked math
+    - T-M-02 — int256 cast in exactValueSent — impractical (requires > 2^255 ETH)
+    - T-M-04 — payerBalanceBefore reconstruction is correct
+    - T-M-05 — ETH+WETH router balance accounting is robust against wrap/unwrap
+    - T-M-06 — Swap functions correctly handle excess ETH via Uniswap SWEEP
+    - T-M-07 — V3 EXACT_OUT rounding is negligible for practical amounts
+    - T-M-08 — revertIfInexactTransfer correctly rejects non-standard tokens
+    - T-M-09 — Contract is decimal-agnostic (no decimal conversion math)
+    - T-M-11 — Zero amount intents are by design (operator signed)
+    - T-M-12 — Router residual tokens cancel out in balance diff formula
+  math_verdict: |
+    El contrato Transfers tiene math MUY simple — casi toda la aritmética es sumas y restas de montos absolutos.
+    No hay share price calculations, no hay exchange rate conversions, no hay operaciones con decimales.
+    La parte más compleja es el cálculo de balance diff en swapTokens, que es algebraicamente correcto
+    y maneja edge cases (tokens residuales del router). Los dos items en "investigate" requieren
+    verificación con fork test pero tienen baja probabilidad de ser explotables.

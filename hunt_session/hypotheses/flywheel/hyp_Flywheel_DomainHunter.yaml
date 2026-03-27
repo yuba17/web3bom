@@ -1,0 +1,590 @@
+hunter: DomainHunter
+protocol: Flywheel
+date: "2026-03-27"
+components_analyzed:
+  - Flywheel.sol
+  - Campaign.sol
+  - CampaignHooks.sol
+  - Constants.sol
+  - hooks/AdConversion.sol
+  - hooks/SimpleRewards.sol
+  - hooks/CashbackRewards.sol
+  - hooks/BridgeReferralFees.sol
+
+hypotheses:
+
+  - id: FW-DOM-01
+    title: "Attribution provider can bypass FINALIZING state and attribution window via ACTIVE→FINALIZED"
+    description: |
+      In AdConversion._onUpdateStatus (line 576-579), the attribution provider is allowed to transition
+      directly from ACTIVE → FINALIZED, bypassing the FINALIZING state entirely. This means the
+      attribution provider can finalize the campaign instantly without the attribution window period,
+      potentially cutting off pending conversions that publishers expected to be processed.
+
+      The FINALIZING state exists to give the attribution provider time to submit remaining attributions
+      before finalization. But if the attribution provider IS the one doing ACTIVE → FINALIZED, they
+      skip their own window. This is intentional per design (trusted attribution provider), but creates
+      a trust asymmetry: publishers who drove conversions during the ACTIVE period lose their attribution
+      window because the attribution provider can unilaterally finalize. Combined with withdrawFunds
+      (which ignores allocated payouts when FINALIZED), the advertiser can then withdraw all remaining
+      funds, effectively stealing from publishers with pending conversions.
+
+      Attack path: attribution provider colludes with advertiser → ACTIVE→FINALIZED → advertiser
+      withdraws all funds → publishers who expected payouts get nothing.
+    severity: medium
+    confidence: 55
+    affected_functions:
+      - "AdConversion._onUpdateStatus (line 576-579)"
+      - "Flywheel.updateStatus (line 520-538)"
+      - "Flywheel.withdrawFunds (line 492-513)"
+    attack_scenario: |
+      1. Campaign ACTIVE with conversions being processed, publishers driving traffic
+      2. Attribution provider calls updateStatus(campaign, FINALIZED, "") — allowed by line 578 check (only blocks advertiser)
+      3. Campaign instantly FINALIZED — no FINALIZING period, no attribution window
+      4. Advertiser calls withdrawFunds — solvency check at line 509 ignores totalAllocatedPayouts for FINALIZED campaigns
+      5. All unprocessed conversion payouts are effectively abandoned
+    solidity_invariant: |
+      // If campaign has pending conversions (totalAllocatedPayouts > 0), ACTIVE → FINALIZED should not be allowed
+      function invariant_no_finalize_with_pending_payouts(address campaign) external {
+        if (flywheel.campaignStatus(campaign) == Flywheel.CampaignStatus.FINALIZED) {
+          // After finalization, allocated payouts should be zero or distributable
+          t(flywheel.totalAllocatedPayouts(campaign, token) == 0, "FW-DOM-01: finalized with pending payouts");
+        }
+      }
+
+  - id: FW-DOM-02
+    title: "Finalized campaign ignores allocated payouts in solvency, allowing advertiser to steal allocated funds"
+    description: |
+      In Flywheel.withdrawFunds (line 508-512), when a campaign is FINALIZED, the solvency check
+      ONLY requires balance >= totalAllocatedFees, completely ignoring totalAllocatedPayouts.
+
+      This means: if there are allocated (but not yet distributed) payouts, the advertiser can
+      withdraw those funds after finalization. The allocations still exist in storage, but the
+      funds backing them are gone. Any subsequent distribute() call would fail with SendFailed
+      because the campaign no longer has the tokens.
+
+      The key question is: can allocations exist when a campaign is FINALIZED? Yes — the
+      acceptingPayouts modifier allows allocations during ACTIVE and FINALIZING states. If the
+      campaign transitions to FINALIZED while allocations are pending, those allocations become
+      unbacked.
+
+      In AdConversion, the attribution provider can go ACTIVE→FINALIZED directly. In SimpleRewards,
+      the manager controls status. Either way, allocated payouts can be stranded.
+    severity: high
+    confidence: 70
+    affected_functions:
+      - "Flywheel.withdrawFunds (line 492-513, specifically 509-511)"
+      - "Flywheel.allocate (line 332-359)"
+      - "Flywheel.distribute (line 405-439)"
+    attack_scenario: |
+      1. Campaign ACTIVE, manager allocates 100 USDC to recipient via allocate()
+      2. totalAllocatedPayouts[campaign][USDC] = 100
+      3. Manager transitions campaign: ACTIVE → FINALIZING → FINALIZED (or ACTIVE → FINALIZED via attribution provider)
+      4. Owner calls withdrawFunds with amount = campaignBalance - totalAllocatedFees
+      5. Solvency check passes because FINALIZED ignores totalAllocatedPayouts
+      6. The 100 USDC allocation is now unbacked — distribute() will revert with SendFailed
+      7. Recipient loses their allocated payout
+    solidity_invariant: |
+      // Campaign balance must always cover allocated payouts + allocated fees, regardless of status
+      function invariant_solvency_covers_allocations(address campaign, address token) external {
+        uint256 balance = token == Constants.NATIVE_TOKEN ? campaign.balance : IERC20(token).balanceOf(campaign);
+        uint256 totalAllocated = flywheel.totalAllocatedPayouts(campaign, token) + flywheel.totalAllocatedFees(campaign, token);
+        gte(balance, totalAllocated, "FW-DOM-02: campaign insolvent for allocated payouts");
+      }
+
+  - id: FW-DOM-03
+    title: "CashbackRewards payment state can change after allocation — refund reduces maxAllowedRewardAmount"
+    description: |
+      CashbackRewards._validatePaymentReward reads payment state from ESCROW.paymentState() to
+      determine hasCollectedPayment, capturableAmount, and refundableAmount. The maxRewardBps
+      check uses refundableAmount (for SEND/DISTRIBUTE) and capturableAmount + refundableAmount
+      (for ALLOCATE).
+
+      Critical issue: the escrow payment state is EXTERNAL and can change between allocate() and
+      distribute(). Specifically:
+      - At allocate() time: payment captured for 100 USDC, refundableAmount=100, maxReward at 10% = 10 USDC, allocate 10
+      - Between allocate and distribute: merchant partially refunds 50 USDC, refundableAmount=50
+      - At distribute() time: maxAllowedRewardAmount = 50 * 10% = 5 USDC, but trying to distribute 10
+      - Result: RewardExceedsMaxPercentage error, funds stuck as allocated but undistributable
+
+      The allocated funds in Flywheel storage are locked (totalAllocatedPayouts increased) but
+      cannot be distributed. They can only be freed via deallocate(), but the manager must know
+      to do this. Meanwhile the funds are locked from the advertiser.
+    severity: medium
+    confidence: 65
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward (line 292-345)"
+      - "CashbackRewards._onDistribute (line 219-261)"
+      - "CashbackRewards._onAllocate (line 138-172)"
+    attack_scenario: |
+      1. Payment of 100 USDC collected in escrow
+      2. Manager allocates 10 USDC reward (10% max, check passes: 10 <= 100*10/100)
+      3. Merchant refunds 60 USDC via escrow — refundableAmount drops to 40
+      4. Manager tries to distribute the 10 USDC allocation
+      5. Validation: maxAllowedRewardAmount = 40 * 10% = 4 USDC, totalRewardAmount = 10 > 4
+      6. RewardExceedsMaxPercentage reverts — funds permanently locked unless deallocated
+    solidity_invariant: |
+      // After successful allocation, distribution of the same amount should not revert due to max percentage
+      // (unless external state changed — this invariant detects the design gap)
+      function invariant_allocated_rewards_distributable(address campaign, bytes32 paymentHash) external {
+        CashbackRewards.RewardState memory rs = cashback.rewards(campaign, paymentHash);
+        // If allocated > 0, there should exist a valid distribution path
+        if (rs.allocated > 0) {
+          // The allocated amount was valid at allocation time but may not be at distribution time
+          // This is a known design tension with external escrow state
+          t(true, "FW-DOM-03: informational — allocated rewards may become undistributable");
+        }
+      }
+
+  - id: FW-DOM-04
+    title: "CREATE2 front-running — different hookData produces different campaign address"
+    description: |
+      Campaign address is deterministic via CREATE2 with salt = keccak256(abi.encode(hooks, nonce, hookData)).
+      The hookData is included in the salt, so different hookData → different address.
+
+      Front-running risk: if an advertiser broadcasts a createCampaign tx, an attacker can observe
+      the mempool and front-run with the SAME (hooks, nonce, hookData) to create the campaign first.
+      However, this doesn't help the attacker because createCampaign returns early if already deployed
+      (line 283), and the hookData determines the campaign parameters (owner, attributionProvider, etc).
+
+      The real risk is the opposite: attacker uses the SAME hooks and nonce but DIFFERENT hookData
+      to create a campaign at a DIFFERENT address. This doesn't front-run the victim's campaign
+      (different address), but could confuse off-chain systems that predicted the address.
+
+      Actually, since the salt includes hookData, an attacker cannot create a campaign at the
+      victim's predicted address with different parameters. The design is safe.
+    severity: informational
+    confidence: 30
+    affected_functions:
+      - "Flywheel.createCampaign (line 274-289)"
+      - "Flywheel._campaignSalt (line 681-683)"
+      - "Flywheel.predictCampaignAddress (line 566-572)"
+    attack_scenario: |
+      1. Advertiser calls predictCampaignAddress(hooks, nonce, hookData) to get expected address
+      2. Advertiser funds the predicted address in advance
+      3. Attacker front-runs createCampaign with same (hooks, nonce) but different hookData
+      4. Attacker's campaign deploys at a DIFFERENT address (different salt) — no impact on victim
+      5. Victim's createCampaign succeeds normally at the predicted address
+      6. No actual attack — hookData in salt prevents address hijacking
+    solidity_invariant: |
+      // Campaign address is uniquely determined by (hooks, nonce, hookData)
+      function invariant_campaign_address_deterministic(address hooks, uint256 nonce, bytes memory hookData) external {
+        address predicted = flywheel.predictCampaignAddress(hooks, nonce, hookData);
+        // Same inputs always produce same address
+        eq(predicted, flywheel.predictCampaignAddress(hooks, nonce, hookData), "FW-DOM-04: non-deterministic address");
+      }
+
+  - id: FW-DOM-05
+    title: "State machine allows INACTIVE→ACTIVE and INACTIVE→FINALIZED but also INACTIVE→FINALIZING"
+    description: |
+      Flywheel.updateStatus (line 526-530) validates transitions with three rules:
+      1. newStatus != oldStatus
+      2. oldStatus != FINALIZED
+      3. If FINALIZING, can only go to FINALIZED
+
+      This means from INACTIVE, the allowed transitions are:
+      - INACTIVE → ACTIVE (intended)
+      - INACTIVE → FINALIZING (unblocked by core — depends on hooks)
+      - INACTIVE → FINALIZED (unblocked by core — depends on hooks)
+
+      In AdConversion, INACTIVE → FINALIZING is NOT explicitly blocked. The hook only blocks:
+      - Advertiser from INACTIVE: only FINALIZED allowed (line 566)
+      - Attribution provider from INACTIVE: only ACTIVE allowed (line 568)
+
+      So INACTIVE → FINALIZING is blocked for both advertiser and attribution provider.
+      But if a third party somehow calls updateStatus... they'd be blocked by line 562
+      (only attributionProvider or advertiser can update).
+
+      In SimpleRewards, only the manager can update status (onlyManager modifier), and there
+      are no additional transition restrictions. So manager CAN do INACTIVE → FINALIZING.
+      This creates a campaign that is in FINALIZING state without ever being ACTIVE, which
+      is semantically incorrect but likely low impact since acceptingPayouts allows FINALIZING.
+    severity: low
+    confidence: 60
+    affected_functions:
+      - "Flywheel.updateStatus (line 526-530)"
+      - "SimpleRewards._onUpdateStatus (line 144-150)"
+    attack_scenario: |
+      1. Manager creates campaign (status = INACTIVE)
+      2. Manager calls updateStatus(campaign, FINALIZING, "")
+      3. Core allows it: oldStatus != newStatus, oldStatus != FINALIZED, no FINALIZING restriction
+      4. SimpleRewards allows it: onlyManager passes, no additional checks
+      5. Campaign is now FINALIZING without ever being ACTIVE
+      6. acceptingPayouts allows FINALIZING, so payouts can still be processed
+      7. But semantically, the campaign was never active — attribution deadlines etc. may be wrong
+    solidity_invariant: |
+      // Campaign should not enter FINALIZING without having been ACTIVE first
+      function invariant_finalizing_requires_active_history(address campaign) external {
+        if (flywheel.campaignStatus(campaign) == Flywheel.CampaignStatus.FINALIZING) {
+          // Ghost variable tracking: was this campaign ever ACTIVE?
+          t(wasEverActive[campaign], "FW-DOM-05: FINALIZING without prior ACTIVE state");
+        }
+      }
+
+  - id: FW-DOM-06
+    title: "BridgeReferralFees._onSend has no access control — anyone can drain campaign funds"
+    description: |
+      BridgeReferralFees._onSend (line 69-108) has NO access control check. Any address can call
+      Flywheel.send() for a BridgeReferralFees campaign and specify themselves as the user parameter
+      in hookData. The comment at line 140-141 explicitly acknowledges this:
+      "If tokens are sent into the campaign outside of this scope on accident, anyone can take them
+      (no access control for `onSend` hook)"
+
+      The bridgedAmount calculation (line 78-79) takes the full campaign balance minus allocated fees.
+      So if someone sends tokens to the campaign address, anyone can call send() and receive ALL of
+      those tokens. This is by design for the atomic bridge use case (tokens arrive and leave in same
+      tx), but tokens that accumulate between txs are vulnerable.
+
+      The key domain-specific concern: if the campaign has a persistent balance (e.g., from failed
+      fee sends that fall back to allocation, or from direct deposits), any caller can drain it.
+    severity: medium
+    confidence: 75
+    affected_functions:
+      - "BridgeReferralFees._onSend (line 69-108)"
+      - "Flywheel.send (line 299-323)"
+    attack_scenario: |
+      1. BridgeReferralFees campaign is ACTIVE with accumulated balance from failed fee sends
+      2. totalAllocatedFees = 50 USDC, campaign balance = 150 USDC
+      3. Attacker calls Flywheel.send(campaign, USDC, encode(attacker, "", 0))
+      4. bridgedAmount = 150 - 50 = 100 USDC, feeBps = 0 (empty code → _processBuilderCode fails → feeBps = 0)
+      5. Payout: attacker receives 100 USDC
+      6. Solvency check: balance (50) >= totalAllocated (50) — passes
+    solidity_invariant: |
+      // BridgeReferralFees campaign balance should only decrease via authorized bridge operations
+      // (This invariant will break by design — the protocol accepts this risk)
+      function invariant_bridge_campaign_no_unauthorized_drain(address campaign, address token) external {
+        // Track balance changes outside of atomic bridge operations
+        uint256 balance = IERC20(token).balanceOf(campaign);
+        uint256 allocated = flywheel.totalAllocatedFees(campaign, token);
+        // In atomic use: balance should equal allocated after each tx
+        // Persistent balance > allocated indicates drainable funds
+        t(balance <= allocated + 1, "FW-DOM-06: bridge campaign has drainable surplus");
+      }
+
+  - id: FW-DOM-07
+    title: "conversionConfigCount uint16 cast truncation on initial config array length"
+    description: |
+      In AdConversion._onCreateCampaign (line 381), the configs array length is cast to uint16:
+      `conversionConfigCount[campaign] = uint16(configs.length);`
+
+      configs.length is uint256. If the hookData contains more than 65535 configs, the cast silently
+      truncates. For example, 65536 configs → conversionConfigCount = 0. Then the for loop at
+      line 383 (`for (uint16 i = 0; i < count; i++)`) uses count = configs.length (uint256), so
+      it would process all configs. But i is uint16, so after 65535 iterations, i overflows.
+      Actually, in Solidity 0.8+, uint16 overflow reverts. So the loop would revert at i = 65535
+      when trying i + 1 = 65536 as uint16.
+
+      But the real issue is: if exactly 65536 configs are passed, conversionConfigCount = 0
+      (truncated), but 65535 configs are actually stored (IDs 1-65535, loop reverts before
+      storing ID 65536). This mismatch means getConversionConfig would revert for all stored
+      configs since configId > conversionConfigCount (which is 0).
+
+      Practical impact is LOW — nobody would pass 65536+ configs, and gas would be astronomical.
+      But the truncation is technically unsafe.
+    severity: informational
+    confidence: 40
+    affected_functions:
+      - "AdConversion._onCreateCampaign (line 381)"
+      - "AdConversion.addConversionConfig (line 256-270)"
+    attack_scenario: |
+      1. Attacker crafts hookData with configs array of length 65536
+      2. _onCreateCampaign casts: conversionConfigCount = uint16(65536) = 0
+      3. Loop: for (uint16 i = 0; i < 65536; i++) — reverts at overflow after i=65535
+      4. Transaction reverts — no actual harm, but indicates unsafe cast
+      5. With exactly 65535 configs: conversionConfigCount = 65535, all stored correctly — no issue
+    solidity_invariant: |
+      // conversionConfigCount should equal the actual number of stored configs
+      function invariant_config_count_matches_storage(address campaign) external {
+        uint16 count = adConversion.conversionConfigCount(campaign);
+        // Every configId from 1 to count should have isActive = true (initially)
+        for (uint16 i = 1; i <= count; i++) {
+          // Config should exist
+          AdConversion.ConversionConfig memory config = adConversion.getConversionConfig(campaign, i);
+          // At creation time, all should be active
+        }
+      }
+
+  - id: FW-DOM-08
+    title: "AdConversion fee key collision — different attribution providers share same key space"
+    description: |
+      In AdConversion._onSend (line 505), the fee allocation key is:
+      `key: bytes32(bytes20(attributionProvider))`
+
+      And in _onDistributeFees (line 523):
+      `bytes32 key = bytes32(bytes20(sender))`
+
+      The key is derived from the attribution provider address, truncated to 20 bytes and
+      left-padded to bytes32. This means bytes32(bytes20(addr)) = addr padded with 12 zero bytes
+      on the right.
+
+      If two different campaigns share the same token and the same attribution provider, their
+      fee allocations use the same key in the global allocatedFee mapping:
+      allocatedFee[campaign][token][key]. But since campaign is part of the mapping key, there's
+      no collision between campaigns.
+
+      Within a single campaign, the attribution provider is fixed, so there's only one key.
+      No collision issue.
+
+      However, in SimpleRewards._onAllocate (line 88), the key is bytes32(bytes20(recipient)).
+      If an allocation key happens to equal a fee key (same address used as both payout recipient
+      and attribution provider), the allocatedPayout and allocatedFee are in DIFFERENT mappings,
+      so no collision. This is safe.
+    severity: informational
+    confidence: 20
+    affected_functions:
+      - "AdConversion._onSend (line 505)"
+      - "AdConversion._onDistributeFees (line 523)"
+    attack_scenario: |
+      No actual attack — the mapping structure (campaign → token → key) prevents cross-campaign
+      collisions, and allocatedPayout vs allocatedFee are separate mappings preventing key-type
+      collisions.
+    solidity_invariant: |
+      // Fee allocations should only be accessible by the correct attribution provider
+      function invariant_fee_key_isolation(address campaign, address token) external {
+        // No cross-campaign fee key collision possible due to mapping structure
+        t(true, "FW-DOM-08: informational — key isolation is structurally enforced");
+      }
+
+  - id: FW-DOM-09
+    title: "BridgeReferralFees._safePercent rounds down, losing dust to the campaign"
+    description: |
+      BridgeReferralFees._safePercent (line 200) calculates:
+      `(amount / 1e4) * basisPoints + ((amount % 1e4) * basisPoints) / 1e4`
+
+      This splits the calculation to avoid overflow but rounds down twice. The user payout at
+      line 93 is `bridgedAmount - feeAmount`, so rounding down the fee benefits the user (they
+      get slightly more). The fee recipient gets slightly less.
+
+      But the important issue: the user receives `bridgedAmount - feeAmount` and the fee is
+      `feeAmount`. The sum `(bridgedAmount - feeAmount) + feeAmount = bridgedAmount`. The
+      solvency check should pass since the total sent equals the balance minus previously
+      allocated fees. No dust is trapped.
+
+      Actually, looking more carefully: if feeAmount rounds down by 1 wei, the user gets 1 wei
+      more. Total sent = bridgedAmount. Campaign balance after = previousBalance - bridgedAmount.
+      This equals the totalAllocatedFees (assuming no other changes). Solvency check passes.
+
+      No real vulnerability — the rounding direction favors the user over the fee recipient,
+      which is a reasonable default.
+    severity: informational
+    confidence: 25
+    affected_functions:
+      - "BridgeReferralFees._safePercent (line 199-201)"
+      - "BridgeReferralFees._onSend (line 89-95)"
+    attack_scenario: |
+      No attack — rounding is consistent and doesn't create stuck funds.
+    solidity_invariant: |
+      // Fee + userPayout should equal bridgedAmount (no dust trapped)
+      function invariant_bridge_no_dust(uint256 bridgedAmount, uint8 feeBps) external {
+        uint256 fee = bridge._safePercent(bridgedAmount, feeBps);
+        uint256 userPayout = bridgedAmount - fee;
+        eq(userPayout + fee, bridgedAmount, "FW-DOM-09: dust trapped in bridge fee calculation");
+      }
+
+  - id: FW-DOM-10
+    title: "AdConversion: advertiser can finalize INACTIVE campaign to withdraw prefunded tokens without attribution"
+    description: |
+      In AdConversion._onUpdateStatus (line 565-566):
+      - From INACTIVE, advertiser can ONLY go to FINALIZED
+
+      Combined with _onWithdrawFunds (line 540-548):
+      - Only advertiser can withdraw
+      - Only when campaign is FINALIZED
+
+      This is actually the intended "escape hatch" — advertiser funds the campaign address in
+      advance (predictable via CREATE2), creates the campaign, and if they change their mind
+      before activation, they can immediately finalize and withdraw.
+
+      But there's a subtle issue: the attribution provider also has a role in this campaign.
+      If the advertiser creates the campaign, the attribution provider expects to earn fees
+      from conversions. The advertiser can front-run any INACTIVE → ACTIVE transition by the
+      attribution provider with INACTIVE → FINALIZED, then withdraw all funds.
+
+      This is a trust/fairness issue rather than a strict vulnerability: the advertiser has
+      unilateral power to kill a campaign before activation, denying the attribution provider
+      any business opportunity. The attribution provider may have invested resources to prepare
+      for the campaign.
+    severity: low
+    confidence: 50
+    affected_functions:
+      - "AdConversion._onUpdateStatus (line 564-569)"
+      - "AdConversion._onWithdrawFunds (line 534-548)"
+    attack_scenario: |
+      1. Advertiser creates campaign with attribution provider, funds it with 1000 USDC
+      2. Attribution provider prepares conversion tracking infrastructure
+      3. Attribution provider calls updateStatus(campaign, ACTIVE, "")
+      4. Advertiser front-runs with updateStatus(campaign, FINALIZED, "")
+      5. Campaign FINALIZED without ever being ACTIVE
+      6. Advertiser calls withdrawFunds to recover all 1000 USDC
+      7. Attribution provider's preparation was wasted
+    solidity_invariant: |
+      // If attribution provider has made preparations, advertiser should not be able to unilaterally finalize
+      // (This is a design choice rather than a bug — the advertiser funded the campaign)
+      function invariant_inactive_finalization_fairness(address campaign) external {
+        // Track: was INACTIVE → FINALIZED transition done by advertiser?
+        // This is a governance/trust concern, not a solvency invariant
+        t(true, "FW-DOM-10: informational trust concern");
+      }
+
+  - id: FW-DOM-11
+    title: "CashbackRewards: payment collected check is point-in-time — payment can be reversed/refunded after reward sent"
+    description: |
+      CashbackRewards._validatePaymentReward (line 310-313) checks hasCollectedPayment from the
+      ESCROW. But this check is point-in-time. For the SEND operation, the reward is sent
+      immediately in the same transaction. If the escrow allows the payment to be refunded AFTER
+      collection, the reward has already been sent.
+
+      The escrow returns (hasCollectedPayment, capturableAmount, refundableAmount). The
+      capturableAmount represents funds that can still be captured by the merchant. The
+      refundableAmount represents captured funds that can be refunded.
+
+      If a merchant refunds a payment AFTER the cashback reward was already sent to the buyer,
+      the buyer effectively gets:
+      - Full refund from merchant (via escrow)
+      - Cashback reward (already sent, irreversible)
+
+      The campaign owner loses the cashback amount with no recourse. This is a known design
+      tension with any cashback system, but the protocol has no mechanism to claw back sent
+      rewards.
+
+      The maxRewardBasisPoints cap limits the exposure, but doesn't eliminate it.
+    severity: medium
+    confidence: 60
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward (line 292-345)"
+      - "CashbackRewards._onSend (line 102-135)"
+    attack_scenario: |
+      1. Buyer makes 1000 USDC payment, merchant captures it
+      2. Campaign manager sends 50 USDC cashback reward to buyer (5% reward)
+      3. Merchant issues full refund via escrow — buyer gets 1000 USDC back
+      4. Buyer has 1000 USDC refund + 50 USDC cashback = 1050 USDC net
+      5. Campaign lost 50 USDC on a transaction that was fully reversed
+      6. No clawback mechanism exists in the protocol
+    solidity_invariant: |
+      // Rewards should only be final if the underlying payment is non-refundable
+      // (Protocol accepts this risk by design — the allocate→distribute flow mitigates it)
+      function invariant_sent_rewards_irrecoverable(address campaign, bytes32 paymentHash) external {
+        CashbackRewards.RewardState memory rs = cashback.rewards(campaign, paymentHash);
+        if (rs.distributed > 0) {
+          // Once distributed, cannot be clawed back even if payment is refunded
+          // This is a design choice — use allocate+distribute flow for protection
+          t(true, "FW-DOM-11: distributed rewards are irrecoverable");
+        }
+      }
+
+  - id: FW-DOM-12
+    title: "AdConversion._onSend: zero-amount attribution with non-zero fee creates inconsistent netAmount"
+    description: |
+      In AdConversion._onSend, if a conversion has payoutAmount = 0 but the loop still processes
+      it (amount == 0 is NOT skipped in the attribution loop). However, looking at the code more
+      carefully:
+
+      Line 461: `uint256 netAmount = attributions[i].conversion.payoutAmount;`
+      Line 462-466: If feeBps > 0, `attributionFee = (0 * feeBps) / MAX_BPS = 0`, so netAmount = 0.
+      Line 479: `if (!found && netAmount > 0)` — skips adding to recipients since netAmount = 0.
+
+      The events still emit for zero-amount conversions. This is logically fine — zero payouts
+      are skipped in Flywheel.send (line 314: `if (amount == 0) continue`). But the event emission
+      for a zero-payout conversion could be misleading for indexers.
+
+      No actual fund loss — just an indexing/UX concern.
+    severity: informational
+    confidence: 30
+    affected_functions:
+      - "AdConversion._onSend (line 398-511)"
+    attack_scenario: |
+      No fund loss scenario. Attribution provider submits zero-amount conversions which emit events
+      but create no payouts. Could be used to pollute event logs.
+    solidity_invariant: |
+      // Every conversion processed should have a non-zero payout amount
+      function invariant_no_zero_conversions(uint256 payoutAmount) external {
+        t(payoutAmount > 0, "FW-DOM-12: zero-amount conversion processed");
+      }
+
+  - id: FW-DOM-13
+    title: "SimpleRewards _onWithdrawFunds has no status check — owner can withdraw from ACTIVE campaign"
+    description: |
+      SimpleRewards._onWithdrawFunds (line 133-141) only checks `sender == owners[campaign]`.
+      Unlike AdConversion._onWithdrawFunds which requires FINALIZED status, SimpleRewards allows
+      the owner to withdraw at any status.
+
+      Flywheel.withdrawFunds has no status restriction either — it works for any status.
+      The solvency check at line 509-512 uses FINALIZED-aware logic: if FINALIZED, only
+      totalAllocatedFees must be covered; otherwise, both payouts and fees must be covered.
+
+      So an ACTIVE SimpleRewards campaign owner can withdraw all funds EXCEPT those allocated
+      for payouts and fees. This is by design (owner controls the campaign), but means the owner
+      can rug the campaign by withdrawing all unallocated funds, effectively making the campaign
+      unfundable for new payouts even though it's still ACTIVE.
+
+      The manager (who processes payouts) is different from the owner (who can withdraw). If the
+      owner is malicious, they can withdraw funds while the campaign is active, causing future
+      send/allocate calls to fail due to insufficient funds.
+    severity: low
+    confidence: 50
+    affected_functions:
+      - "SimpleRewards._onWithdrawFunds (line 133-141)"
+      - "Flywheel.withdrawFunds (line 492-513)"
+    attack_scenario: |
+      1. Owner creates campaign, funds it with 1000 USDC, manager starts processing payouts
+      2. Manager allocates 200 USDC in payouts
+      3. Owner calls withdrawFunds for 800 USDC (balance 1000 - allocated 200 = 800 available)
+      4. Campaign balance = 200 USDC (exactly covering allocations)
+      5. Manager tries to send new 100 USDC payout — fails, insufficient funds
+      6. Campaign is effectively drained while still ACTIVE
+    solidity_invariant: |
+      // Active campaign should maintain sufficient balance for ongoing operations
+      // (Design choice — owner has ultimate control over funds)
+      function invariant_active_campaign_funded(address campaign, address token) external {
+        if (flywheel.campaignStatus(campaign) == Flywheel.CampaignStatus.ACTIVE) {
+          uint256 balance = IERC20(token).balanceOf(campaign);
+          uint256 allocated = flywheel.totalAllocatedPayouts(campaign, token) + flywheel.totalAllocatedFees(campaign, token);
+          // Owner can withdraw down to exactly allocated — this is allowed by design
+          gte(balance, allocated, "FW-DOM-13: active campaign below allocation threshold");
+        }
+      }
+
+  - id: FW-DOM-14
+    title: "BridgeReferralFees: bridgedAmount includes totalAllocatedPayouts, potentially overcounting available balance"
+    description: |
+      In BridgeReferralFees._onSend (line 78-79):
+      ```
+      uint256 bridgedAmount = token == Constants.NATIVE_TOKEN ? campaign.balance : IERC20(token).balanceOf(campaign);
+      bridgedAmount -= FLYWHEEL.totalAllocatedFees(campaign, token);
+      ```
+
+      The bridgedAmount only subtracts totalAllocatedFees, NOT totalAllocatedPayouts. For
+      BridgeReferralFees this is fine because this hook doesn't use allocate/distribute (only
+      send), so totalAllocatedPayouts should always be zero for these campaigns.
+
+      BUT: the Flywheel contract doesn't prevent calling allocate() on a BridgeReferralFees
+      campaign. If someone managed to allocate payouts (CampaignHooks._onAllocate reverts with
+      Unsupported by default, and BridgeReferralFees doesn't override it), it would revert.
+
+      So this is safe — the default Unsupported() revert in CampaignHooks prevents allocations
+      on BridgeReferralFees campaigns, ensuring totalAllocatedPayouts is always zero.
+    severity: informational
+    confidence: 20
+    affected_functions:
+      - "BridgeReferralFees._onSend (line 78-79)"
+    attack_scenario: |
+      No attack — the CampaignHooks base class reverts Unsupported() for onAllocate,
+      preventing any allocation on BridgeReferralFees campaigns.
+    solidity_invariant: |
+      // BridgeReferralFees campaigns should never have non-zero totalAllocatedPayouts
+      function invariant_bridge_no_allocated_payouts(address campaign, address token) external {
+        eq(flywheel.totalAllocatedPayouts(campaign, token), 0, "FW-DOM-14: bridge campaign has allocated payouts");
+      }
+
+summary: |
+  Key findings by severity:
+  - HIGH (1): FW-DOM-02 — FINALIZED campaigns ignore allocated payouts in solvency check,
+    allowing advertiser to withdraw funds backing pending allocations.
+  - MEDIUM (3): FW-DOM-01 (attribution provider bypass), FW-DOM-03 (escrow state change
+    after allocation), FW-DOM-06 (BridgeReferralFees no access control on send — acknowledged),
+    FW-DOM-11 (reward irrecoverable after payment refund).
+  - LOW (3): FW-DOM-05 (INACTIVE→FINALIZING skip), FW-DOM-10 (advertiser can kill campaign
+    pre-activation), FW-DOM-13 (owner can drain active SimpleRewards campaign).
+  - INFORMATIONAL (5): FW-DOM-04, FW-DOM-07, FW-DOM-08, FW-DOM-09, FW-DOM-12, FW-DOM-14.
+
+  Top priority for further investigation: FW-DOM-02 (allocated payouts ignored on finalization).

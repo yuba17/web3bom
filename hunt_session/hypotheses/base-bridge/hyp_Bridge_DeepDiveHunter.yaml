@@ -1,0 +1,736 @@
+# DeepDiveHunter Analysis — Base↔Solana Bridge
+# Runs AFTER 9 specialized hunters. Explores CONVERGENCES and cross-cutting attack paths.
+# Analyst: DeepDiveHunter
+# Date: 2026-03-27
+# Bounty: Coinbase Base↔Solana Bridge ($5M)
+# Sources: BR-SIG-*, BR-D-*, BR-M-*, BR-TB-*, BR-W-*, BR-O-*, BR-FLOW-*, BR-DOS-*, BR-ACC-*
+
+hunter: DeepDiveHunter
+component: Bridge
+
+hypotheses:
+
+  ###########################################################################
+  # BR-DD-01 — CONVERGENCE 1+2 COMBINED: registerRemoteToken replay via
+  #            cross-deployment signature + scalar overwrite = fund extraction
+  ###########################################################################
+  - id: BR-DD-01
+    title: "Cross-deployment replay of registerRemoteToken to overwrite scalar and drain deposits"
+    description: |
+      COMBINES: BR-D-01, BR-D-02, BR-D-07, BR-SIG-03, BR-TB-04, BR-TB-05, BR-M-10
+
+      This is the highest-severity combined attack path. It chains two independently-identified
+      weaknesses into a fund-draining exploit:
+
+      STEP 1: Cross-deployment message replay (BR-D-01 + BR-D-07 + BR-SIG-03)
+      The Solana→Base message hash is:
+        hash(nonce, outgoingMessagePubkey, keccak256(sender, ty, data))
+      NO chain ID, NO bridge address, NO domain separator.
+      The validator signature is: toEthSignedMessageHash(abi.encode(messageHashes))
+      Also NO chain ID.
+
+      If the same validator set is used across two EVM deployments (e.g., Base mainnet + testnet,
+      or Base + another OP chain), a batch signed for chain A is valid on chain B provided
+      the nonce range matches. The nonce is BridgeValidator.nextNonce (per-deployment), so
+      on a fresh deployment chain B starts at 0.
+
+      STEP 2: Scalar overwrite via replayed registerRemoteToken (BR-D-02 + BR-TB-05 + BR-M-10)
+      TokenLib.registerRemoteToken unconditionally sets:
+        $.scalars[localToken][remoteToken] = 10 ** scalarExponent
+      No check for existing scalar. No check that deposits are zero.
+
+      If message.sender == REMOTE_BRIDGE (Solana bridge pubkey), __relayMessage decodes and calls
+      registerRemoteToken. On a fresh deployment, there are no deposits yet, so scalar overwrite
+      isn't directly harmful. BUT: if the same deployment later receives real deposits, and a
+      SECOND registerRemoteToken message can be replayed with a different scalar...
+
+      COMBINED ATTACK:
+      1. Bridge on chain A has registered (USDC, solUSDC, scalarExp=12) → scalar = 10^12
+      2. Users deposit 1M USDC on chain A → deposits = 1M * 10^12 = 1e18
+      3. On chain A, Solana bridge sends a NEW registerRemoteToken(USDC, solUSDC, scalarExp=0)
+         This would be legitimate on Solana side (correcting misconfiguration).
+      4. Validators sign this message at nonce N.
+      5. Chain B is deployed AFTER chain A, with same validator set, and nextNonce catches up to N.
+      6. Attacker replays the registerRemoteToken message on chain B.
+         On chain B, USDC/solUSDC scalar changes to 10^0 = 1.
+      7. Now on chain B, finalizeTransfer for 1 remoteAmount releases 1 * 1 = 1 wei USDC.
+         Actually the attack is REVERSE: if scalar INCREASES on chain B...
+
+      REVISED ATTACK (scalar increase):
+      1. Bridge on chain A initially registered scalar = 10^6 (scalarExp=6).
+      2. Chain A later re-registers with scalarExp=12. Validators sign at nonce N.
+      3. Chain B has scalar = 10^6 already and users deposited X USDC.
+      4. Attacker replays the scalarExp=12 registration on chain B.
+      5. Now scalar = 10^12. Attacker bridges back 1 remote unit → localAmount = 10^12.
+         But deposits on chain B are tracked at old scalar (deposits = X * 10^6).
+      6. deposits -= 10^12. If deposits = X * 10^6 >= 10^12, this succeeds when X >= 10^6.
+         Attacker extracts 10^12 local units = 10^6 USDC (with 6 decimals).
+      7. The cost is bridging 1 remote unit from Solana. If remote unit is worth 10^6 local units
+         at the old scalar, attacker pays 10^6 and gets 10^12 — 10^6x profit.
+
+      CRITICAL ASSESSMENT:
+      - Requires same validator set across 2 deployments (operational, NOT code-enforced)
+      - Requires nonce alignment (plausible on fresh deployment)
+      - Requires registerRemoteToken to have been called with different scalars on chain A
+      - The scalar overwrite is the REAL on-chain bug; replay is the delivery mechanism
+      - WITHOUT cross-chain replay, this requires Solana-side compromise for re-registration
+
+      SEVERITY: High if cross-deployment validators overlap. Medium otherwise (Solana compromise needed).
+    severity: high
+    confidence: 55
+    status: pending
+    solidity: |
+      // Invariant: scalar MUST NOT change while deposits > 0
+      // AND message hash MUST include chain-specific domain separator
+      function invariant_BR_DD_01_scalar_replay_protection(
+          address localToken, Pubkey remoteToken
+      ) public view {
+          uint256 deposits = bridge.deposits(localToken, remoteToken);
+          uint256 scalar = bridge.scalars(localToken, remoteToken);
+          // If deposits > 0, registerRemoteToken must be blocked
+          // In current code: no such check exists (TokenLib.sol:269-272)
+          // Adding: require(deposits == 0 || scalar == newScalar) would fix the overwrite
+          // Adding chain ID to hash would fix the replay vector
+      }
+
+  ###########################################################################
+  # BR-DD-02 — CONVERGENCE 3: Validator double-counting reduces effective
+  #            security to (baseThreshold - overlap) + overlap signatures
+  ###########################################################################
+  - id: BR-DD-02
+    title: "Base/partner validator overlap reduces effective multisig from N+M to max(N,M) unique keys"
+    description: |
+      COMBINES: BR-SIG-01, BR-SIG-04, BR-TB-07
+
+      The EVM-side BridgeValidator has TWO independent counting functions:
+        _countBaseSigners: iterates all recovered signers, counts those in VerificationLib.validators
+        _countPartnerSigners: iterates all recovered signers, counts those in IPartner.getSigners()
+
+      There is NO mutual exclusion. A signer that appears in BOTH sets counts toward BOTH thresholds.
+
+      DEEPER ANALYSIS — combining with partner key rotation (BR-SIG-04):
+      IPartner.Signer has (evmAddress, newEvmAddress). BridgeValidator._indexOf matches BOTH:
+        if (addr == addrs[i].evmAddress || addr == addrs[i].newEvmAddress) return i;
+
+      Attack: Partner sets newEvmAddress = baseValidator[0].address during "key rotation".
+      Now baseValidator[0]'s signature counts as:
+        1 base signer (via VerificationLib.isBaseValidator)
+        1 partner signer (via _indexOf matching newEvmAddress)
+
+      With baseThreshold=2, partnerThreshold=1, overlap=1:
+        2 base signatures needed (A, B) — both are base validators
+        1 partner signature needed — A's signature ALSO counts as partner (via newEvmAddress overlap)
+        Total unique keys needed: 2 instead of 3
+
+      With baseThreshold=3, partnerThreshold=2, overlap=2:
+        3 base signatures needed (A, B, C) — all are base validators
+        2 partner signatures needed — A and B also match partner via newEvmAddress
+        Total unique keys needed: 3 instead of 5
+
+      SOLANA-SIDE CHECK: The Solana-side register_output_root has its OWN separate validator sets:
+        base_oracle_config: BaseOracleConfig (signers stored in Bridge account)
+        partner_oracle_config: uses Signers account from partner program
+
+      On Solana side, count_approvals in Signers (line 56-86 of signers.rs) uses matched_indices
+      to prevent double-counting within partner set. But there's NO cross-check against base_oracle_config.
+      BaseOracleConfig.count_approvals (bridge.rs:275-283) also counts independently.
+
+      SAME BUG EXISTS ON BOTH SIDES.
+
+      If a single EVM address is registered as BOTH a base oracle signer AND a partner signer on
+      BOTH chains, its signature counts toward both thresholds on both sides.
+
+      This reduces the key-compromise threshold from (baseThreshold + partnerThreshold) unique keys
+      to max(baseThreshold, partnerThreshold) unique keys.
+
+      For a $5M bridge, if base=3, partner=2, and 2 addresses overlap:
+        Design intent: 5 unique compromised keys to forge messages
+        Reality: 3 unique compromised keys (base validators only) suffice
+
+      IMPORTANT: This is a CODE-LEVEL BUG. The code does not prevent overlap. Whether overlap
+      exists in practice is an operational question, but the code SHOULD enforce mutual exclusion.
+    severity: medium
+    confidence: 75
+    status: pending
+    solidity: |
+      // Invariant: a signer counted toward base threshold MUST NOT also count toward partner threshold
+      function invariant_BR_DD_02_no_double_count(
+          bytes32[] memory messageHashes,
+          bytes calldata sigData
+      ) public view {
+          address[] memory signers = bridgeValidator._getSignersFromSigs(messageHashes, sigData);
+          uint256 baseCount = 0;
+          uint256 partnerCount = 0;
+          uint256 overlapCount = 0;
+          for (uint i = 0; i < signers.length; i++) {
+              bool isBase = verificationLib.isBaseValidator(signers[i]);
+              bool isPartner = _isPartnerSigner(signers[i]);
+              if (isBase) baseCount++;
+              if (isPartner) partnerCount++;
+              if (isBase && isPartner) overlapCount++;
+          }
+          // overlapCount should be 0 for proper security separation
+          // Current code allows overlapCount > 0
+          assert(overlapCount == 0); // FAILS if overlap exists
+      }
+
+  ###########################################################################
+  # BR-DD-03 — CONVERGENCE 4 DEPTH: gasLimit permanently stuck messages
+  #            CAN enable profitable attack via time-locked DeFi positions
+  ###########################################################################
+  - id: BR-DD-03
+    title: "Insufficient gasLimit in TransferAndCall locks tokens on Solana — exploitable if time-sensitive"
+    description: |
+      COMBINES: BRIDGE-FLOW-03, BR-DOS, BR-W-08, BR-TB-14
+
+      gasLimit IS included in the IncomingMessage struct. Looking at the message hash:
+        innerMessageHash = keccak256(abi.encode(message.sender, message.ty, message.data))
+        messageHash = hash(nonce, outgoingMessagePubkey, innerMessageHash)
+
+      gasLimit is in the IncomingMessage struct BUT it's NOT in getInnerMessageHashCd which only
+      hashes (sender, ty, data). And the messageHash function uses (nonce, outgoingMessagePubkey,
+      innerMessageHash) — also no gasLimit.
+
+      CRITICAL FINDING: gasLimit is NOT part of the message hash!
+
+      This means: the relayer submitting relayMessages can set message.gasLimit to ANY value.
+      The validators signed the messageHash which does NOT commit to gasLimit. The relayer
+      can submit the same message with gasLimit = 1 or gasLimit = 10_000_000.
+
+      This is actually a SAFETY FEATURE — a failed message can always be retried with higher gas.
+      But it also means a GRIEFING ATTACK:
+      1. Malicious relayer front-runs honest relay with gasLimit = 1
+      2. Message fails, failures[hash] = true
+      3. Honest relayer retries with correct gasLimit → succeeds
+
+      The griefing is temporary (1 block) because any relayer can immediately retry.
+      Not a fund-loss vulnerability but a liveness concern.
+
+      HOWEVER — a deeper attack exists: SELECTIVE message failure for MEV extraction.
+      1. Attacker observes a pending relayMessages transaction in the mempool
+      2. The batch contains message A (transfers 1000 SOL to user) and message B (a DeFi call)
+      3. Attacker front-runs with a relayMessages call using gasLimit = 1 for message A
+      4. Message A fails (tokens NOT transferred), message B might succeed or fail independently
+      5. If message B is a DeFi operation that depends on message A's tokens, it also fails
+      6. Attacker profits from the delay (e.g., arbitrage on price change during the block)
+
+      Wait — relayMessages processes an array. Each message in the array is independently validated
+      and executed. The attacker would need to submit their OWN relayMessages call with the
+      specific message and low gasLimit, BEFORE the honest relayer's transaction.
+
+      Severity: Low (griefing only, no fund loss). The gasLimit non-commitment is by design.
+    severity: low
+    confidence: 80
+    status: pending
+    solidity: |
+      // Demonstration: gasLimit is NOT part of message hash
+      function property_BR_DD_03_gasLimit_not_in_hash() public pure {
+          IncomingMessage memory msg1 = createMessage(gasLimit: 100);
+          IncomingMessage memory msg2 = createMessage(gasLimit: 999999);
+          // Same content except gasLimit
+          bytes32 hash1 = MessageLib.getMessageHashCd(msg1);
+          bytes32 hash2 = MessageLib.getMessageHashCd(msg2);
+          // hash1 == hash2 because gasLimit is NOT in innerMessageHash
+          // innerMessageHash = keccak256(abi.encode(sender, ty, data))
+          assert(hash1 == hash2); // This PASSES — gasLimit excluded from hash
+      }
+
+  ###########################################################################
+  # BR-DD-04 — NEW: Cross-direction validator overlap (Solana↔Base)
+  #            Base validators and Solana oracle signers are DIFFERENT sets
+  #            for DIFFERENT directions, but share the same physical keys?
+  ###########################################################################
+  - id: BR-DD-04
+    title: "Solana→Base validator set vs Base→Solana oracle set overlap enables cross-direction forgery"
+    description: |
+      The bridge has TWO independent signature verification systems for TWO directions:
+
+      DIRECTION 1: Solana → Base (BridgeValidator.sol on Base)
+        - Base validators: VerificationLib.validators mapping (EVM addresses)
+        - Partner validators: IPartner.getSigners() (EVM addresses)
+        - Sign: abi.encode(messageHashes) with EIP-191 prefix
+        - Result: pre-validates messages in BridgeValidator.validMessages
+
+      DIRECTION 2: Base → Solana (register_output_root on Solana)
+        - Base oracle signers: Bridge.base_oracle_config.signers (EVM [u8;20])
+        - Partner oracle signers: Signers.signers via partner program (EVM [u8;20])
+        - Sign: output_root || base_block_number || total_leaf_count with EIP-191 prefix
+        - Result: registers MMR output root on Solana
+
+      ANALYSIS: These are signing DIFFERENT data formats:
+        Direction 1 signs: "\x19Ethereum Signed Message:\n32" + keccak256(abi.encode(messageHashes[]))
+        Direction 2 signs: "\x19Ethereum Signed Message:\n" + decimal_len + (root || block_num || leaf_count)
+
+      Direction 1: inner data is keccak256 of ABI-encoded bytes32[] array = always 32 bytes
+                   So prefix is "\x19Ethereum Signed Message:\n32"
+
+      Direction 2: inner data is 32 + 8 + 8 = 48 bytes
+                   So prefix is "\x19Ethereum Signed Message:\n48"
+
+      The LENGTH in the EIP-191 prefix differs (32 vs 48), so the signatures are NOT cross-replayable.
+      A signature valid for direction 1 cannot validate direction 2 and vice versa.
+
+      SAFE. The EIP-191 prefix naturally separates the two signature domains because the signed
+      message lengths differ.
+
+      HOWEVER: If both directions used 32-byte messages (e.g., if direction 2 also hashed to 32 bytes
+      before signing), they WOULD be cross-replayable. This is a fragile safety property that depends
+      on message length difference. Worth noting for future changes.
+    severity: informational
+    confidence: 90
+    status: pending
+    solidity: |
+      // Informational: cross-direction replay prevented by EIP-191 length prefix difference
+      // Direction 1: \x19Ethereum Signed Message:\n32 + 32-byte hash
+      // Direction 2: \x19Ethereum Signed Message:\n48 + 48-byte payload
+      // Different prefix → different signed hash → signatures not interchangeable
+      function property_BR_DD_04_cross_direction_safe() public pure returns (bool) {
+          // Safe by construction, but fragile — depends on message length difference
+          return true;
+      }
+
+  ###########################################################################
+  # BR-DD-05 — CONVERGENCE 5 DEPTH: bytes32 encoding analysis with
+  #            CONCRETE Solana-side code verification
+  ###########################################################################
+  - id: BR-DD-05
+    title: "Solana→Base transfer.to encoding is [u8;20] — requires correct ABI padding in oracle layer"
+    description: |
+      COMBINES: BR-W-04, BR-D-14, BR-TB-15
+
+      After reading the FULL Solana source code, I can now provide a definitive analysis.
+
+      SOLANA SIDE (outgoing_message.rs):
+        Transfer.to is [u8; 20] — raw 20-byte EVM address
+
+      SOLANA OUTGOING (bridge_sol.rs, bridge_spl.rs):
+        `to: [u8; 20]` parameter passed directly into Transfer struct
+
+      The OutgoingMessage is stored as a Borsh-serialized Solana account. The oracle/relayer reads
+      this account, constructs the EVM IncomingMessage, and submits it to BridgeValidator + Bridge.
+
+      EVM SIDE (TokenLib.sol):
+        Transfer.to is bytes32
+        address to = address(bytes20(transfer.to))  — takes HIGH 20 bytes
+
+      The oracle layer must convert [u8; 20] → bytes32. This is where the encoding matters:
+        CORRECT: pad on RIGHT → [addr_20_bytes, 0x00...00_12_bytes]
+                 bytes20 extracts first 20 bytes = address ✓
+        WRONG:   pad on LEFT  → [0x00...00_12_bytes, addr_20_bytes]
+                 bytes20 extracts first 20 bytes = 0x000000000000000000000000 ✓ WRONG
+
+      The EVM's abi.encode(address) LEFT-pads: [0x00...00, address_20_bytes]
+      But bytes20(bytes32) takes the HIGH bytes (RIGHT-pad format needed).
+
+      The IncomingMessage.data for Transfer type is ABI-encoded:
+        abi.decode(message.data, (Transfer))
+
+      The Transfer struct has:
+        address localToken (20 bytes, ABI-encoded as left-padded bytes32)
+        Pubkey remoteToken (bytes32)
+        bytes32 to          — THIS is the critical field
+        uint64 remoteAmount (ABI-encoded as left-padded bytes32)
+
+      In ABI encoding, bytes32 is stored as-is (32 bytes, no padding).
+      The oracle must encode `to` as bytes32 with the address in the HIGH 20 bytes.
+
+      If the oracle constructs this correctly (which it must for the bridge to work at all),
+      then there's no vulnerability. This is NOT a smart contract bug — it's an oracle
+      implementation detail.
+
+      BUT: What if a user manually crafts a Solana transaction with a wrong `to` encoding?
+      The Solana side stores `to: [u8; 20]` in the OutgoingMessage. The oracle reads this
+      and MUST place it in bytes32 correctly. The user doesn't control the bytes32 encoding —
+      the oracle does. So user error doesn't apply.
+
+      CONCLUSION: Safe IF oracle encodes correctly. The oracle is Coinbase-controlled (Stage 0).
+      Not a smart contract vulnerability but a critical integration point.
+
+      For the reverse direction (Base→Solana), SVMBridgeLib.serializeTransfer uses transfer.to
+      directly as bytes32 in the Borsh payload. The Solana side's prove_message deserializes
+      the Message from the MMR-proven data. FinalizeBridgeSol.to is a Pubkey (32 bytes), so
+      the full 32 bytes are preserved. No truncation occurs Base→Solana.
+    severity: low
+    confidence: 85
+    status: pending
+    solidity: |
+      // Invariant: transfer.to must have the EVM address in the HIGH 20 bytes
+      // for Solana→Base transfers
+      function property_BR_DD_05_address_alignment(bytes32 to) public pure {
+          address extracted = address(bytes20(to));
+          // If to was correctly encoded (address in high bytes):
+          //   extracted == intended_address
+          // If to was left-padded (address in low bytes):
+          //   extracted == address(0) or wrong address
+          assert(extracted != address(0)); // Minimum check
+      }
+
+  ###########################################################################
+  # BR-DD-06 — NEW: registerRemoteToken for CrossChainERC20 tokens creates
+  #            a dual-path withdrawal — mint path AND deposit-subtraction path
+  ###########################################################################
+  - id: BR-DD-06
+    title: "registerRemoteToken on a CrossChainERC20 creates dual withdrawal path — unbounded mint + deposit drain"
+    description: |
+      NEW FINDING — not previously identified by any hunter.
+
+      TokenLib has TWO finalization paths in finalizeTransfer:
+      1. CrossChainERC20 path (isCrossChainErc20 = true): MINTS tokens, NO deposit tracking
+      2. Native ERC20 path (isCrossChainErc20 = false): transfers FROM deposits
+
+      registerRemoteToken sets $.scalars[localToken][remoteToken] regardless of whether localToken
+      is a CrossChainERC20 or not. It doesn't check isCrossChainErc20.
+
+      NOW: What if registerRemoteToken is called for a localToken that IS a CrossChainERC20?
+
+      In finalizeTransfer:
+        Line 239: if (CrossChainERC20Factory(...).isCrossChainErc20(transfer.localToken))
+        This check runs FIRST. If true, it takes the CrossChainERC20 mint path.
+        The scalar is NEVER used in this path (localAmount = transfer.remoteAmount directly).
+
+      So for CrossChainERC20 tokens, registerRemoteToken's scalar is IRRELEVANT for the
+      finalization path. The scalar would only matter if someone tried to use this CrossChainERC20
+      as localToken in initializeTransfer — but that path checks:
+        if (CrossChainERC20Factory(...).isCrossChainErc20(transfer.localToken)) → takes burn path
+      Which also doesn't use the scalar.
+
+      FALSE ALARM: The two paths are correctly separated. CrossChainERC20 always uses mint/burn.
+      Native ERC20/ETH always uses deposit/transfer. The scalar is only used for native ERC20/ETH.
+      registerRemoteToken on a CrossChainERC20 is a no-op in practice (sets unused scalar).
+
+      HOWEVER: There IS a subtle issue. What if localToken is a contract that was:
+      1. Originally deployed by CrossChainERC20Factory (so isCrossChainErc20 = true)
+      2. But ALSO has a scalar registered via registerRemoteToken
+
+      A user calling bridgeToken with this token would:
+        initializeTransfer → isCrossChainErc20 check → takes BURN path
+        Burns from msg.sender, serializes message.
+
+      On finalization:
+        finalizeTransfer → isCrossChainErc20 check → takes MINT path
+        Mints to recipient.
+
+      The scalar is completely ignored for CrossChainERC20. No issue here.
+
+      ACTUALLY — wait. Let me re-read the initializeTransfer flow more carefully:
+
+      For CrossChainERC20 in initializeTransfer (line 156-170):
+        It checks remoteToken: either bytes32(0) or must match CrossChainERC20.remoteToken()
+        It then BURNS from msg.sender
+        localAmount = transfer.remoteAmount (1:1, no scalar)
+
+      For native ERC20 in initializeTransfer (line 171-208):
+        It requires $.scalars[localToken][remoteToken] != 0 (WrappedSplRouteNotRegistered)
+
+      So if an attacker registers a scalar for a CrossChainERC20 token with a DIFFERENT remoteToken
+      than the CrossChainERC20's configured remoteToken:
+        bridgeToken(localToken=ccERC20, remoteToken=FAKE, ...)
+        isCrossChainErc20 = true → enters CrossChainERC20 path
+        But: Pubkey.unwrap(transfer.remoteToken) == bytes32(0)? No, it's FAKE.
+        transfer.remoteToken == expectedRemoteToken? No, FAKE != real remote.
+        → REVERT: IncorrectRemoteToken
+
+      The check on line 159-162 prevents using a CrossChainERC20 with a wrong remoteToken.
+      The dual-path attack doesn't work.
+
+      CONCLUSION: Not exploitable. The isCrossChainErc20 check and remoteToken validation
+      together prevent any confusion between the two finalization paths.
+    severity: informational
+    confidence: 90
+    status: pending
+    solidity: |
+      // Informational: CrossChainERC20 and native ERC20 paths are properly separated
+      // registerRemoteToken on a CrossChainERC20 is harmless (scalar unused)
+      function property_BR_DD_06_dual_path_safe() public pure returns (bool) {
+          return true;
+      }
+
+  ###########################################################################
+  # BR-DD-07 — NEW: MMR commutative hashing + Solana verification analysis
+  ###########################################################################
+  - id: BR-DD-07
+    title: "MMR commutative hashing sibling swap — Solana prove_message binds nonce to leaf index, preventing swap"
+    description: |
+      EXTENDS: BR-W-03
+
+      The Base-side MMR uses commutative hashing for internal nodes:
+        _hashInternalNode: if (left < right) hash(left, right) else hash(right, left)
+
+      This means H(A,B) == H(B,A) — swapping siblings doesn't change the parent hash.
+
+      The Solana-side prove_message (prove_message.rs:55-89):
+        1. Computes hash_message(nonce.to_be_bytes(), sender, data) = keccak(nonce || sender || data)
+        2. Verifies message_hash matches the computed hash
+        3. Calls mmr::verify_proof(root, message_hash, nonce, proof, total_leaf_count)
+
+      The nonce parameter is used as the leaf INDEX in the MMR verification:
+        mmr::verify_proof uses nonce to determine the leaf's position in the MMR tree structure.
+
+      The message hash includes the nonce: keccak(nonce || sender || data).
+      Different nonces → different message hashes → different leaf values.
+
+      Even with commutative hashing, swapping siblings would require:
+        - Leaf at index i has hash H_i = keccak(i || sender_i || data_i)
+        - Leaf at index i^1 has hash H_{i^1} = keccak(i^1 || sender_{i^1} || data_{i^1})
+        - Parent = H(sort(H_i, H_{i^1})) = same regardless of which is left/right
+
+      ATTACK: Submit a proof for H_i claiming it's at index i^1 (the sibling position).
+      - prove_message receives nonce = i, which it uses to verify the proof at leaf position i
+      - If attacker submits nonce = i^1, the message_hash = keccak(i^1 || sender || data)
+        which is DIFFERENT from H_i = keccak(i || sender || data)
+      - The hash mismatch causes message_hash != computed_hash → REVERT
+
+      CONCLUSION: SAFE. The nonce is embedded in the message hash, so changing the claimed
+      position changes the hash, invalidating the proof. The commutative hashing is NOT
+      exploitable because leaf values are position-dependent.
+    severity: informational
+    confidence: 95
+    status: pending
+    solidity: |
+      // Safe: nonce embedded in hash prevents sibling swap attack
+      function property_BR_DD_07_mmr_position_bound() public pure {
+          bytes32 hash_at_0 = keccak256(abi.encodePacked(uint64(0), sender, data));
+          bytes32 hash_at_1 = keccak256(abi.encodePacked(uint64(1), sender, data));
+          // hash_at_0 != hash_at_1 (nonce differs)
+          // Proof for hash_at_0 at position 0 cannot prove hash_at_1 at position 0
+          assert(hash_at_0 != hash_at_1);
+      }
+
+  ###########################################################################
+  # BR-DD-08 — NEW: Solana-side partner double-counting mirrors EVM bug
+  ###########################################################################
+  - id: BR-DD-08
+    title: "Solana register_output_root has same base/partner double-counting bug as EVM BridgeValidator"
+    description: |
+      EXTENDS BR-DD-02 to Solana side.
+
+      Solana register_output_root (register_output_root.rs:55-122):
+        1. Recovers unique EVM addresses from signatures
+        2. Counts base oracle approvals: bridge.base_oracle_config.count_approvals(&unique_signers)
+        3. If partner threshold > 0: partner_config.count_approvals(&unique_signers)
+
+      BaseOracleConfig.count_approvals (bridge.rs:275-283):
+        Iterates signers, checks if each is in self.signers[..active_len]. Simple contains check.
+
+      Signers.count_approvals (signers.rs:56-86):
+        Iterates signers, matches against evm_address or new_evm_address of each configured signer.
+        Uses matched_indices to prevent double-counting WITHIN partner set.
+        But does NOT exclude signers already counted as base oracle signers.
+
+      SAME BUG as EVM side: a single recovered EVM address can count toward BOTH thresholds.
+
+      This affects the Base→Solana direction (output root registration). A compromised set of
+      overlapping validators could register fraudulent output roots, which would then allow
+      forging message proofs for arbitrary Base→Solana transfers.
+
+      IMPACT on Base→Solana direction:
+      - Attacker registers fake output root with fake MMR root
+      - Constructs arbitrary IncomingMessage on Solana with fake MMR proof
+      - prove_message verifies against the fake root → succeeds
+      - relay_message executes the fake message → mints tokens or transfers from vaults
+      - Fund loss on Solana side
+
+      This is arguably MORE severe than the EVM-side bug because output root registration
+      directly controls which messages are considered valid on Solana.
+    severity: medium
+    confidence: 75
+    status: pending
+    solidity: |
+      // This is a Rust-side bug, but documenting the parallel for completeness
+      // Both EVM BridgeValidator._validateSigs AND Solana register_output_root
+      // have the same pattern: independent counting without mutual exclusion
+      //
+      // EVM: _countBaseSigners + _countPartnerSigners (no exclusion)
+      // Solana: base_oracle_config.count_approvals + partner_config.count_approvals (no exclusion)
+      //
+      // Fix: either exclude base-counted signers from partner counting, or maintain
+      // a single unified validator set with a single threshold
+
+  ###########################################################################
+  # BR-DD-09 — NEW: Fee-on-transfer token round-trip insolvency path
+  ###########################################################################
+  - id: BR-DD-09
+    title: "Fee-on-transfer tokens cause systematic bridge insolvency via finalizeTransfer outbound fee"
+    description: |
+      EXTENDS: BR-D-03
+
+      initializeTransfer for native ERC20 (lines 171-208) CORRECTLY handles fee-on-transfer:
+        1. Measures balanceBefore/balanceAfter
+        2. receivedLocalAmount = balanceAfter - balanceBefore (actual received)
+        3. receivedRemoteAmount = receivedLocalAmount / scalar
+        4. localAmount = receivedRemoteAmount * scalar (rounded down)
+        5. dust = receivedLocalAmount - localAmount (refunded to sender)
+        6. deposits += localAmount (exact amount held)
+
+      finalizeTransfer for native ERC20 (lines 246-254) does NOT handle fee-on-transfer:
+        1. localAmount = transfer.remoteAmount * scalar
+        2. deposits -= localAmount
+        3. safeTransfer(token, to, localAmount)
+
+      If the token charges a fee on safeTransfer (step 3), the recipient receives
+      (localAmount - fee). But deposits was already decremented by the full localAmount.
+
+      The bridge's actual token balance decreases by localAmount (it sends localAmount).
+      The recipient receives (localAmount - fee). The fee is taken FROM the amount sent,
+      not from the bridge's remaining balance.
+
+      Wait — for a fee-on-transfer token, safeTransfer sends localAmount but the recipient
+      gets less. The bridge's actual balance decreases by localAmount. So:
+        Bridge balance: decreased by localAmount (correct)
+        Deposits: decreased by localAmount (correct)
+        Balance = previous - localAmount, Deposits = previous - localAmount
+        Balance == Deposits (still balanced!)
+
+      Actually the fee comes from the TRANSFER, not the bridge:
+        Bridge calls transfer(to, localAmount)
+        Token takes fee from the transferred amount
+        Bridge balance decreases by localAmount
+        Recipient gets localAmount - fee
+        Bridge balance after = Bridge balance before - localAmount
+
+      So both deposits and actual balance decrease by localAmount. They remain in sync.
+      The USER loses the fee (gets less than localAmount), not the bridge.
+
+      BUT: this means each round-trip, the user loses fees in BOTH directions:
+        Deposit: user sends X, bridge receives X - fee_in. Credited: (X - fee_in) / scalar remote units.
+        Withdraw: bridge sends Y = remote_units * scalar, user receives Y - fee_out.
+        Net loss per round-trip: fee_in + fee_out (from user's perspective)
+        Bridge solvency: maintained (deposits always == actual balance)
+
+      CONCLUSION: Bridge solvency is maintained. Users absorb the transfer fees.
+      This is expected behavior for fee-on-transfer tokens. NOT a vulnerability.
+    severity: informational
+    confidence: 90
+    status: pending
+    solidity: |
+      // Invariant: bridge token balance >= tracked deposits, even with fee-on-transfer
+      // Bridge always sends from its balance and decrements deposits by the same amount
+      function invariant_BR_DD_09_solvency_with_fot(
+          address localToken, Pubkey remoteToken
+      ) public view {
+          uint256 balance = IERC20(localToken).balanceOf(address(bridge));
+          uint256 deposits = bridge.deposits(localToken, remoteToken);
+          assert(balance >= deposits);
+      }
+
+  ###########################################################################
+  # BR-DD-10 — NEW: Attack WITHOUT validator compromise — permissionless
+  #            CrossChainERC20 deployment + social engineering
+  ###########################################################################
+  - id: BR-DD-10
+    title: "Permissionless CrossChainERC20 deployment enables token confusion attack on DEX liquidity"
+    description: |
+      This explores attack paths that do NOT require validator or Solana compromise.
+
+      CrossChainERC20Factory.deploy is fully permissionless. Anyone can call:
+        factory.deploy(remoteToken, "USD Coin", "USDC", 6)
+
+      This creates a CrossChainERC20 at a CREATE2-deterministic address with:
+        isCrossChainErc20[address] = true
+        remoteToken() = Pubkey.unwrap(solana_usdc_pubkey)
+
+      The legitimate deployment would use the SAME parameters and get the SAME address.
+      But: if the attacker uses DIFFERENT parameters (e.g., slightly different name like
+      "USD  Coin" with two spaces), they get a DIFFERENT address.
+
+      Wait — actually, if the attacker uses EXACTLY the same parameters, they get the same
+      address. The CREATE2 deployment would revert because code already exists (if legitimate
+      deployment happened first) or succeed (if attacker deploys first).
+
+      If attacker deploys first with same parameters:
+        - Same address, same isCrossChainErc20 = true
+        - Legitimate deployment at same address would revert (code exists)
+        - But the token at that address IS correct (same remoteToken, name, symbol, decimals)
+        - No impact — the attacker just front-ran the deployment of the correct token
+
+      If attacker deploys with different parameters (same remoteToken, different name):
+        - Different address, also isCrossChainErc20 = true
+        - Both tokens have the same remoteToken() pointing to the same Solana token
+        - Bridge can mint BOTH tokens (via finalizeTransfer with localToken = either address)
+        - But the Solana→Base message specifies the exact localToken address
+        - Oracle/validator would only sign messages with the OFFICIAL localToken address
+
+      ACTUAL RISK: UI/social engineering. If users interact with the wrong CrossChainERC20
+      contract thinking it's the official one, they could:
+        1. Buy FAKE_USDC on a DEX (no backing, just social engineering)
+        2. Try to bridge FAKE_USDC back to Solana via bridgeToken
+        3. initializeTransfer checks: CrossChainERC20(FAKE_USDC).remoteToken() == expected
+           → matches! Burns FAKE_USDC, sends message to Solana referencing real USDC mint
+        4. On Solana, the finalization would release real USDC from vault
+        5. But wait — the Solana side processes the message data, not localToken address.
+           The SVMBridgeLib serialization for CrossChainERC20 (Spl type) includes localToken
+           and remoteToken. On Solana, finalize_spl_transfer checks local_token matches the
+           SPL mint, which IS the correct Solana USDC mint.
+
+      WAIT: For the SPL path in SVMBridgeLib.serializeTransfer:
+        result = encodePacked(uint8(1), transfer.localToken, transfer.remoteToken, transfer.to, amount)
+
+      transfer.localToken is the EVM address (20 bytes) of the CrossChainERC20.
+      On Solana, FinalizeBridgeSpl has local_token: Pubkey (Solana mint) and remote_token: [u8; 20].
+
+      The Borsh deserialization on Solana would map:
+        - localToken (EVM address 20 bytes) → FinalizeBridgeSpl.remote_token [u8; 20]
+        - remoteToken (Solana pubkey 32 bytes) → FinalizeBridgeSpl.local_token Pubkey
+
+      Actually the field ordering in Borsh serialization matters. Let me re-read...
+      The Spl variant in SVMBridgeLib: transfer.localToken, transfer.remoteToken, transfer.to, amount
+      On Solana Transfer::Spl(FinalizeBridgeSpl): remote_token [u8;20], local_token Pubkey, to Pubkey, amount u64
+
+      So: EVM localToken (address = 20 bytes) maps to remote_token [u8;20] on Solana.
+      And: EVM remoteToken (Pubkey = 32 bytes) maps to local_token Pubkey on Solana.
+
+      If attacker burns FAKE_USDC (different EVM address), the remote_token in the Solana message
+      is FAKE_ADDR (attacker's ERC20 address). On Solana, the token vault PDA is derived from:
+        [TOKEN_VAULT_SEED, mint_key.as_ref(), self.remote_token.as_ref()]
+
+      If remote_token = FAKE_ADDR, the vault PDA is DIFFERENT from the real vault PDA (which uses
+      REAL_ADDR). There are no tokens in the fake vault → transfer fails!
+
+      CONCLUSION: The token vault PDA derivation on Solana includes the remote_token (EVM address),
+      which means each EVM CrossChainERC20 has its OWN vault on Solana. Deploying a fake
+      CrossChainERC20 doesn't give access to the real vault's tokens.
+
+      This is a robust defense. NOT exploitable.
+    severity: informational
+    confidence: 85
+    status: pending
+    solidity: |
+      // Safe: Solana vault PDA includes remote_token (EVM address), so different ERC20 = different vault
+      function property_BR_DD_10_fake_ccerc20_safe() public pure returns (bool) {
+          return true;
+      }
+
+summary:
+  total_hypotheses: 10
+  critical_findings: 0
+  high_severity:
+    - BR-DD-01 — Cross-deployment replay + scalar overwrite = fund extraction (High, 55% confidence)
+      Requires same validators on multiple deployments + registerRemoteToken re-invocation.
+      The scalar overwrite without deposit check is a real code bug. The cross-chain replay is
+      the delivery mechanism. Fix: add require(deposits == 0) to registerRemoteToken AND add
+      chain ID to message hash.
+  medium_severity:
+    - BR-DD-02 — Base/partner validator double-counting on EVM side (Medium, 75% confidence)
+      Code-level bug: no mutual exclusion between base and partner signer counting.
+      Fix: exclude base-counted signers from partner count or vice versa.
+    - BR-DD-08 — Same double-counting bug on Solana side (Medium, 75% confidence)
+      Mirror of DD-02 in register_output_root. Same fix needed.
+  low_severity:
+    - BR-DD-03 — gasLimit not in hash = griefing only (Low, 80% confidence)
+      By design for retryability. Not a fund-loss vector.
+    - BR-DD-05 — bytes32 address encoding = oracle implementation concern (Low, 85%)
+  informational:
+    - BR-DD-04 — Cross-direction signature safety (safe due to EIP-191 length difference)
+    - BR-DD-06 — CrossChainERC20 dual-path (safe, paths properly separated)
+    - BR-DD-07 — MMR commutative hashing (safe, nonce in hash prevents swap)
+    - BR-DD-09 — Fee-on-transfer solvency (safe, users absorb fees not bridge)
+    - BR-DD-10 — Permissionless CrossChainERC20 (safe, Solana vault PDA includes EVM address)
+
+  priority_for_pipeline:
+    1. BR-DD-01 — registerRemoteToken scalar overwrite is the most reportable finding.
+       The missing `require(deposits == 0)` is a concrete code bug. Cross-chain replay amplifies
+       but isn't required (Solana-side re-registration is sufficient trigger).
+    2. BR-DD-02 + BR-DD-08 — Validator double-counting on BOTH sides. Concrete code bug.
+       Impact depends on operational setup but the code should enforce mutual exclusion.
+    3. BR-DD-01's cross-chain replay component (no chain ID in hash) is a design issue.
+       Independently reportable as a separate finding.

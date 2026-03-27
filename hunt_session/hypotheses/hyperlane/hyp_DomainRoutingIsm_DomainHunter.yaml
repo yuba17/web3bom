@@ -1,0 +1,242 @@
+hunter: DomainHunter
+component: DomainRoutingIsm
+date: "2026-03-27"
+files_analyzed:
+  - solidity/contracts/isms/routing/DomainRoutingIsm.sol
+  - solidity/contracts/isms/routing/AbstractRoutingIsm.sol
+  - solidity/contracts/isms/routing/DefaultFallbackRoutingIsm.sol
+  - solidity/contracts/isms/routing/IncrementalDomainRoutingIsm.sol
+  - solidity/contracts/isms/routing/DomainRoutingIsmFactory.sol
+  - solidity/contracts/libs/Message.sol
+  - solidity/contracts/libs/TypeCasts.sol
+  - solidity/contracts/libs/EnumerableMapExtended.sol
+  - solidity/contracts/Mailbox.sol
+
+hypotheses:
+
+  - id: DRI-DOM-01
+    title: "DefaultFallbackRoutingIsm verifica domains desconocidos con defaultIsm potencialmente inadecuado"
+    description: |
+      DefaultFallbackRoutingIsm.module() retorna mailbox.defaultIsm() para cualquier origin domain
+      que no tenga un ISM específico registrado. Si el defaultIsm es un MultisigIsm configurado para
+      un subset de chains (ej: Ethereum validators), un mensaje desde un domain desconocido (ej: una
+      chain nueva o maliciosa) sería verificado por validators que NO tienen visibilidad de esa chain.
+
+      Sin embargo, esto es BY DESIGN: el owner elige usar DefaultFallbackRoutingIsm precisamente
+      para tener un fallback. El defaultIsm del Mailbox es configurado por el Mailbox owner (trusted).
+      El riesgo real depende de la política del defaultIsm — si es permisivo (ej: TrustedRelayerIsm),
+      cualquier domain desconocido pasa verificación trivialmente.
+
+      El problema fundamental: la decisión de routing se basa en message.origin() que es UNTRUSTED
+      data (es lo que se está verificando). Pero el child ISM es quien valida la autenticidad del
+      message, así que esta circularidad es inherente al diseño de routing ISMs.
+    confidence: 20
+    severity: medium
+    status: investigated_not_exploitable
+    attack_scenario: |
+      1. Attacker identifica un deployment donde DefaultFallbackRoutingIsm se usa como recipient ISM
+      2. El defaultIsm del Mailbox es un TrustedRelayerIsm (o similar ISM permisivo)
+      3. Attacker craft un mensaje con origin=999999 (domain sin ISM específico)
+      4. DefaultFallbackRoutingIsm.module(999999) → mailbox.defaultIsm() → TrustedRelayerIsm
+      5. Si el relayer es el msg.sender de Mailbox.process(), el mensaje pasa verificación
+      6. El recipient procesa un mensaje que dice venir de domain 999999, que no existe
+
+      MITIGACIÓN: El recipient.handle() recibe origin como parámetro y puede validar si acepta
+      ese domain. Además, el Mailbox.process() es permissionless — cualquiera puede llamarlo,
+      pero el ISM es quien gate-keepea. Si el defaultIsm requiere signatures válidas de validators
+      que solo firman mensajes reales, el ataque falla.
+
+      VEREDICTO: Depende enteramente de la configuración del defaultIsm. No es un bug en el código
+      sino un riesgo de misconfiguration. El owner debe asegurarse de que el defaultIsm sea
+      suficientemente estricto para domains desconocidos.
+    solidity: |
+      // DefaultFallbackRoutingIsm.sol:21-29
+      function module(uint32 origin) public view override returns (IInterchainSecurityModule) {
+          (bool contained, bytes32 _module) = _modules.tryGet(origin);
+          if (contained) {
+              return IInterchainSecurityModule(_module.bytes32ToAddress());
+          } else {
+              return mailbox.defaultIsm(); // <-- fallback para ANY unknown domain
+          }
+      }
+
+  - id: DRI-DOM-02
+    title: "Metadata passthrough — child ISM recibe metadata sin validación de correspondencia con origin"
+    description: |
+      AbstractRoutingIsm.verify() pasa _metadata as-is al child ISM:
+        route(_message).verify(_metadata, _message)
+
+      El routing selecciona child ISM basado en message.origin(). El metadata es construido
+      off-chain por el relayer. No hay validación on-chain de que el metadata corresponda al
+      origin domain del mensaje.
+
+      Analizado en profundidad: esto NO es explotable porque:
+      1. Cada child ISM valida su propio metadata independientemente. Un MultisigIsm verifica
+         firmas contra sus validators configurados. Un AggregationIsm verifica sub-ISMs.
+      2. El metadata incorrecto simplemente falla la verificación del child ISM.
+      3. No existe forma de "confundir" un child ISM con metadata de otro domain porque cada
+         ISM tiene su propia configuración de validators/thresholds.
+      4. El message entero (incluyendo origin) se pasa al child ISM, quien puede (y debe)
+         validar que el message es consistente con el metadata.
+    confidence: 10
+    severity: low
+    status: investigated_not_exploitable
+    attack_scenario: |
+      HIPÓTESIS: Attacker craft metadata válido para ISM-A (domain=1) pero envía message con
+      origin=2, esperando que DomainRoutingIsm route a ISM-B que acepte el metadata de ISM-A.
+
+      REFUTACIÓN: ISM-B tiene su propia configuración. Si ISM-B es un MultisigIsm, requiere
+      firmas de SUS validators sobre ESTE message. Las firmas de validators de ISM-A no son
+      válidas para ISM-B (diferentes validator sets). El message hash incluye todos los campos
+      (origin, sender, etc.), así que firmas sobre message-con-origin=1 no valen para
+      message-con-origin=2 porque el hash es diferente.
+
+      EXCEPCIÓN TEÓRICA: Si ISM-A e ISM-B comparten exactamente los mismos validators Y
+      thresholds, podrían aceptar el mismo metadata. Pero en ese caso, la verificación es
+      correcta de todos modos — el mismo set de validators atesta ambos domains.
+    solidity: |
+      // AbstractRoutingIsm.sol:38-43
+      function verify(
+          bytes calldata _metadata,
+          bytes calldata _message
+      ) public returns (bool) {
+          return route(_message).verify(_metadata, _message);
+          // _metadata pasa as-is, pero child ISM lo valida contra SU config
+      }
+
+  - id: DRI-DOM-03
+    title: "Owner puede reemplazar ISM de un domain activo, invalidando mensajes en tránsito"
+    description: |
+      DomainRoutingIsm.set() permite al owner cambiar el ISM de cualquier domain en cualquier
+      momento. Si hay mensajes en tránsito (despachados pero no procesados), el relayer habrá
+      construido metadata para el ISM anterior. Al llegar al destino, el nuevo ISM rechazará
+      el metadata.
+
+      Esto es un DoS sobre mensajes legítimos en tránsito, no un bypass de seguridad.
+      El owner es trusted, así que esto es by design (el owner puede actualizar ISMs).
+      Pero en un escenario de governance attack o compromised owner key, un atacante podría:
+      1. Cambiar el ISM de un domain crítico a un ISM permisivo
+      2. Enviar mensajes maliciosos que pasan el ISM permisivo
+      3. Restaurar el ISM original
+
+      IncrementalDomainRoutingIsm mitiga parcialmente: no permite remove() ni overwrite de
+      domains existentes. Solo append. Esto es una defensa contra este vector.
+    confidence: 25
+    severity: medium
+    status: investigated_design_risk
+    attack_scenario: |
+      1. Owner (o governance attacker) llama ism.set(domain=1, newPermissiveIsm)
+      2. Attacker envía mensaje malicioso con origin=1 y metadata trivial
+      3. DomainRoutingIsm routes to newPermissiveIsm que retorna true
+      4. Mailbox.process() acepta el mensaje, recipient lo ejecuta
+      5. Owner restaura ISM original: ism.set(domain=1, originalIsm)
+
+      MITIGACIÓN: IncrementalDomainRoutingIsm previene este ataque al prohibir overwrite.
+      También, el Mailbox tiene su propio owner que controla el defaultIsm separadamente.
+      Timelock en governance agrega delay para detección.
+
+      VEREDICTO: Riesgo de centralización, no un bug. Documentado como design decision.
+      IncrementalDomainRoutingIsm existe específicamente para mitigar esto.
+    solidity: |
+      // DomainRoutingIsm.sol:70-75 — owner puede cambiar ISM de cualquier domain
+      function set(uint32 _domain, IInterchainSecurityModule _module) external onlyOwner {
+          _set(_domain, address(_module));
+      }
+
+      // IncrementalDomainRoutingIsm.sol:22-31 — mitiga al prohibir overwrite
+      function _set(uint32 _domain, address _module) internal override {
+          require(!_modules.contains(_domain), "Domain already exists");
+          super._set(_domain, _module);
+      }
+
+  - id: DRI-DOM-04
+    title: "EnumerableMapExtended uint32→uint256 cast no tiene truncation risk pero uint32Keys tiene downcast"
+    description: |
+      El mapa _modules usa uint256 keys internamente. _set() recibe uint32 que se promueve
+      a uint256 sin pérdida. module() recibe uint32 y llama tryGet(origin) que también promueve.
+      No hay colisión posible entre uint32 values.
+
+      Sin embargo, uint32Keys() hace downcast: uint32(uint256keys[i]). Si alguien pudiera
+      insertar un key con valor > type(uint32).max (ej: via herencia o bypass), el downcast
+      truncaría silenciosamente. Pero _set() solo acepta uint32 _domain, así que valores
+      > uint32.max no pueden entrar por la interfaz pública.
+
+      La función domains() retorna uint256[], que es correcto. uint32Keys() es solo una
+      convenience function que asume todos los keys son uint32 — lo cual es un invariante
+      mantenido por _set().
+    confidence: 5
+    severity: informational
+    status: not_exploitable
+    attack_scenario: |
+      No hay attack path viable. Todos los entry points (_set via set() o initialize())
+      reciben uint32, que se promueve a uint256 sin pérdida. No existe forma de insertar
+      un key > uint32.max a través de la interfaz pública.
+
+      Riesgo teórico: un contrato heredero que llame _modules.set() directamente con un
+      uint256 > uint32.max. Pero esto requiere modificar el código, no es un ataque externo.
+    solidity: |
+      // EnumerableMapExtended.sol:29-37 — downcast seguro porque solo uint32 entra
+      function uint32Keys(UintToBytes32Map storage map) internal view returns (uint32[] memory _keys) {
+          uint256[] memory uint256keys = keys(map);
+          _keys = new uint32[](uint256keys.length);
+          for (uint256 i = 0; i < uint256keys.length; i++) {
+              _keys[i] = uint32(uint256keys[i]); // safe: only uint32 values inserted via _set
+          }
+      }
+
+  - id: DRI-DOM-05
+    title: "Factory deploy permite front-running de initialize en minimal proxy"
+    description: |
+      DomainRoutingIsmFactory.deploy() crea un minimal proxy y llama initialize() en la
+      misma transacción. La función initialize() tiene el modifier `initializer` de OZ,
+      que previene re-inicialización. Pero entre MinimalProxy.create() y la llamada a
+      initialize(), hay un window teórico donde otro actor podría front-run la inicialización.
+
+      ANÁLISIS: En la práctica, MinimalProxy.create() y initialize() ocurren en la MISMA
+      transacción (deploy() es una función external que hace ambas atomically). Un front-runner
+      tendría que insertar su tx ENTRE las dos operaciones internas, lo cual es imposible
+      dentro de una misma transacción.
+
+      PERO: si alguien usa la implementación directamente (no via factory), y llama
+      MinimalProxy.create() y initialize() en transacciones separadas, SÍ hay un window.
+      El factory lo hace bien, pero uso directo es vulnerable.
+    confidence: 15
+    severity: low
+    status: investigated_not_exploitable
+    attack_scenario: |
+      VIA FACTORY: No explotable — deploy() es atómico dentro de una tx.
+
+      VIA USO DIRECTO (sin factory):
+      1. Deployer crea minimal proxy de DomainRoutingIsm en tx1
+      2. Attacker front-runs tx2 (que llamaría initialize) con su propia initialize()
+      3. Attacker se hace owner del ISM proxy
+      4. Attacker configura ISMs permisivos para todos los domains
+      5. Si este ISM se usa como recipient ISM, mensajes maliciosos pasan verificación
+
+      VEREDICTO: El factory es seguro. El riesgo solo existe para deployments manuales
+      que no usen el factory. Esto es un patrón conocido en minimal proxies.
+    solidity: |
+      // DomainRoutingIsmFactory.sol:29-36 — atómico, seguro
+      function deploy(
+          address _owner, uint32[] calldata _domains,
+          IInterchainSecurityModule[] calldata _modules
+      ) external returns (DomainRoutingIsm) {
+          DomainRoutingIsm _ism = DomainRoutingIsm(MinimalProxy.create(implementation()));
+          _ism.initialize(_owner, _domains, _modules); // misma tx, no front-runnable
+          return _ism;
+      }
+
+summary: |
+  DomainRoutingIsm es un componente relativamente simple y bien diseñado. El routing basado en
+  message.origin() (data no confiable) es inherente al diseño de ISMs de routing — la circularidad
+  (el message es lo que se verifica, pero también determina quién verifica) se resuelve porque cada
+  child ISM valida independientemente usando su propia configuración de validators/thresholds.
+
+  No se encontraron vulnerabilidades explotables. Los riesgos identificados son:
+  1. DefaultFallbackRoutingIsm confía en que el defaultIsm del Mailbox sea adecuado para ALL domains (config risk)
+  2. Owner centralización — mitigado por IncrementalDomainRoutingIsm para append-only
+  3. Metadata passthrough es seguro porque cada child ISM valida independientemente
+  4. No hay domain collision ni TypeCasts overflow issues
+
+  El diseño más interesante es IncrementalDomainRoutingIsm que elimina el vector de owner-replaces-ISM,
+  mostrando que el equipo ya consideró este riesgo.

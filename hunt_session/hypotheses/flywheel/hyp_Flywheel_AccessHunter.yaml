@@ -1,0 +1,494 @@
+hunter: AccessHunter
+target: Flywheel Protocol (src/)
+date: 2026-03-27
+status: complete
+
+# ============================================================
+# ACCESS CONTROL MODEL SUMMARY
+# ============================================================
+#
+# Flywheel.sol: NO access control on external functions. Anyone can call
+#   createCampaign, send, allocate, deallocate, distribute, distributeFees,
+#   withdrawFunds, updateStatus, updateMetadata. ALL access control is
+#   delegated to CampaignHooks via onlyFlywheel modifier + internal _on* checks.
+#
+# Campaign.sol: sendTokens + updateContractURI restricted to FLYWHEEL (immutable, set in constructor).
+#   FLYWHEEL = msg.sender at deploy time = the Flywheel contract that deployed it via Clones.
+#   Since Campaign is a clone, FLYWHEEL is baked into the implementation's bytecode at
+#   deploy time. All clones share the same FLYWHEEL. This is SECURE.
+#
+# CampaignHooks.sol: All external on* functions have onlyFlywheel modifier.
+#   Internal _on* functions are where each hook implements its own access control.
+#
+# ROLE MAP PER HOOK:
+#   BridgeReferralFees: _onSend=ANYONE, _onWithdrawFunds=ANYONE, _onUpdateStatus=ANYONE,
+#                       _onDistributeFees=ANYONE (no sender checks), _onUpdateMetadata=METADATA_MANAGER only
+#   SimpleRewards: _onSend/_onAllocate/_onDeallocate/_onDistribute/_onUpdateStatus/_onUpdateMetadata=manager,
+#                  _onWithdrawFunds=owner, _onDistributeFees=default(reverts)
+#   CashbackRewards: inherits SimpleRewards, same model + payment validation
+#   AdConversion: _onSend=attributionProvider, _onWithdrawFunds=advertiser+FINALIZED,
+#                 _onUpdateStatus=attributionProvider|advertiser (with FSM rules),
+#                 _onDistributeFees=attributionProvider, _onUpdateMetadata=attributionProvider|advertiser
+# ============================================================
+
+hypotheses:
+
+  - id: ACC-01
+    title: "BridgeReferralFees: _onSend has no caller restriction - anyone can drain campaign funds"
+    description: |
+      BridgeReferralFees._onSend (line 69-108) does NOT check the `sender` parameter at all.
+      The function calculates `bridgedAmount` as the campaign's current token balance minus
+      totalAllocatedFees, then sends (bridgedAmount - feeAmount) to the `user` address decoded
+      from hookData. The `user` address is attacker-controlled via hookData.
+
+      HOWEVER: This is BY DESIGN. The comment on line 139-141 of _onWithdrawFunds explicitly states:
+      "If tokens are sent into the campaign outside of this scope on accident, anyone can take them
+      (no access control for `onSend` hook)". The intended usage is atomic: bridge sends tokens to
+      campaign, then immediately calls send() in the same tx. Any leftover tokens are fair game.
+
+      The real question is: can an attacker front-run a legitimate bridge operation? If a bridge
+      deposits tokens to the campaign in tx1 and calls send() in tx2, an attacker can sandwich.
+      But the intended pattern is atomic (same tx), so this is a design choice, not a bug.
+    severity: informational
+    confidence: 85
+    affected_functions:
+      - "BridgeReferralFees._onSend (src/hooks/BridgeReferralFees.sol:69-108)"
+      - "Flywheel.send (src/Flywheel.sol:299-323)"
+    attack_scenario: |
+      1. Bridge deposits 100 USDC to campaign address
+      2. In same block but before bridge's send() tx, attacker calls Flywheel.send(campaign, USDC, hookData)
+         where hookData encodes (attacker_address, "", 0) as (user, code, feeBps)
+      3. bridgedAmount = 100 USDC (balance - 0 allocated fees)
+      4. feeBps = 0 (or capped to MAX_FEE_BASIS_POINTS), feeAmount = 0
+      5. Attacker receives 100 USDC
+      6. Bridge's send() tx gets 0 USDC (balance is now 0)
+
+      MITIGATION: If bridge deposits + send are atomic (same tx), this is not exploitable.
+      The design explicitly accepts non-atomic deposits as user error.
+    solidity_invariant: |
+      // INV: BridgeReferralFees campaign balance should only decrease via legitimate send operations
+      // This is intentionally permissionless - not a real invariant violation
+      // The protocol accepts this risk by design (see comment line 139-141)
+
+  - id: ACC-02
+    title: "BridgeReferralFees: _onWithdrawFunds has no caller restriction - anyone can withdraw"
+    description: |
+      BridgeReferralFees._onWithdrawFunds (line 133-144) does NOT check the `sender` parameter.
+      It simply decodes a Flywheel.Payout from hookData and returns it. Anyone can call
+      Flywheel.withdrawFunds() for a BridgeReferralFees campaign and specify any recipient/amount.
+
+      The Flywheel.withdrawFunds (line 492-513) enforces solvency: the campaign must retain
+      enough balance for totalAllocatedFees + totalAllocatedPayouts (or just fees if FINALIZED).
+      So the attacker can only withdraw "excess" funds beyond what's allocated.
+
+      SAME DESIGN DECISION as ACC-01. The contract comments explicitly acknowledge this.
+      BridgeReferralFees is designed as a pass-through: funds arrive and leave atomically.
+      Any residual balance is considered recoverable by anyone.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "BridgeReferralFees._onWithdrawFunds (src/hooks/BridgeReferralFees.sol:133-144)"
+      - "Flywheel.withdrawFunds (src/Flywheel.sol:492-513)"
+    attack_scenario: |
+      1. Someone accidentally sends 10 ETH directly to a BridgeReferralFees campaign
+      2. Attacker calls Flywheel.withdrawFunds(campaign, NATIVE_TOKEN, encode(Payout(attacker, 10 ETH, "")))
+      3. Solvency check passes (10 ETH >= 0 allocated)
+      4. Attacker receives 10 ETH
+
+      This is documented and intentional behavior.
+    solidity_invariant: |
+      // INV: withdrawFunds should respect solvency (this IS enforced by Flywheel)
+      // assert(campaignBalance >= totalAllocatedPayouts + totalAllocatedFees)
+
+  - id: ACC-03
+    title: "BridgeReferralFees: _onUpdateStatus has no caller restriction - anyone can activate"
+    description: |
+      BridgeReferralFees._onUpdateStatus (line 147-157) does NOT check the `sender` parameter.
+      It only validates that newStatus == ACTIVE. Since campaigns start as INACTIVE, anyone can
+      transition a BridgeReferralFees campaign from INACTIVE to ACTIVE.
+
+      Once ACTIVE, it can never be changed to any other status (the hook rejects all non-ACTIVE
+      transitions). The Flywheel itself prevents FINALIZED->anything and FINALIZING->non-FINALIZED.
+      Combined with the hook rejecting non-ACTIVE, the campaign becomes permanently ACTIVE.
+
+      Impact: Anyone can activate a campaign that was just created. If the campaign creator intended
+      to fund the campaign before activating it, an attacker could activate it prematurely.
+      But for BridgeReferralFees, activation doesn't matter much since _onSend has no access control
+      anyway, and the campaign is designed to be a pass-through.
+    severity: low
+    confidence: 70
+    affected_functions:
+      - "BridgeReferralFees._onUpdateStatus (src/hooks/BridgeReferralFees.sol:147-157)"
+      - "Flywheel.updateStatus (src/Flywheel.sol:520-538)"
+    attack_scenario: |
+      1. Protocol deploys BridgeReferralFees campaign via createCampaign()
+      2. Before protocol can fund/configure it, attacker calls updateStatus(campaign, ACTIVE, "")
+      3. Campaign is now permanently ACTIVE (cannot be paused/finalized)
+
+      Low impact because BridgeReferralFees is designed as perpetual ACTIVE anyway.
+    solidity_invariant: |
+      // INV: Only authorized actors should transition campaign status
+      // function invariant_onlyAuthorizedStatusChange() {
+      //   // For BridgeReferralFees this is intentionally open
+      // }
+
+  - id: ACC-04
+    title: "BridgeReferralFees: _onDistributeFees has no caller restriction"
+    description: |
+      BridgeReferralFees._onDistributeFees (line 113-130) does NOT check the `sender` parameter.
+      Anyone can call Flywheel.distributeFees() and trigger fee distribution for any builder code.
+
+      However, the fee recipient is determined by _processBuilderCode(string(hookData)) which
+      resolves the payout address from the BuilderCodes registry. The caller cannot redirect fees
+      to an arbitrary address - they go to the registered payout address for that builder code.
+
+      The amount is also pulled from FLYWHEEL.allocatedFee(campaign, token, fallbackKey) which
+      is immutable storage. So the caller can trigger distribution but cannot control the amount
+      or recipient.
+
+      Impact: None. Anyone can trigger fee distribution, but it goes to the rightful recipient.
+      This is actually helpful (anyone can "poke" the system to distribute pending fees).
+    severity: informational
+    confidence: 95
+    affected_functions:
+      - "BridgeReferralFees._onDistributeFees (src/hooks/BridgeReferralFees.sol:113-130)"
+      - "Flywheel.distributeFees (src/Flywheel.sol:448-483)"
+    attack_scenario: |
+      No attack. Anyone can trigger fee distribution but cannot redirect or inflate fees.
+    solidity_invariant: |
+      // INV: distributeFees always sends to BuilderCodes.payoutAddress(code)
+      // Cannot be redirected by caller
+
+  - id: ACC-05
+    title: "SimpleRewards: owner/manager separation - owner can withdraw but cannot send/allocate"
+    description: |
+      SimpleRewards has two roles:
+      - owner: can only withdrawFunds (line 139)
+      - manager: can send, allocate, deallocate, distribute, updateStatus, updateMetadata
+
+      The owner CANNOT change the manager (no setManager function). The manager CANNOT withdraw
+      funds. Neither role can change the other.
+
+      HOWEVER: The manager controls updateStatus. The manager can transition the campaign to
+      FINALIZED. Once FINALIZED, Flywheel.withdrawFunds (line 509-512) changes solvency to
+      only require totalAllocatedFees (ignoring totalAllocatedPayouts). This means the owner
+      can withdraw allocated-but-undistributed payouts after the manager finalizes.
+
+      This is the intended design: manager finalizes when campaign is done, owner reclaims
+      remaining funds. But if the manager is malicious or compromised, they could finalize
+      a campaign prematurely, allowing the owner to withdraw funds that were allocated to users.
+
+      The manager could also be colluding with the owner: manager finalizes, owner withdraws
+      allocated funds that should have been distributed to users.
+
+      Evaluated further: The manager already has full control over send/distribute. A malicious
+      manager could just send all funds to themselves via send() with crafted hookData. So the
+      finalize+withdraw path doesn't grant additional power to the owner+manager combo.
+    severity: informational
+    confidence: 80
+    affected_functions:
+      - "SimpleRewards._onWithdrawFunds (src/hooks/SimpleRewards.sol:133-141)"
+      - "SimpleRewards._onUpdateStatus (src/hooks/SimpleRewards.sol:144-150)"
+      - "Flywheel.withdrawFunds (src/Flywheel.sol:508-512)"
+    attack_scenario: |
+      1. Manager calls Flywheel.updateStatus(campaign, FINALIZED, "")
+         (transitions through INACTIVE->ACTIVE->FINALIZING->FINALIZED or shortcuts allowed)
+      2. Owner calls Flywheel.withdrawFunds(campaign, token, encode(Payout(owner, allFunds, "")))
+      3. Solvency check only requires totalAllocatedFees, not totalAllocatedPayouts
+      4. Owner withdraws funds that were allocated to users
+
+      BUT: manager could already send funds to arbitrary addresses via send().
+      No additional privilege escalation.
+    solidity_invariant: |
+      // INV: After finalization, allocated payouts should still be honored
+      // This is a design choice - finalization explicitly releases allocated payouts
+
+  - id: ACC-06
+    title: "AdConversion: attributionProvider can drain campaign via inflated payouts"
+    description: |
+      AdConversion._onSend (line 398-511) restricts the caller to the attributionProvider.
+      The attributionProvider controls the Attribution[] array including payoutAmount per conversion.
+      There is NO on-chain validation that payoutAmount matches any real conversion value.
+
+      The attributionProvider can submit conversions with arbitrarily large payoutAmount values,
+      draining the campaign balance (minus their own fee).
+
+      This is the core trust model: the advertiser trusts the attributionProvider to submit
+      honest attribution data. The advertiser's protection is:
+      1. They choose the attributionProvider at campaign creation
+      2. They can refuse to fund the campaign
+      3. They control finalization (can finalize to stop payouts)
+      4. attributionProvider != advertiser enforced (line 347)
+
+      This is the intended trust model, not a vulnerability.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "AdConversion._onSend (src/hooks/AdConversion.sol:398-511)"
+    attack_scenario: |
+      Malicious attributionProvider submits Attribution with payoutAmount = entire campaign balance.
+      Funds sent to attacker-controlled payoutRecipient.
+
+      Mitigated by: advertiser chooses attributionProvider, campaign creation is permissionless
+      but advertiser controls funding.
+    solidity_invariant: |
+      // INV: Total payouts should not exceed campaign funding
+      // Enforced by Flywheel._assertCampaignSolvency
+
+  - id: ACC-07
+    title: "AdConversion: advertiser can skip attribution window by going INACTIVE->FINALIZED"
+    description: |
+      AdConversion._onUpdateStatus (line 551-591) allows the advertiser to go directly from
+      INACTIVE to FINALIZED (line 566). This bypasses the ACTIVE and FINALIZING states entirely.
+
+      The attribution window (line 582-584) is only set when entering FINALIZING state. If the
+      advertiser goes INACTIVE->FINALIZED, the attributionProvider never gets a chance to submit
+      conversions (campaign was never ACTIVE, so acceptingPayouts modifier blocks send()).
+
+      Scenario: Advertiser creates campaign, funds it, then immediately finalizes it
+      (INACTIVE->FINALIZED). They can then withdraw all funds via _onWithdrawFunds.
+      The attributionProvider never had a chance to process any conversions.
+
+      Impact analysis: Is this actually a problem? The advertiser funded the campaign themselves.
+      If they want to reclaim their own funds before any conversions happen, that seems fair.
+      The attributionProvider hasn't done any work yet. However, if there was an agreement
+      that the attributionProvider would handle X conversions, this is a breach of that
+      off-chain agreement, not a smart contract vulnerability.
+    severity: low
+    confidence: 75
+    affected_functions:
+      - "AdConversion._onUpdateStatus (src/hooks/AdConversion.sol:551-591)"
+      - "AdConversion._onWithdrawFunds (src/hooks/AdConversion.sol:534-548)"
+    attack_scenario: |
+      1. Advertiser creates campaign with attributionProvider, funds it with 100 ETH
+      2. Advertiser calls updateStatus(campaign, FINALIZED, "") (INACTIVE->FINALIZED is allowed)
+      3. Advertiser calls withdrawFunds() to reclaim all 100 ETH
+      4. AttributionProvider never had a window to submit conversions
+
+      Impact: attributionProvider loses expected fees, but no loss of user funds.
+    solidity_invariant: |
+      // INV: attributionProvider should have attribution window before finalization
+      // function invariant_attributionWindowRespected() {
+      //   if (status == FINALIZED && attributionDeadline == 0) {
+      //     // Campaign was finalized from INACTIVE without going through FINALIZING
+      //     // This means attribution window was bypassed
+      //   }
+      // }
+
+  - id: ACC-08
+    title: "Campaign.sendTokens: FLYWHEEL immutable is correct for clones"
+    description: |
+      Campaign.sol line 29: FLYWHEEL = msg.sender in constructor. Since Campaign is the
+      implementation contract deployed by Flywheel's constructor (line 260), FLYWHEEL is
+      correctly set to the Flywheel contract address.
+
+      For clones (line 285: Clones.cloneDeterministic), the clone shares the implementation's
+      bytecode including the immutable FLYWHEEL value. Clones do NOT re-run the constructor.
+      So all clones have FLYWHEEL = the Flywheel that deployed the implementation.
+
+      This is SECURE. There is no way to create a Campaign clone with a different FLYWHEEL.
+      The sendTokens function (line 44-51) correctly restricts to msg.sender == FLYWHEEL.
+
+      Verified: No path to call Campaign.sendTokens without going through Flywheel.
+    severity: none
+    confidence: 99
+    affected_functions:
+      - "Campaign.sendTokens (src/Campaign.sol:44-51)"
+      - "Campaign constructor (src/Campaign.sol:28-30)"
+      - "Flywheel constructor (src/Flywheel.sol:259-261)"
+    attack_scenario: "None. The FLYWHEEL immutable is correctly set and enforced."
+    solidity_invariant: |
+      // INV: Campaign.FLYWHEEL == address(flywheel) for all clones
+      // assert(Campaign(campaign).FLYWHEEL() == address(flywheel))
+
+  - id: ACC-09
+    title: "Flywheel.createCampaign: anyone can create campaigns with any hooks address"
+    description: |
+      Flywheel.createCampaign (line 274-289) has no access control. Anyone can create a campaign
+      with any hooks address. The only validation is hooks != address(0).
+
+      This means an attacker could create a campaign pointing to a malicious hooks contract that
+      returns crafted payouts. However, the campaign starts as INACTIVE and has no funds. The
+      attacker would need to fund it themselves, and the solvency check prevents spending more
+      than the balance.
+
+      Also, createCampaign is deterministic (uses salt from hooks+nonce+hookData). So each
+      unique combination creates a unique campaign. An attacker cannot "hijack" a legitimate
+      campaign creation.
+
+      The early return on line 283 (if campaign.code.length > 0) prevents re-initialization.
+      But it also means if a campaign already exists, createCampaign silently returns without
+      calling onCreateCampaign. This is documented behavior.
+
+      No vulnerability found.
+    severity: none
+    confidence: 95
+    affected_functions:
+      - "Flywheel.createCampaign (src/Flywheel.sol:274-289)"
+    attack_scenario: "None. Permissionless campaign creation is by design."
+    solidity_invariant: |
+      // INV: Each (hooks, nonce, hookData) triple maps to exactly one campaign
+      // INV: Campaign creation is idempotent
+
+  - id: ACC-10
+    title: "AdConversion: attributionProvider can set arbitrary fee recipient in _onDistributeFees"
+    description: |
+      AdConversion._onDistributeFees (line 514-530) restricts the sender to attributionProvider.
+      But the recipient is decoded from hookData (line 525): `address recipient = abi.decode(hookData, (address))`.
+
+      The attributionProvider can direct their accumulated fees to ANY address they choose.
+      This is expected behavior - it's their fee, they choose where to receive it.
+
+      The fee amount is pulled from FLYWHEEL.allocatedFee (line 524), which is immutable storage
+      set during _onSend. The attributionProvider cannot inflate the fee amount.
+
+      No vulnerability.
+    severity: none
+    confidence: 95
+    affected_functions:
+      - "AdConversion._onDistributeFees (src/hooks/AdConversion.sol:514-530)"
+    attack_scenario: "None. attributionProvider directing their own fees is expected."
+    solidity_invariant: |
+      // INV: Distributed fee amount <= allocatedFee[campaign][token][key]
+
+  - id: ACC-11
+    title: "BridgeReferralFees: bridgedAmount calculation can be manipulated via direct token transfer"
+    description: |
+      BridgeReferralFees._onSend (line 78-79) calculates bridgedAmount as:
+        campaign.balance (or IERC20.balanceOf(campaign)) - FLYWHEEL.totalAllocatedFees(campaign, token)
+
+      This uses the LIVE balance of the campaign. If an attacker sends tokens directly to the
+      campaign address before a legitimate send() call, the bridgedAmount increases. The attacker
+      could then call send() themselves (since _onSend has no access control) to claim the
+      inflated amount.
+
+      But this requires the attacker to SEND their own tokens to the campaign, then claim them
+      back. Net result: attacker gets back what they sent (minus any fees). No profit unless
+      they can front-run someone else's deposit.
+
+      Front-running scenario: Bridge deposits X tokens to campaign. Attacker sees this in mempool,
+      front-runs with send() call. Attacker gets X tokens. Bridge's subsequent send() gets 0.
+
+      This is the same as ACC-01 and is acknowledged by design.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "BridgeReferralFees._onSend (src/hooks/BridgeReferralFees.sol:78-79)"
+    attack_scenario: "Same as ACC-01. Front-running non-atomic deposits."
+    solidity_invariant: |
+      // INV: bridgedAmount should correspond to the actual bridged amount, not total balance
+      // This is a known design trade-off
+
+  - id: ACC-12
+    title: "AdConversion: conversion config validation skipped when configId == 0"
+    description: |
+      AdConversion._onSend line 439: `if (configId != 0)` — when configId is 0, ALL config
+      validation is skipped. The attributionProvider can submit conversions with configId=0
+      to bypass:
+      - Config existence check (line 440)
+      - Config active check (implicit - only checked inside the if block)
+      - Onchain/offchain type matching (lines 445-446)
+
+      This means the attributionProvider can submit conversions that don't match any registered
+      config. The comment on line 49 says "0 = no config/unregistered".
+
+      Impact: The attributionProvider already has full control over conversion amounts (ACC-06).
+      Bypassing config validation doesn't grant additional power — it just means they can
+      submit unregistered conversion types. The advertiser trusts the attributionProvider anyway.
+
+      However, if the advertiser set up specific configs expecting them to be enforced, the
+      attributionProvider can bypass them by using configId=0. This weakens the config system.
+    severity: low
+    confidence: 65
+    affected_functions:
+      - "AdConversion._onSend (src/hooks/AdConversion.sol:435-447)"
+    attack_scenario: |
+      1. Advertiser creates campaign with specific configs (e.g., only onchain events allowed)
+      2. attributionProvider submits conversions with configId=0 to bypass config checks
+      3. Offchain conversions processed even though config only allows onchain
+
+      Impact: config enforcement bypass, but attributionProvider is already trusted.
+    solidity_invariant: |
+      // INV: All processed conversions should match a valid, active config
+      // function invariant_configIdNonZero(Attribution[] memory attrs) {
+      //   for (uint i; i < attrs.length; i++) {
+      //     assert(attrs[i].conversion.configId > 0);
+      //     assert(conversionConfigs[campaign][attrs[i].conversion.configId].isActive);
+      //   }
+      // }
+
+  - id: ACC-13
+    title: "AdConversion: allowlist bypass when publisherRefCode is empty string"
+    description: |
+      AdConversion._onSend line 428-432: The allowlist check has a condition:
+        `if (bytes(publisherRefCode).length != 0 && !allowedPublishers[campaign][publisherRefCode])`
+
+      If publisherRefCode is an empty string, the allowlist check is SKIPPED entirely.
+      The attributionProvider can submit conversions with empty publisherRefCode to bypass
+      the allowlist.
+
+      Similarly on line 423: the registry validation check also has `bytes(publisherRefCode).length != 0`
+      guard, so empty publisherRefCode bypasses both checks.
+
+      When publisherRefCode is empty AND payoutRecipient is address(0), line 455-456 would call
+      BUILDER_CODES.payoutAddress("") which may revert or return address(0).
+
+      But if payoutRecipient is set (non-zero), the empty publisherRefCode just means "no publisher"
+      and the conversion is processed directly to the specified payoutRecipient.
+
+      Impact: The attributionProvider can process conversions without a valid publisher, bypassing
+      the allowlist. This is likely intended (not all conversions need a publisher).
+    severity: low
+    confidence: 60
+    affected_functions:
+      - "AdConversion._onSend (src/hooks/AdConversion.sol:422-432)"
+    attack_scenario: |
+      1. Advertiser creates campaign with allowlist of specific publishers
+      2. attributionProvider submits conversions with publisherRefCode="" and payoutRecipient=attackerAddr
+      3. Allowlist check skipped, conversion processed to attacker
+
+      Impact: Allowlist bypass, but attributionProvider is trusted actor.
+    solidity_invariant: |
+      // INV: If campaign hasAllowlist, all non-empty publisherRefCodes must be in allowlist
+      // Note: empty publisherRefCode intentionally bypasses
+
+# ============================================================
+# SUMMARY
+# ============================================================
+summary: |
+  Analyzed 8 source files across the Flywheel Protocol for access control vulnerabilities.
+
+  FINDINGS BY SEVERITY:
+  - Critical/High: 0
+  - Medium: 0
+  - Low: 3 (ACC-03, ACC-07, ACC-12)
+  - Informational: 5 (ACC-01, ACC-02, ACC-04, ACC-05, ACC-06, ACC-11, ACC-13)
+  - No Issue: 3 (ACC-08, ACC-09, ACC-10)
+
+  KEY CONCLUSIONS:
+
+  1. BridgeReferralFees intentionally has NO access control on _onSend, _onWithdrawFunds,
+     _onUpdateStatus, and _onDistributeFees. This is DOCUMENTED AND BY DESIGN (see comments
+     on lines 139-141). The contract is a pass-through for atomic bridge operations. Any
+     non-atomic deposits are explicitly accepted as user risk.
+
+  2. Campaign.sendTokens is SECURE. The FLYWHEEL immutable is correctly set via the
+     implementation contract's constructor, and all clones share this value. No path exists
+     to call sendTokens without going through Flywheel.
+
+  3. SimpleRewards owner/manager separation is functional but the manager has significant
+     power (can finalize campaign, enabling owner to withdraw allocated payouts). This is
+     the intended trust model.
+
+  4. AdConversion has proper dual-role separation (advertiser/attributionProvider). The
+     attributionProvider cannot withdraw funds. The advertiser cannot submit conversions.
+     The INACTIVE->FINALIZED shortcut (ACC-07) is the most notable edge case but has
+     limited impact since the advertiser is reclaiming their own funds.
+
+  5. The protocol's architecture correctly delegates ALL access control to hooks via the
+     CampaignHooks.onlyFlywheel pattern. The Flywheel itself is intentionally permissionless,
+     relying on hooks to enforce policy. This is a clean design.
+
+  HONEST ASSESSMENT: No exploitable access control vulnerabilities found. The BridgeReferralFees
+  permissionless design is the most "dangerous" aspect but it's explicitly documented and
+  the attack requires front-running non-atomic deposits, which is a known trade-off.

@@ -1,0 +1,349 @@
+hunter: OracleHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+protocol: coinbase-smart-wallet
+file: src/CoinbaseSmartWallet.sol + MagicSpend/src/MagicSpend.sol
+domain: trust
+generated_at: '2026-03-27T00:00:00Z'
+
+# SURFACE ASSESSMENT: CoinbaseSmartWallet no usa price oracles (Chainlink, TWAP, etc.).
+# Las unicas "fuentes de datos externas" son: block.timestamp (expiry), block.chainid
+# (replay protection), y address(this).balance (rate-limit en MagicSpend).
+# Superficie de oracle attacks clasica es MINIMA. Hipotesis son de baja/media confianza.
+hypotheses:
+- id: CSW-O-01
+  title: "MagicSpend: balance como oracle de rate-limit — inflable via selfdestruct para bypass de maxWithdrawDenominator"
+  severity: low
+  confidence: 35
+  tier: 2
+  type: property
+  description: "MagicSpend maxWithdraw limit usa address(this).balance que es manipulable via selfdestruct/coinbase rewards"
+  attack_scenario: >
+    Un atacante puede inflar address(this).balance del contrato MagicSpend enviando ETH
+    via selfdestruct (o coinbase reward en PoS). Esto incrementa el maxAllowed
+    (address(this).balance / maxWithdrawDenominator) permitiendo que un WithdrawRequest
+    con amount mayor al esperado pase la validación en _validateRequest(). Si el owner
+    firmó un request por un amount grande pensando que el limit lo bloquearía, ahora ese
+    request pasa. Sin embargo, el impacto real es limitado: el owner firma amounts
+    específicos, el limit es solo rate-limiting, no authorization. El atacante necesitaría
+    un request firmado por más de lo que el balance original permitiría.
+  impact: "Bypass del rate-limit de retiro si el owner firmó requests grandes pre-emptivamente. Impacto práctico bajo porque el owner controla qué firma."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Antes de cada validateRequest, verificar que el maxAllowed no fue inflado
+    uint256 balanceBefore = address(magicSpend).balance;
+    // Atacante envía ETH via selfdestruct
+    uint256 balanceAfter = address(magicSpend).balance;
+    uint256 maxAllowedBefore = balanceBefore / magicSpend.maxWithdrawDenominator();
+    uint256 maxAllowedAfter = balanceAfter / magicSpend.maxWithdrawDenominator();
+    // Si alguien puede inflar balance, maxAllowed sube
+    t(maxAllowedAfter >= maxAllowedBefore, "CSW-O-01: maxAllowed can only increase with balance");
+    // El invariante real es: ¿puede un request pasar que no debería?
+    // Esto depende de si el owner firmó un amount > maxAllowedBefore
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 35
+  notes: >
+    El rate limit de maxWithdrawDenominator es una protección operacional, no de seguridad.
+    El owner firma cada WithdrawRequest individualmente con amount específico. El limit
+    solo previene que un request válido firmado drene todo el contrato en una tx.
+    Inflar balance via selfdestruct solo RELAJA el limit, no crea requests nuevos.
+    Impacto real requiere que el owner haya pre-firmado requests grandes.
+  poc_sketch: ''
+  call_stack: 'MagicSpend._validateRequest() L347 -> address(this).balance / maxWithdrawDenominator'
+  status: investigate
+
+- id: CSW-O-02
+  title: "MagicSpend: off-by-one en expiry check — block.timestamp == expiry sigue siendo valido"
+  severity: low
+  confidence: 30
+  tier: 2
+  type: property
+  description: "MagicSpend WithdrawRequest.expiry usa block.timestamp — sin validación de staleness mínima ni máxima"
+  attack_scenario: >
+    El owner firma un WithdrawRequest con expiry muy lejano (ej. type(uint48).max).
+    Si la clave privada del owner se compromete en el futuro, todos los requests
+    no-usados con expiry lejano pueden ejecutarse. No hay mecanismo de revocación
+    masiva (solo nonces individuales). Alternativamente, si el owner firma con expiry
+    corto, un atacante puede intentar manipulación de timestamp de bloque (±15s en PoS)
+    para ejecutar requests justo después de su "vencimiento real".
+  impact: "Si hay requests con expiry largo y la clave se compromete, todos los requests pendientes son ejecutables. Impacto depende del volumen de requests pre-firmados."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que block.timestamp se respeta estrictamente
+    // En withdraw(): block.timestamp > expiry → revert
+    // En validatePaymasterUserOp: expiry se pasa al EntryPoint como validUntil
+    // Invariante: un request expirado nunca debe ejecutarse
+    uint48 expiry = withdrawRequest.expiry;
+    if (block.timestamp > expiry) {
+        // withdraw() revierte aquí — OK
+        // Pero validatePaymasterUserOp NO chequea expiry directamente,
+        // lo delega al EntryPoint via validationData
+        t(true, "CSW-O-02: expired requests should revert");
+    }
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 30
+  notes: >
+    El diseño es correcto: withdraw() chequea expiry directamente, validatePaymasterUserOp
+    delega al EntryPoint via validationData encoding. No hay bug aquí per se, pero la
+    falta de revocación masiva es un riesgo operacional si la clave se compromete.
+    Block timestamp manipulation en PoS es ±12s (1 slot), insuficiente para explotar.
+  poc_sketch: ''
+  call_stack: 'MagicSpend.withdraw() L191 -> block.timestamp > withdrawRequest.expiry'
+  status: investigate
+
+- id: CSW-O-03
+  title: "CoinbaseSmartWallet: getUserOpHashWithoutChainId — hash identico cross-chain, estado divergente puede causar efectos inesperados"
+  severity: high
+  confidence: 25
+  tier: 2
+  type: property
+  description: "getUserOpHashWithoutChainId excluye chainId — el hash es idéntico en todas las chains donde el EntryPoint tiene la misma dirección"
+  attack_scenario: >
+    El hash de UserOp para executeWithoutChainIdValidation solo incluye
+    UserOperationLib.hash(userOp) + entryPoint(). Si un usuario firma una operación
+    de addOwnerAddress en chain A, esa misma firma es válida en chain B (by design).
+    Pero si el estado de owners difiere entre chains (ej. un owner fue removido en
+    chain B pero no en A), la operación cross-chain puede tener efectos inesperados.
+    Específicamente: removeOwnerAtIndex(index) cross-chain puede remover un owner
+    DIFERENTE si los índices divergieron (H-01 conocido de C4).
+  impact: "Remoción del owner equivocado en una chain donde los índices divergieron. Puede llevar a lockout permanente del wallet."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Invariante: el hash sin chainId es determinístico y no depende de estado de chain
+    bytes32 hashA = wallet.getUserOpHashWithoutChainId(userOp);
+    // En otra chain con mismo EntryPoint:
+    // bytes32 hashB = wallet.getUserOpHashWithoutChainId(userOp);
+    // hashA == hashB siempre — by design
+    // El riesgo es que el EFECTO de la operación difiera entre chains
+    t(true, "CSW-O-03: cross-chain hash consistency");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 25
+  notes: >
+    Este es un finding CONOCIDO (H-01 de la auditoría C4 de Coinbase). La omisión de
+    chainId es by design para owner management cross-chain. El riesgo de índices
+    divergentes ya fue reportado. Marcado como false positive para nuestro hunt ya que
+    es conocido, pero se documenta por completitud.
+  poc_sketch: ''
+  call_stack: 'CoinbaseSmartWallet.getUserOpHashWithoutChainId() L263-264 -> keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))'
+  status: false_positive
+
+- id: CSW-O-04
+  title: "MagicSpend: expiry encoding en validationData — ventana entre validacion y ejecucion en ERC-4337"
+  severity: low
+  confidence: 20
+  tier: 2
+  type: property
+  description: "MagicSpend validatePaymasterUserOp no chequea expiry — delega al EntryPoint, pero la ventana entre validación y ejecución puede ser explotable"
+  attack_scenario: >
+    En validatePaymasterUserOp, el expiry se codifica en validationData como validUntil
+    (L140: uint256(withdrawRequest.expiry) << 160). El EntryPoint evalúa esto al
+    validar el UserOp. Pero entre la validación y la ejecución real del UserOp puede
+    pasar tiempo (especialmente en bundles grandes o bajo congestión). Si el expiry
+    está justo en el borde, el UserOp podría validar OK pero ejecutar después del
+    expiry real. Sin embargo, el EntryPoint de ERC-4337 v0.6 aplica validUntil
+    durante la fase de validación, no de ejecución — por lo que esto es seguro.
+  impact: "Ninguno — el EntryPoint respeta validUntil correctamente durante validación."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que validationData codifica correctamente el expiry
+    uint256 validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160);
+    // Extraer validUntil: bits [160..207]
+    uint48 validUntil = uint48(validationData >> 160);
+    eq(uint256(validUntil), uint256(withdrawRequest.expiry), "CSW-O-04: expiry encoding correct");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 20
+  notes: >
+    Investigado y descartado. El encoding de validationData sigue la spec de ERC-4337
+    correctamente. El EntryPoint valida validUntil antes de ejecutar. No hay ventana
+    de explotación entre validación y ejecución en el modelo de ERC-4337.
+  poc_sketch: ''
+  call_stack: 'MagicSpend.validatePaymasterUserOp() L140'
+  status: false_positive
+
+- id: CSW-O-05
+  title: "MagicSpend: block.chainid en getHash — invalida requests post-fork, no es explotable"
+  severity: informational
+  confidence: 15
+  tier: 2
+  type: property
+  description: "MagicSpend getHash incluye block.chainid — cambio de chainid post-fork invalida requests firmados"
+  attack_scenario: >
+    getHash() incluye block.chainid en el hash firmado (L305). Después de un hard fork
+    que cambie el chainId (como ETH/ETC), todos los WithdrawRequests firmados para el
+    chainId original serían inválidos en la chain nueva. Esto es comportamiento correcto
+    (protección contra replay cross-chain). Sin embargo, en la chain del fork donde el
+    chainId NO cambia, los requests siguen siendo válidos — potencialmente en ambas
+    chains si una NO cambia su chainId. Esto es un edge case extremo de fork.
+  impact: "En caso de fork, requests podrían ser válidos en la chain que mantiene el chainId original. Protección correcta por diseño."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que getHash incluye chainId
+    bytes32 hash = magicSpend.getHash(account, withdrawRequest);
+    // El hash cambia si chainId cambia — correcto
+    // Invariante: mismo request, diferente chain → diferente hash
+    t(true, "CSW-O-05: chainId included in withdraw hash");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 15
+  notes: >
+    By design. La inclusión de block.chainid es la protección correcta contra replay
+    cross-chain. El edge case de fork es conocido y aceptado en todo el ecosistema.
+    No es un finding reportable.
+  poc_sketch: ''
+  call_stack: 'MagicSpend.getHash() L300-311 -> block.chainid'
+  status: false_positive
+
+- id: CSW-O-06
+  title: "CoinbaseSmartWallet: validateUserOp devuelve validUntil=0 (indefinido) — UserOps validos indefinidamente"
+  severity: low
+  confidence: 20
+  tier: 2
+  type: property
+  description: "CoinbaseSmartWallet no tiene validUntil/validAfter — UserOps tienen validez indefinida una vez firmados"
+  attack_scenario: >
+    validateUserOp retorna validationData = 0 en caso de firma válida, lo que implica
+    validUntil = 0 (indefinido) y validAfter = 0. Esto significa que un UserOp firmado
+    pero no enviado puede ser ejecutado en cualquier momento futuro mientras el nonce no
+    haya sido consumido. Si un usuario firma un UserOp y luego cambia de opinión, no hay
+    forma de invalidarlo excepto consumir ese nonce con otra operación. Un atacante con
+    acceso a un UserOp firmado (ej. mempool, relay) puede ejecutarlo en cualquier momento.
+  impact: "UserOps firmados son válidos indefinidamente. Sin mecanismo de expiración nativo excepto consumir el nonce."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // validateUserOp retorna 0 (success) sin validUntil
+    uint256 validationData = wallet.validateUserOp(userOp, userOpHash, 0);
+    // validationData == 0 implica validUntil == 0 == indefinido
+    eq(validationData, 0, "CSW-O-06: no time bounds on valid signature");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 20
+  notes: >
+    Esto es by design en ERC-4337 — el nonce del EntryPoint previene replay.
+    La "expiración" se logra via el nonce: si quieres invalidar un UserOp, envías
+    otra operación que consume ese nonce. El modelo de seguridad depende del nonce,
+    no de time-bounds. Comportamiento estándar, no reportable.
+  poc_sketch: ''
+  call_stack: 'CoinbaseSmartWallet.validateUserOp() L191-196'
+  status: false_positive
+
+- id: CSW-O-07
+  title: "MagicSpend: balance oracle compartido en bundle — multiples UserOps ven mismo maxAllowed, postOp puede fallar por balance insuficiente"
+  severity: medium
+  confidence: 40
+  tier: 1
+  type: property
+  description: "MagicSpend _validateRequest chequea balance ANTES de marcar nonce — si múltiples requests en mismo bundle, el balance decrece pero maxAllowed se calcula con balance actual"
+  attack_scenario: >
+    En un bundle ERC-4337 con múltiples UserOps que usan MagicSpend como paymaster,
+    cada validatePaymasterUserOp se ejecuta secuencialmente. El primer request ve
+    address(this).balance = X, maxAllowed = X/denom. Después de postOp del primero,
+    el balance decrece. Pero validatePaymasterUserOp del segundo request ya se ejecutó
+    ANTES de postOp del primero (validación de todos los UserOps ocurre antes de ejecución
+    en ERC-4337). Así que todos los requests en un bundle ven el MISMO balance para el
+    cálculo de maxAllowed. Esto permite que N requests de X/denom cada uno pasen validación,
+    pero en ejecución (postOp) podrían fallar por insufficient balance.
+    El comentario en L153-156 reconoce esto: "The flow here can only revert if there are
+    > maxWithdrawDenominator withdraws in the same transaction".
+  impact: "Si > maxWithdrawDenominator UserOps usan MagicSpend en un bundle, postOp reverts y el paymaster pierde reputación en el EntryPoint. No hay pérdida de fondos directa, pero sí DoS."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Simular N requests en un bundle donde N > maxWithdrawDenominator
+    uint256 denom = magicSpend.maxWithdrawDenominator();
+    uint256 balance = address(magicSpend).balance;
+    uint256 maxPerRequest = balance / denom;
+    // Si N > denom requests pasan validación con amount = maxPerRequest,
+    // total withdraw = N * maxPerRequest > balance → postOp reverts
+    t(denom > 0, "CSW-O-07: denominator must be positive");
+    // Invariante: sum of all validated withdraws in a bundle <= balance
+  ghost_vars:
+  - uint256 internal ghost_totalValidatedWithdraws;
+  validated: false
+  priority: medium
+  confidence: 40
+  notes: >
+    Documentado por el propio equipo en el código (L153-156). El impacto es reputación
+    del paymaster, no pérdida de fondos de usuarios. El bundler/searcher controla qué
+    UserOps incluye en un bundle. Un bundler competente no incluiría > denom requests.
+    Riesgo: un bundler malicioso podría degradar la reputación del paymaster.
+  poc_sketch: ''
+  call_stack: 'MagicSpend._validateRequest() L347 -> MagicSpend.postOp() L148-172'
+  status: investigate
+
+false_positives:
+- hunter: OracleHunter
+  id: CSW-FP-01
+  reason: >
+    CoinbaseSmartWallet NO usa oráculos de precio (Chainlink, Uniswap TWAP, etc.).
+    No hay latestRoundData(), no hay price feeds, no hay conversiones ETH/USD.
+    El contrato es un smart account wallet, no un protocolo DeFi con dependencias de precio.
+    Las únicas "fuentes de datos externas" son: (1) block.timestamp para expiry en MagicSpend,
+    (2) block.chainid para replay protection en getHash, (3) address(this).balance para
+    rate limiting en MagicSpend. Ninguna de estas es un oráculo en el sentido tradicional.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      Smart account wallets (ERC-4337) no usan oráculos de precio directamente.
+      OracleHunter tiene superficie mínima aquí — enfocarse en external data
+      dependencies (balance manipulation, timestamp, chainId) en vez de price feeds.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: CSW-FP-02
+  reason: >
+    La manipulación de address(this).balance via selfdestruct para inflar maxAllowed
+    en MagicSpend (CSW-O-01) tiene impacto práctico nulo. El owner firma cada
+    WithdrawRequest con un amount específico. El maxWithdrawDenominator es solo un
+    rate-limit de seguridad operacional. Inflar el balance solo RELAJA el limit,
+    no permite crear requests nuevos. Para explotar esto, necesitas: (a) un request
+    firmado por más de lo que el balance original permitiría, Y (b) enviar ETH al
+    contrato para subir el limit. El atacante pierde el ETH enviado y solo logra
+    que un request ya-firmado pase el rate limit.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: trust.md
+    content: >
+      address(this).balance como rate-limit en paymasters no es un oráculo explotable.
+      El owner firma amounts específicos — inflar balance solo relaja el rate limit,
+      no crea authorization nueva. selfdestruct balance inflation aquí es informational.
+    briefing_update_applied: false
+
+- hunter: OracleHunter
+  id: CSW-FP-03
+  reason: >
+    Cross-chain replay sin chainId (CSW-O-03) es un finding CONOCIDO de la auditoría
+    C4 de Coinbase (H-01). Los índices de owners pueden divergir entre chains, causando
+    que removeOwnerAtIndex elimine al owner equivocado. Ya reportado y documentado.
+    No es un finding nuevo para nuestro hunt.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: ''
+    content: ''
+    briefing_update_applied: false

@@ -1,0 +1,319 @@
+hunter: MathHunter
+component: MagicSpend
+date: "2026-03-27"
+status: complete
+
+hypotheses:
+
+- id: MS-M-01
+  hunter: MathHunter
+  component: MagicSpend
+  title: "Division by zero DoS when maxWithdrawDenominator == 0"
+  severity: "Low"
+  confidence: 75
+  description: |
+    In _validateRequest (L347), `address(this).balance / maxWithdrawDenominator` will revert
+    with a division-by-zero panic if maxWithdrawDenominator is set to 0. The owner can call
+    setMaxWithdrawDenominator(0) at any time. Once set, ALL validatePaymasterUserOp and
+    withdraw() calls for native ETH revert, effectively bricking the paymaster.
+
+    However, this requires owner action (onlyOwner), so the trust model assumes the owner
+    is benign. Additionally, _setMaxWithdrawDenominator has no zero-check, which is a
+    missing input validation issue. The impact is self-inflicted DoS — owner can fix by
+    calling setMaxWithdrawDenominator again with a non-zero value.
+
+    Severity is Low because it requires owner misconfiguration and is self-recoverable.
+    On a bounty program that explicitly trusts the owner, this is likely QA/informational.
+  solidity: |
+    // L347 in _validateRequest:
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    // If maxWithdrawDenominator == 0 => PANIC: division by zero
+
+    // L329-333 in _setMaxWithdrawDenominator:
+    function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+        maxWithdrawDenominator = newDenominator; // No zero check!
+        emit MaxWithdrawDenominatorSet(newDenominator);
+    }
+  attack_scenario: |
+    1. Owner calls setMaxWithdrawDenominator(0) (accidentally or maliciously)
+    2. Any user tries to use MagicSpend as paymaster or calls withdraw() with ETH
+    3. _validateRequest hits L347: address(this).balance / 0 => revert (Panic 0x12)
+    4. All paymaster operations for native ETH are bricked until owner sets non-zero value
+    5. ERC-20 withdrawals via withdraw() are also affected since _validateRequest is called
+       (but the check on L348 only triggers for asset == address(0), so ERC-20 skips the div)
+    NOTE: ERC-20 path actually bypasses L348 condition, so only ETH is affected.
+  impact: |
+    Self-inflicted DoS on paymaster. All ETH withdraw operations revert. Owner can recover
+    by setting a non-zero denominator. No fund loss. Likely informational/QA given owner
+    trust model.
+  status: rejected_owner_trust
+
+- id: MS-M-02
+  hunter: MathHunter
+  component: MagicSpend
+  title: "Accumulation of _withdrawable via multiple UserOps in single bundle"
+  severity: "Medium"
+  confidence: 30
+  description: |
+    In validatePaymasterUserOp (L143), `_withdrawable[userOp.sender] += withdrawAmount - maxCost`
+    uses += accumulation. If a bundler includes multiple UserOps from the same sender, each
+    referencing MagicSpend as paymaster with different valid WithdrawRequests, the _withdrawable
+    balance accumulates across all of them.
+
+    The key question: can a user extract more ETH than the owner authorized?
+
+    Analysis: Each WithdrawRequest requires a unique nonce (L343-344) and a valid owner
+    signature (L139). The owner explicitly signs each (account, amount, nonce) tuple. So
+    if the owner signs 3 requests for 1 ETH each, the user can legitimately accumulate
+    3 ETH in _withdrawable. This is by design.
+
+    However, there's a subtle issue: the maxAllowed check on L347-349 uses
+    `address(this).balance / maxWithdrawDenominator` which decreases as each UserOp's
+    postOp sends ETH out. But validatePaymasterUserOp runs for ALL UserOps in validation
+    phase BEFORE any execution phase. So during validation, balance hasn't decreased yet,
+    and multiple requests can each pass the maxAllowed check. Then in execution, all postOps
+    send ETH, potentially draining more than intended per-transaction.
+
+    BUT: the maxWithdrawDenominator is a rate-limiter, not a security invariant. The owner
+    signed each request. The comment on L153-154 acknowledges this: "can only revert if
+    there are > maxWithdrawDenominator withdraws in the same transaction."
+
+    This is a known/documented limitation, not a bug.
+  solidity: |
+    // L143: accumulation in validatePaymasterUserOp
+    _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+
+    // L347-349: maxAllowed check uses current balance
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+        revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+    }
+
+    // L152-154 comment acknowledges this:
+    // "The flow here can only revert if there are > maxWithdrawDenominator
+    //  withdraws in the same transaction, which should be highly unlikely."
+  attack_scenario: |
+    1. Owner signs 10 WithdrawRequests of 1 ETH each for user Alice (different nonces)
+    2. Contract has 10 ETH, maxWithdrawDenominator = 10 (maxAllowed = 1 ETH per request)
+    3. Bundler includes all 10 UserOps in one bundle
+    4. During validation phase: balance is still 10 ETH, each request passes maxAllowed check
+    5. During execution phase: each postOp sends ~1 ETH, total ~10 ETH drained
+    6. Rate limiter bypassed — but owner signed all 10, so no unauthorized extraction
+  impact: |
+    The maxWithdrawDenominator rate limiter can be bypassed via bundle stuffing, but since
+    each request requires owner signature, there's no unauthorized fund extraction. The
+    developers explicitly document this as a known limitation (L152-154). Not a vulnerability.
+  status: rejected_known_limitation
+
+- id: MS-M-03
+  hunter: MathHunter
+  component: MagicSpend
+  title: "Zero-value _withdrawable accumulation with withdrawAmount == maxCost"
+  severity: "Informational"
+  confidence: 85
+  description: |
+    When withdrawAmount == maxCost exactly, L143 adds 0 to _withdrawable:
+    `_withdrawable[userOp.sender] += 0`. Then in postOp (L165):
+    `withdrawable = 0 + (maxGasCost - actualGasCost)`.
+
+    The user receives only the gas refund (maxGasCost - actualGasCost).
+
+    Analysis: This is completely correct behavior. The user requested exactly enough to
+    cover gas, so the excess is just the gas savings. No side effects, no exploit vector.
+
+    The nonce IS consumed (L352), which is the only "side effect" — a nonce is burned for
+    a zero-surplus withdraw. But this is intentional: the request was used to pay for gas.
+  solidity: |
+    // withdrawAmount == maxCost:
+    _withdrawable[userOp.sender] += 0; // L143: no-op addition
+
+    // postOp:
+    uint256 withdrawable = 0 + (maxGasCost - actualGasCost); // only gas refund
+  attack_scenario: |
+    1. User submits UserOp with withdrawAmount == maxCost (e.g., both = 0.01 ETH)
+    2. _withdrawable gets += 0
+    3. postOp sends gas refund: maxGasCost - actualGasCost (small amount)
+    4. No exploit — user gets their gas savings as intended
+  impact: |
+    No impact. Correct behavior. The nonce is consumed, but that's expected since the
+    request was used for gas sponsorship.
+  status: rejected_not_vuln
+
+- id: MS-M-04
+  hunter: MathHunter
+  component: MagicSpend
+  title: "maxWithdrawDenominator == 1 disables rate limiting entirely"
+  severity: "Informational"
+  confidence: 90
+  description: |
+    If owner sets maxWithdrawDenominator = 1, then maxAllowed = address(this).balance / 1
+    = full balance. A single WithdrawRequest can drain the entire contract balance in one
+    operation. Combined with the fact that the owner must sign the request, this means the
+    owner is authorizing a full drain.
+
+    If maxWithdrawDenominator is set to a very large number, maxAllowed rounds to 0 for
+    small balances, blocking ALL withdrawals (even legitimate small ones). For example,
+    balance = 1 ETH, denominator = 1e18 => maxAllowed = 0 wei, all requests > 0 revert.
+
+    These are configuration edge cases, not vulnerabilities. The owner controls the
+    denominator and must also sign each withdraw request.
+  solidity: |
+    // maxWithdrawDenominator = 1:
+    uint256 maxAllowed = address(this).balance / 1; // maxAllowed == full balance
+
+    // maxWithdrawDenominator = 1e18, balance = 1 ETH:
+    uint256 maxAllowed = 1e18 / 1e18; // maxAllowed = 1 wei
+    // Any request > 1 wei reverts with WithdrawTooLarge
+  attack_scenario: |
+    1. Owner sets maxWithdrawDenominator = 1
+    2. User with signed request for full balance can withdraw everything in one tx
+    3. No rate limiting protection against bundled operations
+    OR:
+    1. Owner sets maxWithdrawDenominator = type(uint256).max
+    2. maxAllowed = 0 for any reasonable balance
+    3. All ETH withdrawals blocked (DoS) until owner fixes denominator
+  impact: |
+    Configuration edge cases under owner control. No unauthorized fund extraction.
+    Informational only.
+  status: rejected_owner_trust
+
+- id: MS-M-05
+  hunter: MathHunter
+  component: MagicSpend
+  title: "postOp gas refund calculation assumes EntryPoint invariant (actualGasCost <= maxGasCost)"
+  severity: "Medium"
+  confidence: 20
+  description: |
+    Line 165: `uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost)`
+    This subtraction would underflow (revert in 0.8.23) if actualGasCost > maxGasCost.
+
+    The ERC-4337 EntryPoint v0.6 guarantees that actualGasCost <= maxGasCost because
+    actualGasCost is computed from actual gas used, which cannot exceed the gas limits
+    set in the UserOperation (which determine maxCost in validatePaymasterUserOp).
+
+    If this invariant were ever broken (EntryPoint bug, upgrade, or different EntryPoint
+    implementation), postOp would revert, locking user funds in _withdrawable permanently
+    (since _withdrawable is only cleared in postOp and withdrawGasExcess).
+
+    However, the EntryPoint address is hardcoded (L326) to v0.6, and this invariant is
+    fundamental to ERC-4337. The probability of this breaking is near zero.
+
+    WAIT — there IS a recovery path: withdrawGasExcess() (L178-185) allows the user to
+    withdraw _withdrawable directly. So even if postOp reverts, funds are NOT permanently
+    locked. The user can call withdrawGasExcess() in a separate transaction.
+
+    Confidence: 20% — this relies on an EntryPoint bug that doesn't exist.
+  solidity: |
+    // L165: assumes maxGasCost >= actualGasCost (EntryPoint invariant)
+    uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+
+    // If violated: underflow => revert => postOp fails
+    // But _withdrawable[account] still has the pre-gas surplus
+    // User can recover via:
+    // L178-185: withdrawGasExcess() — reads _withdrawable and sends to msg.sender
+  attack_scenario: |
+    1. Hypothetical: EntryPoint v0.6 has a bug where actualGasCost > maxGasCost
+    2. postOp reverts due to underflow on L165
+    3. EntryPoint catches postOp revert, calls postOp again with PostOpMode.postOpReverted
+    4. L157-159: postOp reverts again with UnexpectedPostOpRevertedMode
+    5. _withdrawable[account] still holds the pre-gas surplus from validation
+    6. User calls withdrawGasExcess() to recover the pre-gas surplus
+    7. Gas refund portion is lost, but surplus is recoverable
+  impact: |
+    Theoretical only. Depends on EntryPoint invariant violation. Even if it occurred,
+    pre-gas surplus is recoverable via withdrawGasExcess(). Gas refund portion would be
+    lost. Practically zero risk.
+  status: rejected_external_invariant
+
+- id: MS-M-06
+  hunter: MathHunter
+  component: MagicSpend
+  title: "Rounding direction in maxAllowed favors protocol (truncation rounds down)"
+  severity: "Informational"
+  confidence: 95
+  description: |
+    Line 347: `address(this).balance / maxWithdrawDenominator` uses Solidity integer
+    division which truncates (rounds toward zero). This means the actual maximum allowed
+    is slightly less than the "fair" value for non-divisible amounts.
+
+    Example: balance = 10 ETH, denominator = 3 => maxAllowed = 3.33... => truncated to 3 ETH.
+    User is limited to 3 ETH instead of 3.33 ETH.
+
+    This rounding direction FAVORS the protocol (conservative), which is the correct
+    direction for a rate limiter. If it rounded up, users could extract slightly more
+    than intended.
+
+    No vulnerability here — rounding in the right direction.
+  solidity: |
+    // L347: integer division truncates (rounds down) — favors protocol
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    // balance=10e18, denom=3 => maxAllowed = 3333333333333333333 (not 3333333333333333334)
+  attack_scenario: |
+    No attack. Rounding favors the protocol (conservative direction).
+    User gets slightly less than theoretical maximum, not more.
+  impact: |
+    No impact. Correct rounding direction for a rate limiter.
+  status: rejected_not_vuln
+
+- id: MS-M-07
+  hunter: MathHunter
+  component: MagicSpend
+  title: "No accounting for contract ETH obligations — _withdrawable not tracked against balance"
+  severity: "Medium"
+  confidence: 40
+  description: |
+    The contract does not maintain a global accounting of total outstanding _withdrawable
+    obligations. Consider this sequence:
+
+    1. Contract has 10 ETH
+    2. User A validates UserOp: withdrawAmount=8, maxCost=1 => _withdrawable[A] += 7
+    3. User B validates UserOp: withdrawAmount=8, maxCost=1 => _withdrawable[B] += 7
+    4. Total obligations: 14 ETH in _withdrawable, but contract only has 10 ETH
+
+    In step 3, the maxAllowed check passes because balance is still 10 ETH (no ETH has
+    been sent yet during validation phase). Both pass with maxAllowed = 10/denom.
+
+    When postOp executes for A: sends 7 + gas_refund ~= 7.5 ETH. Balance = 2.5 ETH.
+    When postOp executes for B: tries to send 7 + gas_refund ~= 7.5 ETH. Balance = 2.5 ETH.
+    => forceSafeTransferETH will attempt to send 7.5 ETH but contract only has 2.5 ETH.
+
+    BUT: SafeTransferLib.forceSafeTransferETH uses a special mechanism. Let me check...
+    Actually, safeTransferETH (used in _withdraw) reverts on insufficient balance.
+    forceSafeTransferETH (used in postOp L170) has fallback behavior but still needs
+    sufficient ETH.
+
+    The EntryPoint handles postOp reverts by calling postOp again with postOpReverted mode,
+    which this contract reverts on (L157-159). This causes the entire UserOp to revert.
+
+    So: the second UserOp in the bundle would fail. The bundler might exclude it.
+    No actual fund loss — just operational disruption. And this requires the owner to have
+    signed both requests knowing the contract doesn't have enough balance.
+
+    The maxWithdrawDenominator exists precisely to mitigate this — if denom >= 2, each
+    request can take at most half the balance.
+
+    Confidence: 40% — the issue is real in theory but the rate limiter and owner signatures
+    make it practically unexploitable.
+  solidity: |
+    // No global accounting of total _withdrawable obligations
+    // validatePaymasterUserOp only checks per-request maxAllowed:
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator; // L347
+
+    // But _withdrawable is per-user accumulation:
+    _withdrawable[userOp.sender] += withdrawAmount - maxCost; // L143
+
+    // No check: sum(_withdrawable[all_users]) <= address(this).balance
+  attack_scenario: |
+    1. Contract has 10 ETH, maxWithdrawDenominator = 2 (maxAllowed = 5 ETH)
+    2. Owner signs requests: Alice 5 ETH, Bob 5 ETH (both valid under maxAllowed)
+    3. Both UserOps in same bundle, validation phase: both pass (balance still 10 ETH)
+    4. Execution phase: Alice's postOp sends ~5 ETH. Bob's postOp tries to send ~5 ETH.
+    5. If Alice's gas refund pushes her total above 5 ETH, Bob's postOp may fail
+    6. Bundler handles failure, Bob's UserOp excluded from bundle
+    7. Bob can retry in next block — no fund loss, just delayed execution
+  impact: |
+    Operational disruption: some UserOps in a bundle may fail if total obligations exceed
+    balance. No permanent fund loss — failed UserOps can be retried. The rate limiter
+    (maxWithdrawDenominator) exists to mitigate this. Known and documented limitation
+    (L152-156 comments).
+  status: rejected_known_limitation

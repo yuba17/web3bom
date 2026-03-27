@@ -1,0 +1,321 @@
+# WildcardHunter — wrapped-tokens-os (cbETH, Coinbase Immunefi $5M critical)
+# Component: StakedTokenV1 + MintForwarder + ExchangeRateUpdater + RateLimit
+# Date: 2026-03-27
+
+hunter: WildcardHunter
+component: WrappedTokensOS
+platform: immunefi
+bounty_tier: "$5M critical"
+
+hypotheses:
+
+  #############################################################################
+  # HYP-W-01: Multiple MintForwarders bypass aggregate rate limit
+  #############################################################################
+  - id: HYP-W-01
+    title: "Multiple MintForwarders para el mismo token permiten mint ilimitado en agregado"
+    severity: high
+    confidence: 35
+    creative_angle: >
+      Nada en MintForwarder ni en StakedTokenV1/FiatTokenV2_1 impide que el owner
+      del token configure MULTIPLES MintForwarders como minters del mismo token.
+      Cada MintForwarder tiene rate limits INDEPENDIENTES. Si el owner deploya N
+      MintForwarders, el rate limit efectivo es N * maxAllowance por intervalo.
+      Esto no es un bug en el smart contract per se, sino un design gap: el rate
+      limit existe para limitar damage de un caller comprometido, pero si el owner
+      (multisig Coinbase) deploya multiples forwarders, la proteccion se diluye.
+    target_function: "MintForwarder.mint() + tokenContract.configureMinter()"
+    target_file: "contracts/wrapped-tokens/MintForwarder.sol"
+    target_line: 85-103
+    attack_path:
+      - "1. Owner deploya MintForwarder_A y MintForwarder_B, ambos apuntando al mismo StakedTokenV1 proxy"
+      - "2. En el token, owner llama configureMinter() para ambos forwarders"
+      - "3. Cada forwarder tiene su propio rate limit de, digamos, 1000 cbETH/dia"
+      - "4. Un caller configurado en AMBOS forwarders puede mint 2000 cbETH/dia"
+      - "5. Con N forwarders: N * 1000 cbETH/dia, sin limite superior en N"
+    impact: >
+      Si un caller esta configurado en multiples forwarders, puede superar el rate
+      limit intencionado. Sin embargo, requiere que el owner (Coinbase multisig) haya
+      configurado este escenario, lo que es un privileged admin action.
+    why_others_miss: >
+      Los auditores miran cada contrato aislado. El rate limit de MintForwarder
+      funciona perfectamente en aislamiento. Solo al considerar el deployment
+      pattern (multiples instancias) emerge el bypass.
+    verdict: "Probablemente informational/design — requiere owner misconfiguration"
+    solidity: |
+      // Invariant: total mint across ALL forwarders <= expected single rate limit
+      // Cannot be checked on-chain without a registry of all forwarders
+
+  #############################################################################
+  # HYP-W-02: configureCaller reset destroza allowance mid-flight
+  #############################################################################
+  - id: HYP-W-02
+    title: "configureCaller sobrescribe allowance y allowancesLastSet, causando race condition con mint en vuelo"
+    severity: medium
+    confidence: 45
+    creative_angle: >
+      Cuando owner llama configureCaller() para un caller que YA existe,
+      RateLimit.sol L118 hace: maxAllowances[caller] = allowances[caller] = amount.
+      Esto RESETEA el allowance a `amount` y allowancesLastSet a block.timestamp.
+      Si el caller tiene un mint tx pendiente en el mempool que depende del
+      allowance anterior, dos escenarios:
+      (a) Si el nuevo amount es MENOR, el mint tx puede revert por insuficiente allowance.
+      (b) Si el nuevo amount es MAYOR, el caller recibe un "free" allowance boost
+          sin esperar el intervalo — efectivamente un rate limit bypass instantaneo.
+    target_function: "RateLimit.configureCaller()"
+    target_file: "contracts/wrapped-tokens/RateLimit.sol"
+    target_line: 109-122
+    attack_path:
+      - "1. Caller tiene allowance = 100 (de 1000 max), ha consumido 900 en este intervalo"
+      - "2. Owner llama configureCaller(caller, 2000, interval) para 'upgradearlo'"
+      - "3. allowances[caller] se resetea a 2000 INMEDIATAMENTE"
+      - "4. Caller puede mint 2000 mas RIGHT NOW, sin esperar replenish"
+      - "5. Total minted en este intervalo: 900 + 2000 = 2900, excediendo ambos limites"
+    impact: >
+      Rate limit bypass temporal. En un intervalo, un caller puede mint mas tokens
+      de lo intencionado. Requiere owner action (configureCaller) que coincida con
+      caller activity, pero el owner NO tiene forma de hacer un "safe reconfigure"
+      que preserve el consumo del intervalo actual.
+    why_others_miss: >
+      Se ve como una admin function simple. La interaccion temporal entre
+      reconfiguracion y consumo parcial del rate limit no es obvia.
+    verdict: "Low/Medium — requiere owner action, pero el owner no puede evitarlo"
+    solidity: |
+      // Before configureCaller: consumed = maxAllowances[caller] - allowances[caller]
+      // After configureCaller: consumed should be >= previous consumed
+      // VIOLATED: consumed resets to 0
+
+  #############################################################################
+  # HYP-W-03: ExchangeRateUpdater rate limit aplica al DELTA, no al rate absoluto
+  #############################################################################
+  - id: HYP-W-03
+    title: "Rate limit en ExchangeRateUpdater limita el cambio por update, no el cambio acumulado — zigzag attack"
+    severity: medium
+    confidence: 55
+    creative_angle: >
+      ExchangeRateUpdater.updateExchangeRate() L107-119 calcula exchangeRateChange
+      como abs(newRate - currentRate) y requiere que sea <= allowances[caller].
+      Pero el allowance se replenishes linealmente. Un atacante puede hacer MULTIPLES
+      updates pequenos en la misma direccion, cada uno dentro del allowance, y el efecto
+      acumulado excede lo que un single update podria lograr. Peor: puede hacer
+      zigzag (up-down-up) para consumir allowance en ambas direcciones sin mover
+      el rate neto, pero creando volatilidad artificial para front-running/sandwich.
+    target_function: "ExchangeRateUpdater.updateExchangeRate()"
+    target_file: "contracts/wrapped-tokens/staking/ExchangeRateUpdater.sol"
+    target_line: 86-126
+    attack_path:
+      - "1. Caller tiene maxAllowance = 1e16 (1% de 1e18 exchange rate)"
+      - "2. Caller espera replenish completo: allowance = 1e16"
+      - "3. Caller sube rate a currentRate + 1e16, consume todo el allowance"
+      - "4. Caller espera un intervalo completo, replenish a 1e16 de nuevo"
+      - "5. Caller sube otra vez: ahora rate se ha movido 2e16 total"
+      - "6. Repite N veces: rate se mueve N * 1e16 sin limite superior"
+      - "ZIGZAG variante: up 1e16, down 1e16, up 1e16... rate neto = +1e16 pero 3e16 de allowance consumido, creando price oscillation"
+    impact: >
+      El rate limit protege contra un cambio INSTANTANEO grande, pero NO protege
+      contra cambios acumulados grandes. Un caller comprometido puede gradualmente
+      mover el exchange rate a un valor arbitrario, cada update dentro del rate limit.
+      Esto es by-design para rate limiting, pero el impacto es que un caller comprometido
+      puede, con paciencia, manipular el exchange rate de cbETH a cualquier valor.
+      El zigzag variante puede crear MEV opportunities via price oscillation sin
+      necesitar control prolongado.
+    why_others_miss: >
+      Cada update individual respeta el rate limit perfectamente. Solo al pensar en
+      secuencias de updates emerge el bypass acumulativo. El zigzag es especialmente
+      sutil porque la rate cambia neto es 0 pero el caller fuerza volatilidad.
+    verdict: "Medium — design tradeoff real, zigzag es el angulo mas interesante"
+    solidity: |
+      // Invariant: abs(exchangeRate_now - exchangeRate_at_deploy) <= maxAllowance * N_intervals_elapsed
+      // This HOLDS but N_intervals can be very large
+      // Zigzag invariant: exchangeRate should be monotonically non-decreasing (for staking)
+      // VIOLATED by zigzag
+
+  #############################################################################
+  # HYP-W-04: Oracle bypass — owner cambia oracle, ExchangeRateUpdater pierde acceso
+  #############################################################################
+  - id: HYP-W-04
+    title: "StakedTokenV1.updateOracle() puede revocar ExchangeRateUpdater sin alternativa rate-limited"
+    severity: low
+    confidence: 60
+    creative_angle: >
+      Si ExchangeRateUpdater ES el oracle del StakedTokenV1, su rate limit protege
+      el exchange rate. Pero si owner del StakedTokenV1 llama updateOracle() con
+      un EOA, ese EOA puede llamar updateExchangeRate() directamente en StakedTokenV1
+      SIN ningun rate limit. El rate limit solo existe en ExchangeRateUpdater, no
+      en StakedTokenV1.updateExchangeRate(). El check es solo onlyOracle (L65-71).
+      Esto significa que la proteccion del rate limit es OPCIONAL y depende de
+      la configuracion del oracle address.
+    target_function: "StakedTokenV1.updateOracle() + updateExchangeRate()"
+    target_file: "contracts/wrapped-tokens/staking/StakedTokenV1.sol"
+    target_line: 77-107
+    attack_path:
+      - "1. Coinbase opera con ExchangeRateUpdater como oracle (rate limited)"
+      - "2. Multisig compromised/social-engineered llama updateOracle(attacker_EOA)"
+      - "3. attacker_EOA llama updateExchangeRate(1) directamente en StakedTokenV1"
+      - "4. Exchange rate cae de ~1.05e18 a 1, sin ningun rate limit"
+      - "5. Todos los holders de cbETH ven su valor collapsar instantaneamente"
+    impact: >
+      Exchange rate puede ser manipulado sin limite si oracle es un EOA.
+      Pero requiere owner (Coinbase multisig) action. Es design by choice, no un bug.
+    why_others_miss: >
+      Los auditores asumen que oracle = ExchangeRateUpdater siempre. El contrato
+      no enforcea esta assumption.
+    verdict: "Informational — privileged admin can shoot themselves"
+    solidity: |
+      // Check: StakedTokenV1.oracle() should always be ExchangeRateUpdater
+      // NOT enforced on-chain
+
+  #############################################################################
+  # HYP-W-05: renounceOwnership() en MintForwarder/ExchangeRateUpdater = brick permanente
+  #############################################################################
+  - id: HYP-W-05
+    title: "Ownable.renounceOwnership() herencia no override permite brick de MintForwarder/ExchangeRateUpdater"
+    severity: low
+    confidence: 50
+    creative_angle: >
+      RateLimit hereda Ownable de OZ 4.2.0 que tiene renounceOwnership() public.
+      Ni RateLimit, ni MintForwarder, ni ExchangeRateUpdater override/disable esta
+      funcion. Si owner llama renounceOwnership(), owner = address(0) y NADIE puede:
+      configureCaller, removeCaller, o re-initialize. El contrato sigue funcionando
+      con los callers actuales, pero no puede ser administrado. Si un caller se
+      compromete, no hay forma de removerlo.
+    target_function: "Ownable.renounceOwnership() (inherited)"
+    target_file: "contracts/wrapped-tokens/RateLimit.sol (inherits Ownable)"
+    target_line: "OZ Ownable.sol ~L61"
+    attack_path:
+      - "1. Owner (Coinbase multisig) accidentalmente llama renounceOwnership()"
+      - "2. owner = address(0), todas las funciones onlyOwner son inaccesibles"
+      - "3. Callers existentes siguen mintando/actualizando rate con sus configs"
+      - "4. Si un caller se compromete, nadie puede llamar removeCaller()"
+      - "5. Caller comprometido puede mint/update hasta su rate limit... forever"
+    impact: >
+      Irrecoverabilidad permanente. No se pueden agregar, remover, o reconfigurar callers.
+      Combinado con caller compromise, el rate limit es el unico freno y no puede
+      ser reducido.
+    why_others_miss: >
+      renounceOwnership es una funcion estandar de OZ. La mayoria asume que nunca
+      se llama por accidente. Pero la falta de override es un design gap.
+    verdict: "Low — accidental admin action, pero consecuencias irreversibles"
+    solidity: |
+      // RateLimit should override renounceOwnership to revert
+      // function renounceOwnership() public override { revert("disabled"); }
+
+  #############################################################################
+  # HYP-W-06: Division by zero en _getReplenishAmount si intervals[caller] = 0
+  #############################################################################
+  - id: HYP-W-06
+    title: "Division by zero en _getReplenishAmount si caller fue removido pero callers[caller] no fue reset"
+    severity: low
+    confidence: 20
+    creative_angle: >
+      _getReplenishAmount() L195-196 divide por intervals[caller]. Si intervals[caller]
+      es 0, esto reverts con panic. removeCaller() L129-134 deletes intervals[caller]
+      (sets to 0) AND callers[caller] (sets to false). Entonces onlyCallers modifier
+      previene que un caller removido llame mint(). PERO: hay un edge case con
+      currentAllowance() L155-158 que es public y llama _replenishAllowance() sin
+      onlyCallers check. Si alguien llama currentAllowance(removedCaller), llega a
+      _getReplenishAmount con intervals = 0, y... allowances[caller] == maxAllowances[caller]
+      (ambos 0), asi que el early return en L165 lo salva. NOT exploitable.
+    target_function: "RateLimit._getReplenishAmount()"
+    target_file: "contracts/wrapped-tokens/RateLimit.sol"
+    target_line: 187-204
+    attack_path:
+      - "1. Caller es removido: intervals, allowances, maxAllowances todos = 0"
+      - "2. Alguien llama currentAllowance(removedCaller)"
+      - "3. _replenishAllowance: allowances[caller] (0) == maxAllowances[caller] (0) -> return early"
+      - "4. Division by zero NEVER reached porque el early return lo protege"
+      - "NOT EXPLOITABLE — early return en L165 protege"
+    impact: "Ninguno. El early return previene el panic."
+    why_others_miss: "N/A"
+    verdict: "DESCARTADA — analisis completo muestra que no es explotable"
+    solidity: |
+      // allowances[caller] == maxAllowances[caller] when both are 0 -> early return
+
+  #############################################################################
+  # HYP-W-07: Exchange rate = 1 permite manipulacion instantanea
+  #############################################################################
+  - id: HYP-W-07
+    title: "StakedTokenV1 no tiene minimo para exchange rate — se puede setear a 1 wei"
+    severity: medium
+    confidence: 40
+    creative_angle: >
+      StakedTokenV1.updateExchangeRate() L98-100 solo requiere newExchangeRate > 0.
+      No hay minimo razonable. Si el oracle (comprometido) setea rate = 1, y el rate
+      se usa off-chain para conversiones cbETH <-> ETH, los holders pierden todo
+      su valor. El ExchangeRateUpdater tiene rate limit que limita el delta por update,
+      pero como vimos en HYP-W-03, con multiples updates se puede llegar a 1
+      eventualmente. Sin embargo, si oracle es un EOA (HYP-W-04), se puede hacer
+      en un solo tx.
+    target_function: "StakedTokenV1.updateExchangeRate()"
+    target_file: "contracts/wrapped-tokens/staking/StakedTokenV1.sol"
+    target_line: 97-107
+    attack_path:
+      - "1. Oracle (EOA sin rate limit, o ExchangeRateUpdater caller comprometido con tiempo)"
+      - "2. Setea exchangeRate = 1 (o minimo posible per rate limit)"
+      - "3. cbETH exchange rate colapsa"
+      - "4. Atacante compra cbETH barato en DEXes que usan este rate"
+      - "5. Oracle se restaura, atacante vende cbETH a rate real"
+    impact: "Depende de que use el exchange rate. Si es solo informational on-chain, bajo. Si DEXes/lending lo usan como oracle, critico."
+    why_others_miss: "Asumen que el exchange rate tiene bounds razonables."
+    verdict: "Medium si el rate se usa como oracle en DeFi, Info si es solo informational"
+    solidity: |
+      // require(newExchangeRate >= MIN_EXCHANGE_RATE) is MISSING
+      // require(newExchangeRate <= MAX_EXCHANGE_RATE) is MISSING
+
+  #############################################################################
+  # HYP-W-08: FiatTokenV2_1 rescueERC20 interaction con StakedTokenV1
+  #############################################################################
+  - id: HYP-W-08
+    title: "FiatTokenV2_1.rescueERC20() heredada permite al owner rescatar tokens del propio contrato"
+    severity: low
+    confidence: 30
+    creative_angle: >
+      FiatTokenV2_1 (codigo USDC) tiene rescueERC20(IERC20 tokenContract, address to,
+      uint256 amount) que permite al owner sacar cualquier ERC20 atrapado en el contrato.
+      StakedTokenV1 hereda esto. Si accidentalmente se envian cbETH AL contrato cbETH
+      (en vez de transferir normalmente), el owner puede rescatarlos. Esto es feature,
+      no bug. Pero: si rescueERC20 se llama con el propio token como argumento, intenta
+      transferir cbETH que el contrato tiene en su balance. Esto solo afecta tokens
+      enviados directamente (no via mint). Bajo impacto.
+    target_function: "FiatTokenV2_1.rescueERC20() (inherited by StakedTokenV1)"
+    target_file: "centre-tokens/contracts/v2/FiatTokenV2_1.sol"
+    target_line: "~L50-60 (external dependency)"
+    attack_path:
+      - "1. Usuario envia accidentalmente 100 cbETH al contrato cbETH"
+      - "2. Owner llama rescueERC20(cbETH_address, owner, 100)"
+      - "3. 100 cbETH transferidos a owner"
+      - "4. No hay impacto en exchange rate ni supply"
+    impact: "Ninguno material. Feature, no bug."
+    why_others_miss: "N/A"
+    verdict: "DESCARTADA — feature by design en FiatTokenV2_1"
+    solidity: |
+      // rescueERC20 does not interact with exchange rate storage
+
+# =============================================================================
+# RESUMEN DE PRIORIDAD
+# =============================================================================
+#
+# TIER 1 (investigar con PoC):
+#   - HYP-W-03 (zigzag rate oscillation) — Medium, 55% confidence
+#     Angulo mas interesante. El rate limit protege updates individuales pero
+#     no previene acumulacion ni zigzag. Si cbETH exchange rate es usado por
+#     DEXes/lending como oracle, zigzag = MEV extraction.
+#
+#   - HYP-W-02 (configureCaller race condition) — Medium, 45% confidence
+#     Rate limit bypass real durante reconfiguracion. Requiere owner action
+#     pero el owner no tiene alternativa segura.
+#
+# TIER 2 (reportar si los demas hunters convergen):
+#   - HYP-W-07 (no min/max exchange rate) — Medium, 40% confidence
+#     Depende de como se usa el exchange rate externamente.
+#
+#   - HYP-W-01 (multiple forwarders) — High severity IF exploitable, 35% confidence
+#     Design gap, no smart contract bug.
+#
+# TIER 3 (informational):
+#   - HYP-W-04 (oracle sin rate limit) — Low, 60% confidence (high confidence it exists, low severity)
+#   - HYP-W-05 (renounceOwnership brick) — Low, 50% confidence
+#
+# DESCARTADAS:
+#   - HYP-W-06 (division by zero) — NOT exploitable
+#   - HYP-W-08 (rescueERC20) — Feature, not bug

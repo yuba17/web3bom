@@ -1,0 +1,840 @@
+protocol: coinbase-smart-wallet
+component: CoinbaseSmartWallet
+file: src/CoinbaseSmartWallet.sol + MagicSpend/src/MagicSpend.sol + src/MultiOwnable.sol + src/ERC1271.sol + src/CoinbaseSmartWalletFactory.sol
+domain: trust
+hunter: DeepDiveHunter
+generated_at: '2026-03-27T00:00:00Z'
+
+# ===========================================================================
+# CONVERGENCE ANALYSIS
+# ===========================================================================
+# The 9 hunters converged on these areas (ordered by # of hunters mentioning):
+#
+# 1. Cross-chain replay of owner management ops (9/9 hunters)
+#    - Known H-01 from C4. Extensively analyzed. NO NEW ANGLE found.
+#    - removeLastOwner cross-chain brick is a VARIANT but likely known.
+#
+# 2. upgradeToAndCall in canSkipChainIdValidation + code.length check (6/9)
+#    - TOCTOU impossible post-Dencun. Solady UUPS has its own check.
+#    - Cross-chain code mismatch is real but requires CREATE-deployed impls.
+#    - ALL 6 hunters concluded LOW LIKELIHOOD.
+#
+# 3. MagicSpend _withdrawable accumulation + multi-op bundles (5/9)
+#    - TrustBoundaryHunter CSW-12 identified the rate limit bypass via
+#      multiple validates before any postOp. This is the MOST PROMISING
+#      convergence — but the code DOCUMENTS this as known (L153-156).
+#
+# 4. ERC-1271 vs validateUserOp signature domain separation (5/9)
+#    - Confirmed SAFE by all 5. replaySafeHash provides clean separation.
+#
+# 5. requireUV=false for WebAuthn (4/9)
+#    - Known design decision. C4 L-04. Not exploitable as a standalone bug.
+#
+# 6. maxWithdrawDenominator = 0 causes division by zero DoS (3/9)
+#    - Admin-only. ownerWithdraw still works. Low/Informational.
+#
+# GAPS IDENTIFIED:
+# - NO hunter deeply analyzed EIP-7702 + fresh storage (only WildcardHunter
+#   CSW-W-08 touched it). This is the STRONGEST novel angle.
+# - NO hunter analyzed what happens when CoinbaseSmartWallet IS the owner
+#   of MagicSpend (nested trust boundary).
+# - NO hunter analyzed the interaction between executeBatch and MagicSpend
+#   withdrawGasExcess in a SINGLE UserOp with reentrancy implications.
+# - NO hunter analyzed the factory's msg.value behavior when alreadyDeployed
+#   with Solady's actual LibClone implementation (only FlowHunter speculated).
+# - NO hunter verified if Solady's UUPSUpgradeable.upgradeToAndCall has its
+#   OWN code.length check (critical for the cross-chain upgrade vector).
+# ===========================================================================
+
+invariants:
+
+# ===========================================================================
+# DD-01: EIP-7702 delegation to CoinbaseSmartWallet — initialize() takeover
+# ===========================================================================
+# CONVERGENCE: WildcardHunter CSW-W-08 (65% confidence), AccessHunter CSW-AC-01 (60%)
+# NOVEL ANGLE: Neither hunter analyzed the FULL attack chain with EIP-7702
+# specifically, and neither checked if the bounty scope covers EIP-7702.
+# Post-Pectra (live since May 2025), this is a CURRENT threat.
+- id: DD-01
+  tier: 1
+  type: property
+  description: >
+    EIP-7702 (live on Ethereum mainnet post-Pectra) permite que un EOA delegue
+    su codigo a una implementacion existente. Si un EOA delega a la implementacion
+    de CoinbaseSmartWallet (no al proxy, sino al implementation contract directamente),
+    el storage del EOA es VIRGEN: nextOwnerIndex() == 0. Esto permite que CUALQUIERA
+    llame initialize() en el EOA y se registre como owner. A diferencia del proxy
+    pattern donde el constructor bloquea re-inicializacion en la implementation,
+    EIP-7702 usa el storage del EOA delegante, no el de la implementation.
+
+    CRUCIALMENTE: el constructor de CoinbaseSmartWallet hace _initializeOwners([address(0)])
+    en el IMPLEMENTATION contract. Esto pone nextOwnerIndex=1 en el storage de la
+    implementation. Pero con EIP-7702, el EOA tiene su PROPIO storage, donde
+    nextOwnerIndex es 0 por defecto. La proteccion del constructor NO aplica.
+
+    DIFERENCIA CON CSW-W-08: El WildcardHunter identifico el concepto pero con
+    65% confianza y sin PoC sketch completo. Mi analisis agrega:
+    (1) El EOA original PIERDE control porque la wallet abstraction paths (EntryPoint)
+        ahora requieren firma via _isValidSignature contra los owners registrados,
+        que son del atacante.
+    (2) El EOA puede revocar la delegacion 7702 enviando una tx normal (sin 4337),
+        pero si no tiene ETH para gas (fue drenado), no puede revocar.
+    (3) Si el EOA tenia tokens ERC-20/NFTs, el atacante los drena via execute().
+
+    BRUTALMENTE HONESTO: Este ES un vector real pero depende de que alguien use
+    EIP-7702 delegation al implementation de CoinbaseSmartWallet directamente.
+    Si Coinbase deploya una version 7702-aware (con initCode check o storage
+    sentinel), este vector desaparece. Probabilidad MEDIA si el bounty cubre
+    EIP-7702 interactions, BAJA si no.
+  attack_scenario: >
+    1. Alice (EOA) tiene 10 ETH + tokens. Alice delega su code a CoinbaseSmartWallet
+       implementation via EIP-7702 AUTH_LIST.
+    2. Alice's storage es virgen: slot para nextOwnerIndex = 0.
+    3. Attacker (Bob) observa la delegacion on-chain.
+    4. Bob llama Alice.initialize([abi.encode(bob_address)]).
+    5. nextOwnerIndex era 0 → pasa el check → Bob es owner del account de Alice.
+    6. Bob llama (via EntryPoint o directamente como owner):
+       Alice.execute(token_contract, 0, abi.encodeCall(IERC20.transfer, (bob, balance))).
+    7. Todos los tokens de Alice son transferidos a Bob.
+    8. Alice puede intentar revocar la delegacion 7702, pero si Bob ya dreno
+       el ETH, Alice no puede pagar gas para revocar.
+    NOTA: Alice tambien podria front-run la initialize con su propia tx, pero
+    hay una race condition en el mempool.
+  impact: "Perdida total de fondos del EOA que delega via EIP-7702 a CoinbaseSmartWallet implementation sin proteccion"
+  impact_rating: Critical
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Simular EIP-7702 delegation: EOA con storage virgen
+    // Verificar que initialize() es llamable por cualquiera
+    // cuando nextOwnerIndex() == 0
+
+    // En un EOA con delegacion 7702, el storage es del EOA
+    // nextOwnerIndex en el slot ERC-7201 es 0 por defecto
+    uint256 noi = wallet.nextOwnerIndex();
+    if (noi == 0) {
+        // VULNERABLE: cualquiera puede llamar initialize
+        bytes[] memory attackerOwners = new bytes[](1);
+        attackerOwners[0] = abi.encode(attacker);
+        wallet.initialize(attackerOwners);
+        bool isOwner = wallet.isOwnerAddress(attacker);
+        t(!isOwner, "DD-01: EIP-7702 delegated EOA takeover via initialize()");
+    }
+  ghost_vars: []
+  validated: false
+  priority: critical
+  confidence: 70
+  notes: >
+    ALTA CONFIANZA en la mecanica del ataque. La pregunta clave es si el bounty
+    scope de Coinbase Onchain cubre EIP-7702 interactions. Si lo cubre, esto es
+    un Critical. Si no, es informacional pero extremadamente valioso para Coinbase.
+    Verificar: (1) si Coinbase ha deployado una version 7702-aware, (2) si el
+    bounty dice "all chains where deployed" (Pectra ya es live en mainnet).
+    La mitigacion seria agregar un sentinel value en el constructor que se
+    verifique en initialize(), o usar un patron de inicializacion que funcione
+    tanto para proxies como para 7702 delegations.
+
+# ===========================================================================
+# DD-02: MagicSpend validatePaymasterUserOp — _withdrawable + nonce state
+# committed BEFORE sig verification result is actionable by EntryPoint
+# ===========================================================================
+# CONVERGENCE: FlowHunter CSW-FL-12 (70%), DoSHunter CSW-D-04 (55%),
+# TrustBoundaryHunter CSW-12 (45%), MathHunter CSW-MATH-02 (40%)
+# NOVEL ANGLE: Los hunters analizaron los paths individualmente pero ninguno
+# verifico el EXACT behavior del EntryPoint v0.6 cuando sigFailed=1.
+- id: DD-02
+  tier: 1
+  type: property
+  description: >
+    En MagicSpend.validatePaymasterUserOp (L121-144):
+    1. Primero: decode WithdrawRequest, check amount >= maxCost
+    2. Luego: _validateRequest (marca nonce used, checks maxAllowed)
+    3. Despues: sigFailed = !isValidWithdrawSignature (verifica firma)
+    4. Finalmente: _withdrawable[sender] += amount - maxCost
+
+    El ORDEN es critico: el nonce se marca como USED (paso 2) ANTES de verificar
+    la firma (paso 3). Y _withdrawable se incrementa (paso 4) DESPUES de la
+    verificacion de firma, pero la validationData solo se RETORNA al EntryPoint.
+
+    En EntryPoint v0.6, si validatePaymasterUserOp retorna validationData con
+    sigFailed=1, el EntryPoint PROCESA esto en _validatePrepayment. Segun el
+    codigo del EP v0.6, si la firma del paymaster falla, la operacion se marca
+    como fallida pero los SIDE EFFECTS de validatePaymasterUserOp (nonce marcado,
+    _withdrawable incrementado) ya estan commiteados en el storage de MagicSpend.
+
+    PREGUNTA CRITICA: ¿El EntryPoint v0.6 revierte el inner call completo cuando
+    paymaster sig falla, o solo marca el resultado?
+
+    Respuesta tras analizar el EP v0.6 source:
+    - _validatePrepayment llama validatePaymasterUserOp en un CALL (no staticcall)
+    - Si la funcion retorna (no revierte), los side effects PERSISTEN
+    - El EP luego chequea validationData y si sig failed, la operacion no se ejecuta
+    - PERO: validatePaymasterUserOp ya modifico storage (nonce + _withdrawable)
+    - Si la ejecucion no ocurre, postOp TAMPOCO se llama
+    - Resultado: _withdrawable tiene funds acumulados, nonce esta quemado
+
+    IMPACTO: ¿Puede alguien llamar withdrawGasExcess() para extraer _withdrawable?
+    - withdrawGasExcess solo requiere msg.sender == account del UserOp
+    - Si el atacante ES el sender, puede llamar withdrawGasExcess en otra tx
+    - PERO: el atacante necesitaria un WithdrawRequest firmado por el owner de
+      MagicSpend, con asset=address(0) y un nonce valido
+    - Si la firma es invalida, sigFailed=1, pero _withdrawable ya se incremento
+    - El atacante NO puede usar una firma completamente falsa porque necesita
+      que _validateRequest pase (nonce valido, amount <= maxAllowed)
+    - El nonce es un uint256 — el atacante puede probar nonces arbitrarios
+    - WAIT: _validateRequest verifica _nonceUsed ANTES de marcar, asi que nonces
+      inventados que no estan marcados como used pasarian
+    - PERO la firma se verifica DESPUES, y si es invalida, sigFailed=1
+
+    CONCLUSION: Si el EP v0.6 NO revierte el call a validatePaymasterUserOp
+    cuando retorna sigFailed=1, entonces:
+    1. Nonce quemado sin operacion ejecutada
+    2. _withdrawable incrementado sin postOp que lo limpie
+    3. El sender puede llamar withdrawGasExcess() para extraer fondos
+
+    BRUTALMENTE HONESTO: Necesita verificacion fork contra el EP v0.6 real.
+    La probabilidad depende del comportamiento exacto del EntryPoint.
+    FlowHunter CSW-FL-12 llego a 70% confianza pero no verifico en fork.
+  attack_scenario: >
+    1. Atacante conoce el address de MagicSpend y tiene una wallet (sender address).
+    2. Atacante crafta un UserOp con paymasterAndData que incluye un WithdrawRequest:
+       - asset: address(0) (ETH)
+       - amount: maxAllowed (balance/denominator)
+       - nonce: algun nonce no-usado para su address
+       - expiry: futuro
+       - signature: INVALIDA (basura)
+    3. Bundler simula el UserOp. validatePaymasterUserOp no revierte (retorna
+       validationData con sigFailed=1). El bundler lo incluye.
+    4. EntryPoint llama validatePaymasterUserOp:
+       - _validateRequest pasa (nonce fresh, amount <= maxAllowed)
+       - Nonce marcado como used ✓
+       - sigFailed = true (firma invalida)
+       - _withdrawable[attacker] += amount - maxCost ✓
+       - Retorna validationData con sigFailed=1
+    5. EntryPoint ve sigFailed=1. No ejecuta el UserOp. No llama postOp.
+    6. Estado de MagicSpend: _withdrawable[attacker] > 0, nonce quemado.
+    7. Atacante llama MagicSpend.withdrawGasExcess() directamente.
+    8. _withdrawable[attacker] se transfiere al atacante.
+    9. Atacante recibe ETH de MagicSpend sin firma valida del owner.
+
+    CONDICIONES:
+    - El bundler DEBE incluir el UserOp a pesar de sigFailed=1 en simulacion
+    - WAIT: el bundler simularia validatePaymasterUserOp, veria sigFailed=1,
+      y RECHAZARIA el UserOp. Los bundlers no incluyen ops con sig failure.
+    - ENTONCES: este vector requiere un bundler que no simula correctamente,
+      o que el atacante ES el bundler.
+    - Si el atacante es bundler, puede incluir su propio UserOp con sig failure.
+    - PERO: el bundler paga gas de la wallet para la validacion. Si el wallet
+      tiene deposit en el EntryPoint, ese deposit se consume para la validacion.
+      Si no tiene deposit, el EntryPoint revierte antes.
+  impact: "Potencial extraccion de ETH de MagicSpend sin firma valida si EP v0.6 commitea side effects de validatePaymasterUserOp cuando sigFailed=1. Requiere bundler malicioso o no-simulante."
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Fork test contra EP v0.6 real:
+    // 1. Deploy MagicSpend con 10 ETH, denominator=10
+    // 2. Crear wallet con deposit en EP
+    // 3. Craftar UserOp con WithdrawRequest valido pero firma invalida
+    // 4. Llamar EP.handleOps
+    // 5. Verificar: ¿_withdrawable[wallet] > 0 despues de handleOps?
+    // 6. Si si: llamar withdrawGasExcess() y verificar que se reciben fondos
+
+    // Pseudocodigo del invariante:
+    uint256 wBefore = ghost_withdrawable[account];
+    bool sigValid = ghost_lastSigValid;
+    if (!sigValid) {
+        // Si la firma fue invalida, _withdrawable NO debe haber cambiado
+        eq(ghost_withdrawable[account], wBefore,
+           "DD-02: _withdrawable changed with invalid sig");
+    }
+  ghost_vars:
+    - mapping(address => uint256) internal ghost_withdrawable;
+    - bool internal ghost_lastSigValid;
+  validated: false
+  priority: high
+  confidence: 45
+  notes: >
+    Este es el invariante MAS IMPORTANTE para verificar con fork test.
+    Si el EP v0.6 revierte todo el inner call cuando sigFailed=1 (incluyendo
+    los side effects de validatePaymasterUserOp), entonces NO hay bug.
+    Si los side effects persisten, es un Critical/High.
+    El DoSHunter (CSW-D-04) noto que validatePaymasterUserOp marca nonce ANTES
+    de la firma. FlowHunter (CSW-FL-12) llego a la misma conclusion pero con
+    la nota de que "el EP v0.6 revierte la ENTERA simulacion". Necesita
+    verificacion concreta. La mayoria de bundlers rechazan ops con sig failure
+    en simulacion, lo cual reduce la probabilidad drasticamente.
+
+# ===========================================================================
+# DD-03: MagicSpend multi-op bundle rate limit bypass — documented but
+# potentially more severe than acknowledged
+# ===========================================================================
+# CONVERGENCE: TrustBoundaryHunter CSW-12 (45%), DoSHunter CSW-D-06 (50%),
+# OracleHunter CSW-O-07 (40%), WildcardHunter CSW-W-06 (40%),
+# FlowHunter CSW-FL-04 (40%)
+# NOVEL ANGLE: 5 hunters converged en este vector. El codigo lo DOCUMENTA
+# como known (L153-156), pero la pregunta es si el impacto va mas alla
+# de "reputation damage" — ¿puede causar perdida directa de fondos?
+- id: DD-03
+  tier: 1
+  type: property
+  description: >
+    EntryPoint v0.6 procesa UserOps en un bundle asi:
+    FASE 1 (validacion): para CADA op, llama validatePaymasterUserOp
+    FASE 2 (ejecucion): para CADA op, ejecuta calldata + postOp
+
+    En FASE 1, TODOS los validatePaymasterUserOp se ejecutan con el MISMO
+    balance de MagicSpend (porque los postOps aun no han transferido fondos).
+    El check maxAllowed = address(this).balance / maxWithdrawDenominator
+    se evalua N veces con el mismo balance.
+
+    Si denominator = 10 y balance = 100 ETH, maxAllowed = 10 ETH por op.
+    Un bundler puede incluir 10 UserOps del mismo usuario (diferentes nonces
+    de MagicSpend, cada uno por 10 ETH). TODOS pasan la validacion.
+
+    En FASE 2, los postOps intentan enviar 10 ETH cada uno. El primero funciona
+    (balance 100 → 90), el segundo (90 → 80)... hasta el decimo (10 → 0).
+    TOTAL: 100 ETH drenados. El maxWithdrawDenominator fue COMPLETAMENTE bypaseado.
+
+    Pero ESPERA: cada op necesita un WithdrawRequest firmado por el owner de
+    MagicSpend con amount = 10 ETH. El atacante necesita 10 firmas del owner.
+    Si el owner solo firma requests por cantidades razonables, no hay ataque.
+
+    ESCENARIO REAL: Un backend de firma automatizada (signer service) que firma
+    WithdrawRequests on-demand. Si el backend no tiene rate limiting propio
+    (confiando en maxWithdrawDenominator), un usuario malicioso puede obtener
+    N requests firmados y luego bundlearlos todos en una tx.
+
+    DIFERENCIA CON LOS 5 HUNTERS: Todos identificaron el mecanismo pero lo
+    clasificaron como "known issue, documented". Lo que NINGUNO analizo es:
+    - ¿El backend de Coinbase tiene rate limiting adicional?
+    - ¿El bundler de Coinbase (que opera en Base) permite N ops del mismo sender?
+    - Si MagicSpend se usa con un backend de firma de terceros, ¿hay mas riesgo?
+
+    BRUTALMENTE HONESTO: El codigo DOCUMENTA este comportamiento (L153-156).
+    Coinbase probablemente tiene rate limiting en su backend. Pero el contrato
+    on-chain NO lo tiene. Si un tercero deploya MagicSpend con un backend
+    de firma sin rate limiting, es explotable. Como finding del bounty,
+    probablemente Low/Info porque es documented. Pero como finding de seguridad
+    general, es Medium.
+  attack_scenario: >
+    1. Backend de firma automatizado firma N WithdrawRequests para user X,
+       cada uno por maxAllowed, con nonces diferentes.
+    2. User X bundlea N UserOps con MagicSpend como paymaster en un solo handleOps.
+    3. Todas las validaciones pasan (balance no ha cambiado aun).
+    4. Todos los postOps ejecutan transfers — balance de MagicSpend drenado.
+    5. maxWithdrawDenominator completamente bypaseado.
+  impact: "Bypass completo del rate limit on-chain de MagicSpend. Requiere N firmas del owner. Impacto real depende del backend de firma."
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Fork test:
+    // 1. Deploy MagicSpend con 100 ETH, denominator=10
+    // 2. Crear 10 WithdrawRequests firmados por el owner, cada uno por 10 ETH
+    // 3. Crear 10 UserOps usando cada request
+    // 4. handleOps con los 10 UserOps
+    // 5. Verificar: MagicSpend balance == 0 (rate limit bypaseado)
+
+    uint256 balance = address(magicSpend).balance;
+    uint256 denom = magicSpend.maxWithdrawDenominator();
+    uint256 maxPerOp = balance / denom;
+    // Si N >= denom ops se procesan en el mismo bundle:
+    uint256 totalDrained = maxPerOp * denom;
+    // totalDrained == balance (o cercano, dependiendo de truncamiento)
+    lte(totalDrained, balance, "DD-03: rate limit bypass math check");
+  ghost_vars:
+    - uint256 internal ghost_totalBundleWithdraw;
+  validated: false
+  priority: medium
+  confidence: 60
+  notes: >
+    DOCUMENTED en el codigo (L153-156). Coinbase probablemente tiene mitigaciones
+    off-chain. Como finding del bounty: Low/Info (known, documented).
+    Como finding de seguridad: Medium (on-chain rate limiting es insuficiente).
+    5 de 9 hunters convergieron en esto — la convergencia confirma que es un
+    area de riesgo real, pero la documentacion explicita reduce su novedad.
+
+# ===========================================================================
+# DD-04: Factory createAccount con msg.value y alreadyDeployed=true —
+# ETH irrecuperable en la Factory
+# ===========================================================================
+# CONVERGENCE: FlowHunter CSW-FL-03 (65%), AccessHunter CSW-AC-02 (50%)
+# NOVEL ANGLE: Ninguno verifico el comportamiento EXACTO de
+# LibClone.createDeterministicERC1967 con msg.value cuando alreadyDeployed.
+- id: DD-04
+  tier: 1
+  type: property
+  description: >
+    CoinbaseSmartWalletFactory.createAccount es payable y pasa msg.value a
+    LibClone.createDeterministicERC1967(msg.value, implementation, salt).
+
+    Segun la implementacion de Solady LibClone.createDeterministicERC1967:
+    - Si el proxy NO existe: CREATE2 deploya con msg.value → ETH va al proxy. OK.
+    - Si el proxy YA existe (alreadyDeployed=true): CREATE2 falla (address collision).
+      Solady RETORNA la address existente pero NO hace nada con msg.value.
+      El ETH queda en el contrato que llamo CREATE2, que es la FACTORY.
+
+    La factory NO tiene:
+    - Una funcion withdraw para recuperar ETH atrapado
+    - Un check que revierta si alreadyDeployed && msg.value > 0
+    - Un mecanismo para reenviar msg.value al proxy existente
+
+    RESULTADO: Si alguien llama createAccount{value: X}(owners, nonce) y la
+    wallet ya existe, los X ETH quedan PERMANENTEMENTE atrapados en la Factory.
+
+    BRUTALMENTE HONESTO: Esto requiere que el usuario envie ETH con createAccount
+    cuando la wallet ya existe. Es un error del usuario, no un ataque. Pero la
+    funcion es payable sin advertencia, y la Factory no tiene mecanismo de
+    recuperacion. Impacto: Loss of user funds por error de UX, no por exploit.
+    Severity: Medium si hay usuarios que pre-fundan wallets, Low si no.
+
+    VERIFICACION NECESARIA: Confirmar que LibClone de Solady realmente deja
+    el ETH en la Factory y no lo reenvia. La version exacta de Solady importa.
+  attack_scenario: >
+    1. Alice llama createAccount{value: 1 ETH}(owners, 0). Wallet se crea con 1 ETH. OK.
+    2. Bob llama createAccount{value: 5 ETH}(owners, 0) (mismos params).
+    3. alreadyDeployed=true. CREATE2 no se ejecuta. Los 5 ETH van a la Factory.
+    4. La Factory no tiene withdraw(). Los 5 ETH estan permanentemente atrapados.
+    5. Bob pierde 5 ETH irrecuperablemente.
+    NOTA: Si Bob es el mismo Alice (re-call por accidente o via un script
+    automatizado que re-intenta createAccount con value), los fondos se pierden.
+  impact: "Perdida directa de ETH para quien llame createAccount con value cuando la wallet ya existe. Fondos irrecuperables en la Factory."
+  impact_rating: Medium
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Fork test:
+    // 1. createAccount{value: 1 ether}(owners, 0) — primera vez
+    // 2. Verificar wallet.balance == 1 ether
+    // 3. createAccount{value: 5 ether}(owners, 0) — segunda vez
+    // 4. Verificar: ¿factory.balance == 5 ether? ¿o wallet.balance == 6 ether?
+    // 5. Si factory.balance > 0 y no hay withdraw, fondos atrapados
+
+    uint256 factoryBal = address(factory).balance;
+    if (factoryBal > 0) {
+        // Fondos atrapados en factory — verificar que no hay withdraw
+        // factory no tiene receive(), fallback(), withdraw(), ni selfdestruct
+        t(factoryBal == 0, "DD-04: ETH stuck in factory");
+    }
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 55
+  notes: >
+    Necesita verificacion con la version exacta de Solady LibClone usada.
+    Versiones mas nuevas de Solady podrian tener comportamiento diferente.
+    Si LibClone REENVIA el ETH al proxy existente (via low-level call),
+    entonces no hay bug. Si CREATE2 consume msg.value y falla, el ETH
+    queda en la Factory. La clave es revisar el assembly de LibClone.
+    FlowHunter (CSW-FL-03) llego a 65% confianza pero no verifico.
+    Si se confirma, esto es un Medium reportable con PoC simple.
+
+# ===========================================================================
+# DD-05: CoinbaseSmartWallet como owner de otro CoinbaseSmartWallet —
+# nested ERC-1271 verification chain con gas amplification
+# ===========================================================================
+# CONVERGENCE: TrustBoundaryHunter CSW-08 (55%), AccessHunter CSW-AC-11 (25%)
+# NOVEL ANGLE: Ninguno analizo la CADENA de ERC-1271 calls cuando un
+# CoinbaseSmartWallet es owner de otro CoinbaseSmartWallet.
+- id: DD-05
+  tier: 1
+  type: property
+  description: >
+    Cuando un CoinbaseSmartWallet (WalletA) tiene como owner otro
+    CoinbaseSmartWallet (WalletB), la validacion de firma crea una cadena:
+
+    1. WalletA._isValidSignature(hash, sig)
+    2. ownerAtIndex(i) = abi.encode(address(WalletB)) → 32 bytes → address path
+    3. SignatureCheckerLib.isValidSignatureNow(WalletB, hash, sigData)
+    4. WalletB tiene code → ERC-1271 path: WalletB.isValidSignature(hash, sigData)
+    5. WalletB.replaySafeHash(hash) → DIFERENTE hash (incluye WalletB.address + chainId)
+    6. WalletB._isValidSignature(replaySafeHash(hash), sigData)
+
+    PROBLEMA: En paso 3, SignatureCheckerLib pasa el hash DIRECTO a
+    WalletB.isValidSignature. Pero WalletB wrappea ese hash con SU PROPIO
+    replaySafeHash (paso 5), que incluye WalletB.address y chainId.
+
+    Esto significa que el firmante original necesita firmar:
+    replaySafeHash_WalletB(hash_from_WalletA)
+
+    Pero hash_from_WalletA es:
+    - Para validateUserOp: userOpHash (que incluye WalletA.address)
+    - Para isValidSignature: replaySafeHash_WalletA(originalHash)
+
+    La cadena completa para ERC-1271 de WalletA con owner WalletB:
+    - Protocolo llama WalletA.isValidSignature(H, sig)
+    - WalletA wrappea: H' = replaySafeHash_A(H)
+    - WalletA verifica: SignatureCheckerLib.isValidSignatureNow(WalletB, H', sigData)
+    - → WalletB.isValidSignature(H', sigData)
+    - WalletB wrappea: H'' = replaySafeHash_B(H')
+    - WalletB verifica: _isValidSignature(H'', sigDataInner)
+    - El firmante EOA (owner de WalletB) firmó H''
+
+    ESTO FUNCIONA CORRECTAMENTE pero tiene implicaciones:
+    1. GAS: Cada hop agrega ~50K gas (ERC-1271 call + hashing)
+    2. Si hay N niveles de nesting, gas = O(N * 50K)
+    3. Un atacante puede crear una cadena larga de wallets-como-owners
+       para amplificar el gas de validacion
+    4. En validateUserOp, el gas de validacion es limitado por verificationGasLimit
+    5. Si la cadena es lo suficientemente larga, la validacion SIEMPRE excede
+       el gas limit, haciendo la wallet inutilizable (DoS permanente)
+
+    BRUTALMENTE HONESTO: Requiere que alguien cree intencionalmente una cadena
+    larga de wallets-como-owners. No es un ataque a wallets existentes.
+    Pero un owner malicioso de un multi-owner wallet podria:
+    1. Crear una cadena de 10 wallets: W1→W2→W3→...→W10
+    2. Registrar W1 como owner del wallet victima
+    3. Cualquier validacion via el ownerIndex de W1 consumiria ~500K gas extra
+    4. No causa perdida de fondos directa, pero degrada UX significativamente
+
+    Severity: Low (DoS via gas amplification, requiere setup malicioso).
+  attack_scenario: >
+    1. Wallet-victima tiene owners: [Alice(0), W1(1)] donde W1 es otro smart wallet.
+    2. W1 tiene owner W2, W2 tiene owner W3, ..., W9 tiene owner W10, W10 tiene EOA Bob.
+    3. Bob firma algo para la wallet-victima. La cadena de isValidSignature recorre
+       W1→W2→...→W10→Bob. Gas: ~10 * 50K = 500K gas extra.
+    4. Bundlers rechazan UserOps con verificationGasLimit > cierto umbral.
+    5. Si el threshold es < gas requerido, la wallet no puede operar via el
+       ownerIndex de W1.
+    6. Alice (index 0) aun puede operar normalmente.
+    IMPACTO: Degradacion de servicio, no perdida de fondos.
+  impact: "DoS parcial: validacion via el owner-wallet en cadena consume gas excesivo. Otros owners no afectados."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Medir gas de isValidSignature con cadena de N wallets
+    // Setup: crear W1→W2→W3→W4→W5 con EOA al final
+    // Registrar W1 como owner de wallet principal
+    // Llamar isValidSignature y medir gas
+    uint256 gasBefore = gasleft();
+    bytes4 result = walletMain.isValidSignature(testHash, chainedSig);
+    uint256 gasUsed = gasBefore - gasleft();
+    // Si gasUsed > 500_000 para 5 hops, la amplificacion es significativa
+    lte(gasUsed, 500_000, "DD-05: nested ERC-1271 gas amplification");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 40
+  notes: >
+    Impacto bajo. No causa perdida de fondos. Requiere setup malicioso intencional.
+    Otros owners pueden operar normalmente. Un owner que registra un smart contract
+    como co-owner ya acepta este riesgo. Documentar como informational.
+    La mitigacion seria un gas limit check en _isValidSignature o un depth counter,
+    pero esto complicaria el codigo sin beneficio significativo.
+
+# ===========================================================================
+# DD-06: MagicSpend getHash usa EIP-191 v0x45, NO EIP-712 —
+# discrepancia con el ecosistema de firma moderna
+# ===========================================================================
+# CONVERGENCE: Ningun hunter analizo el formato de hash de getHash en detalle
+# NOVEL ANGLE: getHash usa toEthSignedMessageHash (EIP-191 personal_sign),
+# no un typed hash EIP-712. Esto tiene implicaciones para phishing.
+- id: DD-06
+  tier: 2
+  type: property
+  description: >
+    MagicSpend.getHash (L300-311) produce un hash usando
+    SignatureCheckerLib.toEthSignedMessageHash que es EIP-191 version 0x45
+    ("\x19Ethereum Signed Message:\n32"). Esto convierte un hash arbitrario
+    en un "personal_sign" hash.
+
+    El owner de MagicSpend firma WithdrawRequests usando personal_sign
+    (eth_personalSign en los wallets). El hash firmado es:
+    keccak256("\x19Ethereum Signed Message:\n" + len + abi.encode(address(this), account, chainid, asset, amount, nonce, expiry))
+
+    PROBLEMA POTENCIAL: personal_sign es vulnerable a "blind signing" attacks.
+    El usuario (owner de MagicSpend) ve un hash opaco en su wallet UI, no un
+    mensaje estructurado legible. Con EIP-712, el wallet puede mostrar los
+    campos individuales (account, amount, asset, etc.) al firmante.
+
+    PERO: el owner de MagicSpend es Coinbase (un backend automatizado, no un
+    humano firmando en MetaMask). El backend sabe exactamente que esta firmando.
+    Esto hace que el formato de personal_sign sea aceptable operacionalmente.
+
+    El riesgo seria si el owner de MagicSpend es un EOA humano que firma
+    manualmente — podria ser engañado para firmar un WithdrawRequest malicioso
+    sin entender el contenido. Pero esto es un edge case de UX, no un bug.
+
+    ADICIONALMENTE: EIP-191 personal_sign y EIP-712 typed data tienen prefijos
+    diferentes (\x19Ethereum Signed Message vs \x19\x01), asi que una firma
+    para getHash no puede ser usada como firma EIP-712 y viceversa. No hay
+    cross-contamination.
+
+    BRUTALMENTE HONESTO: No es un bug explotable. Es una decision de diseño
+    aceptable para un backend automatizado. Informational at best.
+  attack_scenario: >
+    1. Si el owner de MagicSpend fuera un humano firmando en MetaMask:
+    2. Atacante crafta un WithdrawRequest por 100 ETH para su cuenta
+    3. Convence al owner de firmar el hash via social engineering
+    4. El owner ve un hash opaco en MetaMask, no "Withdraw 100 ETH to 0xattacker"
+    5. Owner firma pensando que es otra cosa → atacante drena MagicSpend
+    MITIGACION: El owner es Coinbase (backend automatizado). No aplica.
+  impact: "Informational — firma opaca para humanos, no relevante para backend automatizado"
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que getHash produce un EIP-191 personal_sign hash
+    bytes32 hash = magicSpend.getHash(account, request);
+    // El hash debe tener el prefijo de personal_sign
+    // No se puede verificar directamente el prefijo desde el hash final
+    // Solo documentar el formato
+    t(hash != bytes32(0), "DD-06: getHash produces non-zero hash");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    Decision de diseño, no un bug. El backend de Coinbase firma automaticamente.
+    EIP-712 seria mejor UX pero no cambia la seguridad para un backend.
+    No reportable como finding del bounty.
+
+# ===========================================================================
+# DD-07: validateUserOp ABI decode discrepancy —
+# abi.decode en memory vs calldata slicing en execution
+# ===========================================================================
+# CONVERGENCE: AccessHunter CSW-AC-10 (35%)
+# NOVEL ANGLE: Solo 1 hunter menciono esto. Es el unico vector que podria
+# permitir bypass del code.length check para upgradeToAndCall.
+- id: DD-07
+  tier: 1
+  type: property
+  description: >
+    En validateUserOp (L170-183), cuando se detecta executeWithoutChainIdValidation:
+    1. bytes[] memory calls = abi.decode(userOp.callData[4:], (bytes[]))
+    2. Para cada call, extrae bytes4 selector y verifica upgradeToAndCall
+    3. Si upgradeToAndCall: extrae newImplementation via assembly mload
+
+    La decodificacion usa abi.decode en MEMORY (copiando desde calldata).
+
+    En la ejecucion real, executeWithoutChainIdValidation recibe bytes[] CALLDATA:
+    1. for each call in calls: bytes4 selector = bytes4(call)
+    2. _call(address(this), 0, call)
+
+    La pregunta: ¿puede un calldata malformado (non-standard ABI encoding)
+    causar que la decodificacion en MEMORY (validateUserOp) vea datos DIFERENTES
+    a los que executeWithoutChainIdValidation procesa en CALLDATA?
+
+    ANALISIS PROFUNDO:
+    - ABI encoding estandar usa offsets relativos para bytes[] arrays
+    - abi.decode en Solidity 0.8.23 es STRICT: verifica bounds, padding, offsets
+    - Calldata slicing (bytes calldata call = calls[i]) tambien es strict
+    - Ambos paths decodifican el MISMO calldata, solo que uno copia a memory
+      y otro opera directamente en calldata
+    - En Solidity 0.8.23, NO hay discrepancia conocida entre decodificacion
+      de abi.decode(memory) y calldata slicing para bytes[] standard
+    - Non-standard ABI (overlapping offsets, dirty padding) podria causar
+      diferencias en versiones antiguas de Solidity, pero 0.8.23 es strict
+
+    PERO: hay un detalle sutil. En validateUserOp (L170):
+      bytes[] memory calls = abi.decode(userOp.callData[4:], (bytes[]));
+    Esto decodifica desde calldata a memory.
+
+    En executeWithoutChainIdValidation (L210):
+      bytes calldata call = calls[i];
+    Esto accede directamente al calldata.
+
+    Los dos paths LEEN EL MISMO CALLDATA. La unica diferencia es que el primero
+    COPIA a memory y el segundo LEE in-place. Para calldata bien formado,
+    producen los mismos resultados. Para calldata malformado, Solidity 0.8.23
+    revierte en ambos casos (bounds checking).
+
+    CONCLUSIÓN: No hay discrepancia explotable en Solidity 0.8.23.
+    El AccessHunter tenia razon en ser cauteloso pero 35% confidence era apropiado.
+
+    BRUTALMENTE HONESTO: Probabilidad de explotacion ~0% en la version actual.
+    Podria ser relevante si se cambia a una version de Solidity con decodificacion
+    mas laxa, pero eso es especulativo.
+  attack_scenario: >
+    Requiere encontrar un calldata que abi.decode interprete diferente a
+    calldata slicing en Solidity 0.8.23. No se conoce tal payload.
+  impact: "Si existiera discrepancia: bypass del code.length check → wallet bricked via cross-chain upgrade a empty address. PERO: no hay discrepancia conocida."
+  impact_rating: Critical
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar consistencia de decodificacion:
+    // Encode y decode una batch con upgradeToAndCall
+    bytes[] memory calls = new bytes[](1);
+    calls[0] = abi.encodeWithSelector(
+        UUPSUpgradeable.upgradeToAndCall.selector,
+        someAddress,
+        ""
+    );
+    bytes memory encoded = abi.encodeWithSelector(
+        CoinbaseSmartWallet.executeWithoutChainIdValidation.selector,
+        calls
+    );
+    // Decode como lo hace validateUserOp
+    bytes[] memory decoded = abi.decode(encoded[4:], (bytes[]));
+    // Extraer address como lo hace validateUserOp
+    address impl;
+    bytes memory callData = decoded[0];
+    assembly { impl := mload(add(callData, 36)) }
+    eq(impl, someAddress, "DD-07: decode consistency check");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 20
+  notes: >
+    Probabilidad extremadamente baja. Solidity 0.8.23 tiene strict ABI decoding.
+    El AccessHunter (CSW-AC-10) fue el unico en explorar este angulo con 35%
+    confianza. Confirmo que no hay path explotable conocido. Mantener como
+    invariante defensivo pero no es reportable.
+
+# ===========================================================================
+# DD-08: Interaccion MagicSpend.withdraw() durante UserOp execution +
+# _withdrawable doble conteo edge case
+# ===========================================================================
+# CONVERGENCE: FlowHunter CSW-FL-04 (40%), SignatureHunter CSW-05 (35%),
+# WildcardHunter CSW-W-11 (45%)
+# NOVEL ANGLE: ¿Que pasa si el UserOp execution llama TANTO
+# withdrawGasExcess() COMO withdraw() con un segundo WithdrawRequest?
+- id: DD-08
+  tier: 1
+  type: property
+  description: >
+    Escenario no analizado por ningun hunter individualmente:
+
+    1. MagicSpend es paymaster del UserOp. validatePaymasterUserOp se ejecuta:
+       - WithdrawRequest1: amount=1 ETH, maxCost=0.1 ETH
+       - _withdrawable[user] += 0.9 ETH
+       - Nonce1 marcado como used
+
+    2. Ejecucion del UserOp (callData):
+       a. user llama MagicSpend.withdrawGasExcess() → recibe 0.9 ETH, _withdrawable=0
+       b. user llama MagicSpend.withdraw(WithdrawRequest2) con OTRO nonce firmado
+          - WithdrawRequest2: amount=2 ETH, asset=address(0), nonce2, expiry
+          - withdraw() verifica firma (del owner de MagicSpend), nonce, maxAllowed
+          - Si pasa: _withdraw(address(0), user, 2 ETH) via safeTransferETH
+          - user recibe 2 ETH adicionales
+
+    3. postOp: _withdrawable[user] = 0 (ya fue deleteado). Gas refund:
+       maxGasCost - actualGasCost. user recibe el refund.
+
+    Total recibido: 0.9 + 2.0 + refund = 2.9 + refund ETH.
+    Total autorizado: 1 ETH (request1) + 2 ETH (request2) = 3 ETH.
+    Total pagado de MagicSpend: 1 ETH (via paymaster) + 2 ETH (via withdraw) = 3 ETH.
+
+    ESTO ES CORRECTO. No hay doble conteo. Las dos operaciones son independientes:
+    - PaymasterUserOp con request1 maneja 1 ETH (split entre withdrawGasExcess + refund)
+    - withdraw() con request2 maneja 2 ETH
+
+    PERO: ¿que pasa con el check maxAllowed en _validateRequest para request2?
+    Al momento de withdraw(request2), el balance de MagicSpend ya disminuyo
+    por la transferencia de withdrawGasExcess (0.9 ETH). Si el balance original
+    era justo para ambos requests, el segundo podria fallar por WithdrawTooLarge.
+
+    Esto es un edge case de interaccion: el usuario puede quedarse sin poder
+    ejecutar el segundo withdraw porque el primero (withdrawGasExcess) ya redujo
+    el balance que _validateRequest usa para calcular maxAllowed.
+
+    BRUTALMENTE HONESTO: No es un bug — es el comportamiento correcto del rate
+    limiting. El primer withdraw reduce el balance, el segundo ve un balance
+    menor. Funciona como se espera. No hay doble conteo ni perdida de fondos.
+  attack_scenario: >
+    No es un ataque. Es una interaccion normal entre withdrawGasExcess y withdraw
+    en la misma tx. El comportamiento es correcto.
+  impact: "Ninguno — accounting correcto tras analisis profundo."
+  impact_rating: Low
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verificar que withdrawGasExcess + withdraw en la misma tx
+    // no causa doble conteo
+    uint256 msBefore = address(magicSpend).balance;
+    // ... UserOp con withdrawGasExcess + withdraw(request2) en callData ...
+    uint256 msAfter = address(magicSpend).balance;
+    uint256 totalRequested = request1.amount + request2.amount;
+    uint256 actualDecrease = msBefore - msAfter;
+    eq(actualDecrease, totalRequested, "DD-08: total withdrawn matches total requested");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 75
+  notes: >
+    Analizado y DESCARTADO como vector de ataque. El accounting es correcto.
+    Las dos operaciones (paymaster flow y withdraw flow) son independientes
+    y correctamente contabilizadas. Mantener como invariante de regression.
+
+false_positives:
+- hunter: DeepDiveHunter
+  id: DD-FP-01
+  reason: >
+    La idea de que CoinbaseSmartWallet como owner de MagicSpend crea un vector
+    especial fue investigada y descartada. MagicSpend.owner() usa Solady Ownable
+    que es una relacion 1:1 (no multi-owner como el wallet). Si el owner de
+    MagicSpend es un CoinbaseSmartWallet, las operaciones del owner pasan por
+    el wallet's access control normalmente. No hay amplificacion de riesgo
+    mas alla de lo que ya existe con cualquier smart contract como owner.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: add_to_trampas
+    briefing: erc4337-smart-accounts.md
+    content: "Smart wallet como owner de otro contrato: no crea vectores nuevos, la cadena de access control funciona normalmente"
+    briefing_update_applied: false
+
+- hunter: DeepDiveHunter
+  id: DD-FP-02
+  reason: >
+    Salt collision en Factory: keccak256(abi.encode(owners, nonce)) donde owners
+    es bytes[] y nonce es uint256. Dos owner sets diferentes producen salts
+    diferentes (modulo keccak collision que es computacionalmente imposible).
+    El mismo owner set con diferente nonce tambien produce salt diferente.
+    No hay forma de producir la misma address con diferentes owners.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+- hunter: DeepDiveHunter
+  id: DD-FP-03
+  reason: >
+    Cross-chain createAccount con mismo owners + nonce pero diferente implementation:
+    La Factory tiene implementation como IMMUTABLE. Si la Factory se deploya en
+    dos chains con diferentes implementations, la address del proxy sera diferente
+    (initCodeHash incluye la implementation address). No hay confusion cross-chain
+    entre implementations distintas via la Factory estandar.
+  investigated_at: '2026-03-27T00:00:00Z'
+  pending_briefing_update:
+    action: none
+    briefing: null
+    content: null
+    briefing_update_applied: false
+
+summary: >
+  RESUMEN DeepDiveHunter — CoinbaseSmartWallet + MagicSpend
+
+  8 hipotesis generadas (5 nuevas, 3 refinamiento de convergencias).
+
+  FINDINGS POR PRIORIDAD:
+
+  1. DD-01 [CRITICAL, 70% confianza] — EIP-7702 delegation permite initialize()
+     takeover en EOAs con storage virgen. Post-Pectra, este es un vector real
+     si alguien delega a la implementation de CoinbaseSmartWallet. El constructor
+     solo protege el storage de la implementation, no el del EOA delegante.
+     ACCION: Verificar si el bounty scope cubre EIP-7702. Si si, reportar.
+
+  2. DD-02 [HIGH, 45% confianza] — _withdrawable + nonce state committed en
+     validatePaymasterUserOp ANTES de que el EntryPoint pueda actuar sobre
+     sigFailed=1. Si los side effects persisten cuando sig falla, permite
+     extraccion via withdrawGasExcess() sin firma valida.
+     ACCION: Fork test contra EP v0.6 real. Prioridad alta.
+
+  3. DD-04 [MEDIUM, 55% confianza] — Factory createAccount con msg.value cuando
+     alreadyDeployed=true atrapa ETH permanentemente en la Factory.
+     ACCION: Verificar Solady LibClone behavior. PoC simple si se confirma.
+
+  4. DD-03 [MEDIUM, 60% confianza] — Rate limit bypass via multi-op bundle.
+     Documentado en el codigo (L153-156). Probablemente Low/Info para bounty.
+
+  5. DD-05, DD-06, DD-07, DD-08 — Low priority, informational.
+
+  VEREDICTO GENERAL: El sistema es MUY robusto. 9 hunters + DeepDive encontraron
+  pocos vectores nuevos despues de C4 + Cantina + Certora. El unico finding
+  potencialmente reportable es DD-01 (EIP-7702) si esta en scope, y DD-02/DD-04
+  si se confirman con fork tests.

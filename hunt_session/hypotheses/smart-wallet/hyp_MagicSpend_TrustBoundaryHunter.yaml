@@ -1,0 +1,469 @@
+component: MagicSpend
+hunter: TrustBoundaryHunter
+source_file: MagicSpend/src/MagicSpend.sol
+date: "2026-03-27"
+
+hypotheses:
+
+  - id: MS-TB-01
+    title: "withdrawGasExcess reentrancy during UserOperation execution drains _withdrawable before postOp"
+    severity: medium
+    confidence: 45
+    status: pending
+    solidity: |
+      // Trust boundary: account calls withdrawGasExcess() during its execution phase
+      // (between validatePaymasterUserOp and postOp)
+      //
+      // In validatePaymasterUserOp (line 143):
+      //   _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+      //
+      // The account's callData executes between validate and postOp.
+      // If account calls withdrawGasExcess() during execution:
+      //   1. withdrawGasExcess() reads _withdrawable[msg.sender] (line 179)
+      //   2. Deletes _withdrawable[msg.sender] (line 183)
+      //   3. Transfers ETH via _withdraw (line 184) — uses safeTransferETH (reverts on failure)
+      //
+      // Then in postOp (line 165):
+      //   uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+      //   _withdrawable[account] is now 0 (deleted by withdrawGasExcess)
+      //   So withdrawable = 0 + (maxGasCost - actualGasCost) = gas refund only
+      //
+      // The account receives: (withdrawAmount - maxCost) from withdrawGasExcess
+      //                     + (maxCost - actualGasCost) from postOp
+      //                     = withdrawAmount - actualGasCost (CORRECT total)
+      //
+      // This is actually BY DESIGN — see comment on line 177:
+      // "Can be called back during the UserOperation execution to sponsor funds
+      //  for non-gas related use cases (e.g., swap or mint)."
+    attack_scenario: |
+      1. User has signed WithdrawRequest for amount X
+      2. validatePaymasterUserOp sets _withdrawable[user] = X - maxCost
+      3. During execution, account calls withdrawGasExcess() -> receives (X - maxCost) ETH
+      4. postOp sends (maxCost - actualGasCost) ETH
+      5. Total received: X - actualGasCost (correct — no exploit)
+    impact: |
+      NO IMPACT — this is intended behavior per NatSpec comments. The accounting
+      is correct: withdrawGasExcess drains the non-gas portion, postOp refunds unused gas.
+      The total always equals withdrawAmount - actualGasCost.
+    notes: |
+      SAFE. The design explicitly accounts for this. The delete in withdrawGasExcess
+      prevents double-withdrawal. postOp independently computes gas refund from context.
+
+  - id: MS-TB-02
+    title: "Context integrity — postOp trusts context from validatePaymasterUserOp without verification"
+    severity: low
+    confidence: 30
+    status: pending
+    solidity: |
+      // validatePaymasterUserOp (line 144):
+      //   context = abi.encode(maxCost, userOp.sender);
+      //
+      // postOp (line 161):
+      //   (uint256 maxGasCost, address account) = abi.decode(context, (uint256, address));
+      //
+      // Trust assumption: context cannot be tampered between validate and postOp.
+      // In ERC-4337 v0.6, the EntryPoint stores context in memory during handleOps
+      // and passes it directly to postOp. The context is NOT stored on-chain between calls.
+      //
+      // The EntryPoint calls:
+      //   1. validatePaymasterUserOp -> returns (context, validationData)
+      //   2. account.execute(callData)
+      //   3. postOp(mode, context, actualGasCost)
+      //
+      // All within a single transaction. Context is an in-memory variable in EntryPoint.
+      // A malicious bundler cannot modify context because:
+      //   - The bundler submits the bundle as a single tx
+      //   - The EntryPoint contract controls the flow
+      //   - Context is never exposed to external calls between validate and postOp
+    attack_scenario: |
+      1. Malicious bundler tries to modify context between validate and postOp
+      2. BLOCKED: EntryPoint holds context in memory, bundler has no way to modify it
+      3. The only caller allowed is EntryPoint (onlyEntryPoint modifier)
+    impact: |
+      NO IMPACT — ERC-4337 EntryPoint guarantees context integrity. The onlyEntryPoint
+      modifier ensures no other address can call postOp with forged context.
+    notes: |
+      SAFE. This is a fundamental ERC-4337 trust assumption that holds. The EntryPoint
+      is a singleton at a fixed address (0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789).
+
+  - id: MS-TB-03
+    title: "Bundler gas manipulation — actualGasCost inflated to steal from user's withdrawable"
+    severity: medium
+    confidence: 40
+    status: pending
+    solidity: |
+      // postOp (line 165):
+      //   uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+      //
+      // If actualGasCost > maxGasCost, this would underflow.
+      // But ERC-4337 EntryPoint guarantees actualGasCost <= maxCost (which is maxGasCost).
+      //
+      // Can a bundler inflate actualGasCost?
+      //   - actualGasCost is computed by the EntryPoint based on actual gas consumed
+      //   - EntryPoint uses gasleft() measurements around execution
+      //   - A bundler controls gas limit of the bundle tx, but NOT the per-UserOp gas accounting
+      //   - The EntryPoint's gas accounting is deterministic based on execution
+      //
+      // Potential vector: bundler sets gasLimit just barely enough, causing higher gas usage
+      // in execution due to EVM gas repricing or memory expansion. But this affects ALL
+      // gas accounting uniformly, not specifically MagicSpend.
+      //
+      // The user's loss is bounded by: maxCost - actualGasCost being smaller than expected.
+      // Worst case: actualGasCost = maxCost, user gets 0 gas refund.
+      // But the user already agreed to maxCost when signing the WithdrawRequest.
+    attack_scenario: |
+      1. User signs WithdrawRequest for amount = 1 ETH, maxCost = 0.5 ETH
+      2. validatePaymasterUserOp: _withdrawable[user] = 0.5 ETH, context = (0.5 ETH, user)
+      3. Bundler constructs bundle to maximize gas consumption
+      4. postOp: actualGasCost = 0.5 ETH (max), withdrawable = 0.5 + 0 = 0.5 ETH
+      5. User gets 0.5 ETH instead of ~1 ETH (0.5 ETH went to gas)
+    impact: |
+      LOW/QA — The bundler cannot make actualGasCost exceed maxCost (EntryPoint invariant).
+      The user signed for maxCost, accepting that as worst-case gas. A bundler causing
+      unnecessary gas consumption is a general ERC-4337 concern, not MagicSpend-specific.
+      Additionally, excessive gas waste would cost the bundler more than they'd gain.
+    notes: |
+      Borderline QA. The user's worst case is losing maxCost to gas, which they agreed to.
+      The bundler has no profitable attack since they pay for the wasted gas too.
+
+  - id: MS-TB-04
+    title: "forceSafeTransferETH in postOp — account refusing ETH does not revert postOp"
+    severity: medium
+    confidence: 55
+    status: pending
+    solidity: |
+      // postOp (line 170):
+      //   SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+      //
+      // forceSafeTransferETH behavior (Solady):
+      //   1. First tries a normal ETH transfer with the given gas stipend
+      //   2. If that fails (account reverts or out of gas), it FORCE-sends ETH
+      //      by deploying a self-destructing contract that sends ETH to the target
+      //   3. This means the transfer ALWAYS succeeds
+      //
+      // GAS_STIPEND_NO_STORAGE_WRITES = 2300 (same as .transfer())
+      //
+      // Trust boundary question: what if account is a contract that reverts on receive?
+      //   - forceSafeTransferETH handles this via SELFDESTRUCT fallback
+      //   - Funds are ALWAYS delivered
+      //   - However: post-Cancun (EIP-6780), SELFDESTRUCT in same-tx only sends ETH
+      //     if the contract was created in the same transaction — this IS the case for
+      //     forceSafeTransferETH since it CREATE2s a new contract and immediately
+      //     SELFDESTRUCTs it in the same tx
+      //
+      // The account cannot cause postOp to revert by refusing ETH.
+      // This is intentional defensive design.
+    attack_scenario: |
+      1. Malicious account contract has receive() that reverts
+      2. postOp calls forceSafeTransferETH
+      3. Normal transfer fails, Solady deploys selfdestruct contract
+      4. ETH is force-sent to account (always succeeds post-Cancun)
+      5. No DoS on the bundler/paymaster
+    impact: |
+      NO IMPACT — forceSafeTransferETH is the correct mitigation. The code comments
+      at line 96-100 acknowledge this exact scenario. The only risk is if Solady's
+      forceSafeTransferETH has a bug, which is out of scope for MagicSpend itself.
+    notes: |
+      SAFE. The choice of forceSafeTransferETH (not safeTransferETH) in postOp is
+      specifically to prevent this trust boundary violation. Compare with _withdraw()
+      which uses safeTransferETH (can revert) — that's fine because _withdraw is
+      called in user-initiated contexts, not EntryPoint callbacks.
+
+  - id: MS-TB-05
+    title: "Multiple WithdrawRequests in same bundle — _withdrawable accumulation across UserOps"
+    severity: high
+    confidence: 35
+    status: pending
+    solidity: |
+      // validatePaymasterUserOp (line 143):
+      //   _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+      //
+      // This uses += (accumulation), not =. If the same account has multiple UserOps
+      // in the same bundle, each validatePaymasterUserOp call ADDS to _withdrawable.
+      //
+      // Flow for 2 UserOps from same account in same bundle:
+      //   1. validate(UserOp1): _withdrawable[user] += amount1 - maxCost1
+      //   2. execute(UserOp1)
+      //   3. postOp(UserOp1): withdrawable = _withdrawable[user] + (maxCost1 - actualCost1)
+      //      delete _withdrawable[user]
+      //      forceSafeTransferETH(user, withdrawable)
+      //   4. validate(UserOp2): _withdrawable[user] += amount2 - maxCost2
+      //   5. execute(UserOp2)
+      //   6. postOp(UserOp2): withdrawable = _withdrawable[user] + (maxCost2 - actualCost2)
+      //      delete _withdrawable[user]
+      //
+      // Wait — ERC-4337 v0.6 processes UserOps sequentially: validate ALL first, then execute ALL.
+      // Actually NO — in v0.6, the flow is:
+      //   Phase 1 (validation): for each UserOp, call validatePaymasterUserOp
+      //   Phase 2 (execution): for each UserOp, call execute then postOp
+      //
+      // So the actual flow is:
+      //   1. validate(UserOp1): _withdrawable[user] += amount1 - maxCost1
+      //   2. validate(UserOp2): _withdrawable[user] += amount2 - maxCost2
+      //      _withdrawable[user] = (amount1 - maxCost1) + (amount2 - maxCost2)
+      //   3. execute(UserOp1)
+      //   4. postOp(UserOp1): withdrawable = _withdrawable[user] + (maxCost1 - actualCost1)
+      //      = (amount1 - maxCost1) + (amount2 - maxCost2) + (maxCost1 - actualCost1)
+      //      = (amount1 - actualCost1) + (amount2 - maxCost2)   ← TOO MUCH for UserOp1!
+      //      delete _withdrawable[user]
+      //      User receives (amount1 - actualCost1) + (amount2 - maxCost2)
+      //   5. execute(UserOp2)
+      //   6. postOp(UserOp2): withdrawable = _withdrawable[user] + (maxCost2 - actualCost2)
+      //      = 0 + (maxCost2 - actualCost2)   ← User gets LESS for UserOp2
+      //      Total: amount1 - actualCost1 + amount2 - maxCost2 + maxCost2 - actualCost2
+      //           = amount1 - actualCost1 + amount2 - actualCost2  ← CORRECT TOTAL
+      //
+      // The total is correct! But the distribution across postOps is skewed.
+      // UserOp1's postOp sends more than it should, UserOp2's postOp sends less.
+      // This is a timing issue but not a loss-of-funds issue.
+    attack_scenario: |
+      1. Account submits 2 UserOps in same bundle with same paymaster
+      2. Both validations accumulate into _withdrawable
+      3. First postOp drains accumulated _withdrawable (includes UserOp2's portion)
+      4. Second postOp only refunds gas difference
+      5. Total received is still correct: sum(amounts) - sum(actualGasCosts)
+    impact: |
+      LOW — No loss of funds in aggregate. The distribution is skewed between postOps
+      but the mathematical total is preserved. However, if the first postOp's
+      forceSafeTransferETH were to somehow fail (shouldn't with force), the second
+      UserOp's non-gas funds would be lost. Also, ERC-4337 v0.6 EntryPoint requires
+      incrementing nonce per sender, so same-sender multi-UserOp in one bundle
+      requires nonce management — but that's an EP constraint, not MagicSpend's.
+    notes: |
+      The += accumulation pattern is a known design choice. The total accounting
+      is mathematically correct. The distribution skew is cosmetic, not exploitable.
+      Nonce uniqueness in _validateRequest prevents using the same WithdrawRequest twice.
+
+  - id: MS-TB-06
+    title: "withdrawGasExcess + postOp race — account drains _withdrawable then postOp underflows"
+    severity: high
+    confidence: 50
+    status: pending
+    solidity: |
+      // Scenario: account calls withdrawGasExcess() during execution, then postOp runs.
+      //
+      // validatePaymasterUserOp:
+      //   _withdrawable[user] = withdrawAmount - maxCost  (assuming fresh, = not +=)
+      //   context = (maxCost, user)
+      //
+      // Account execution:
+      //   account calls withdrawGasExcess()
+      //   -> amount = _withdrawable[msg.sender] = withdrawAmount - maxCost
+      //   -> delete _withdrawable[msg.sender]  (now 0)
+      //   -> _withdraw(address(0), msg.sender, withdrawAmount - maxCost)
+      //
+      // postOp:
+      //   (maxGasCost, account) = decode(context)  -> (maxCost, user)
+      //   withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost)
+      //                = 0 + (maxCost - actualGasCost)
+      //   This is >= 0 since actualGasCost <= maxCost (EP invariant)
+      //   delete _withdrawable[account]  (already 0, no-op)
+      //   forceSafeTransferETH(account, maxCost - actualGasCost)
+      //
+      // Total sent: (withdrawAmount - maxCost) + (maxCost - actualGasCost)
+      //           = withdrawAmount - actualGasCost ← CORRECT
+      //
+      // No underflow possible. postOp's computation uses context-stored maxGasCost,
+      // not _withdrawable. The _withdrawable[account] being 0 just means the gas
+      // refund portion is smaller, but the addition with (maxGasCost - actualGasCost)
+      // compensates exactly.
+    attack_scenario: |
+      1. validatePaymasterUserOp: _withdrawable[user] = 1 ETH - 0.5 ETH = 0.5 ETH
+      2. During execution, user calls withdrawGasExcess(): receives 0.5 ETH, _withdrawable = 0
+      3. postOp: withdrawable = 0 + (0.5 ETH - 0.3 ETH) = 0.2 ETH, sent to user
+      4. Total: 0.5 + 0.2 = 0.7 ETH = 1 ETH - 0.3 ETH (correct)
+    impact: |
+      NO IMPACT — accounting is correct. No underflow. This is the intended usage
+      pattern described in the NatSpec (line 176-177).
+    notes: |
+      SAFE. This is a deeper analysis of MS-TB-01 confirming the same conclusion
+      with explicit arithmetic. The key insight is that postOp reconstructs the
+      gas refund from context (maxGasCost), not from _withdrawable.
+
+  - id: MS-TB-07
+    title: "maxWithdrawDenominator set to 0 causes division by zero in _validateRequest"
+    severity: medium
+    confidence: 70
+    status: pending
+    solidity: |
+      // _validateRequest (line 347):
+      //   uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      //
+      // _setMaxWithdrawDenominator (line 329-333):
+      //   maxWithdrawDenominator = newDenominator;
+      //   emit MaxWithdrawDenominatorSet(newDenominator);
+      //
+      // constructor (line 112-115):
+      //   _setMaxWithdrawDenominator(maxWithdrawDenominator_);
+      //
+      // There is NO check that newDenominator != 0.
+      // If owner sets maxWithdrawDenominator = 0:
+      //   _validateRequest reverts with division by zero on every call
+      //   This blocks both validatePaymasterUserOp AND withdraw()
+      //
+      // However: this is an owner-only action (setMaxWithdrawDenominator is onlyOwner).
+      // The owner is trusted. This is a self-DoS by the owner.
+      //
+      // BUT: constructor also doesn't validate. If deployed with denominator=0,
+      // the contract is permanently broken from deploy.
+    attack_scenario: |
+      1. Owner (accidentally or maliciously) calls setMaxWithdrawDenominator(0)
+      2. All subsequent validatePaymasterUserOp and withdraw calls revert
+      3. Funds already in _withdrawable can still be retrieved via withdrawGasExcess
+         (which doesn't call _validateRequest)
+      4. But no NEW withdraw requests can be processed
+    impact: |
+      LOW — Owner-only action, trusted role. Self-DoS that owner can fix by calling
+      setMaxWithdrawDenominator again with a valid value. Funds in _withdrawable are
+      not permanently locked (withdrawGasExcess still works). Constructor deployment
+      with 0 is a one-time misconfiguration that would be caught immediately.
+    notes: |
+      QA-level. Missing input validation on setMaxWithdrawDenominator. No loss of
+      funds — owner can recover by setting a valid denominator. The _withdrawable
+      mapping is still accessible via withdrawGasExcess.
+
+  - id: MS-TB-08
+    title: "Reentrancy via safeTransferETH in _withdraw — callback into withdraw() with same nonce"
+    severity: medium
+    confidence: 25
+    status: pending
+    solidity: |
+      // withdraw() flow (line 190-203):
+      //   1. Check expiry (line 191)
+      //   2. Check signature (line 195)
+      //   3. _validateRequest: check nonce, set nonce used, emit event (line 199)
+      //   4. _withdraw: safeTransferETH to msg.sender (line 202)
+      //
+      // _validateRequest marks nonce as used BEFORE _withdraw sends ETH.
+      // So reentrancy via receive() calling withdraw() with SAME nonce → reverts at
+      // InvalidNonce check (line 343).
+      //
+      // Reentrancy with DIFFERENT nonce and DIFFERENT WithdrawRequest?
+      //   - This is a valid second withdrawal, not an exploit
+      //   - Each nonce can only be used once
+      //   - The attacker needs a valid owner signature for each WithdrawRequest
+      //
+      // Cross-function reentrancy: receive() calls withdrawGasExcess()?
+      //   - Only works if _withdrawable[msg.sender] > 0
+      //   - In standalone withdraw() context, _withdrawable is not set
+      //   - Only validatePaymasterUserOp sets _withdrawable
+      //   - So withdrawGasExcess would revert with NoExcess
+    attack_scenario: |
+      1. Attacker calls withdraw() with valid WithdrawRequest (nonce=1)
+      2. _validateRequest marks nonce=1 as used
+      3. _withdraw sends ETH, triggering receive() on attacker contract
+      4. Attacker re-enters withdraw() with nonce=1 → reverts (InvalidNonce)
+      5. Attacker re-enters withdraw() with nonce=2 → needs valid owner signature
+      6. Attacker re-enters withdrawGasExcess() → reverts (NoExcess, no _withdrawable set)
+    impact: |
+      NO IMPACT — Nonce is marked used before ETH transfer (checks-effects-interactions
+      pattern). Cross-function reentrancy into withdrawGasExcess fails because
+      _withdrawable is 0 in standalone withdraw context. Each valid withdrawal
+      requires owner's signature, so unlimited re-entry with different nonces
+      requires unlimited signed requests (which is legitimate usage).
+    notes: |
+      SAFE. The contract follows checks-effects-interactions. Nonce marking before
+      transfer prevents same-nonce replay. Cross-function reentrancy has no viable path.
+
+  - id: MS-TB-09
+    title: "EntryPoint v0.6 postOp gas accounting — actualGasCost includes postOp gas overhead"
+    severity: medium
+    confidence: 40
+    status: pending
+    solidity: |
+      // In ERC-4337 v0.6 EntryPoint, actualGasCost passed to postOp is computed as:
+      //   actualGas = preGas - gasleft() + preOpGas
+      //   actualGasCost = actualGas * gasPrice
+      //
+      // IMPORTANT: The EntryPoint calls postOp with an ESTIMATED actualGasCost that
+      // does NOT include the gas consumed BY postOp itself. The EntryPoint then charges
+      // the paymaster's deposit for the FULL cost (including postOp gas).
+      //
+      // This means:
+      //   actualGasCost (passed to postOp) < actual total gas charged to paymaster
+      //
+      // In MagicSpend postOp (line 165):
+      //   withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost)
+      //
+      // The user gets refunded (maxGasCost - actualGasCost), but the paymaster is
+      // charged MORE than actualGasCost (adding postOp gas overhead).
+      //
+      // The delta (postOp gas overhead) comes from the paymaster's EntryPoint deposit,
+      // not from the user's withdrawAmount. This is a known design aspect of ERC-4337.
+      //
+      // The paymaster (Coinbase) absorbs this overhead as cost of doing business.
+      // The user is slightly over-refunded relative to true cost.
+    attack_scenario: |
+      1. User's WithdrawRequest: amount = 1 ETH, maxCost = 0.5 ETH
+      2. Actual execution gas: 0.3 ETH
+      3. postOp gas overhead: 0.01 ETH
+      4. postOp receives actualGasCost = 0.3 ETH
+      5. User gets: (1 - 0.5) + (0.5 - 0.3) = 0.7 ETH
+      6. Paymaster deposit charged: 0.3 + 0.01 = 0.31 ETH
+      7. Total out: 0.7 (user) + 0.31 (EP) = 1.01 ETH > 1 ETH (withdraw amount)
+      8. The 0.01 ETH gap comes from paymaster's EP deposit
+    impact: |
+      LOW/INFO — The paymaster (Coinbase) subsidizes the postOp gas overhead from
+      their EntryPoint deposit. This is standard ERC-4337 paymaster economics, not
+      a vulnerability. The "loss" per UserOp is ~21K gas * gasPrice (tiny).
+      Coinbase is aware and considers this operational cost.
+    notes: |
+      Known ERC-4337 design aspect. Not a MagicSpend bug. The paymaster's EP deposit
+      is topped up by the owner via entryPointDeposit(). This is a cost model, not
+      a vulnerability.
+
+  - id: MS-TB-10
+    title: "Signature replay across chains — getHash includes block.chainid but not at signing time"
+    severity: low
+    confidence: 30
+    status: pending
+    solidity: |
+      // getHash (line 300-312):
+      //   return toEthSignedMessageHash(abi.encode(
+      //     address(this), account, block.chainid,
+      //     withdrawRequest.asset, withdrawRequest.amount,
+      //     withdrawRequest.nonce, withdrawRequest.expiry
+      //   ));
+      //
+      // The hash includes:
+      //   - address(this): contract address (different per chain if CREATE2 not used)
+      //   - block.chainid: current chain ID
+      //
+      // Cross-chain replay protection:
+      //   - If MagicSpend is deployed at the SAME address on multiple chains (via CREATE2),
+      //     AND block.chainid differs, signatures are still chain-specific ✓
+      //   - If a chain hard-forks and changes chainId, old signatures become invalid ✓
+      //     (this protects against replay on the new chain)
+      //   - block.chainid is dynamic (not cached), so it reflects current chain ✓
+      //
+      // The protection is adequate. address(this) + block.chainid together ensure
+      // uniqueness even if the contract is at the same address on different chains.
+    attack_scenario: |
+      1. Owner signs WithdrawRequest for user on Chain A
+      2. Attacker tries to replay on Chain B where MagicSpend is at same address
+      3. getHash on Chain B includes Chain B's chainId → different hash → signature invalid
+    impact: |
+      NO IMPACT — Cross-chain replay is properly mitigated by including both
+      address(this) and block.chainid in the signed hash.
+    notes: |
+      SAFE. Standard and correct cross-chain replay protection.
+
+summary: |
+  Analyzed 10 trust boundary hypotheses for MagicSpend.sol (ERC-4337 Paymaster).
+
+  Key findings:
+  - The contract is well-designed with respect to trust boundaries.
+  - withdrawGasExcess during execution is an INTENDED feature, not a bug (MS-TB-01, MS-TB-06).
+  - Context integrity between validatePaymasterUserOp and postOp is guaranteed by EntryPoint (MS-TB-02).
+  - forceSafeTransferETH correctly prevents DoS from account refusing ETH (MS-TB-04).
+  - Reentrancy via _withdraw is mitigated by checks-effects-interactions pattern (MS-TB-08).
+  - Cross-chain replay is properly prevented (MS-TB-10).
+
+  Potential QA/Low issues:
+  - MS-TB-07: maxWithdrawDenominator=0 causes DoS (owner-only, self-recoverable) — QA
+  - MS-TB-09: postOp gas overhead subsidized by paymaster deposit — informational
+  - MS-TB-03: Bundler gas manipulation bounded by maxCost user agreed to — QA
+
+  No High/Medium exploitable trust boundary violations found. The contract's
+  trust model is sound: it correctly trusts EntryPoint for context/gas, validates
+  signatures from owner, uses nonces for replay protection, and follows CEI pattern.

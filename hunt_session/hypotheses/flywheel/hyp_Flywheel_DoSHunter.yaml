@@ -1,0 +1,445 @@
+hunter: DoSHunter
+protocol: Flywheel
+date: "2026-03-27"
+component: Flywheel (core + all hooks)
+
+hypotheses:
+
+  - id: DOS-01
+    title: "Malicious recipient reverts on receive blocks entire send() batch"
+    description: |
+      In Flywheel.send() (line 317-318), if ANY payout transfer fails the entire
+      transaction reverts via `SendFailed`. A malicious contract recipient can
+      implement a reverting receive()/fallback() to permanently block all payouts
+      in any batch that includes it. For native ETH, Campaign.sendTokens uses
+      `payable(recipient).call{value: amount}("")` — a reverting contract returns
+      success=false. For ERC20, trySafeTransfer also returns false on revert.
+
+      HOWEVER: the hook controls who the recipients are. In AdConversion, the
+      attributionProvider chooses recipients. In SimpleRewards, the manager chooses.
+      In BridgeReferralFees, there's only 1 recipient per call. So this is only
+      exploitable if:
+      (a) An attacker can get themselves into a batch they don't control (AdConversion
+          with publisher allowlist bypass — unlikely), OR
+      (b) The attributionProvider/manager is malicious (trusted role).
+
+      For BridgeReferralFees: user is the recipient, only 1 payout per send, so
+      self-DoS only. Not exploitable against others.
+
+      Net assessment: LOW severity because recipients are chosen by trusted roles
+      (attributionProvider/manager), not by arbitrary users. The design is still
+      fragile — a single bad recipient poisons the whole batch — but the access
+      control on who sets recipients mitigates the impact.
+    severity: low
+    confidence: 60
+    affected_functions:
+      - "Flywheel.send() lines 310-320"
+      - "Flywheel.distribute() lines 417-434"
+      - "Campaign.sendTokens() line 44-51"
+    attack_scenario: |
+      1. AttackContract deploys a contract that reverts on ETH receive
+      2. AttributionProvider (AdConversion) or Manager (SimpleRewards) includes
+         AttackContract address as one of several recipients in a batch
+      3. send() or distribute() iterates payouts, hits AttackContract, sendTokens
+         returns false, entire tx reverts with SendFailed
+      4. ALL other legitimate recipients in the same batch are denied their payouts
+      5. To fix: must exclude the malicious recipient, which requires re-submitting
+         the batch without them (no per-recipient skip mechanism for payouts)
+    solidity_invariant: |
+      // INV: A single recipient failure should not block other recipients
+      // This invariant SHOULD hold but currently DOES NOT for send/distribute
+      function invariant_single_recipient_failure_no_batch_block() public {
+          // If N-1 recipients can receive tokens, the batch should partially succeed
+          // Currently: if 1 fails, all N fail
+          // Note: fees already handle this correctly via _processFees try-pattern
+      }
+
+  - id: DOS-02
+    title: "distribute() has identical batch-revert-on-single-failure as send()"
+    description: |
+      Flywheel.distribute() (line 431-432) has the exact same pattern as send():
+      `if (!success) revert SendFailed(...)`. Same issue as DOS-01. A malicious
+      recipient in a distribution batch blocks all distributions. Same mitigations
+      apply — recipients are chosen by trusted hook roles.
+    severity: low
+    confidence: 60
+    affected_functions:
+      - "Flywheel.distribute() lines 417-434"
+    attack_scenario: |
+      Same as DOS-01 but via the distribute() path. Manager/attributionProvider
+      submits a batch of distributions. One recipient is a reverting contract.
+      All distributions in the batch fail.
+    solidity_invariant: |
+      // INV: distribute should not revert entirely due to one bad recipient
+      function invariant_distribute_partial_success() public {
+          // Same structural issue as DOS-01
+      }
+
+  - id: DOS-03
+    title: "Intentional design: distributeFees() does NOT revert on failure — inconsistency analysis"
+    description: |
+      distributeFees() (lines 467-477) correctly handles failed transfers by
+      emitting FeeTransferFailed and skipping the failed recipient. _processFees()
+      (lines 622-653) also handles failures gracefully, converting failed sends
+      into allocations.
+
+      This is NOT a bug — it's the CORRECT pattern. The inconsistency is that
+      send() and distribute() DON'T use this pattern for payouts. The protocol
+      deliberately chose: fees are non-critical (can retry via distributeFees),
+      payouts are critical (must succeed atomically or not at all).
+
+      This design choice is defensible but creates the DOS-01/DOS-02 surface.
+      The fee path is well-designed with fallback allocation on failure.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "Flywheel.distributeFees() lines 466-477"
+      - "Flywheel._processFees() lines 622-653"
+    attack_scenario: |
+      Not an attack. This is an architecture observation. The fee path is resilient
+      to recipient failures. The payout path is not. This inconsistency is by design
+      but worth documenting.
+    solidity_invariant: |
+      // INV: distributeFees never reverts due to a single recipient failure
+      function invariant_distributeFees_no_revert_on_recipient_failure() public {
+          // This HOLDS — fees gracefully handle failures
+          // Contrast with send/distribute which revert on any failure
+      }
+
+  - id: DOS-04
+    title: "AdConversion._onSend O(n^2) deduplication loop — gas bomb with many attributions"
+    description: |
+      In AdConversion._onSend (lines 468-476), for each attribution, an inner loop
+      scans all previously seen unique recipients: `for (uint256 j = 0; j < uniqueCount; j++)`.
+      With N attributions and M unique recipients, worst case is O(N*M) ≈ O(N^2) when
+      all recipients are unique.
+
+      However, the caller is the attributionProvider (trusted role, line 404). They
+      control the attributions array size. If they submit a massive array, they pay
+      the gas. This is self-DoS at most.
+
+      Practical limit: ~300-500 unique attributions before hitting Base block gas limit
+      (depending on other operations). Each inner loop iteration costs ~200 gas for
+      MLOAD + comparison. 500^2 * 200 = 50M gas, which exceeds block gas limit.
+
+      But again: only the attributionProvider can trigger this, and they choose to.
+    severity: low
+    confidence: 70
+    affected_functions:
+      - "AdConversion._onSend() lines 468-476"
+    attack_scenario: |
+      1. AttributionProvider submits send() with 500+ unique recipient attributions
+      2. Inner dedup loop runs O(n^2): 500 * 500 / 2 = 125K iterations
+      3. At ~200 gas per iteration = ~25M gas, approaching block gas limit
+      4. Transaction fails with out-of-gas
+      5. Legitimate attributions in the batch are all denied
+
+      Mitigation: attributionProvider is trusted and can batch smaller sets.
+      This is operational, not adversarial.
+    solidity_invariant: |
+      // INV: _onSend should complete within block gas limit for reasonable batch sizes
+      function invariant_onSend_gas_bounded(uint256 attributionCount) public {
+          // For attributionCount <= 100, gas should be < 5M
+          // For attributionCount > 200, may exceed practical limits
+          vm.assume(attributionCount <= 100);
+          uint256 gasBefore = gasleft();
+          // ... execute _onSend with attributionCount unique recipients
+          uint256 gasUsed = gasBefore - gasleft();
+          assert(gasUsed < 5_000_000);
+      }
+
+  - id: DOS-05
+    title: "SimpleRewards/CashbackRewards unbounded arrays from hooks — gas limit DoS"
+    description: |
+      SimpleRewards._onSend (line 72) decodes `abi.decode(hookData, (Flywheel.Payout[]))` —
+      the array size is controlled by the manager (trusted role). Similarly for
+      _onAllocate, _onDeallocate, _onDistribute. Flywheel.sol then iterates these
+      arrays (lines 310, 344, 378, 417).
+
+      CashbackRewards adds validation per element (_validatePaymentReward with
+      external ESCROW.paymentState call), making each iteration more expensive.
+
+      The loops in Flywheel are O(n) which is fine, but CashbackRewards adds
+      an external call per element (~2600 gas minimum for cold ESCROW access,
+      then ~100 for warm). With 500 elements: 500 * 2600 = 1.3M gas just for
+      escrow reads, plus storage writes for rewards tracking.
+
+      Again: manager-controlled, not adversarial. Operational concern only.
+    severity: informational
+    confidence: 75
+    affected_functions:
+      - "SimpleRewards._onSend() line 72"
+      - "SimpleRewards._onAllocate() lines 83-91"
+      - "CashbackRewards._onSend() lines 102-135"
+      - "CashbackRewards._onAllocate() lines 138-172"
+      - "Flywheel.send() lines 310-320"
+      - "Flywheel.allocate() lines 344-358"
+    attack_scenario: |
+      1. Manager submits allocate() with extremely large PaymentReward array
+      2. CashbackRewards iterates with external ESCROW calls per element
+      3. Transaction runs out of gas
+      4. All allocations in the batch fail
+
+      Not adversarial — manager controls the input and pays gas.
+    solidity_invariant: |
+      // INV: Hook-returned arrays should be processable within block gas limit
+      function invariant_hook_arrays_gas_bounded() public {
+          // Operational: manager should batch reasonably
+      }
+
+  - id: DOS-06
+    title: "BridgeReferralFees: dust deposits can inflate bridgedAmount calculation"
+    description: |
+      In BridgeReferralFees._onSend (lines 78-79):
+      ```
+      uint256 bridgedAmount = token == Constants.NATIVE_TOKEN ? campaign.balance : IERC20(token).balanceOf(campaign);
+      bridgedAmount -= FLYWHEEL.totalAllocatedFees(campaign, token);
+      ```
+
+      bridgedAmount = total campaign balance minus allocated fees. If someone sends
+      dust tokens/ETH directly to the campaign contract (which has `receive() payable`),
+      that dust inflates bridgedAmount.
+
+      HOWEVER: BridgeReferralFees._onSend has NO access control (anyone can call
+      Flywheel.send for this hook). The payout goes to `user` (decoded from hookData).
+      So if an attacker deposits dust, the NEXT caller of send() gets the dust as
+      part of their bridgedAmount. The attacker loses the dust — the next user gains it.
+
+      This is NOT a DoS — it's a donation to the next user. The attacker cannot profit
+      from this. They can't block operations either, since dust only increases the
+      available amount.
+
+      One edge case: if campaign has a solvency check and somehow allocated amounts
+      exceed balance, but dust deposits only INCREASE balance, so solvency improves.
+
+      Verdict: NOT a vulnerability. Dust deposits help the next user, hurt the depositor.
+    severity: informational
+    confidence: 80
+    affected_functions:
+      - "BridgeReferralFees._onSend() lines 78-79"
+      - "Campaign.receive() line 33"
+    attack_scenario: |
+      1. Attacker sends 1 wei ETH to campaign address
+      2. Next legitimate bridge user calls send()
+      3. bridgedAmount includes the 1 wei dust
+      4. User receives slightly more than expected
+      5. Attacker lost 1 wei, user gained 1 wei
+
+      Not exploitable. No DoS vector.
+    solidity_invariant: |
+      // INV: Direct deposits to campaign cannot block or reduce legitimate payouts
+      function invariant_dust_no_dos() public {
+          // bridgedAmount = balance - allocatedFees >= actual bridged amount
+          // Dust only increases the left side, never decreases it
+      }
+
+  - id: DOS-07
+    title: "CashbackRewards: broken/paused ESCROW external dependency blocks all operations"
+    description: |
+      CashbackRewards._validatePaymentReward (lines 298-313) makes two external calls
+      to ESCROW:
+      - ESCROW.getHash(paymentReward.paymentInfo) (line 299)
+      - ESCROW.paymentState(paymentInfoHash) (line 311)
+
+      If ESCROW is paused, self-destructed, or returns unexpected data, ALL
+      CashbackRewards operations (send, allocate, deallocate, distribute) will revert.
+
+      The ESCROW is immutable (set in constructor, line 87), so it cannot be updated
+      if the escrow contract becomes unavailable.
+
+      HOWEVER: the revertOnError flag (decoded from hookData) only controls whether
+      validation errors are reverted or emitted — it does NOT protect against the
+      external call itself reverting. If ESCROW.getHash() reverts, the whole tx reverts
+      regardless of revertOnError.
+
+      Severity depends on ESCROW's trust model. If ESCROW is upgradeable and admin
+      is compromised, they could pause it to DoS all CashbackRewards campaigns.
+      If ESCROW is immutable and battle-tested, risk is low.
+    severity: medium
+    confidence: 50
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward() lines 298-314"
+      - "CashbackRewards._onSend() line 114-115"
+      - "CashbackRewards._onAllocate() line 150-151"
+      - "CashbackRewards._onDeallocate() line 187-188"
+      - "CashbackRewards._onDistribute() line 231-232"
+    attack_scenario: |
+      1. ESCROW contract is upgraded (if upgradeable) or admin pauses it
+      2. ESCROW.getHash() or paymentState() reverts on all calls
+      3. ALL CashbackRewards campaign operations (send/allocate/deallocate/distribute)
+         revert because _validatePaymentReward cannot complete
+      4. Funds in CashbackRewards campaigns are stuck — cannot send or distribute
+      5. withdrawFunds still works (goes through SimpleRewards._onWithdrawFunds,
+         no ESCROW dependency) — owner can recover funds
+
+      Mitigated by: withdrawFunds path does not depend on ESCROW.
+    solidity_invariant: |
+      // INV: If ESCROW is unavailable, fund withdrawal should still work
+      function invariant_escrow_down_withdraw_works() public {
+          // withdrawFunds -> SimpleRewards._onWithdrawFunds -> no ESCROW call
+          // This HOLDS — owner can always withdraw even if ESCROW is broken
+      }
+      // INV: If ESCROW is unavailable, no CashbackRewards operations should work
+      function invariant_escrow_required_for_operations() public {
+          // send/allocate/deallocate/distribute all call ESCROW
+          // This is a design dependency, not a bug per se
+      }
+
+  - id: DOS-08
+    title: "createCampaign clone spam — no rate limiting on campaign creation"
+    description: |
+      Flywheel.createCampaign (line 274) is permissionless — anyone can call it
+      with any hooks address and nonce. Each call deploys a minimal clone via
+      Clones.cloneDeterministic. The salt is deterministic (hooks + nonce + hookData),
+      so the same parameters produce the same address (early return on line 283).
+
+      An attacker could spam createCampaign with different nonces to:
+      - Deploy many clone contracts (storage bloat)
+      - Emit many CampaignCreated events (indexer spam)
+      - Call hooks.onCreateCampaign which may have state-writing side effects
+
+      HOWEVER: each deployment costs ~45K gas (clone creation). At 30 gwei gas price,
+      each campaign costs ~0.00135 ETH. Deploying 10K campaigns costs ~13.5 ETH.
+      On Base (low gas), it's cheaper but still has a cost.
+
+      The hooks contract can implement its own access control in _onCreateCampaign
+      (AdConversion stores state, BridgeReferralFees restricts to nonce=0).
+
+      This is a standard permissionless factory pattern. Not a real vulnerability.
+    severity: informational
+    confidence: 85
+    affected_functions:
+      - "Flywheel.createCampaign() lines 274-289"
+    attack_scenario: |
+      1. Attacker calls createCampaign in loop with incrementing nonces
+      2. Each call deploys a clone and stores CampaignInfo
+      3. Thousands of campaigns created, bloating storage and event logs
+      4. Indexers must process all events
+
+      Cost-prohibitive and no direct harm to protocol functionality.
+      Hooks can add their own access control.
+    solidity_invariant: |
+      // INV: Campaign creation should not affect existing campaigns
+      function invariant_new_campaign_no_side_effects() public {
+          // Creating new campaigns does not modify state of existing ones
+      }
+
+  - id: DOS-09
+    title: "ReentrancyGuardTransient on Base — transient storage compatibility"
+    description: |
+      Flywheel uses Solady's ReentrancyGuardTransient and overrides
+      `_useTransientReentrancyGuardOnlyOnMainnet()` to return false (line 686-688),
+      explicitly enabling transient storage on ALL chains including Base.
+
+      Base (OP Stack L2) has supported EIP-1153 transient storage (TSTORE/TLOAD)
+      since the Dencun upgrade (March 2024). As of 2026, this is fully supported.
+
+      The override is correct — without it, Solady's default only uses transient
+      storage on mainnet (chainid == 1) and falls back to regular storage on other
+      chains. By returning false, Flywheel ensures transient storage is used
+      everywhere, which is both gas-efficient and correct for reentrancy protection.
+
+      No vulnerability here. The implementation is correct and intentional.
+    severity: informational
+    confidence: 95
+    affected_functions:
+      - "Flywheel._useTransientReentrancyGuardOnlyOnMainnet() lines 686-688"
+    attack_scenario: |
+      No attack. Transient storage is supported on Base since Dencun.
+      The override is the correct pattern for using Solady's transient
+      reentrancy guard on non-mainnet chains.
+    solidity_invariant: |
+      // INV: nonReentrant modifier prevents reentrancy on all chains
+      function invariant_reentrancy_guard_works() public {
+          // Transient storage clears at end of transaction
+          // Reentrancy within same tx is blocked by the guard
+      }
+
+  - id: DOS-10
+    title: "AdConversion._onCreateCampaign unbounded publisher allowlist and config arrays"
+    description: |
+      In AdConversion._onCreateCampaign (lines 372-391), two loops iterate over
+      user-supplied arrays:
+      - allowedPublisherRefCodes (line 374): writes to storage per element
+      - configs (line 383): writes ConversionConfig to storage per element
+
+      The configs array is bounded by MAX_CONVERSION_CONFIGS (uint16.max = 65535),
+      but conversionConfigCount is cast as uint16(configs.length) on line 381 without
+      checking overflow. If configs.length > 65535, the cast silently truncates.
+
+      Actually: the cast `uint16(configs.length)` would truncate. But the loop uses
+      `uint256 count = configs.length` (line 382) and iterates the full array.
+      So you could store more configs than conversionConfigCount tracks. But
+      configs.length > 65535 would cost enormous gas for storage writes (65K+ SSTORE
+      operations = 1.3B gas minimum), making this impractical.
+
+      The allowedPublisherRefCodes array has no explicit bound. Each element does
+      a storage write. Large arrays would exceed gas limits naturally.
+
+      The real concern: createCampaign is called once per campaign. The gas cost
+      is paid by the creator. Self-DoS only.
+    severity: informational
+    confidence: 75
+    affected_functions:
+      - "AdConversion._onCreateCampaign() lines 372-391"
+    attack_scenario: |
+      1. Creator calls createCampaign with extremely large allowedPublisherRefCodes
+         or configs array
+      2. Transaction exceeds block gas limit
+      3. Campaign creation fails
+      4. Only the creator is affected — they retry with smaller arrays
+
+      Self-inflicted. Not adversarial.
+    solidity_invariant: |
+      // INV: Campaign creation should succeed with reasonable input sizes
+      function invariant_create_campaign_gas_bounded() public {
+          // With <= 100 publishers and <= 100 configs, creation should succeed
+      }
+
+  - id: DOS-11
+    title: "BridgeReferralFees no access control on send — anyone can drain campaign balance"
+    description: |
+      BridgeReferralFees._onSend has NO access control check on `sender`. Any
+      address can call Flywheel.send() for a BridgeReferralFees campaign. The
+      hookData contains (user, code, feeBps) — the caller chooses who receives
+      the tokens.
+
+      bridgedAmount = campaign.balance - totalAllocatedFees. If the campaign has
+      unallocated balance (e.g., tokens sent to it waiting for the bridge user
+      to claim), anyone can call send() and redirect those tokens to themselves.
+
+      This is DOCUMENTED in the code (line 140-142): "If tokens are sent into the
+      campaign outside of this scope on accident, anyone can take them."
+
+      The intended flow is atomic: bridge deposits tokens → same tx calls send()
+      → tokens go to user. If deposit and send are not atomic, the tokens are
+      up for grabs.
+
+      From a DoS perspective: an attacker can front-run legitimate send() calls
+      to steal the bridged tokens. This is more of a theft vector than DoS, but
+      it could DoS the bridge workflow by stealing funds before intended recipients.
+
+      NOTE: This is more accurately a front-running/MEV issue than pure DoS.
+      Flagging as it was found during DoS analysis.
+    severity: medium
+    confidence: 65
+    affected_functions:
+      - "BridgeReferralFees._onSend() lines 69-108"
+      - "Flywheel.send() lines 299-323"
+    attack_scenario: |
+      1. Bridge deposits tokens into campaign (separate tx or visible in mempool)
+      2. Attacker front-runs the legitimate send() call
+      3. Attacker calls Flywheel.send(campaign, token, hookData) where hookData
+         encodes (attackerAddress, "", 0) — no fee, attacker as recipient
+      4. bridgedAmount = campaign.balance - allocatedFees = entire deposit
+      5. All tokens sent to attacker
+      6. Legitimate user's send() finds bridgedAmount = 0, receives nothing
+
+      Assumes non-atomic deposit+send. If atomic (same tx), not exploitable.
+    solidity_invariant: |
+      // INV: Only intended recipients should receive bridge payouts
+      // This invariant MAY NOT HOLD if deposit and send are not atomic
+      function invariant_bridge_payout_only_intended_recipient() public {
+          // bridgedAmount goes to whoever calls send() first
+          // No access control means first caller wins
+      }

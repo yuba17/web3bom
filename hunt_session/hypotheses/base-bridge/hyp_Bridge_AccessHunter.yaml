@@ -1,0 +1,494 @@
+hunter: AccessHunter
+component: Bridge
+date: "2026-03-27"
+files_analyzed:
+  - src/Bridge.sol
+  - src/BridgeValidator.sol
+  - src/Twin.sol
+  - src/CrossChainERC20.sol
+  - src/CrossChainERC20Factory.sol
+  - src/periphery/RelayerOrchestrator.sol
+  - src/libraries/CallLib.sol
+  - src/libraries/TokenLib.sol
+  - src/libraries/MessageLib.sol
+  - src/libraries/VerificationLib.sol
+  - src/libraries/MessageStorageLib.sol
+  - src/libraries/SVMBridgeLib.sol
+  - src/libraries/SVMLib.sol
+  - src/interfaces/IPartner.sol
+
+summary: |
+  The bridge access control model is well-designed overall. The critical path
+  (Solana->Base message relay) is protected by a multi-validator signature scheme
+  (base + partner thresholds). The internal relay function __relayMessage uses
+  msg.sender == address(this) which can only be called via the try/catch in
+  _validateAndRelay. CrossChainERC20 mint/burn is immutably tied to the Bridge
+  address. Twin.execute is restricted to Bridge or self.
+
+  Most hypotheses below are LOW confidence or INFO severity. The code is
+  tight — there are no obvious access control bypasses. The main attack
+  surface is validator key compromise (out of scope for smart contract bugs)
+  and griefing/DoS via permissionless functions.
+
+hypotheses:
+  - id: BR-ACC-01
+    title: "Guardian can permanently DoS the bridge via setPaused"
+    description: |
+      Bridge.setPaused (line 265) requires only GUARDIAN_ROLE (bit 0). A guardian
+      can call setPaused(true) at any time. The owner can revoke the role, but
+      there is no timelock or multi-sig requirement. A compromised or malicious
+      guardian can repeatedly pause the bridge. The owner must actively revoke
+      the role to stop it. During the time between pause and owner reaction,
+      all bridgeCall, bridgeToken, and relayMessages are blocked. Additionally,
+      BridgeValidator.registerMessages also checks Bridge.paused(), so even
+      message pre-validation is blocked.
+
+      However: the owner (OwnableRoles) can revokeRoles at any time, and there
+      is no way for a guardian to prevent their own role revocation. So the DoS
+      is temporary — bounded by owner reaction time.
+    attack_path: |
+      1. Guardian calls Bridge.setPaused(true)
+      2. All bridge operations revert with Paused()
+      3. Owner must call revokeRoles(guardian, GUARDIAN_ROLE) + setPaused(false)
+      4. During the gap, funds in transit from Solana cannot be relayed
+    severity: "Low"
+    confidence: "High"
+    affected_code: "Bridge.sol:265"
+    solidity: |
+      // Invariant: guardian cannot permanently DoS if owner is active
+      function echidna_guardianCannotPermanentlyPause() public returns (bool) {
+        // If paused by guardian, owner can always unpause by revoking + unpausing
+        // This is a design concern, not a code bug
+        return true;
+      }
+    status: pending
+    notes: |
+      This is a known design tradeoff. Guardian pause is intentional for emergency
+      response. The risk is if guardian key is compromised. Severity is Low because
+      owner can always recover. Could be Info depending on threat model.
+
+  - id: BR-ACC-02
+    title: "registerMessages is permissionless but signature-gated — no bypass found"
+    description: |
+      BridgeValidator.registerMessages (line 172) has no access control modifier.
+      Anyone can call it. However, the function requires valid signatures from
+      both base validators (threshold check) and partner validators (if threshold > 0).
+
+      The signature covers abi.encode(messageHashes) where messageHashes are derived
+      from sequential nonces starting at nextNonce. The nonce is strictly monotonic
+      (incremented after successful registration). Signatures are verified via
+      ECDSA.recover with sorted-ascending signer enforcement and duplicate detection.
+
+      Analysis: No bypass found. The permissionless design is intentional — anyone
+      can submit pre-signed batches (relayer model). The sequential nonce prevents
+      replay and reordering. The signature threshold prevents unauthorized registration.
+    attack_path: |
+      N/A — no exploit path identified.
+      Attempted vectors:
+      1. Replay: blocked by sequential nonce (nextNonce increments)
+      2. Forge signatures: requires threshold private keys
+      3. Reorder messages: nonce is sequential, hashes include nonce
+      4. Skip nonces: hashes computed from nextNonce, cannot skip
+    severity: "Info"
+    confidence: "High"
+    affected_code: "BridgeValidator.sol:172-196"
+    solidity: |
+      function echidna_registerMessagesRequiresValidSigs() public returns (bool) {
+        // Without valid validator signatures, registerMessages should always revert
+        return true;
+      }
+    status: rejected
+    notes: |
+      Permissionless by design. Signature verification is sound. No bypass.
+
+  - id: BR-ACC-03
+    title: "__relayMessage entrypoint check — self-call only via try/catch"
+    description: |
+      Bridge.__relayMessage (line 215) checks msg.sender == address(this) via
+      _assertSenderIsEntrypoint(). The only code path that calls this.__relayMessage
+      is _validateAndRelay (line 358) using this.__relayMessage{gas: message.gasLimit}(message).
+
+      Can an attacker force Bridge to call __relayMessage externally?
+      - Bridge inherits OwnableRoles (no arbitrary call functionality)
+      - Bridge has no fallback/receive that could be abused
+      - Bridge has no delegatecall to user-controlled code
+      - The only external call from Bridge is this.__relayMessage itself
+
+      The msg.sender == address(this) check is sound for this contract design.
+      An external contract cannot set msg.sender to the Bridge address.
+    attack_path: |
+      N/A — no exploit path identified.
+      Attempted vectors:
+      1. Direct call: reverts with SenderIsNotEntrypoint
+      2. Via Twin delegatecall: Twin's delegatecall executes in Twin's context,
+         msg.sender would be Twin, not Bridge
+      3. Via relay of a Call message targeting Bridge.__relayMessage: this would
+         go through Twin.execute -> Bridge.__relayMessage, but msg.sender = Twin,
+         not Bridge
+    severity: "Info"
+    confidence: "High"
+    affected_code: "Bridge.sol:215-217, Bridge.sol:371-373"
+    solidity: |
+      function echidna_relayMessageOnlySelfCall() public returns (bool) {
+        // __relayMessage can only be called by Bridge itself
+        // Any external call should revert with SenderIsNotEntrypoint
+        return true;
+      }
+    status: rejected
+    notes: |
+      Sound design. The self-call pattern with try/catch is a common and safe pattern
+      for isolating execution failures without reverting the whole transaction.
+
+  - id: BR-ACC-04
+    title: "Twin.execute allows delegatecall — Solana user can destroy Twin or steal its assets"
+    description: |
+      Twin.execute (line 84) accepts a Call struct that can be CallType.DelegateCall.
+      A Solana user who controls a Twin can delegatecall to a malicious contract that
+      SELFDESTRUCTs the Twin (pre-Dencun) or modifies its storage. However:
+
+      1. Twin is a beacon proxy — storage is per-proxy, implementation is shared
+      2. The BRIDGE immutable is in the implementation, not proxy storage, so it
+         cannot be overwritten via delegatecall
+      3. Post-Dencun, SELFDESTRUCT only sends ETH without destroying the contract
+      4. A Solana user destroying their own Twin only harms themselves
+
+      The real question: can a Solana user's Twin delegatecall be used to attack
+      OTHER contracts? Yes — the Twin can delegatecall to arbitrary code, executing
+      in the Twin's context. But the Twin only holds the Solana user's own assets,
+      so this is "self-harm" only.
+
+      HOWEVER: if any protocol grants allowances or permissions to a Twin address
+      (e.g., ERC20 approvals), the Solana user could abuse delegatecall to execute
+      arbitrary logic with those permissions. This is a design risk but not a direct
+      vulnerability in the bridge code itself.
+    attack_path: |
+      1. Solana user sends Call message with CallType.DelegateCall
+      2. Bridge relays to Twin.execute
+      3. Twin delegatecalls to attacker contract
+      4. Attacker contract runs in Twin's context with Twin's storage/balance
+      5. Can drain Twin's ETH, call approve on Twin's tokens, etc.
+      Impact: only the Solana user's own Twin is affected
+    severity: "Info"
+    confidence: "High"
+    affected_code: "Twin.sol:84-87, CallLib.sol:46-49"
+    solidity: |
+      function echidna_twinDelegatecallSelfHarm() public returns (bool) {
+        // Twin delegatecall can only affect the Twin's own context
+        // Other users' Twins are unaffected
+        return true;
+      }
+    status: rejected
+    notes: |
+      By design. Each Solana user has sovereignty over their own Twin. The Twin
+      is their execution proxy. Delegatecall is intentionally allowed for
+      composability.
+
+  - id: BR-ACC-05
+    title: "CrossChainERC20 mint/burn — immutable _BRIDGE prevents impersonation"
+    description: |
+      CrossChainERC20.mint and .burn (lines 149, 162) use onlyBridge modifier
+      checking msg.sender == _BRIDGE. The _BRIDGE is an immutable set in the
+      constructor of the implementation contract. All proxies share this
+      implementation, so _BRIDGE is the same for all CrossChainERC20 tokens.
+
+      Can another contract impersonate the Bridge?
+      - _BRIDGE is immutable (stored in bytecode), cannot be modified
+      - The Bridge address is set at deploy time via constructor
+      - No proxy admin can change the implementation to one with a different _BRIDGE
+        without upgrading the beacon, which requires the beacon owner
+      - If the beacon owner upgrades to a malicious implementation, that's a
+        trusted admin attack (out of scope for most bounties)
+
+      No bypass found for onlyBridge.
+    attack_path: |
+      N/A — no exploit path.
+      Attempted vectors:
+      1. Forge msg.sender: impossible in EVM
+      2. Upgrade beacon to malicious impl: requires beacon owner (trusted)
+      3. Deploy fake CrossChainERC20 with different _BRIDGE: would not be
+         registered in CrossChainERC20Factory.isCrossChainErc20 mapping
+    severity: "Info"
+    confidence: "High"
+    affected_code: "CrossChainERC20.sol:71-74, CrossChainERC20.sol:149, CrossChainERC20.sol:162"
+    solidity: |
+      function echidna_onlyBridgeCanMintBurn() public returns (bool) {
+        // CrossChainERC20 mint/burn only callable by immutable BRIDGE
+        return true;
+      }
+    status: rejected
+    notes: Sound design. Immutable bridge reference is the correct pattern.
+
+  - id: BR-ACC-06
+    title: "Anyone can deploy CrossChainERC20 tokens via factory — potential for confusion attacks"
+    description: |
+      CrossChainERC20Factory.deploy (line 83) is permissionless. Anyone can deploy
+      a CrossChainERC20 for any remoteToken/name/symbol/decimals combination.
+      The deployed token is marked in isCrossChainErc20 mapping and can be used
+      for bridging (mint/burn path).
+
+      Attack scenario: Attacker deploys a token with misleading name/symbol
+      (e.g., "USDC" pointing to a worthless Solana token). Users interacting
+      with the bridge UI could be tricked into receiving worthless wrapped tokens.
+
+      However: the actual token bridging requires the remoteToken to match the
+      CrossChainERC20's stored remoteToken. A fake "USDC" would have a different
+      remoteToken than the real USDC wrapper, so it wouldn't intercept legitimate
+      USDC bridging. The risk is UI confusion only.
+
+      Additionally: the CREATE2 salt is deterministic from (remoteToken, name,
+      symbol, decimals). So the "correct" token for a given Solana mint can only
+      be deployed once with those exact params. An attacker could frontrun the
+      "official" deployment, but the resulting token would be identical.
+    attack_path: |
+      1. Attacker calls factory.deploy("USDC", someRandomSolanaMint, "USDC", 6)
+      2. Token is deployed and registered in isCrossChainErc20
+      3. Users see a token named "USDC" but it wraps a worthless Solana token
+      4. No financial loss from bridge perspective — only UI confusion
+    severity: "Low"
+    confidence: "Medium"
+    affected_code: "CrossChainERC20Factory.sol:83-89"
+    solidity: |
+      function echidna_factoryDeployPermissionless() public returns (bool) {
+        // Anyone can deploy tokens, but the bridge only uses registered ones
+        // and remoteToken matching prevents cross-contamination
+        return true;
+      }
+    status: pending
+    notes: |
+      The permissionless factory design is intentional. The CREATE2 determinism
+      ensures that the "correct" token for a given set of params always has the
+      same address regardless of who deploys it. The risk is limited to UI/UX.
+      Most bounty programs would classify this as Informational.
+
+  - id: BR-ACC-07
+    title: "registerRemoteToken via __relayMessage — REMOTE_BRIDGE sender check"
+    description: |
+      In Bridge.__relayMessage (line 222), when message.sender == REMOTE_BRIDGE,
+      the code decodes message.data as a Call struct and extracts (localToken,
+      remoteToken, scalarExponent) to call TokenLib.registerRemoteToken.
+
+      This registers a scalar mapping: scalars[localToken][remoteToken] = 10^scalarExponent.
+
+      Can an attacker craft a message with sender == REMOTE_BRIDGE?
+      - The message must be pre-validated by BridgeValidator (signatures required)
+      - The message hash includes the sender field (innerMessageHash = keccak256(sender, ty, data))
+      - Validators would only sign messages that actually came from the Solana bridge program
+      - An attacker cannot forge the sender field without validator collusion
+
+      If validators are compromised, they could register arbitrary scalars for
+      any localToken/remoteToken pair. This could enable theft via inflated scalars
+      on finalizeTransfer. But validator compromise is a trust assumption.
+
+      Interesting edge case: registerRemoteToken has NO check that localToken
+      is a valid ERC20 or that the scalar is reasonable. A malicious registration
+      with scalarExponent=77 would set scalar = 10^77, and a subsequent
+      finalizeTransfer would compute localAmount = remoteAmount * 10^77, which
+      could overflow or drain deposits far beyond what was deposited.
+
+      BUT: this can only happen with compromised validators, which is the core
+      trust assumption of Stage 0.
+    attack_path: |
+      1. Compromised validators sign a message with sender=REMOTE_BRIDGE
+      2. Message data encodes (localToken=WETH, remoteToken=X, scalarExponent=77)
+      3. registerRemoteToken sets scalars[WETH][X] = 10^77
+      4. Subsequent finalizeTransfer for WETH with remoteAmount=1 tries to
+         transfer 10^77 WETH — draining all deposits
+      Requires: validator key compromise (core trust assumption)
+    severity: "Medium"
+    confidence: "Low"
+    affected_code: "Bridge.sol:222-230, TokenLib.sol:269-272"
+    solidity: |
+      function echidna_registerRemoteTokenOnlyViaBridge() public returns (bool) {
+        // registerRemoteToken is internal, only callable from __relayMessage
+        // when message.sender == REMOTE_BRIDGE (which requires valid signatures)
+        return true;
+      }
+    status: pending
+    notes: |
+      The lack of bounds on scalarExponent is notable. Even with honest validators,
+      a bug in the Solana bridge program could send an incorrect scalarExponent.
+      No upper bound check exists. However, this is protected by the validator
+      threshold, making it Low/Medium depending on threat model. The validators
+      ARE the security boundary in Stage 0.
+
+  - id: BR-ACC-08
+    title: "RelayerOrchestrator.validateAndRelay is permissionless — by design"
+    description: |
+      RelayerOrchestrator.validateAndRelay (line 57) has no access control.
+      Anyone can call it. It simply forwards to BridgeValidator.registerMessages
+      and Bridge.relayMessages, both of which have their own security checks
+      (signature validation and message pre-validation respectively).
+
+      The orchestrator is a convenience wrapper for atomic register+relay.
+      Since both underlying functions are already permissionless (registerMessages
+      requires signatures, relayMessages requires pre-validated messages), the
+      orchestrator adds no new attack surface.
+    attack_path: |
+      N/A — no exploit. The orchestrator delegates to already-secured functions.
+    severity: "Info"
+    confidence: "High"
+    affected_code: "RelayerOrchestrator.sol:57-69"
+    solidity: |
+      function echidna_orchestratorNoAdditionalRisk() public returns (bool) {
+        return true;
+      }
+    status: rejected
+    notes: Permissionless by design. No new attack surface.
+
+  - id: BR-ACC-09
+    title: "BridgeValidator has no admin functions post-initialization — validators are immutable"
+    description: |
+      BridgeValidator inherits Initializable but does NOT expose any functions
+      to add/remove validators or change thresholds after initialization.
+      VerificationLib has internal functions (setThreshold, addValidator,
+      removeValidator) but BridgeValidator never calls them.
+
+      This means: once initialized, the validator set and thresholds are FROZEN.
+      The only way to change them is to upgrade the BridgeValidator proxy
+      (deployed via ERC1967Factory with an admin).
+
+      Implications:
+      1. If a validator key is compromised, it cannot be rotated without proxy upgrade
+      2. If threshold needs adjustment, requires proxy upgrade
+      3. This is safer from an access control perspective (no admin functions to exploit)
+         but operationally rigid
+
+      The partner validator threshold is stored in regular storage (not immutable),
+      so a proxy upgrade could change it. But there is NO function to change it
+      without upgrading.
+
+      Note: partner validators are read dynamically from PARTNER_VALIDATORS
+      contract (IPartner.getSigners()), so the partner set CAN change without
+      upgrading BridgeValidator. Only the partner THRESHOLD is frozen.
+    attack_path: |
+      N/A — this is an operational observation, not an exploit.
+    severity: "Info"
+    confidence: "High"
+    affected_code: "BridgeValidator.sol (entire contract)"
+    solidity: |
+      function echidna_validatorSetImmutablePostInit() public returns (bool) {
+        // No external functions exist to modify validator set or thresholds
+        return true;
+      }
+    status: rejected
+    notes: |
+      Design choice — simpler and more secure but less flexible. The proxy
+      upgrade path provides the escape hatch. Base validators are truly frozen;
+      partner validators rotate via IPartner contract.
+
+  - id: BR-ACC-10
+    title: "Twin auto-deployment allows anyone to trigger Twin creation for any Solana pubkey"
+    description: |
+      In Bridge.__relayMessage (lines 242-248), if a Twin doesn't exist for a
+      message sender, one is deployed deterministically. The deployment happens
+      inside the relay flow, which is triggered by anyone calling relayMessages
+      with a pre-validated message.
+
+      An attacker cannot choose WHICH Solana pubkey gets a Twin deployed — that's
+      determined by the message.sender field, which is signed by validators.
+      The Twin address is deterministic (based on Solana pubkey salt), so
+      deploying it early vs. late makes no difference to the final address.
+
+      No access control issue here.
+    attack_path: |
+      N/A — Twin deployment is deterministic and permissionless by design.
+    severity: "Info"
+    confidence: "High"
+    affected_code: "Bridge.sol:242-248"
+    solidity: |
+      function echidna_twinDeploymentDeterministic() public returns (bool) {
+        return true;
+      }
+    status: rejected
+    notes: Deterministic deployment means no front-running advantage.
+
+  - id: BR-ACC-11
+    title: "Message replay prevention — successes mapping prevents double-execution"
+    description: |
+      Bridge._validateAndRelay (line 352) checks successes[messageHash] before
+      executing. If true, it returns early (no revert, just skip). After successful
+      execution, successes[messageHash] = true (line 360).
+
+      For failed messages, failures[messageHash] = true but successes remains false,
+      allowing retry. On successful retry, failures is deleted (line 360) and
+      successes is set to true.
+
+      The message hash is computed from (nonce, outgoingMessagePubkey, innerMessageHash)
+      where innerMessageHash = keccak256(sender, ty, data). This is deterministic
+      and collision-resistant.
+
+      No replay is possible for successfully executed messages.
+    attack_path: |
+      N/A — replay prevention is sound.
+    severity: "Info"
+    confidence: "High"
+    affected_code: "Bridge.sol:348-368"
+    solidity: |
+      function echidna_noMessageReplay() public returns (bool) {
+        // A successfully executed message cannot be executed again
+        return true;
+      }
+    status: rejected
+    notes: Standard and correct replay prevention pattern.
+
+  - id: BR-ACC-12
+    title: "CrossChainERC20.initialize can be front-run on the implementation contract"
+    description: |
+      CrossChainERC20 constructor calls _disableInitializers() (line 87), which
+      prevents initialize() from being called on the implementation contract.
+      Proxies CAN call initialize() once (Initializable modifier).
+
+      The factory deploys a proxy AND immediately calls initialize() in the same
+      transaction (_deploy, line 96-102). This is atomic — no front-running window.
+
+      However, if someone deploys a CrossChainERC20 beacon proxy manually (outside
+      the factory), there would be a window between proxy deployment and initialization.
+      But such a proxy would NOT be registered in isCrossChainErc20, so it wouldn't
+      be recognized by the bridge's transfer logic.
+    attack_path: |
+      N/A — factory atomic deploy+init prevents front-running.
+    severity: "Info"
+    confidence: "High"
+    affected_code: "CrossChainERC20Factory.sol:91-105"
+    solidity: |
+      function echidna_factoryAtomicDeployInit() public returns (bool) {
+        return true;
+      }
+    status: rejected
+    notes: |
+      _disableInitializers on implementation + atomic deploy+init on proxies
+      is the correct pattern. No vulnerability.
+
+  - id: BR-ACC-13
+    title: "Failed message can be retried indefinitely — gas griefing via repeated relay attempts"
+    description: |
+      When a message fails (catch block at line 363), failures[messageHash] = true
+      but the message remains valid in BridgeValidator.validMessages. Anyone can
+      call relayMessages again with the same message, consuming gas for the
+      message.gasLimit allocation in the try block.
+
+      If a message is designed to always fail (e.g., calls a contract that always
+      reverts), anyone can grief relayers by repeatedly submitting it, wasting gas.
+      But the griefer pays their own gas, so this is not economically viable.
+
+      The only concern: if relayers auto-retry failed messages, a permanently
+      failing message could waste relayer gas. This is an off-chain concern.
+    attack_path: |
+      1. Solana user crafts a message that always fails on Base
+      2. Validators sign it (valid message from Solana)
+      3. Each relay attempt costs gas proportional to message.gasLimit
+      4. Relayer wastes gas retrying
+      Impact: relayer gas waste (off-chain concern)
+    severity: "Info"
+    confidence: "Medium"
+    affected_code: "Bridge.sol:348-368"
+    solidity: |
+      function echidna_failedMessageRetry() public returns (bool) {
+        // Failed messages can be retried - this is by design for legitimate
+        // messages that fail due to temporary conditions
+        return true;
+      }
+    status: rejected
+    notes: |
+      By design — retry is necessary for messages that fail due to temporary
+      conditions (e.g., insufficient liquidity). The griefer pays their own gas.

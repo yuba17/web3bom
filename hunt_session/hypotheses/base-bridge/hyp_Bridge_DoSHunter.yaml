@@ -1,0 +1,700 @@
+protocol: coinbase-bridge
+component: Bridge
+file: bridge/base/src/Bridge.sol
+domain: dos
+hunter: DoSHunter
+generated_at: '2026-03-27T00:00:00Z'
+invariants:
+
+#######################################################################
+# H1: gasLimit NOT in hash — retryable by design (MITIGATED)
+#######################################################################
+- id: BRG-D-01
+  tier: 2
+  type: property
+  description: >
+    gasLimit is excluded from IncomingMessage hash — messages are retryable with different gasLimit.
+    Verify this property holds: a message that fails with low gasLimit can always be retried with higher gasLimit.
+  attack_scenario: >
+    The Solana sender sets gasLimit in the IncomingMessage struct. The message hash is
+    computed from (nonce, outgoingMessagePubkey, keccak256(sender, ty, data)) — gasLimit
+    is INTENTIONALLY excluded (MessageLib.sol lines 50-51). This means:
+    1. If a message fails due to insufficient gasLimit, failures[hash] = true
+    2. Anyone can resubmit the same message with a higher gasLimit value
+    3. On success, successes[hash] = true and failures[hash] is deleted
+    This is a GOOD design. However, we must verify there's no edge case where a
+    malicious front-runner repeatedly relays with gasLimit=1 to waste validator gas
+    and create noise. Each failed attempt costs the relayer gas but marks the message
+    as failed — the next relayer with correct gasLimit still succeeds.
+    VERDICT: No permanent DoS. Design is correct. Marking as MITIGATED.
+  impact: "None — messages are always retryable"
+  impact_rating: Informational
+  likelihood: N/A
+  severity_final: null
+  solidity: |
+    // Verify gasLimit is not in hash
+    IncomingMessage memory msg1 = IncomingMessage({
+        outgoingMessagePubkey: pubkey,
+        nonce: 1,
+        sender: sender,
+        gasLimit: 100_000,  // low
+        ty: MessageType.Transfer,
+        data: transferData
+    });
+    IncomingMessage memory msg2 = msg1;
+    msg2.gasLimit = 500_000;  // high
+    bytes32 h1 = MessageLib.getMessageHash(msg1);
+    bytes32 h2 = MessageLib.getMessageHash(msg2);
+    eq(h1, h2, "BRG-D-01: same hash regardless of gasLimit");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    Confirmed by reading MessageLib.sol: getInnerMessageHash hashes (sender, ty, data).
+    getMessageHash hashes (nonce, outgoingMessagePubkey, innerMessageHash). gasLimit nowhere.
+    This is intentional and correct design for retryability.
+  poc_sketch: ""
+
+#######################################################################
+# H2: relayMessages batch — partial failure by gas exhaustion
+#######################################################################
+- id: BRG-D-02
+  tier: 2
+  type: property
+  description: >
+    In relayMessages, if early messages consume most of the transaction gas, later
+    messages in the batch may fail due to the 1/64 rule, even though each message's
+    individual gasLimit might be sufficient.
+  attack_scenario: >
+    relayMessages (Bridge.sol line 204-208) iterates over messages[] and calls
+    _validateAndRelay for each. _validateAndRelay (line 348-368) does:
+      try this.__relayMessage{gas: message.gasLimit}(message)
+    The EVM 1/64 rule (EIP-150) means the caller retains 1/64 of remaining gas.
+    Attack: Relayer submits batch [msg_A, msg_B, msg_C] where:
+      - msg_A.gasLimit = very high (consumes most tx gas on a complex call)
+      - msg_B and msg_C have moderate gasLimit requirements
+    After msg_A executes, remaining gas may be insufficient for msg_B's external call.
+    However, the try/catch catches the OOG, msg_B/C are marked as failures, and can
+    be retried in a separate transaction.
+    VERDICT: Temporary inconvenience for relayer, not a permanent DoS. Messages are
+    retryable. The relayer should size batches appropriately.
+  impact: "Temporary delay — messages can be retried individually"
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Batch with 3 messages where first consumes most gas
+    // Verify later messages are marked as failures, not successes
+    // And can be retried in separate transactions
+    IncomingMessage[] memory batch = new IncomingMessage[](3);
+    batch[0] = heavyMessage;  // high gasLimit, complex execution
+    batch[1] = normalMessage;
+    batch[2] = normalMessage2;
+    bridge.relayMessages(batch);  // with limited tx gas
+    // batch[1] and batch[2] should be in failures[], retryable
+    t(bridge.failures(hash1), "BRG-D-02: later message marked as failure");
+    t(!bridge.successes(hash1), "BRG-D-02: not marked as success");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 80
+  notes: >
+    This is expected behavior for batched execution. The relayer is incentivized to
+    provide sufficient gas. Not a vulnerability — just operational consideration.
+  poc_sketch: ""
+
+#######################################################################
+# H3: BridgeValidator sequential nonce — validator censorship vector
+#######################################################################
+- id: BRG-D-03
+  tier: 1
+  type: property
+  description: >
+    BridgeValidator.registerMessages uses strictly sequential nonces. If validators
+    refuse to sign message at nonce N, ALL subsequent messages (N+1, N+2, ...) are
+    permanently blocked until nonce N is registered.
+  attack_scenario: >
+    BridgeValidator.registerMessages (line 172-196):
+      uint256 currentNonce = nextNonce;
+      for (i) { messageHashes[i] = MessageLib.getMessageHash(currentNonce++, ...); }
+      nextNonce = currentNonce;
+    The nonce MUST be consecutive. If validators collude to NOT sign message N:
+    1. nextNonce stays at N
+    2. Message N+1 cannot be registered because the validator set signs over
+       messageHashes computed with nonces starting from nextNonce
+    3. Even if validators sign N+1, registerMessages computes hashes using
+       currentNonce = nextNonce = N, so the hashes won't match the signatures
+    4. ALL cross-chain communication is halted
+
+    This is a CENSORSHIP vector. In Stage 0 (current), validators are trusted.
+    But the trust model means:
+    - A single compromised validator quorum can halt the bridge
+    - The base threshold + partner threshold must BOTH be met
+    - If partnerValidatorThreshold > 0 and partner refuses, bridge halts
+
+    IMPORTANT: There is NO skip mechanism, NO admin override for nonces, and NO
+    way to force-register a message without validator signatures. The only recovery
+    is deploying a new BridgeValidator contract.
+  impact: "Complete bridge halt — all Solana→Base messages blocked permanently"
+  impact_rating: High
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify nonce gap blocks all subsequent messages
+    uint256 nonceBefore = bridgeValidator.nextNonce();
+    // Skip registering message at nonce N
+    // Try to register message at nonce N+1 — should fail because
+    // registerMessages computes hash with nextNonce (= N), not N+1
+    // The computed hash won't match the validators' signatures over N+1
+    eq(bridgeValidator.nextNonce(), nonceBefore, "BRG-D-03: nonce didn't advance");
+  ghost_vars: []
+  validated: false
+  priority: high
+  confidence: 90
+  notes: >
+    This is inherent to Stage 0 trust model. The validators ARE the trust anchor.
+    However, the lack of an admin emergency mechanism to skip/force nonces is worth
+    noting. If one message is contentious (e.g., a sanctioned address), the validators
+    must still sign it or the entire bridge halts. There's no selective censorship —
+    it's all or nothing. The comment at VerificationLib.sol line 23-24 mentions this
+    will be replaced by CrossL2Inbox in Stage 1. Worth flagging as design consideration.
+  poc_sketch: |
+    1. Validators sign and register messages nonces 0-99 (normal operation)
+    2. Message at nonce 100 is from a controversial sender
+    3. Validators refuse to sign nonce 100
+    4. nextNonce = 100, stuck forever
+    5. Messages 101, 102, ... exist on Solana but can never be registered on Base
+    6. Bridge is completely halted for Solana→Base direction
+    7. Base→Solana direction (via MMR/proofs) still works independently
+
+#######################################################################
+# H4: Twin deployment gas cost — bounded by validator gating
+#######################################################################
+- id: BRG-D-04
+  tier: 2
+  type: property
+  description: >
+    Each new Solana pubkey triggering a Call/TransferAndCall message deploys a Twin
+    beacon proxy. Deployment cost is ~50K-100K gas per twin. However, deployment
+    requires a validator-signed message, so spam is rate-limited by validators.
+  attack_scenario: >
+    Bridge.sol __relayMessage (lines 242-248):
+      if (twinAddress == address(0)) {
+          twinAddress = LibClone.deployDeterministicERC1967BeaconProxy(TWIN_BEACON, salt);
+          twins[message.sender] = twinAddress;
+      }
+    For each unique Solana pubkey that sends a Call or TransferAndCall, a new Twin is
+    deployed via CREATE2. The cost is paid by the relayer (in gas).
+
+    Attack surface analysis:
+    - To trigger Twin deployment, an attacker needs validators to sign messages with
+      new sender pubkeys. Validators control what gets signed.
+    - The Solana side would need to create OutgoingMessage accounts with different
+      sender pubkeys. Each costs SOL rent on Solana.
+    - Even if an attacker creates 1000 messages from different pubkeys, the gas cost
+      for twin deployment is paid by the relayer, not the bridge contract.
+
+    VERDICT: Rate-limited by validator signatures and Solana rent costs. Not economically
+    viable as an attack. The relayer can also batch and gas-estimate before submitting.
+  impact: "Relayer gas cost increase — no permanent DoS"
+  impact_rating: Informational
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify twin deployment is deterministic and one-time
+    address twin1 = bridge.twins(pubkey1);
+    eq(twin1, address(0), "BRG-D-04: no twin yet");
+    bridge.relayMessages(messagesFromPubkey1);
+    address twin1After = bridge.twins(pubkey1);
+    t(twin1After != address(0), "BRG-D-04: twin deployed");
+    // Second message from same pubkey does NOT redeploy
+    bridge.relayMessages(messagesFromPubkey1Again);
+    eq(bridge.twins(pubkey1), twin1After, "BRG-D-04: twin reused");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    LibClone.deployDeterministicERC1967BeaconProxy reverts if the proxy already exists
+    at that address (CREATE2 collision). But the code checks twins[sender] != address(0)
+    first and skips deployment. The only edge is if twins mapping was somehow corrupted,
+    but that requires storage corruption which is out of scope.
+  poc_sketch: ""
+
+#######################################################################
+# H5: MMR storage growth — unbounded $.nodes array
+#######################################################################
+- id: BRG-D-05
+  tier: 1
+  type: property
+  description: >
+    MessageStorageLib.sendMessage appends to $.nodes (unbounded array) on every
+    outgoing message. The array grows as O(2N) for N leaves (leaves + internal nodes).
+    After millions of messages, storage and proof generation become increasingly expensive.
+  attack_scenario: >
+    MessageStorageLib._appendLeafToMmr (line 184-200):
+      $.nodes.push(leafHash);
+      _createParentNodes(newLeafNodeIndex, originalLeafCount);
+    For each leaf, 1 node is pushed. Then _createParentNodes pushes 0 to log2(N)
+    additional nodes depending on binary representation. Total nodes after N leaves
+    is approximately 2N - popcount(N).
+
+    sendMessage is called from bridgeCall and bridgeToken. Both require msg.sender to
+    be a real user paying gas. So the cost of growing the array is borne by senders.
+
+    generateProof (line 101-145) is a VIEW function. It does O(log N) SLOADs to build
+    the proof. At N = 2^32 (~4 billion messages), this is ~32 SLOADs — totally fine.
+    At N = 2^64 (uint64 max), ~64 SLOADs — still fine for a view function.
+
+    The _calculateRoot function called during sendMessage also does O(log N) SLOADs
+    to bag the peaks. But with warm slots (just written), this is cheap.
+
+    REAL CONCERN: The $.nodes array length is a uint256 slot. After 2^63 messages,
+    the nextNonce (uint64) wraps. But the nodes array keeps growing. Actually,
+    nextNonce is uint64, so max ~18.4 quintillion messages. Nodes array would be
+    ~36.8 quintillion entries — impossible to fill in practice.
+
+    VERDICT: Theoretically unbounded but practically limited by uint64 nonce and
+    the economic cost of sending messages (each costs gas). Not a real DoS vector.
+    generateProof cost grows logarithmically, not linearly.
+  impact: "Theoretical — proof generation cost grows O(log N), negligible in practice"
+  impact_rating: Informational
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify MMR growth is bounded by O(2N)
+    uint64 nonceBefore = bridge.getNextNonce();
+    bridge.bridgeCall(ixs);
+    uint64 nonceAfter = bridge.getNextNonce();
+    eq(nonceAfter, nonceBefore + 1, "BRG-D-05: nonce incremented by 1");
+    // Node count grows by 1 (leaf) + popcount-related internal nodes
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 95
+  notes: >
+    The real cost concern would be if there were an on-chain function that iterates
+    over ALL nodes. There isn't — generateProof does O(log N) reads, and
+    _calculateRoot during sendMessage reads only the peaks (also O(log N)).
+    MAX_PEAKS is hardcoded to 64, further bounding memory allocation.
+  poc_sketch: ""
+
+#######################################################################
+# H6: CrossChainERC20Factory — front-run deployment to grief
+#######################################################################
+- id: BRG-D-06
+  tier: 1
+  type: property
+  description: >
+    CrossChainERC20Factory.deploy uses CREATE2 with salt = keccak256(remoteToken, name,
+    symbol, decimals). Anyone can front-run a legitimate deployment. However, the
+    resulting token is identical — same parameters, same address.
+  attack_scenario: >
+    CrossChainERC20Factory.deploy (line 83-89) and _deploy (line 91-105):
+      bytes32 salt = keccak256(abi.encode(remoteToken, name, symbol, decimals));
+      localToken = LibClone.deployDeterministicERC1967BeaconProxy(BEACON, salt);
+    The salt is fully deterministic from public parameters. An attacker who sees a
+    pending deploy() tx in the mempool can front-run with identical parameters.
+
+    HOWEVER: The attack is SELF-DEFEATING:
+    1. If attacker front-runs with SAME parameters → same salt → same address.
+       The token is deployed correctly. The legitimate tx reverts (already deployed),
+       but the token works fine. isCrossChainErc20[address] = true is already set.
+    2. If attacker tries DIFFERENT parameters → different salt → different address.
+       This doesn't block the legitimate deployment at all.
+    3. The deployer field in the event is cosmetic — it doesn't affect functionality.
+
+    The only grief is the legitimate deployer's tx reverts and wastes gas. The token
+    is still correctly deployed and fully functional.
+
+    EDGE CASE: What if the attacker deploys with WRONG parameters (e.g., wrong decimals)?
+    This creates a different token at a different address. The legitimate deployment
+    still succeeds at the correct address. But if the legitimate deployer doesn't realize
+    and tries to interact with the wrong address... this is user error, not a contract bug.
+
+    IMPORTANT SUBTLETY: What about deploySolWrapper()? It uses NATIVE_SOL_PUBKEY as the
+    remoteToken. If an attacker calls deploy() with the NATIVE_SOL_PUBKEY, it reverts
+    because of the CannotWrapNativeSOL check (line 87). But deploySolWrapper() calls
+    _deploy directly, bypassing that check. So the SOL wrapper can only be deployed via
+    deploySolWrapper(). However, deploySolWrapper() is permissionless — anyone can call it.
+    Once called, the second call reverts (CREATE2 collision). This is fine — it's designed
+    to be called once.
+  impact: "Legitimate deployer's tx reverts, wastes gas. Token still deployed correctly."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify front-running produces identical result
+    bytes32 salt = keccak256(abi.encode(remoteToken, name, symbol, decimals));
+    address predicted = LibClone.predictDeterministicAddressERC1967BeaconProxy(
+        factory.BEACON(), salt, address(factory)
+    );
+    // Attacker deploys first
+    vm.prank(attacker);
+    address deployed = factory.deploy(remoteToken, name, symbol, decimals);
+    eq(deployed, predicted, "BRG-D-06: deterministic address");
+    t(factory.isCrossChainErc20(deployed), "BRG-D-06: registered");
+    // Legitimate deployer tries — reverts but token already works
+    vm.prank(legitimateDeployer);
+    vm.expectRevert(); // CREATE2 collision
+    factory.deploy(remoteToken, name, symbol, decimals);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    The front-running grief is minimal because the token ends up correctly deployed.
+    The only cost is wasted gas for the legitimate deployer. This is a common pattern
+    in CREATE2 factories and generally considered acceptable. Base also has a private
+    mempool option for sequencer, reducing front-run risk further.
+  poc_sketch: |
+    1. Legitimate deployer sends factory.deploy("USDC-SOL", "USDC", "USDC", 6)
+    2. Attacker sees mempool, front-runs with same params
+    3. Token deployed at deterministic address, isCrossChainErc20 = true
+    4. Legitimate deployer's tx reverts with CREATE2 collision
+    5. Token is still fully functional — no actual DoS
+
+#######################################################################
+# H7: __relayMessage gas — relayer gas waste via high gasLimit messages
+#######################################################################
+- id: BRG-D-07
+  tier: 2
+  type: property
+  description: >
+    Since gasLimit is not in the message hash, the relayer chooses the gasLimit when
+    submitting IncomingMessage. A relayer who sets gasLimit too high for a reverting
+    call wastes their own gas. This is not an external attack vector.
+  attack_scenario: >
+    _validateAndRelay (Bridge.sol line 358):
+      try this.__relayMessage{gas: message.gasLimit}(message)
+    The gasLimit is a field in the IncomingMessage struct submitted by the relayer.
+    Since it's NOT in the message hash, the relayer can set any value.
+
+    Potential concern: Could a Solana user craft a message whose execution always
+    reverts after consuming exactly gasLimit gas? E.g., a Call to a contract that
+    does while(true){} — this would consume all allocated gas and revert.
+
+    Analysis:
+    1. The relayer chooses gasLimit, not the Solana sender
+    2. The relayer can simulate the transaction before submitting (eth_estimateGas)
+    3. Even if the execution consumes all gas and reverts, the message is marked as
+       failure and can be retried (or not — it's the relayer's choice)
+    4. The EVM 1/64 rule ensures the outer _validateAndRelay retains enough gas to
+       execute the catch block and continue the loop
+
+    VERDICT: The relayer is self-sovereign over gas costs. Not an attack vector.
+    A smart relayer simulates before submitting.
+  impact: "Relayer wastes own gas — self-inflicted, not an external attack"
+  impact_rating: Informational
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify 1/64 rule: after __relayMessage reverts, enough gas
+    // remains to execute catch block (failures[hash] = true, emit event)
+    // and continue the for loop to process next messages
+    t(true, "BRG-D-07: operational consideration, not invariant");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    One subtle point: the try/catch on this.__relayMessage is an EXTERNAL call to self.
+    The 1/64 rule applies. If the relayer provides txGas and sets message.gasLimit =
+    txGas * 63/64, then after the external call, only txGas/64 remains. For the catch
+    block to succeed, it needs enough gas for: SSTORE (failures[hash] = true) ~20K +
+    LOG2 (emit event) ~2K = ~22K gas. So txGas/64 >= 22K → txGas >= 1.4M. This is
+    fine for any reasonable transaction. The relayer just needs to ensure tx gas > gasLimit * 64/63.
+  poc_sketch: ""
+
+#######################################################################
+# H8: registerMessages can be called by ANYONE — spam registration
+#######################################################################
+- id: BRG-D-08
+  tier: 1
+  type: property
+  description: >
+    BridgeValidator.registerMessages is permissionless — anyone with valid validator
+    signatures can call it. Could a third party register messages out of order or
+    cause issues by front-running the official relayer?
+  attack_scenario: >
+    BridgeValidator.registerMessages (line 172-196) has no access control beyond
+    the whenNotPaused modifier. The function validates signatures and registers
+    message hashes. However:
+
+    1. The nonces are strictly sequential (nextNonce). So you can't register
+       messages out of order — the nonce sequence is enforced.
+    2. The signatures are over the EXACT message hashes derived from the nonces.
+       You can't reuse signatures for different messages.
+    3. If someone front-runs registerMessages with the same data, the second call
+       would try to increment nextNonce again, compute different hashes (because
+       nonce changed), and the signatures won't match.
+
+    Wait — actually, if attacker front-runs with the EXACT same calldata:
+    - Attacker's tx: nextNonce goes from N to N+K, messages registered
+    - Legitimate tx: nextNonce is now N+K, computes hashes with N+K..N+2K-1,
+      signatures were for N..N+K-1, signature validation fails → revert
+
+    The legitimate relayer's tx reverts (wasted gas), but messages are correctly
+    registered. The relayer just needs to detect this and not re-submit.
+
+    VERDICT: Front-running registerMessages is possible but harmless — the messages
+    still get registered. The front-runner pays gas. The legitimate relayer's tx
+    fails but can detect this via events.
+  impact: "Legitimate relayer's tx reverts, wastes gas. Messages still registered."
+  impact_rating: Low
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify front-running registerMessages is self-defeating
+    uint256 nonceBefore = bridgeValidator.nextNonce();
+    // Attacker front-runs with same signed messages
+    vm.prank(attacker);
+    bridgeValidator.registerMessages(signedMessages, sigs);
+    // Nonce advanced
+    eq(bridgeValidator.nextNonce(), nonceBefore + signedMessages.length,
+       "BRG-D-08: nonce advanced by attacker");
+    // Legitimate relayer tries same data — fails because nonce mismatch
+    vm.expectRevert(); // signature validation fails
+    bridgeValidator.registerMessages(signedMessages, sigs);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    The permissionless nature of registerMessages is intentional — it allows anyone
+    to be a relayer. The atomic validateAndRelay in RelayerOrchestrator helps the
+    official relayer avoid the register/relay race condition.
+  poc_sketch: ""
+
+#######################################################################
+# H9: relayMessages permissionless — grief via failed message spam
+#######################################################################
+- id: BRG-D-09
+  tier: 2
+  type: property
+  description: >
+    relayMessages is permissionless. An attacker could repeatedly call relayMessages
+    with already-validated messages using gasLimit=0, causing failures and emitting
+    FailedToRelayMessage events. This creates noise but no permanent damage.
+  attack_scenario: >
+    Bridge.relayMessages (line 204-208) is permissionless. _validateAndRelay checks:
+    1. successes[hash] → skip if already succeeded (line 352-354)
+    2. validMessages[hash] → revert if not validated (line 356)
+    3. try __relayMessage{gas: gasLimit} → catch sets failures[hash]
+
+    Attack: For a validated but not-yet-relayed message, attacker calls relayMessages
+    with gasLimit=0 (or very low). The external call fails (OOG), failures[hash] = true.
+    The legitimate relayer then calls with proper gasLimit. On success:
+    - delete failures[hash] (line 360)
+    - successes[hash] = true (line 361)
+
+    So the attack just creates one failure event before the success. No permanent harm.
+    After success, subsequent calls skip the message (line 352-354).
+
+    VERDICT: Noise-only attack. No permanent DoS. The legitimate relayer always wins.
+  impact: "False failure events emitted — noise only, no permanent DoS"
+  impact_rating: Informational
+  likelihood: Medium
+  severity_final: null
+  solidity: |
+    // Verify: attacker fails message, legitimate relayer succeeds
+    // Step 1: Attacker relays with gasLimit=0
+    IncomingMessage memory msg_ = validMessage;
+    msg_.gasLimit = 0;
+    bridge.relayMessages(toArray(msg_));
+    t(bridge.failures(hash), "BRG-D-09: marked as failure");
+    t(!bridge.successes(hash), "BRG-D-09: not yet succeeded");
+    // Step 2: Legitimate relayer retries with proper gasLimit
+    msg_.gasLimit = 500_000;
+    bridge.relayMessages(toArray(msg_));
+    t(bridge.successes(hash), "BRG-D-09: now succeeded");
+    t(!bridge.failures(hash), "BRG-D-09: failure cleared");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 92
+  notes: >
+    The design handles this correctly. failures[] is deleted on success, and
+    successes[] prevents re-execution. The attacker only wastes their own gas.
+  poc_sketch: ""
+
+#######################################################################
+# H10: Twin beacon upgrade — mass DoS via beacon implementation change
+#######################################################################
+- id: BRG-D-10
+  tier: 1
+  type: property
+  description: >
+    All Twin proxies point to the same TWIN_BEACON. If the beacon owner upgrades the
+    implementation to a broken/malicious contract, ALL twins become non-functional.
+    This is an admin trust assumption, not a permissionless DoS.
+  attack_scenario: >
+    Bridge.sol uses TWIN_BEACON (immutable, line 39) for all Twin proxy deployments.
+    The beacon pattern means all Twin proxies delegate to the same implementation.
+    If the beacon owner (assumed to be the bridge admin/multisig):
+    1. Upgrades to a buggy implementation → all Twins break
+    2. Upgrades to a malicious implementation → all Twins compromised
+    3. Selfdestruct the implementation → all Twin calls revert
+
+    This is a centralization/trust risk, not a permissionless DoS. The beacon owner
+    is presumably a trusted multisig or governance contract.
+
+    VERDICT: Admin trust assumption. Standard for beacon proxy pattern.
+    Worth documenting but not a vulnerability in the traditional sense.
+  impact: "All Twin contracts break if beacon upgraded maliciously"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify all twins use same beacon
+    address twin1 = bridge.twins(pubkey1);
+    address twin2 = bridge.twins(pubkey2);
+    // Both proxies delegate to TWIN_BEACON's implementation
+    t(true, "BRG-D-10: centralization risk - admin trust assumption");
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 80
+  notes: >
+    Standard beacon proxy trust assumption. The bridge owner controls the beacon.
+    In Coinbase's context, this is managed by their security team. Not a bug but
+    a centralization vector worth noting in any comprehensive audit.
+  poc_sketch: ""
+
+#######################################################################
+# H11: Paused state — guardian can unilaterally halt bridge
+#######################################################################
+- id: BRG-D-11
+  tier: 2
+  type: property
+  description: >
+    Any address with GUARDIAN_ROLE can pause the bridge. The pause affects both
+    directions: bridgeCall, bridgeToken (Base→Solana) and relayMessages (Solana→Base).
+    Also blocks registerMessages in BridgeValidator.
+  attack_scenario: >
+    Bridge.setPaused (line 265-268): onlyRoles(GUARDIAN_ROLE).
+    BridgeValidator.registerMessages: whenNotPaused checks Bridge(BRIDGE).paused().
+
+    If a guardian key is compromised:
+    1. Attacker calls setPaused(true)
+    2. ALL bridge operations halt immediately
+    3. Only the owner can remove the guardian role (OwnableRoles from Solady)
+
+    The owner (presumably a multisig) would need to react to:
+    - Remove compromised guardian: revokeRoles(guardian, GUARDIAN_ROLE)
+    - Unpause: setPaused(false) — but only guardians can call this!
+
+    WAIT: setPaused is onlyRoles(GUARDIAN_ROLE). The OWNER cannot call setPaused
+    directly unless the owner also has GUARDIAN_ROLE. Let me verify...
+
+    OwnableRoles from Solady: onlyRoles checks hasAnyRole. The owner's special
+    powers don't include roles unless explicitly granted. So if all guardians are
+    compromised and none of them will call setPaused(false), the bridge stays paused.
+
+    HOWEVER: The owner can grant themselves GUARDIAN_ROLE via grantRoles, then call
+    setPaused(false). So recovery is possible but requires owner action.
+
+    VERDICT: Guardian compromise → temporary pause. Recoverable by owner.
+    Standard emergency pause design.
+  impact: "Temporary bridge halt — recoverable by owner granting self guardian role"
+  impact_rating: Medium
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify pause blocks all operations
+    vm.prank(guardian);
+    bridge.setPaused(true);
+    vm.expectRevert(Bridge.Paused.selector);
+    bridge.relayMessages(messages);
+    vm.expectRevert(Bridge.Paused.selector);
+    bridge.bridgeCall(ixs);
+    // Owner recovers by granting self guardian role
+    vm.prank(owner);
+    bridge.grantRoles(owner, bridge.GUARDIAN_ROLE());
+    bridge.setPaused(false);
+  ghost_vars: []
+  validated: false
+  priority: medium
+  confidence: 85
+  notes: >
+    Standard emergency pause pattern. The key insight is that the owner CANNOT
+    directly unpause without first granting themselves GUARDIAN_ROLE. This adds
+    a step to recovery but is not a permanent DoS.
+  poc_sketch: ""
+
+#######################################################################
+# H12: CallLib.execute — unbounded gas in delegatecall/create
+#######################################################################
+- id: BRG-D-12
+  tier: 1
+  type: property
+  description: >
+    Twin.execute → CallLib.execute supports DelegateCall and Create/Create2.
+    A DelegateCall to a malicious contract could selfdestruct the Twin or modify
+    its storage arbitrarily. A Create/Create2 could consume all gas in constructor.
+  attack_scenario: >
+    CallLib.execute (lines 42-65):
+    - CallType.DelegateCall: call.to.delegatecall(call.data)
+    - CallType.Create: create(value, ...) — deploys arbitrary bytecode
+    - CallType.Create2: create2(value, ..., salt)
+
+    DelegateCall from Twin to a malicious contract runs in Twin's context. The
+    malicious contract can:
+    1. selfdestruct(attacker) — destroys Twin, steals ETH balance
+    2. Modify Twin's storage — corrupt state
+
+    HOWEVER: This requires the message to be validator-signed. The Solana sender
+    explicitly sends a DelegateCall instruction. Validators sign it. So:
+    - The Solana sender is attacking their OWN Twin (self-harm)
+    - Validators approved the message
+
+    An external attacker CANNOT delegatecall to someone else's Twin because:
+    - Twin.execute requires msg.sender == BRIDGE || msg.sender == address(this)
+    - Bridge only calls execute for the Twin matching message.sender
+    - message.sender is a Solana pubkey validated by the protocol
+
+    VERDICT: Self-harm only. A Solana user can destroy their own Twin via
+    delegatecall. This is by design — the Twin is the user's proxy.
+    Not an attack vector against other users.
+  impact: "Self-harm — user can destroy their own Twin"
+  impact_rating: Informational
+  likelihood: Low
+  severity_final: null
+  solidity: |
+    // Verify delegatecall runs in Twin's context (self-harm)
+    // Attacker's twin only — cannot affect other users' twins
+    t(true, "BRG-D-12: delegatecall is self-sovereign");
+  ghost_vars: []
+  validated: false
+  priority: low
+  confidence: 90
+  notes: >
+    The DelegateCall capability is intentional — it allows Solana users to execute
+    complex operations through their Twin. The risk is limited to self-harm.
+    Validators might want to filter DelegateCall messages as an additional safety
+    measure, but that's an off-chain policy decision.
+  poc_sketch: ""
+
+#######################################################################
+# SUMMARY
+#######################################################################
+# TIER 1 (investigate further):
+#   BRG-D-03: Validator nonce sequencing censorship (High impact, Low likelihood)
+#   BRG-D-05: MMR unbounded growth (Informational — logarithmic, acceptable)
+#   BRG-D-06: Factory CREATE2 front-run (Low impact — token still works)
+#   BRG-D-08: Permissionless registerMessages front-run (Low — self-defeating)
+#   BRG-D-10: Beacon upgrade centralization risk (Medium — admin trust)
+#   BRG-D-12: DelegateCall self-harm via Twin (Informational — by design)
+#
+# TIER 2 (lower priority):
+#   BRG-D-01: gasLimit not in hash — MITIGATED by design
+#   BRG-D-02: Batch gas exhaustion — retryable
+#   BRG-D-04: Twin deployment gas — validator-gated
+#   BRG-D-07: Relayer gas waste — self-inflicted
+#   BRG-D-09: Failed message spam — noise only
+#   BRG-D-11: Guardian pause — recoverable
+#
+# TOP FINDING: BRG-D-03 (nonce sequencing) is the most significant DoS vector.
+# It's inherent to Stage 0 trust model but has NO recovery mechanism besides
+# deploying a new BridgeValidator. Worth flagging as design consideration.

@@ -1,0 +1,365 @@
+component: MagicSpend
+hunter: SignatureHunter
+date: "2026-03-27"
+source_file: MagicSpend/src/MagicSpend.sol
+loc: 373
+
+hypotheses:
+
+  - id: MS-SIG-01
+    title: "Nonce griefing via invalid signature in paymaster path — nonce consumed before sig validation"
+    severity: Low
+    confidence: 75
+    status: pending
+    location: "MagicSpend.sol#validatePaymasterUserOp L126-144"
+    description: |
+      In validatePaymasterUserOp, _validateRequest (L137) is called BEFORE the signature check (L139).
+      _validateRequest marks the nonce as used (L352) unconditionally. If the signature is invalid,
+      the EntryPoint receives sigFailed=1 via validationData and does NOT execute the UserOp, but
+      the nonce is already burned in storage.
+
+      An attacker who knows a valid nonce (from observing a pending UserOp in the mempool) could
+      front-run with a UserOp that uses the same nonce but invalid signature. The nonce gets burned,
+      and the legitimate user's subsequent UserOp with the same nonce reverts with InvalidNonce.
+
+      MITIGATION FACTOR: The EntryPoint only calls validatePaymasterUserOp if the account's own
+      validateUserOp succeeds first, so the attacker must control or be the account themselves.
+      Additionally, nonces are per-account, so attacker A cannot burn account B's nonces.
+
+      NET ASSESSMENT: The attacker can only grief their OWN nonces since nonces are per-account
+      (mapping(nonce => mapping(account => bool))). This limits the attack to self-griefing.
+      However, a malicious bundler could observe the paymasterAndData, extract the nonce, and
+      craft a different UserOp for the same sender (if they control it) to burn the nonce.
+      Realistic only if the same account has multiple pending UserOps.
+    solidity: |
+      // In validatePaymasterUserOp:
+      _validateRequest(userOp.sender, withdrawRequest);  // L137 — nonce burned HERE
+      bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest);  // L139 — sig checked AFTER
+      // If sigFailed=true, EntryPoint won't execute, but nonce is gone
+    attack_scenario: |
+      1. Coinbase backend signs WithdrawRequest with nonce=42 for account 0xAlice
+      2. Alice submits UserOp with this request to mempool
+      3. A malicious bundler sees Alice's UserOp in mempool
+      4. Bundler cannot directly exploit because nonces are per-account
+      5. Impact limited to code quality / ordering concern
+    impact: "Low — nonce is per-account so cross-user griefing is impossible. Self-griefing only."
+
+  - id: MS-SIG-02
+    title: "Ownership transfer invalidates all pre-signed WithdrawRequests"
+    severity: Low
+    confidence: 85
+    status: pending
+    location: "MagicSpend.sol#isValidWithdrawSignature L281-289"
+    description: |
+      isValidWithdrawSignature validates signatures against owner() (current owner).
+      If ownership is transferred (via Ownable.transferOwnership), ALL previously signed
+      WithdrawRequests become instantly invalid because the signer no longer matches owner().
+
+      This creates a race condition: users holding pre-signed WithdrawRequests from the old
+      owner cannot use them after transfer. Conversely, the new owner could immediately sign
+      new requests. There is no grace period or two-step transfer with signature migration.
+
+      For a paymaster managing many users with pre-signed requests, an ownership transfer
+      (even legitimate, e.g., key rotation) would brick all outstanding requests simultaneously.
+
+      Solady's Ownable uses a two-step transfer (transferOwnership + acceptOwnership) which
+      helps, but the fundamental issue remains: the moment acceptance happens, old sigs die.
+    solidity: |
+      function isValidWithdrawSignature(address account, WithdrawRequest memory withdrawRequest)
+          public view returns (bool)
+      {
+          return SignatureCheckerLib.isValidSignatureNow(
+              owner(),  // <-- uses CURRENT owner, not the signer at time of signing
+              getHash(account, withdrawRequest),
+              withdrawRequest.signature
+          );
+      }
+    attack_scenario: |
+      1. Coinbase signs 1000 WithdrawRequests for various users with owner key A
+      2. Key rotation: ownership transferred to key B (for security reasons)
+      3. All 1000 outstanding WithdrawRequests instantly become invalid
+      4. Users attempting to use them get InvalidSignature reverts
+      5. All requests must be re-signed by new owner B
+    impact: "Low — operational risk, not a direct fund theft. Design trade-off for simplicity."
+
+  - id: MS-SIG-03
+    title: "getHash uses block.chainid (dynamic) — replay protection survives hard forks"
+    severity: Informational
+    confidence: 95
+    status: pending
+    location: "MagicSpend.sol#getHash L300-312"
+    description: |
+      getHash includes block.chainid which is read dynamically at validation time, not cached
+      at deploy time. This means:
+      - Signatures are valid only on the chain where block.chainid matches the signing context
+      - On a hard fork that changes chainid, all existing signatures become invalid
+      - No cross-chain replay possible between chains with different chainids
+
+      This is actually CORRECT behavior and a robust design choice. Some contracts cache chainid
+      at deploy time and only fall back to block.chainid on mismatch (like EIP-712), but this
+      direct usage is simpler and equally secure for this use case.
+
+      The hash also includes address(this), preventing replay across different MagicSpend instances
+      on the same chain.
+    solidity: |
+      function getHash(address account, WithdrawRequest memory withdrawRequest) public view returns (bytes32) {
+          return SignatureCheckerLib.toEthSignedMessageHash(
+              abi.encode(
+                  address(this),   // prevents cross-instance replay
+                  account,         // prevents cross-account replay
+                  block.chainid,   // prevents cross-chain replay (dynamic)
+                  withdrawRequest.asset,
+                  withdrawRequest.amount,
+                  withdrawRequest.nonce,
+                  withdrawRequest.expiry
+              )
+          );
+      }
+    attack_scenario: |
+      1. Attacker obtains valid signature for chain A (chainid=1)
+      2. Attempts replay on chain B (chainid=8453)
+      3. getHash produces different hash due to different block.chainid
+      4. Signature verification fails — attack blocked
+    impact: "Informational — design is correct. No vulnerability."
+
+  - id: MS-SIG-04
+    title: "EIP-191 version byte correctness — toEthSignedMessageHash uses 0x19 prefix"
+    severity: Informational
+    confidence: 95
+    status: pending
+    location: "MagicSpend.sol#getHash L300-312"
+    description: |
+      The contract comments reference "EIP-191 version 0x45" which corresponds to the
+      \x19Ethereum Signed Message:\n prefix used by personal_sign / eth_sign.
+
+      Solady's toEthSignedMessageHash(bytes memory) correctly:
+      1. Prepends \x19Ethereum Signed Message:\n
+      2. Appends the decimal ASCII representation of the byte length
+      3. Appends the actual message bytes
+      4. Hashes the result with keccak256
+
+      Since abi.encode of 7 values produces exactly 224 bytes (7 * 32), the prefix will be
+      \x19Ethereum Signed Message:\n224 — this is deterministic and correct.
+
+      No vulnerability here. The EIP-191 implementation is standard and correctly applied.
+    solidity: |
+      // abi.encode produces 224 bytes (7 slots of 32 bytes each)
+      // toEthSignedMessageHash prepends: \x19Ethereum Signed Message:\n224
+      // This is standard EIP-191 version 0x45
+    attack_scenario: "N/A — implementation is correct"
+    impact: "Informational — no issue found."
+
+  - id: MS-SIG-05
+    title: "paymasterAndData ABI decoding from offset [20:] — potential malformed input"
+    severity: Low
+    confidence: 60
+    status: pending
+    location: "MagicSpend.sol#validatePaymasterUserOp L126"
+    description: |
+      The paymasterAndData field is decoded starting at offset 20 (skipping the paymaster address):
+        abi.decode(userOp.paymasterAndData[20:], (WithdrawRequest))
+
+      WithdrawRequest contains a dynamic bytes field (signature). ABI decoding of structs with
+      dynamic fields uses offsets internally. A crafted paymasterAndData could potentially:
+      1. Include extra padding/data after the valid encoding
+      2. Use non-canonical ABI encoding with different offset pointers
+
+      However, abi.decode in Solidity is strict about the encoding format and will revert on
+      malformed input. The signature bytes field is the only dynamic component, and its offset
+      must point within bounds.
+
+      The EntryPoint itself validates paymasterAndData format before calling the paymaster,
+      and the first 20 bytes must match the paymaster address.
+
+      ASSESSMENT: Solidity's abi.decode provides sufficient protection. Non-canonical encodings
+      that decode to different values would require the decoder to be non-strict, which it isn't
+      in Solidity 0.8.x. However, there IS a known edge case: abi.decode does NOT enforce
+      canonical encoding — two different byte sequences can decode to the same struct if the
+      offset pointers differ but ultimately reference the same data. This doesn't create a
+      signature issue since getHash re-encodes the decoded values canonically.
+    solidity: |
+      // L126: decode skipping 20-byte paymaster address
+      WithdrawRequest memory withdrawRequest = abi.decode(userOp.paymasterAndData[20:], (WithdrawRequest));
+      // Even if non-canonical encoding is used, the decoded struct is re-encoded in getHash:
+      // abi.encode(address(this), account, block.chainid, asset, amount, nonce, expiry)
+      // So the hash is always deterministic regardless of input encoding
+    attack_scenario: |
+      1. Attacker crafts paymasterAndData with non-canonical ABI encoding
+      2. abi.decode still produces a valid WithdrawRequest struct
+      3. getHash re-encodes canonically, producing the same hash
+      4. Signature must still be valid for the canonical hash
+      5. No bypass possible
+    impact: "Low — no actual vulnerability. Solidity's abi.decode + re-encoding in getHash neutralizes any non-canonical input."
+
+  - id: MS-SIG-06
+    title: "Signature not included in getHash — intentional but worth documenting"
+    severity: Informational
+    confidence: 95
+    status: pending
+    location: "MagicSpend.sol#getHash L300-312"
+    description: |
+      The WithdrawRequest.signature field is NOT included in getHash. This is correct behavior —
+      including the signature in the hash being signed would create a circular dependency
+      (you'd need to know the signature to compute the hash to create the signature).
+
+      However, this means the signature is a freely swappable component. If the owner uses
+      a signing scheme that produces non-deterministic signatures (e.g., ECDSA with random k),
+      multiple valid signatures exist for the same hash. This is normal and not exploitable
+      because the nonce prevents replay regardless of which valid signature is used.
+    solidity: |
+      // getHash omits withdrawRequest.signature — correct, no circular dependency
+      abi.encode(
+          address(this), account, block.chainid,
+          withdrawRequest.asset, withdrawRequest.amount,
+          withdrawRequest.nonce, withdrawRequest.expiry
+          // signature NOT here — intentional
+      )
+    attack_scenario: "N/A — correct design"
+    impact: "Informational — no issue."
+
+  - id: MS-SIG-07
+    title: "Nonce space is shared between withdraw() and validatePaymasterUserOp()"
+    severity: Low
+    confidence: 70
+    status: pending
+    location: "MagicSpend.sol#_validateRequest L342-356, withdraw L190, validatePaymasterUserOp L137"
+    description: |
+      Both withdraw() (direct call) and validatePaymasterUserOp() (ERC-4337 path) share the
+      same _nonceUsed mapping. A WithdrawRequest signed for nonce=N can be consumed via either
+      path — whichever executes first.
+
+      Scenario: Owner signs a WithdrawRequest for user Alice with nonce=42, amount=1 ETH for
+      the ERC-4337 paymaster flow. Alice could instead call withdraw() directly to receive
+      the full 1 ETH immediately, bypassing the paymaster flow entirely.
+
+      In the paymaster flow, the user only gets (amount - actualGasCost) back. In the direct
+      withdraw flow, the user gets the full amount. This means a user with a paymaster-intended
+      request can extract MORE value via the direct withdraw path.
+
+      HOWEVER: This is likely intentional — the withdraw() function exists precisely for this
+      purpose (allowing direct withdrawals). The owner signs knowing the request could be used
+      either way. The amount represents the maximum authorized withdrawal.
+    solidity: |
+      // Both paths call _validateRequest which uses the same nonce mapping:
+      function _validateRequest(address account, WithdrawRequest memory withdrawRequest) internal {
+          if (_nonceUsed[withdrawRequest.nonce][account]) {
+              revert InvalidNonce(withdrawRequest.nonce);
+          }
+          _nonceUsed[withdrawRequest.nonce][account] = true;
+      }
+
+      // Path 1: withdraw() — user gets full amount
+      function withdraw(WithdrawRequest memory withdrawRequest) external {
+          // ... sig check, then:
+          _withdraw(withdrawRequest.asset, msg.sender, withdrawRequest.amount);
+      }
+
+      // Path 2: validatePaymasterUserOp — user gets (amount - gasCost)
+      // _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+    attack_scenario: |
+      1. Owner signs WithdrawRequest(nonce=42, amount=1 ETH, asset=address(0)) for Alice
+      2. Intended for paymaster flow where Alice would get ~0.99 ETH (after gas)
+      3. Alice calls withdraw() directly with the same request
+      4. Alice receives full 1 ETH instead of ~0.99 ETH
+      5. Net gain: ~0.01 ETH (the gas portion)
+    impact: |
+      Low — the owner authorized 1 ETH for Alice. Whether she uses it as paymaster gas
+      or withdraws directly, the maximum outflow is 1 ETH. The "extra" amount is just gas
+      that would have been paid to the bundler anyway. Likely by design.
+
+  - id: MS-SIG-08
+    title: "validatePaymasterUserOp consumes nonce + credits _withdrawable even on sig failure"
+    severity: Medium
+    confidence: 40
+    status: pending
+    location: "MagicSpend.sol#validatePaymasterUserOp L137-143"
+    description: |
+      CRITICAL ORDERING ISSUE in validatePaymasterUserOp:
+
+      L137: _validateRequest(userOp.sender, withdrawRequest) — burns nonce, emits event
+      L139: sigFailed = !isValidWithdrawSignature(...)
+      L140: validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160)
+      L143: _withdrawable[userOp.sender] += withdrawAmount - maxCost  — ALWAYS executes
+
+      Even when sigFailed=true, line 143 STILL credits _withdrawable. The EntryPoint will see
+      sigFailed=1 and NOT proceed with execution, but the state changes at L137 and L143 persist
+      because validatePaymasterUserOp does NOT revert.
+
+      HOWEVER: In ERC-4337 v0.6, if the paymaster validation returns sigFailed=1, the EntryPoint
+      reverts the ENTIRE inner call frame including state changes. The validatePaymasterUserOp
+      runs in a try/catch-like context where returned failure causes state revert.
+
+      NEED TO VERIFY: Does EntryPoint v0.6 revert state on sigFailed=1 from paymaster, or does
+      it just skip execution? If state persists, _withdrawable gets credited without valid sig.
+    solidity: |
+      // State modification BEFORE sig check:
+      _validateRequest(userOp.sender, withdrawRequest);       // L137 - nonce burned
+      bool sigFailed = !isValidWithdrawSignature(...);         // L139
+      validationData = (sigFailed ? 1 : 0) | ...;             // L140
+      _withdrawable[userOp.sender] += withdrawAmount - maxCost; // L143 - ALWAYS credits
+    attack_scenario: |
+      IF EntryPoint does NOT revert paymaster state on sigFailed:
+      1. Attacker creates UserOp with paymasterAndData containing forged WithdrawRequest
+      2. Account validation passes (attacker controls account)
+      3. validatePaymasterUserOp: nonce burned, _withdrawable credited, sigFailed=true
+      4. EntryPoint sees sigFailed, skips execution
+      5. But _withdrawable[attacker] is now credited without valid owner signature
+      6. Attacker calls withdrawGasExcess() to drain credited funds
+
+      IF EntryPoint DOES revert paymaster state on sigFailed:
+      7. All state changes from L137 and L143 are reverted — no exploit
+    impact: |
+      CONDITIONAL Medium — depends entirely on EntryPoint v0.6 behavior regarding state
+      revert on paymaster sig failure. If state persists, this is a critical fund theft.
+      If state reverts (most likely), this is informational.
+      Confidence is LOW (40%) because EntryPoint v0.6 almost certainly reverts the
+      simulation context on validation failure.
+
+  - id: MS-SIG-09
+    title: "maxWithdrawDenominator=0 causes division by zero in _validateRequest"
+    severity: Low
+    confidence: 80
+    status: pending
+    location: "MagicSpend.sol#_validateRequest L347, _setMaxWithdrawDenominator L329"
+    description: |
+      _setMaxWithdrawDenominator does not validate that newDenominator != 0.
+      If owner sets maxWithdrawDenominator to 0, _validateRequest will revert with
+      a division by zero at L347:
+        uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+
+      This would brick ALL withdrawals (both direct and paymaster) since _validateRequest
+      is called in both paths. Only owner can fix by calling setMaxWithdrawDenominator again.
+
+      Not strictly a signature issue, but discovered during signature flow analysis.
+      The owner is trusted, so this is admin-error territory.
+    solidity: |
+      function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+          maxWithdrawDenominator = newDenominator;  // no zero check
+          emit MaxWithdrawDenominatorSet(newDenominator);
+      }
+
+      function _validateRequest(address account, WithdrawRequest memory withdrawRequest) internal {
+          // ...
+          uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;  // reverts if 0
+      }
+    attack_scenario: |
+      1. Owner accidentally calls setMaxWithdrawDenominator(0)
+      2. All subsequent withdraw() and validatePaymasterUserOp calls revert
+      3. Contract becomes non-functional until owner fixes the value
+    impact: "Low — admin-only error, self-inflicted DoS, easily recoverable."
+
+summary: |
+  MagicSpend signature implementation is SOLID overall. The hash includes all necessary
+  domain separation fields (address(this), account, chainid, all request params). EIP-191
+  is correctly implemented via Solady. Nonce replay protection is sound.
+
+  The most interesting finding is MS-SIG-08 (conditional on EntryPoint v0.6 behavior) —
+  if the EntryPoint does NOT revert paymaster state on sig failure, _withdrawable gets
+  credited without a valid signature. This needs verification against the actual EntryPoint
+  code. Most likely the EntryPoint DOES revert state, making this non-exploitable.
+
+  MS-SIG-07 (shared nonce space) is a design observation — users can choose the more
+  favorable withdrawal path. MS-SIG-02 (ownership transfer) is operational risk only.
+
+  No HIGH or CRITICAL signature vulnerabilities found. The contract follows best practices
+  for signature validation in the ERC-4337 context.

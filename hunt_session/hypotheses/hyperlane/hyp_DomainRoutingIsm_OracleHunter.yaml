@@ -1,0 +1,261 @@
+hunter: OracleHunter
+component: DomainRoutingIsm
+date: "2026-03-27"
+contracts_analyzed:
+  - DomainRoutingIsm.sol
+  - AbstractRoutingIsm.sol
+  - DefaultFallbackRoutingIsm.sol
+  - DomainRoutingIsmFactory.sol
+
+hypotheses:
+  - id: DRI-OR-01
+    title: "DefaultFallbackRoutingIsm external dependency on mailbox.defaultIsm() creates silent security downgrade"
+    description: |
+      DefaultFallbackRoutingIsm.module() makes an external call to mailbox.defaultIsm() for any
+      unconfigured domain. This is a live external dependency — the returned ISM can change at any
+      time if the Mailbox owner calls setDefaultIsm(). There is no caching, no snapshot, no event
+      emitted by DomainRoutingIsm when the fallback is actually used.
+
+      The dependency is read at verify-time (not at set-time), meaning:
+      - Mailbox owner changes defaultIsm from StrictMultisigIsm to WeakIsm
+      - All DefaultFallbackRoutingIsm instances with unconfigured domains IMMEDIATELY use WeakIsm
+      - No notification to any recipient relying on those ISMs
+      - A relayer can submit messages from unconfigured domains verified by the new weaker ISM
+
+      This is not a code bug — it's the intended fallback design. However, it is an external dependency
+      risk: the security posture of every DefaultFallbackRoutingIsm user for unconfigured domains is
+      entirely controlled by an external actor (Mailbox owner) without any notification mechanism.
+
+      Realistically, the Mailbox owner is a trusted protocol multisig, so exploitation requires
+      compromised governance or malicious upgrade. The real risk is ACCIDENTAL downgrade during
+      routine Mailbox maintenance.
+    confidence: 30
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Recipient uses DefaultFallbackRoutingIsm configured for domains 1-5 with strict multisig
+      2. Domain 6 goes live; DomainRoutingIsm owner hasn't configured it yet
+      3. Mailbox owner updates defaultIsm for unrelated maintenance reasons (e.g., migration)
+      4. New defaultIsm has lower security threshold or different validator set
+      5. Attacker exploits weaker defaultIsm to forge message from domain 6
+      6. DefaultFallbackRoutingIsm.module(6) returns new weak defaultIsm
+      7. AbstractRoutingIsm.verify() calls weakIsm.verify() → true
+      8. Mailbox.process() delivers forged message to recipient
+
+      Impact: verification bypass for unconfigured domains, limited by Mailbox owner trust.
+      Probability: low (requires Mailbox owner action + unconfigured domain + attacker awareness).
+    solidity: |
+      // INVARIANT: DefaultFallbackRoutingIsm fallback ISM should not change unexpectedly
+      function invariant_fallback_ism_stability(uint32 unconfiguredDomain) public {
+          DefaultFallbackRoutingIsm ism = DefaultFallbackRoutingIsm(ISM_ADDR);
+          // Snapshot the fallback ISM
+          IInterchainSecurityModule fallbackBefore = ism.module(unconfiguredDomain);
+          // If Mailbox owner changes defaultIsm, the fallback changes silently
+          // This test verifies the coupling exists
+          address newIsm = address(new MockAlwaysTrueIsm());
+          vm.prank(mailbox.owner());
+          mailbox.setDefaultIsm(newIsm);
+          IInterchainSecurityModule fallbackAfter = ism.module(unconfiguredDomain);
+          // This WILL be different — demonstrating the external dependency
+          t(address(fallbackBefore) != address(fallbackAfter), "Fallback ISM changed silently");
+      }
+
+  - id: DRI-OR-02
+    title: "Child ISM upgradeability — registered ISM can change behavior without DomainRoutingIsm knowledge"
+    description: |
+      When owner calls set(domain, ism), DomainRoutingIsm stores the ISM address and validates
+      isContract(). However, if the ISM at that address is a proxy (UUPS, TransparentProxy, etc.),
+      its implementation can be upgraded at any time by the proxy admin WITHOUT any notification to
+      DomainRoutingIsm.
+
+      The verify() call in AbstractRoutingIsm (line 42) delegates to route(_message).verify(),
+      which calls the child ISM. If the child ISM has been upgraded to a contract that:
+      - Always returns true (security bypass)
+      - Always reverts (DoS)
+      - Has different validator sets or thresholds
+
+      DomainRoutingIsm has no way to detect this change. There's no version check, no interface
+      validation beyond the initial isContract(), no hash of the ISM's bytecode at registration time.
+
+      This is inherent to the proxy pattern and not specific to DomainRoutingIsm — any contract
+      that stores an address to a proxy has this property. The trust model is: "you trust the ISM
+      address you configure." If that ISM is a proxy, you also trust its admin.
+
+      Not a code vulnerability. Design-inherent trust delegation. The owner who calls set() is
+      responsible for understanding whether the ISM is upgradeable.
+    confidence: 15
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. Owner sets domain 1 → MultisigIsmProxy (a transparent proxy to MultisigIsm implementation)
+      2. Proxy admin (different entity) upgrades MultisigIsmProxy to AlwaysTrueIsm
+      3. DomainRoutingIsm still maps domain 1 → same proxy address
+      4. route(message_from_domain_1).verify() now calls AlwaysTrueIsm.verify() → true
+      5. Forged messages from domain 1 pass verification
+
+      Impact: complete verification bypass for that domain.
+      Probability: very low — requires compromised proxy admin AND attacker awareness.
+      Mitigation: use non-upgradeable ISMs, or monitor ISM implementation slots.
+    solidity: |
+      // INVARIANT: Child ISM implementation should not change post-registration
+      // NOTE: This is a monitoring invariant, not enforceable by DomainRoutingIsm
+      function invariant_child_ism_stable(uint32 domain) public view returns (bool) {
+          address ismAddr = address(domainRoutingIsm.module(domain));
+          // Check if ISM is a proxy by reading EIP-1967 implementation slot
+          bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+          bytes32 impl = vm.load(ismAddr, implSlot);
+          // If impl != 0, it's a proxy — flag for manual review
+          // Cannot enforce stability on-chain without snapshotting
+          return impl == bytes32(0); // true if not a proxy (safer)
+      }
+
+  - id: DRI-OR-03
+    title: "isContract check returns false for contracts in constructor — race condition during deployment"
+    description: |
+      Address.isContract() checks code.length > 0. During a contract's constructor execution,
+      code.length is 0 (code is deployed AFTER constructor returns). If _set() is called with
+      an address that is currently being constructed, isContract() returns false and the tx reverts.
+
+      This is a PROTECTION, not a vulnerability — it prevents setting an ISM that hasn't finished
+      deploying. The only scenario where this matters is if someone tries to atomically deploy an
+      ISM and register it in the same transaction via a factory that calls both in the constructor.
+      In that case, the ISM must be deployed BEFORE calling set(), which is the natural order.
+
+      The inverse is also safe: selfdestruct. If a registered ISM selfdestructs:
+      - Same transaction: isContract() still returns true (code exists until tx ends)
+      - Next transaction: isContract() returns false, but _set() isn't re-called; the ISM address
+        is already stored. Calls to verify() on a selfdestructed contract return false (no code to
+        execute), which causes verify to revert or return empty data.
+
+      Post-EIP-6780 (Dencun), selfdestruct only deletes code if called in the same tx as creation.
+      So registered ISMs can't be selfdestructed in practice on modern EVM.
+
+      No vulnerability. isContract() behaves correctly for all realistic deployment scenarios.
+    confidence: 10
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. Attacker deploys ISM via CREATE2 in constructor, tries to call set() in same constructor
+      2. isContract(newIsm) returns false because newIsm is still in constructor
+      3. set() reverts with "ISM must be a contract"
+      4. Attack fails — protection works as intended
+
+      Selfdestruct path (post-Dencun):
+      1. ISM registered at address X
+      2. ISM calls selfdestruct — no effect unless called in creation tx (EIP-6780)
+      3. ISM remains functional; verify() continues to work
+      4. No vulnerability
+    solidity: |
+      // INVARIANT: Cannot register ISM that is in constructor
+      function invariant_no_constructor_ism() public {
+          // Deploy a factory that tries to set ISM in its own constructor
+          // The ISM deployed inside the constructor won't have code yet
+          vm.expectRevert("ISM must be a contract");
+          new MaliciousFactory(address(domainRoutingIsm), 42);
+      }
+
+  - id: DRI-OR-04
+    title: "AbstractRoutingIsm.verify() trusts child ISM return value without additional validation"
+    description: |
+      AbstractRoutingIsm.verify() at line 42 does: `return route(_message).verify(_metadata, _message)`.
+      This is a direct external call that trusts the bool return value from the child ISM.
+
+      Analysis of potential return value manipulation:
+      - Solidity ABI decoding: if child ISM returns non-standard data (not exactly 32 bytes encoding
+        a bool), Solidity's ABI decoder will revert. This is safe.
+      - If child ISM returns nothing (0 bytes), ABI decoder reverts. Safe.
+      - If child ISM returns > 32 bytes, only first 32 bytes decoded. If first 32 bytes encode
+        `true`, verify passes. This matches standard ABI behavior.
+      - If child ISM is an EOA (no code), the external call returns true with empty returndata.
+        BUT: _set() checks isContract(), preventing EOAs from being registered. Safe.
+      - If child ISM selfdestructs and code is gone: external call to address with no code returns
+        true with empty returndata. ABI decoder expects 32 bytes, gets 0 → reverts. Safe (DoS, not bypass).
+
+      Wait — actually in Solidity, a call to an address with no code succeeds silently with empty
+      returndata. But since verify() expects a bool return, the ABI decoder checks returndata length.
+      If length < 32, it reverts. So a selfdestructed ISM causes DoS (revert), not a bypass.
+
+      The real protection is the interface typing: IInterchainSecurityModule.verify() returns bool.
+      Solidity enforces ABI decoding on the return value. No manipulation possible through return
+      value tricks.
+
+      SAFE — Solidity's type system handles this correctly.
+    confidence: 10
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. Child ISM is registered, later its code is destroyed (pre-Dencun or same-tx selfdestruct)
+      2. verify() calls childIsm.verify() → external call to codeless address
+      3. Call succeeds with 0 bytes returndata
+      4. Solidity ABI decoder expects bool (32 bytes) → gets 0 bytes → REVERTS
+      5. Result: DoS (messages can't be verified for that domain), NOT a security bypass
+      6. Owner can fix by calling set(domain, newWorkingISM)
+
+      Impact: temporary DoS for one domain, fixable by owner. Not a fund loss scenario.
+    solidity: |
+      // INVARIANT: verify() on codeless address should revert, not return true
+      function invariant_codeless_ism_reverts() public {
+          // Register ISM, then selfdestruct it (simulated)
+          address codelessAddr = address(0xdead);
+          // Bypass isContract check by directly manipulating storage (test only)
+          // In production, this can't happen due to _set() check + EIP-6780
+          vm.etch(codelessAddr, ""); // remove code
+          bytes memory message = _encodeMessage(targetDomain);
+          vm.expectRevert(); // Should revert due to empty returndata
+          abstractRoutingIsm.verify("", message);
+      }
+
+  - id: DRI-OR-05
+    title: "No external price oracles, tokens, or DEX interactions — minimal oracle attack surface"
+    description: |
+      DomainRoutingIsm is pure routing logic with ZERO external financial dependencies:
+      - No price oracles (Chainlink, TWAP, etc.)
+      - No token transfers or balances
+      - No DEX interactions or liquidity pools
+      - No flash loan vectors
+      - No timestamp-dependent pricing
+
+      The only external dependencies are:
+      1. Child ISMs (addresses stored in _modules mapping) — trust delegated to owner
+      2. mailbox.defaultIsm() — only in DefaultFallbackRoutingIsm, trust delegated to Mailbox owner
+      3. Address.isContract() — STATICCALL to get code size, no manipulation possible
+
+      This makes DomainRoutingIsm extremely resistant to typical oracle/external dependency attacks.
+      The attack surface is entirely about TRUST (who controls the ISMs) not about DATA MANIPULATION
+      (oracle prices, exchange rates, etc.).
+    confidence: 95
+    severity: info
+    status: safe
+    attack_scenario: |
+      N/A — No oracle or external financial dependencies to exploit.
+      The component is pure routing logic.
+    solidity: |
+      // INVARIANT: DomainRoutingIsm has no token balances or financial state
+      function invariant_no_financial_state() public view returns (bool) {
+          // Should hold no ETH
+          return address(domainRoutingIsm).balance == 0;
+      }
+
+summary: |
+  DomainRoutingIsm tiene una superficie de ataque de dependencias externas MÍNIMA. No hay
+  oráculos de precio, tokens, DEX, ni ninguna dependencia financiera externa. Es lógica de
+  routing pura.
+
+  Las únicas dependencias externas son:
+  1. Child ISMs registrados por el owner — confianza delegada al owner (design-inherent)
+  2. mailbox.defaultIsm() en DefaultFallbackRoutingIsm — crea un split de trust boundary
+     donde el Mailbox owner controla la verificación de dominios no configurados (DRI-OR-01)
+  3. Address.isContract() — STATICCALL seguro, sin posibilidad de manipulación
+
+  El único hallazgo que merece investigación adicional es DRI-OR-01: la dependencia de
+  DefaultFallbackRoutingIsm en mailbox.defaultIsm() es una dependencia LIVE que puede cambiar
+  sin notificación. Esto complementa DRI-AC-04 del AccessHunter — es el mismo issue visto
+  desde la perspectiva de dependencias externas. Severidad medium por el trust boundary split,
+  pero la probabilidad de explotación es baja (requiere acción del Mailbox owner).
+
+  DRI-OR-02 a DRI-OR-04 son análisis de completitud que confirman que el código maneja
+  correctamente los edge cases de contratos proxy, selfdestructed, y return values.
+
+  CONCLUSIÓN: No hay vulnerabilidades explotables de tipo oracle/external dependency.
+  La seguridad del componente depende enteramente del trust model (owner + Mailbox owner),
+  que está bien implementado.

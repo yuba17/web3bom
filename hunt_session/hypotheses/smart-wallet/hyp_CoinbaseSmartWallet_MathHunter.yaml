@@ -1,0 +1,512 @@
+hunter: MathHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+protocol: coinbase-smart-wallet
+files:
+  - smart-wallet/src/CoinbaseSmartWallet.sol
+  - smart-wallet/src/MultiOwnable.sol
+  - MagicSpend/src/MagicSpend.sol
+domain: trust
+
+hypotheses:
+  - id: CSW-M-01
+    title: "MultiOwnable: ownerCount() = nextOwnerIndex - removedOwnersCount no puede underflow pero la lógica de removeLastOwner crea wallet sin owners"
+    severity: high
+    confidence: 55
+    description: |
+      ownerCount() en MultiOwnable.sol línea 195:
+        return $.nextOwnerIndex - $.removedOwnersCount;
+      Con Solidity 0.8.23 no hay underflow silencioso — panic en underflow.
+      El riesgo real es lógico: removeLastOwner() permite explícitamente llegar
+      a ownerCount() == 0 (solo requiere que sea el ÚNICO owner).
+      Si un owner (passkey comprometida o phishing) ejecuta removeLastOwner(),
+      la wallet queda sin owners y NADIE puede ejecutar operaciones privilegiadas:
+      - No se puede llamar addOwnerAddress (requiere onlyOwner)
+      - No se puede llamar upgradeToAndCall (requiere onlyOwner)
+      - No se puede llamar execute / executeBatch (requiere onlyEntryPointOrOwner,
+        y EntryPoint también requiere firma de owner para validar)
+      Los fondos quedan permanentemente bloqueados. El `initialize()` no puede
+      re-llamarse (check nextOwnerIndex != 0 en línea 147).
+    attack_scenario: |
+      1. Wallet tiene 1 owner (passkey comprometida via phishing o malware).
+      2. Atacante firma UserOp con calldata = removeLastOwner(0, ownerBytes).
+      3. removeLastOwner ejecuta, ownerCount() -> 0.
+      4. Wallet queda sin owners. initialize() no puede llamarse (Initialized()).
+      5. Todo el ETH y tokens de la wallet quedan bloqueados para siempre.
+      Nota: requiere comprometer al ÚNICO owner. Con múltiples owners, removeOwnerAtIndex
+      revierte si ownerCount() == 1 (LastOwner error). El riesgo es mayor para
+      wallets con un solo propietario (caso común en mobile wallets).
+    impact: |
+      Pérdida total permanente de fondos si el único owner es comprometido y
+      se ejecuta removeLastOwner. No hay mecanismo de recuperación on-chain.
+      Requiere comprometer al owner — no es explotable sin credenciales.
+      Severity: High (pérdida irreversible) pero likelihood Low (requiere owner comprometido).
+    solidity: |
+      uint256 count = wallet.ownerCount();
+      uint256 nextIdx = wallet.nextOwnerIndex();
+      uint256 removedCount = wallet.removedOwnersCount();
+      eq(count, nextIdx - removedCount, "CSW-M-01: ownerCount inconsistente con indices");
+      // Si removeLastOwner NO fue llamado, ownerCount nunca debe ser 0
+      if (!ghost_removeLastOwnerCalled) {
+          gte(count, 1, "CSW-M-01: ownerCount bajo a 0 sin removeLastOwner");
+      }
+    status: investigate
+    tier: 2
+    notes: |
+      Investigado: removeOwnerAtIndex tiene check ownerCount()==1 -> revert LastOwner().
+      removeLastOwner tiene check ownerCount()>1 -> revert NotLastOwner().
+      El riesgo real es que removeLastOwner ES un path legítimo que permite count=0.
+      Esto es by design para account recovery / self-destruction. El invariante
+      asegura que el único path a count=0 es removeLastOwner.
+
+  - id: CSW-M-02
+    title: "MagicSpend: _withdrawable acumulación multi-UserOp en el mismo bundle sin postOp intermedio"
+    severity: medium
+    confidence: 45
+    description: |
+      En validatePaymasterUserOp() línea 143:
+        _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+      Esta línea ACUMULA con +=. Si el EntryPoint procesa múltiples UserOps del
+      mismo account en el mismo bundle usando MagicSpend como paymaster (con
+      diferentes nonces por el mapping _nonceUsed[nonce][account]):
+      - validateOp1: _withdrawable[sender] += (amount1 - maxCost1)
+      - validateOp2: _withdrawable[sender] += (amount2 - maxCost2) [acumula]
+      - postOp1 ejecuta: lee _withdrawable (tiene amount1+amount2-maxCost1-maxCost2),
+        envía todo al usuario, borra _withdrawable
+      - postOp2 ejecuta: _withdrawable ya es 0, solo envía (maxGasCost2 - actualGas2)
+
+      El usuario obtiene fondos del request2 durante postOp1, y en postOp2 solo
+      recibe el refund de gas. Net amount total es correcto: usuario recibe
+      (amount1 + amount2 - actualGas1 - actualGas2). El ETH del paymaster se
+      consume correctamente porque ambas validaciones quemaron sus nonces y
+      comprometieron el amount del paymaster.
+
+      El verdadero riesgo: si postOp1 falla (por insuficiencia de balance del
+      paymaster para cubrir _withdrawable acumulado), el bundle puede fallar
+      parcialmente con estado inconsistente de _withdrawable.
+    attack_scenario: |
+      1. MagicSpend tiene 10 ETH de balance. maxWithdrawDenominator=2, maxAllowed=5 ETH.
+      2. User crea 2 UserOps en el mismo bundle, cada uno con amount=5 ETH, maxCost=0.1 ETH.
+      3. validateOp1: _withdrawable[user] += 4.9 ETH. balance check: 10/2=5 ETH >= 5 ETH OK.
+      4. validateOp2: _withdrawable[user] += 4.9 ETH = 9.8 ETH total. balance check:
+         balance SIGUE siendo 10 ETH (no ejecutado aún) -> 10/2=5 ETH >= 5 ETH OK.
+      5. postOp1: withdrawable = 9.8 + (0.1 - actualGas1) ≈ 9.85 ETH, envía todo.
+         Si MagicSpend solo tiene 10 ETH pero debe pagar gas al EntryPoint también,
+         puede quedarse sin balance para el segundo postOp.
+      6. El usuario efectivamente retiró 9.8 ETH cuando el límite era 5 ETH por op.
+    impact: |
+      El mecanismo maxWithdrawDenominator puede ser circunvenido por múltiples UserOps
+      del mismo sender en el mismo bundle. Cada validación usa el balance pre-ejecución
+      para el check, permitiendo que el total retirado en un bundle supere el límite
+      individual. No hay pérdida de fondos del paymaster más allá de lo firmado, pero
+      viola la intención del denominador de limitar exposición por transacción.
+    solidity: |
+      // Ghost: rastrear _withdrawable máximo observado por account
+      mapping(address => uint256) internal ghost_maxWithdrawable;
+      uint256 internal ghost_maxAllowed;
+
+      function invariant_withdrawableDoesNotExceedMaxAllowed(address account) internal {
+          uint256 withdrawable = ghost_maxWithdrawable[account];
+          uint256 maxAllowed = address(magicSpend).balance / magicSpend.maxWithdrawDenominator();
+          // Si withdrawable > maxAllowed, el denominador fue circunvenido
+          lte(withdrawable, maxAllowed, "CSW-M-02: _withdrawable excede maxAllowed individual");
+      }
+    status: investigate
+    tier: 2
+    notes: |
+      Investigado: el EntryPoint v0.6 permite bundles con múltiples UserOps del mismo
+      sender. El nonce es diferente para cada UserOp (different seq in same key, o
+      different keys). El check de nonce en _nonceUsed lo maneja correctamente.
+      La acumulación es un riesgo de diseño, no un bug de aritmética directa.
+      Confidence bajo porque el EntryPoint puede tener restricciones adicionales.
+
+  - id: CSW-M-03
+    title: "MagicSpend: maxWithdrawDenominator=0 divide-by-zero bloquea todos los ETH withdrawals"
+    severity: medium
+    confidence: 90
+    description: |
+      En MagicSpend._validateRequest() línea 347:
+        uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      Si maxWithdrawDenominator es 0, esta división revierte con panic 0x12
+      (división por cero) en Solidity 0.8.
+
+      La función _setMaxWithdrawDenominator (línea 329) no valida que
+      newDenominator > 0. El constructor tampoco valida:
+        constructor(address owner_, uint256 maxWithdrawDenominator_) {
+            _setMaxWithdrawDenominator(maxWithdrawDenominator_);
+        }
+      Si se deploya con denominador=0 o el owner llama setMaxWithdrawDenominator(0),
+      todas las operaciones de ETH quedan DoS-eadas.
+
+      Única escapatoria: ownerWithdraw() no llama _validateRequest, así que el
+      owner puede recuperar fondos directamente. Pero todos los usuarios quedan bloqueados.
+    attack_scenario: |
+      1. Owner (accidentalmente o comprometido) llama setMaxWithdrawDenominator(0).
+      2. Cualquier usuario que llame withdraw() con ETH -> _validateRequest() ->
+         address(this).balance / 0 -> panic revert.
+      3. Cualquier UserOp que use MagicSpend como paymaster -> validatePaymasterUserOp
+         -> _validateRequest() -> panic revert -> userOp falla.
+      4. Usuarios no pueden retirar fondos. El paymaster está DoS-eado.
+      5. Solo ownerWithdraw puede rescatar los fondos del paymaster.
+    impact: |
+      DoS total de todas las operaciones ETH del paymaster hasta que el owner corrija.
+      Los fondos del paymaster son rescatables via ownerWithdraw (solo owner).
+      Los usuarios con fondos comprometidos en _withdrawable no pueden retirarlos
+      (withdrawGasExcess tampoco llama _validateRequest, así que eso SI funciona).
+      Medium severity por ser admin-reversible pero potencialmente crítico si el
+      owner key se pierde o el contrato se deploya con denominador=0 por accidente.
+    solidity: |
+      // Invariant: maxWithdrawDenominator siempre > 0
+      function invariant_denominatorNonZero() internal view {
+          t(magicSpend.maxWithdrawDenominator() != 0, "CSW-M-03: maxWithdrawDenominator=0 -> DoS");
+      }
+
+      // Test: deploy con denominador=0 y verificar DoS
+      function test_zeroDenominatorDoS() internal {
+          uint256 denom = magicSpend.maxWithdrawDenominator();
+          if (denom == 0) {
+              // Intentar withdraw debe fallar
+              t(false, "CSW-M-03: denominador 0 activo -> DoS en curso");
+          }
+      }
+    status: investigate
+    tier: 1
+    poc_sketch: |
+      // Foundry PoC:
+      // 1. vm.prank(owner); magicSpend.setMaxWithdrawDenominator(0);
+      // 2. vm.expectRevert(); magicSpend.withdraw(req);
+      // 3. vm.prank(owner); magicSpend.ownerWithdraw(addr(0), owner, balance); // OK
+
+  - id: CSW-M-04
+    title: "MagicSpend: validationData expiry=0 crea withdraw requests perpetuos en contexto paymaster pero no en withdraw() directo"
+    severity: low
+    confidence: 75
+    description: |
+      Hay una discrepancia semántica entre withdraw() y validatePaymasterUserOp()
+      respecto al manejo de expiry=0.
+
+      withdraw() línea 191-193:
+        if (block.timestamp > withdrawRequest.expiry) revert Expired();
+      Con expiry=0: block.timestamp > 0 es SIEMPRE true (desde genesis) -> revert Expired().
+      Así, withdraw() rechaza correctamente requests con expiry=0.
+
+      validatePaymasterUserOp() línea 140:
+        validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160);
+      Con expiry=0: validUntil=0, que en ERC-4337 significa "válido indefinidamente" (sin límite).
+      El EntryPoint NO rechaza requests con validUntil=0.
+
+      Resultado: un withdraw request con expiry=0 es INVÁLIDO para uso directo (withdraw())
+      pero PERPETUAMENTE VÁLIDO para uso como paymaster (validatePaymasterUserOp()).
+      El signer puede no ser consciente de esta asimetría.
+    attack_scenario: |
+      1. MagicSpend owner firma un WithdrawRequest con expiry=0 pensando que es inválido
+         (porque withdraw() lo rechaza) o para indicar "sin expiración".
+      2. El request puede usarse como paymaster input indefinidamente.
+      3. Si el owner cambia o el sistema de signing tiene un bug que emite expiry=0,
+         los requests quedan válidos para siempre como paymaster input.
+      4. Un usuario que recibe un request con expiry=0 puede patrocinarse transacciones
+         sin límite de tiempo hasta que el nonce sea quemado.
+    impact: |
+      Inconsistencia de comportamiento entre withdraw() y validatePaymasterUserOp().
+      Los requests con expiry=0 son perpetuos en el contexto de paymaster.
+      Low severity — el signer controla qué firma, pero la asimetría es una trampa
+      de diseño que podría causar bugs en sistemas de signing automatizados.
+    solidity: |
+      // Invariant: expiry en validationData debe ser consistente con el comportamiento esperado
+      function invariant_expirySemantics(uint48 expiry) internal view {
+          // Si expiry=0, el paymaster acepta pero withdraw directo rechaza
+          // Documentar la discrepancia
+          if (expiry == 0) {
+              // En modo paymaster: válido indefinidamente (validUntil=0 en ERC-4337)
+              // En modo withdraw directo: siempre rechaza (Expired)
+              t(false, "CSW-M-04: expiry=0 crea comportamiento asimetrico");
+          }
+      }
+    status: investigate
+    tier: 2
+
+  - id: CSW-M-05
+    title: "MagicSpend: postOp underflow teórico si actualGasCost > maxGasCost por EntryPoint buggy"
+    severity: low
+    confidence: 40
+    description: |
+      En postOp() línea 165:
+        uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+      Si actualGasCost > maxGasCost, la resta revierte con underflow (Solidity 0.8 panic).
+      Esto causaría que postOp revierta, el EntryPoint llame postOp de nuevo con
+      PostOpMode.postOpReverted, y MagicSpend revierta con UnexpectedPostOpRevertedMode.
+      El _withdrawable[account] quedaría sin borrar — fondos bloqueados.
+
+      El EntryPoint canónico v0.6 GARANTIZA que actualGasCost <= maxCost porque:
+      - actualGasCost = gasUsed * effectiveGasPrice
+      - maxCost = gasLimit * maxFeePerGas
+      - gasUsed <= gasLimit y effectiveGasPrice <= maxFeePerGas (EIP-1559)
+      Así que con el EntryPoint legítimo, el underflow es imposible.
+    attack_scenario: |
+      Solo explotable con un EntryPoint malicioso o buggy que no respete las garantías
+      de ERC-4337. No explotable con el EntryPoint canónico v0.6.
+    impact: |
+      Con EntryPoint canónico: imposible. Con EntryPoint alternativo: fondos
+      bloqueados en _withdrawable. Informational para el scope de este bounty.
+    solidity: |
+      // Invariant: maxGasCost >= actualGasCost en postOp
+      function invariant_gasCostOrder(uint256 maxGasCost, uint256 actualGasCost) internal pure {
+          gte(maxGasCost, actualGasCost, "CSW-M-05: actualGasCost > maxGasCost -> underflow");
+      }
+    status: investigate
+    tier: 3
+
+  - id: CSW-M-06
+    title: "MagicSpend: maxWithdrawDenominator muy grande trunca maxAllowed a 0, bloqueando todos los ETH withdrawals"
+    severity: low
+    confidence: 70
+    description: |
+      En _validateRequest() línea 347-350:
+        uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+        if (withdrawRequest.asset == address(0) && withdrawRequest.amount > maxAllowed) {
+            revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
+        }
+      Si maxWithdrawDenominator es type(uint256).max o cualquier valor > balance,
+      la división entera trunca a 0. Cualquier request con amount > 0 falla con
+      WithdrawTooLarge(amount, 0). El paymaster queda efectivamente DoS-eado
+      para ETH sin causar un revert técnico.
+
+      Similar a CSW-M-03 pero vía truncamiento en lugar de division-by-zero.
+    attack_scenario: |
+      1. Owner setea maxWithdrawDenominator = type(uint256).max.
+      2. maxAllowed = balance / type(uint256).max = 0 para cualquier balance razonable.
+      3. Todos los ETH withdrawals fallan con WithdrawTooLarge(amount, 0).
+      4. Paymaster DoS-eado, fondos rescatables solo via ownerWithdraw.
+    impact: |
+      DoS del paymaster por configuración admin extrema. Admin-reversible.
+      Low severity — solo el owner puede configurar esto.
+    solidity: |
+      // Invariant: maxAllowed debe ser > 0 si el paymaster tiene balance y se espera operativo
+      function invariant_maxAllowedNonZero() internal view {
+          uint256 denom = magicSpend.maxWithdrawDenominator();
+          uint256 balance = address(magicSpend).balance;
+          if (balance > 0 && denom > 0) {
+              uint256 maxAllowed = balance / denom;
+              t(maxAllowed > 0, "CSW-M-06: maxAllowed trunca a 0 -> DoS por configuracion extrema");
+          }
+      }
+    status: investigate
+    tier: 3
+
+  - id: CSW-M-07
+    title: "CoinbaseSmartWallet: nonce key extraction (>> 64) no tiene limite en espacio de keys — key=0 es válido para cualquier función excepto executeWithoutChainId"
+    severity: informational
+    confidence: 85
+    description: |
+      En validateUserOp() línea 180:
+        uint256 key = userOp.nonce >> 64;
+      El key puede ser cualquier uint192 excepto REPLAYABLE_NONCE_KEY=8453 para
+      calls no-replayables. El key=0 es perfectamente válido.
+
+      Matemáticamente, cada key crea un sub-espacio de nonces de 2^64 secuencias.
+      Con REPLAYABLE_NONCE_KEY=8453, las operaciones cross-chain usan el sub-espacio
+      key=8453. Las demás operaciones pueden usar cualquier otro key incluyendo 0.
+
+      No hay overflow posible en el shift: uint256 >> 64 es siempre válido y produce
+      un resultado en [0, 2^192). El resultado se compara con REPLAYABLE_NONCE_KEY
+      (uint256 = 8453). No hay truncamiento.
+
+      El riesgo teórico de wrap-around del sequence counter a 2^64 transacciones
+      por key es prácticamente imposible (quintillones de transacciones).
+    attack_scenario: |
+      No hay vector de ataque real. Análisis confirmatorio de que la aritmética es sana.
+    impact: |
+      Informacional. La aritmética de nonces es correcta y no presenta vulnerabilidades.
+    solidity: |
+      // Verificar bidireccionalidad del nonce encoding/decoding
+      function invariant_nonceDecomposition(uint256 nonce) internal pure {
+          uint256 key = nonce >> 64;
+          uint256 seq = nonce & type(uint64).max;
+          eq((key << 64) | seq, nonce, "CSW-M-07: nonce decomposition no es bijective");
+      }
+
+      // Replayable calls DEBEN usar key=8453, otras no
+      function invariant_nonceKeyConsistency(uint256 nonce, bool isReplayable) internal pure {
+          uint256 key = nonce >> 64;
+          if (isReplayable) {
+              eq(key, 8453, "CSW-M-07: replayable call con key != REPLAYABLE_NONCE_KEY");
+          } else {
+              t(key != 8453, "CSW-M-07: non-replayable call con key == REPLAYABLE_NONCE_KEY");
+          }
+      }
+    status: investigate
+    tier: 3
+
+  - id: CSW-M-08
+    title: "CoinbaseSmartWallet: signatureData de ETH address acepta firmas maleables (s no-canónico) si Solady no enforcea low-s"
+    severity: low
+    confidence: 60
+    description: |
+      En _isValidSignature() para owners ETH address (ownerBytes.length == 32):
+        return SignatureCheckerLib.isValidSignatureNow(owner, hash, sigWrapper.signatureData);
+      Solady's SignatureCheckerLib acepta firmas en formato compact EIP-2098 (64 bytes)
+      y estándar (65 bytes). La biblioteca intenta usar ECDSA con verificación que
+      puede aceptar tanto el valor s como su complemento (order - s) en secp256k1.
+
+      Si Solady no fuerza low-s (s <= secp256k1_order/2), existen DOS firmas válidas
+      para cada (owner, hash): una con (r, s, v) y otra con (r, order-s, 27+28-v).
+      Ambas recuperan la misma dirección de owner.
+
+      Esto no permite robo directo de fondos (ambas firmas son del owner legítimo),
+      pero puede causar problemas en:
+      1. Sistemas off-chain de deduplicación de UserOps por firma.
+      2. Caching de firma para ERC-1271 isValidSignature() calls.
+      3. Bundlers que rechazan "duplicados" basados en firma.
+    attack_scenario: |
+      1. Owner firma UserOp legítimamente con (r, s, v).
+      2. Atacante (o bundler malicioso) calcula firma complementaria (r, order-s, 27+28-v).
+      3. Ambas firmas pasan _isValidSignature() si Solady no enforcea low-s.
+      4. El atacante puede presentar el UserOp con la firma complementaria como
+         si fuera un UserOp "diferente", evadiendo deduplicación basada en firma.
+      5. No se puede gastar más de lo que el calldata autoriza — el impacto es
+         en metadata, no en fondos directamente.
+    impact: |
+      Malleabilidad de firma para ETH address owners. No permite robo de fondos.
+      Puede interferir con sistemas de deduplicación off-chain. Low severity.
+      WebAuthn (P-256) tiene sus propias garantías de no-malleabilidad.
+    solidity: |
+      // Test: verificar que firma complementaria es rechazada
+      // Requires acceso a parámetros ECDSA, difícil en Chimera puro
+      // Pseudo-invariant:
+      function invariant_signatureUniqueness(bytes32 hash, bytes memory sig) internal view {
+          // Para un mismo (hash, owner), solo una firma debe ser válida
+          // En práctica, esto se verifica con un test Foundry directo
+          bool valid = wallet.isValidSignature(hash, sig) == 0x1626ba7e;
+          // Si el complemento también es válido, hay malleabilidad
+      }
+    status: investigate
+    tier: 2
+
+  - id: CSW-M-09
+    title: "MagicSpend: race condition en maxWithdrawDenominator check — múltiples usuarios en el mismo bundle eluden el límite individual"
+    severity: medium
+    confidence: 72
+    description: |
+      En _validateRequest() línea 347:
+        uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      Esta línea usa address(this).balance EN EL MOMENTO DE VALIDACIÓN, antes de
+      que cualquier transferencia ocurra (todas las validaciones del bundle ocurren
+      antes de cualquier ejecución en el EntryPoint v0.6).
+
+      Si un bundle tiene N UserOps de N usuarios diferentes, cada uno con un
+      withdraw request de amount = balance/denominator:
+      - validate_u1: balance=100 ETH, maxAllowed=10 ETH, amount=10 ETH ✓
+      - validate_u2: balance SIGUE siendo 100 ETH (no hubo transferencias aún),
+        maxAllowed=10 ETH, amount=10 ETH ✓
+      - ... (N veces)
+      - postOp_u1: transfiere 10 ETH
+      - postOp_u2: transfiere 10 ETH
+      ...
+
+      N usuarios pueden retirar N * (balance/denominator) en un solo bloque.
+      Con denominator=10 y 10 usuarios coordinados: 10 * 10 ETH = 100 ETH = balance total.
+      El propósito del denominador (limitar exposición por transacción para proteger
+      reputación del paymaster) queda anulado para bundles coordinados.
+    attack_scenario: |
+      1. MagicSpend tiene 100 ETH, maxWithdrawDenominator=10.
+      2. 10 usuarios coordinados crean withdraw requests de 10 ETH cada uno con nonces únicos.
+      3. Bundler agrupa los 10 UserOps en un bundle.
+      4. Todas las validaciones ven balance=100 ETH, maxAllowed=10 ETH → todas válidas.
+      5. Los 10 postOps ejecutan → 100 ETH transferidos.
+      6. El denominador que debía limitar a 10 ETH por bloque fue efectivamente 1x (todo el balance).
+      Coordinar esto requiere 10 withdraw requests firmados por el owner de MagicSpend
+      (o el signer), lo que no es un escenario de attacker externo puro.
+    impact: |
+      El mecanismo de rate-limiting por denominador no protege efectivamente contra
+      bundles coordinados multi-usuario. No hay pérdida de fondos del paymaster más
+      allá de los withdraw requests firmados legítimamente. El impacto es en la
+      REPUTACIÓN del paymaster (se puede vaciar en un bloque) más que en robo.
+      Medium — viola la invariante de diseño pero no es explotable sin firmas legítimas.
+    solidity: |
+      // Ghost: rastrear total comprometido en validaciones del bloque actual
+      uint256 internal ghost_totalCommittedCurrentBlock;
+      uint256 internal ghost_currentBlockNumber;
+
+      function invariant_rateLimitPerBlock() internal view {
+          uint256 maxAllowed = address(magicSpend).balance / magicSpend.maxWithdrawDenominator();
+          // El total comprometido en un bloque no debería exceder maxAllowed
+          // (esto viola el invariante si hay coordinación multi-usuario)
+          lte(ghost_totalCommittedCurrentBlock, maxAllowed,
+              "CSW-M-09: total comprometido en bloque excede maxAllowed individual");
+      }
+    status: investigate
+    tier: 2
+
+  - id: CSW-M-10
+    title: "MultiOwnable: nextOwnerIndex crece monotónicamente sin reutilización — degradación de tooling con muchos add/remove"
+    severity: informational
+    confidence: 85
+    description: |
+      addOwnerAddress() y addOwnerPublicKey() usan _getMultiOwnableStorage().nextOwnerIndex++
+      como índice. Este contador nunca decrementa ni reutiliza slots de owners removidos.
+
+      Con muchos ciclos de add/remove (posible en wallets automatizadas con rotación
+      de claves), nextOwnerIndex crece linealmente mientras ownerCount permanece bajo.
+      Por ejemplo: 1000 add/remove cycles → nextOwnerIndex=1000, ownerCount=1.
+      El mapping ownerAtIndex tiene huecos en 0..998.
+
+      ownerCount() = nextOwnerIndex - removedOwnersCount es MATEMÁTICAMENTE CORRECTO
+      siempre. El riesgo es:
+      1. Herramientas off-chain que iteran [0..nextOwnerIndex] para listar owners
+         hacen llamadas costosas en gas para leer slots vacíos.
+      2. nextOwnerIndex teóricamente puede crecer hacia type(uint256).max (imposible
+         en práctica: 2^256 transacciones).
+      3. Si un sistema on-chain itera los índices (futuro upgrade), podría tener DoS.
+    attack_scenario: |
+      Sin vector de ataque directo en el contrato actual. Degradación de herramientas
+      y posible DoS en futuros contratos que iteren ownerAtIndex.
+    impact: |
+      Informacional. La aritmética es correcta. El crecimiento monotónico del índice
+      es un patrón de diseño conocido con trade-offs aceptados.
+    solidity: |
+      // Ghost: densidad de owners (ownerCount / nextOwnerIndex)
+      function invariant_ownerIndexDensity() internal view {
+          uint256 next = wallet.nextOwnerIndex();
+          uint256 count = wallet.ownerCount();
+          uint256 removed = wallet.removedOwnersCount();
+          // Consistencia matemática
+          eq(count, next - removed, "CSW-M-10: ownerCount no coincide con indices");
+          // Densidad informacional (no un bug, solo métrica)
+          // Si next > 100 y count < next/10, hay fragmentación severa
+      }
+    status: investigate
+    tier: 3
+
+false_positives:
+  - id: CSW-M-FP-01
+    title: "withdrawAmount - maxCost underflow en validatePaymasterUserOp L143"
+    reason: |
+      El check en L129: if (withdrawAmount < maxCost) revert RequestLessThanGasMaxCost.
+      Garantiza withdrawAmount >= maxCost antes de la resta en L143.
+      Solidity 0.8 tiene protección adicional de underflow.
+      No hay path entre el check y la resta donde maxCost pueda cambiar (viene de calldata).
+
+  - id: CSW-M-FP-02
+    title: "postOp re-entrancy via forceSafeTransferETH"
+    reason: |
+      Checks-Effects-Interactions se respeta: delete _withdrawable[account] ocurre
+      ANTES del forceSafeTransferETH en L168-170. Con gas stipend GAS_STIPEND_NO_STORAGE_WRITES
+      (2300), el receptor no puede ejecutar operaciones de escritura. Cualquier
+      intento de re-llamar withdrawGasExcess encuentra _withdrawable=0 -> NoExcess revert.
+      Diseño correcto, no explotable.
+
+  - id: CSW-M-FP-03
+    title: "validationData bit packing collision entre sigFailed y expiry"
+    reason: |
+      sigFailed ocupa bit 0. expiry (uint48) shifteado 160 bits ocupa bits 160-207.
+      No hay overlap. El packing es idéntico al estándar ERC-4337:
+      (sigFailed | validUntil << 160 | validAfter << 208).
+      MagicSpend usa expiry como validUntil y validAfter = 0. Correcto.
+
+  - id: CSW-M-FP-04
+    title: "ownerCount() underflow por removedOwnersCount > nextOwnerIndex"
+    reason: |
+      Solidity 0.8.23 previene underflow (panic). Lógicamente imposible:
+      removedOwnersCount se incrementa solo en _removeOwnerAtIndex, que requiere
+      que el owner exista en ese index (verificación en L254-255).
+      nextOwnerIndex se incrementa en cada addOwner*. No puede haber más removes que adds.

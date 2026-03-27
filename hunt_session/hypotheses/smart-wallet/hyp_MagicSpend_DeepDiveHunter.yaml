@@ -1,0 +1,840 @@
+hunter: DeepDiveHunter
+component: MagicSpend
+contract: MagicSpend.sol
+date: "2026-03-27"
+convergences_analyzed:
+  - "MS-SIG-08 + MS-DOS-06: nonce burned + _withdrawable credited before sig check"
+  - "MS-TB-05 + MS-TB-06: _withdrawable accumulation across bundle + withdrawGasExcess drain"
+  - "MS-TB-01 + cross-contract: CoinbaseSmartWallet executeBatch calling back into MagicSpend"
+  - "MS-W-06 + MS-TB-08: ERC-20 path reentrancy via malicious token"
+  - "MS-M-07 + MS-TB-05: no global accounting + multi-UserOp bundle"
+
+hypotheses:
+
+- id: MS-DD-01
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "validatePaymasterUserOp credits _withdrawable even on sig failure — free ETH via withdrawGasExcess"
+  severity: "Critical"
+  confidence: 50
+  description: |
+    CONVERGENCE of MS-SIG-08 + MS-DOS-06. Both hunters noted the ordering issue independently
+    but neither followed the full attack chain to its conclusion.
+
+    In validatePaymasterUserOp:
+      L137: _validateRequest(userOp.sender, withdrawRequest)  -- burns nonce
+      L139: sigFailed = !isValidWithdrawSignature(...)         -- checks sig AFTER
+      L140: validationData = (sigFailed ? 1 : 0) | ...        -- reports failure
+      L143: _withdrawable[userOp.sender] += withdrawAmount - maxCost  -- ALWAYS credits
+
+    The CRITICAL question: in ERC-4337 v0.6 EntryPoint handleOps (NOT simulation), does
+    the validation loop revert paymaster state changes when validationData indicates sig failure?
+
+    In EntryPoint v0.6 handleOps flow:
+    1. _validatePrepayment() calls validatePaymasterUserOp in the SAME execution context
+       as the main handleOps call — NOT in a try/catch or inner call that gets reverted.
+    2. The validationData (containing sigFailed) is checked AFTER the call returns.
+    3. If sigFailed=1, the EntryPoint marks the UserOp as failed and skips execution+postOp.
+    4. BUT the state changes from validatePaymasterUserOp (nonce burned, _withdrawable credited)
+       PERSIST because they were made in the same call frame.
+
+    Wait — actually in v0.6, _validatePrepayment runs inside _executeUserOp which is called
+    via an inner call. Let me reconsider. The EntryPoint v0.6 uses:
+      - Validation phase: runs in the main context, state changes persist
+      - If any validation fails (returns sigFailed), the ENTIRE UserOp is skipped
+      - State from validation IS reverted for that specific UserOp via the inner call mechanism
+
+    HOWEVER: There is a subtle distinction. In EntryPoint v0.6, the validation loop
+    (_validatePrepayment) runs for ALL UserOps first in the outer loop. The inner handleOp
+    call is only for execution+postOp. The validation state changes are NOT wrapped in
+    a try/catch — they persist unconditionally.
+
+    If this analysis is correct:
+    1. Attacker deploys a CoinbaseSmartWallet (they are an owner)
+    2. Attacker crafts a UserOp with paymasterAndData pointing to MagicSpend
+    3. The WithdrawRequest has a FORGED signature but valid nonce and large amount
+    4. Attacker's wallet passes validateUserOp (attacker is an owner)
+    5. MagicSpend.validatePaymasterUserOp: nonce burned, _withdrawable += (amount - maxCost)
+    6. sigFailed = true, validationData indicates failure
+    7. EntryPoint skips execution + postOp for this UserOp
+    8. _withdrawable[attacker_wallet] now has a credit WITHOUT valid owner signature
+    9. In a SEPARATE transaction, attacker calls withdrawGasExcess() from their wallet
+    10. Attacker receives ETH they were never authorized to withdraw
+
+    KEY UNKNOWN: Does EntryPoint v0.6 revert validation state on sigFailed?
+    If YES → not exploitable. If NO → Critical fund theft.
+
+    Evidence suggesting NO revert: In v0.6 EntryPoint, the validation loop is:
+      for (uint256 i = 0; i < ops.length; i++) {
+          _validatePrepayment(i, ops[i], opInfos[i]);
+      }
+    This is a simple loop — no try/catch, no inner call. State persists.
+
+    Evidence suggesting YES revert: simulateValidation uses try/catch, and handleOps
+    might use a similar mechanism internally.
+  solidity: |
+    // validatePaymasterUserOp — state changes BEFORE sig check
+    _validateRequest(userOp.sender, withdrawRequest);              // L137: nonce burned
+    bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest); // L139
+    validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160); // L140
+    _withdrawable[userOp.sender] += withdrawAmount - maxCost;      // L143: ALWAYS credits
+
+    // If sigFailed but state persists, attacker calls:
+    function withdrawGasExcess() external {
+        uint256 amount = _withdrawable[msg.sender]; // has unauthorized credit
+        if (amount == 0) revert NoExcess();
+        delete _withdrawable[msg.sender];
+        _withdraw(address(0), msg.sender, amount);  // drains funds
+    }
+  attack_scenario: |
+    1. Attacker deploys CoinbaseSmartWallet, adds themselves as owner
+    2. Attacker crafts UserOp: sender=their_wallet, paymasterAndData=MagicSpend+WithdrawRequest
+       WithdrawRequest: amount=50 ETH, maxCost=1 ETH, nonce=unused, expiry=future, signature=GARBAGE
+    3. Bundler submits to EntryPoint.handleOps
+    4. EntryPoint calls wallet.validateUserOp — passes (attacker is owner)
+    5. EntryPoint calls MagicSpend.validatePaymasterUserOp:
+       - _validateRequest: nonce burned, maxAllowed check passes
+       - isValidWithdrawSignature: returns false (garbage sig)
+       - _withdrawable[wallet] += 49 ETH
+       - Returns validationData with sigFailed=1
+    6. EntryPoint sees sigFailed=1, does NOT execute the UserOp, does NOT call postOp
+    7. _withdrawable[wallet] = 49 ETH persists (if state not reverted)
+    8. Attacker submits separate tx: wallet.execute(MagicSpend, 0, withdrawGasExcess())
+    9. withdrawGasExcess sends 49 ETH to attacker's wallet
+    10. Repeat with different nonces — drain entire MagicSpend balance
+  impact: |
+    If EntryPoint v0.6 does NOT revert validation state on paymaster sigFailed:
+    CRITICAL — complete drain of MagicSpend ETH balance. Any user with a smart wallet
+    can steal all funds without needing the owner's signature. Only needs unused nonces
+    (infinite supply since nonces are per-account).
+
+    Total loss: entire MagicSpend ETH balance (could be millions).
+
+    If EntryPoint DOES revert: Not exploitable. Confidence 50% pending EntryPoint verification.
+  status: pending
+
+- id: MS-DD-02
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "CoinbaseSmartWallet executeBatch: withdrawGasExcess + withdraw in same UserOp double-drains"
+  severity: "High"
+  confidence: 40
+  description: |
+    CONVERGENCE of MS-TB-01 + cross-contract interaction analysis.
+
+    During the execution phase of a UserOp (between validatePaymasterUserOp and postOp),
+    the CoinbaseSmartWallet can execute arbitrary calls via execute() or executeBatch().
+
+    Consider this attack:
+    1. User has a valid WithdrawRequest (WR1) with amount=10 ETH signed by owner
+    2. User submits UserOp with MagicSpend as paymaster using WR1
+    3. validatePaymasterUserOp: _withdrawable[user] += 10 - maxCost = 9 ETH
+    4. During execution, wallet's callData calls executeBatch with:
+       a. Call 1: MagicSpend.withdrawGasExcess() → receives 9 ETH, _withdrawable = 0
+       b. Call 2: MagicSpend.withdraw(WR2) with a DIFFERENT valid WithdrawRequest
+          → WR2 has amount=10 ETH, different nonce → receives 10 ETH directly
+    5. postOp: _withdrawable[user] = 0, sends (maxCost - actualGasCost) = gas refund
+
+    Total received: 9 + 10 + gas_refund = ~19 ETH for two 10 ETH requests.
+
+    But wait — is this actually a vulnerability? The user has TWO valid signed requests
+    (WR1 and WR2), each for 10 ETH. So 20 ETH was authorized in total. The user receives
+    ~19 ETH (minus gas). This is CORRECT — the owner signed both.
+
+    THE REAL QUESTION: What if during execution, the wallet calls withdraw() with WR2,
+    and WR2 has asset != address(0) (ERC-20)? Then:
+    - WR1 (paymaster path): drains 10 ETH from MagicSpend's ETH balance
+    - WR2 (direct withdraw): drains ERC-20 tokens from MagicSpend
+
+    Both require valid signatures. No double-spend of a single request.
+
+    HOWEVER: There IS a subtle issue with _withdrawable accumulation in batch.
+    If the wallet calls withdraw() during execution with a THIRD valid ETH request (WR3),
+    the ETH sent via _withdraw goes TO the wallet. But the wallet is mid-execution.
+    The ETH arrives at the wallet's address. Then when postOp runs, more ETH is sent.
+
+    The total is still correct per signed amounts. No vulnerability here — the owner
+    authorized each withdrawal separately.
+
+    BUT WAIT — what about the maxWithdrawDenominator check?
+    - WR1 is validated in validatePaymasterUserOp: balance=100 ETH, maxAllowed=10 (denom=10)
+    - During execution, wallet calls withdraw(WR2): balance is NOW reduced because
+      EntryPoint transferred prefund from MagicSpend's deposit. BUT _withdraw in
+      withdrawGasExcess sends from MagicSpend's balance, not from EntryPoint deposit.
+
+    Actually, withdrawGasExcess sends ETH from MagicSpend's OWN balance (safeTransferETH).
+    After withdrawGasExcess sends 9 ETH, balance drops from 100 to 91 ETH.
+    Then withdraw(WR2) checks: maxAllowed = 91/10 = 9.1 ETH.
+    If WR2.amount = 10 > 9.1, it reverts with WithdrawTooLarge!
+
+    So the maxWithdrawDenominator acts as an unintentional protection here.
+
+    But with denominator=1 or 2, or if WR2 is for ERC-20 (no denominator check):
+    The attack works but it's not really an attack — both requests are owner-signed.
+
+    REVISED ASSESSMENT: No vulnerability. The accounting is correct and each withdrawal
+    requires separate owner authorization.
+  solidity: |
+    // During execution phase, wallet calls back into MagicSpend:
+    // Call 1: withdrawGasExcess
+    function withdrawGasExcess() external {
+        uint256 amount = _withdrawable[msg.sender]; // 9 ETH from validation
+        delete _withdrawable[msg.sender];
+        _withdraw(address(0), msg.sender, amount); // sends 9 ETH to wallet
+    }
+
+    // Call 2: withdraw with separate signed request
+    function withdraw(WithdrawRequest memory withdrawRequest) external {
+        // New request, new nonce, new owner signature required
+        if (!isValidWithdrawSignature(msg.sender, withdrawRequest)) revert InvalidSignature();
+        _validateRequest(msg.sender, withdrawRequest);
+        _withdraw(withdrawRequest.asset, msg.sender, withdrawRequest.amount);
+    }
+  attack_scenario: |
+    1. Owner signs WR1 (nonce=1, 10 ETH) and WR2 (nonce=2, 10 ETH) for Alice's wallet
+    2. Alice submits UserOp with WR1 as paymaster, callData = executeBatch([
+         withdrawGasExcess(), withdraw(WR2)
+       ])
+    3. Validation: _withdrawable[Alice] = 9 ETH
+    4. Execution: withdrawGasExcess → 9 ETH; withdraw(WR2) → 10 ETH (if passes maxAllowed)
+    5. postOp: sends gas refund
+    6. Total: ~19 ETH for 20 ETH authorized — correct, not a vulnerability
+  impact: |
+    No loss beyond what was authorized by the owner. Each WithdrawRequest requires a
+    separate owner signature. The only concern is bypassing maxWithdrawDenominator rate
+    limit by combining paymaster + direct withdraw paths in one tx, but the denominator
+    is a reputation protection mechanism, not a security invariant.
+  status: rejected_no_vuln
+
+- id: MS-DD-03
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "ERC-20 withdraw with malicious token — reentrancy via token transfer callback drains _withdrawable"
+  severity: "Medium"
+  confidence: 55
+  description: |
+    CONVERGENCE of MS-W-06 + MS-TB-08. No hunter analyzed the full reentrancy path
+    through a malicious ERC-20 token.
+
+    withdraw() (L190-203) calls _withdraw() which for ERC-20 (asset != address(0))
+    calls SafeTransferLib.safeTransfer(asset, to, amount) at L370.
+
+    Solady's safeTransfer does a low-level call to the token contract's transfer().
+    If the token is a malicious/hook-enabled ERC-20 (e.g., ERC-777 with hooks, or a
+    custom token with transfer callbacks), the transfer can call back into MagicSpend.
+
+    The reentrancy path:
+    1. Attacker calls withdraw(WR1) where WR1.asset = malicious_token, nonce=1
+    2. _validateRequest: nonce=1 marked used, maxAllowed check skipped (non-ETH)
+    3. _withdraw → safeTransfer(malicious_token, attacker, amount)
+    4. Malicious token's transfer() calls attacker's hook
+    5. Attacker re-enters MagicSpend.withdraw(WR2) with nonce=2, SAME malicious token
+    6. WR2 has a different nonce, valid signature → passes all checks
+    7. _withdraw → safeTransfer(malicious_token, attacker, amount) again
+    8. Can repeat for as many signed requests as available
+
+    BUT: Each re-entry requires a DIFFERENT valid owner-signed WithdrawRequest.
+    The nonce prevents same-request replay. The attacker cannot create new valid requests
+    without the owner's key.
+
+    HOWEVER — what about cross-function reentrancy?
+    Step 5 (alternative): Attacker re-enters withdrawGasExcess() instead.
+    - _withdrawable[attacker] is 0 in standalone withdraw() context
+    - No _withdrawable was set because withdraw() doesn't use validatePaymasterUserOp
+    - Re-entry into withdrawGasExcess reverts with NoExcess
+
+    ANOTHER VECTOR: What if the attacker is ALSO mid-UserOp execution?
+    1. UserOp validated with MagicSpend paymaster → _withdrawable[wallet] = 9 ETH
+    2. During execution, wallet calls withdraw(WR_token) for malicious ERC-20
+    3. Token callback re-enters withdrawGasExcess() from wallet address
+    4. _withdrawable[wallet] = 9 ETH → attacker gets 9 ETH
+    5. delete _withdrawable[wallet]
+    6. Token transfer completes, withdraw() returns
+    7. postOp: _withdrawable[wallet] = 0, sends (maxCost - actualGasCost)
+    8. Total: 9 ETH (from excess) + token amount + gas refund
+
+    Is this correct? The 9 ETH was legitimately credited via validated paymaster request.
+    The withdrawGasExcess during reentrancy just accelerates when the user receives it.
+    The total accounting is still correct — user gets their authorized amounts.
+
+    BUT: The interesting case is if the malicious token's transfer FAILS after the
+    reentrancy. If safeTransfer reverts after the callback, the entire withdraw() call
+    reverts, BUT the withdrawGasExcess() call already sent 9 ETH and deleted
+    _withdrawable. Since they're in the same transaction, the revert of withdraw()
+    would also revert the withdrawGasExcess side effects.
+
+    Actually no — if withdrawGasExcess is called INSIDE the callback of the token
+    transfer, and the token transfer then reverts, EVERYTHING in the call frame reverts
+    including the withdrawGasExcess. So no inconsistency.
+
+    REVISED VECTOR — The real risk is: can the malicious token observe and front-run
+    state? No, it's all in one tx. Can it selectively revert? The revert would undo
+    everything.
+
+    NET ASSESSMENT: The checks-effects-interactions pattern in withdraw() (nonce marked
+    before transfer) prevents same-nonce replay during reentrancy. Each re-entry needs
+    a distinct valid owner-signed request. Cross-function reentrancy into withdrawGasExcess
+    during a combined paymaster+withdraw flow doesn't violate accounting invariants.
+
+    However, there IS one subtle issue: if the owner signs an ERC-20 WithdrawRequest
+    for a token that later becomes malicious (proxy upgrade, admin action), the
+    reentrancy-during-callback could be used to call OTHER functions on MagicSpend
+    that weren't anticipated. Specifically: what if the callback calls
+    MagicSpend.entryPointDeposit or another owner function? Those require onlyOwner,
+    so not exploitable by a regular user.
+
+    The real residual risk: malicious ERC-20 tokens can cause unexpected gas consumption
+    during withdraw(), potentially causing out-of-gas reverts. But this is a self-inflicted
+    issue — the user chose to withdraw that token.
+  solidity: |
+    // withdraw() path with malicious ERC-20:
+    function withdraw(WithdrawRequest memory withdrawRequest) external {
+        if (block.timestamp > withdrawRequest.expiry) revert Expired();
+        if (!isValidWithdrawSignature(msg.sender, withdrawRequest)) revert InvalidSignature();
+        _validateRequest(msg.sender, withdrawRequest);  // nonce burned HERE (CEI ✓)
+        _withdraw(withdrawRequest.asset, msg.sender, withdrawRequest.amount);
+        // ↑ safeTransfer to malicious token → callback → re-enter
+    }
+
+    // Cross-function reentrancy during paymaster-sponsored UserOp:
+    // 1. validatePaymasterUserOp sets _withdrawable[wallet] = X
+    // 2. Execution: wallet calls withdraw(malicious_token_request)
+    // 3. Token callback: wallet calls withdrawGasExcess()
+    // 4. _withdrawable drained early, but postOp handles gas refund independently
+    // Total accounting: still correct
+  attack_scenario: |
+    1. Attacker has CoinbaseSmartWallet, gets owner to sign: WR1 (ETH, paymaster), WR2 (malicious ERC-20)
+    2. UserOp with WR1 as paymaster, callData = execute(MagicSpend, 0, withdraw(WR2))
+    3. Validation: _withdrawable[wallet] = WR1.amount - maxCost
+    4. Execution: withdraw(WR2) → safeTransfer(malicious_token, wallet, amount)
+    5. Token callback on wallet → wallet calls withdrawGasExcess() → gets _withdrawable ETH
+    6. Token transfer completes, withdraw returns
+    7. postOp: _withdrawable = 0, sends gas refund only
+    8. Total: (WR1.amount - maxCost) + gas_refund + WR2 token amount = all authorized amounts
+    9. No unauthorized extraction — each amount was owner-signed
+  impact: |
+    No fund theft possible through this vector. The CEI pattern (nonce before transfer)
+    and per-request owner signatures prevent unauthorized extraction. Cross-function
+    reentrancy via malicious ERC-20 during combined paymaster+withdraw flow does not
+    break accounting invariants. However, the owner should avoid signing requests for
+    untrusted ERC-20 tokens, as they could cause griefing (gas, unexpected callbacks).
+  status: pending
+
+- id: MS-DD-04
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "Multi-UserOp bundle: first postOp drains ALL accumulated _withdrawable from N UserOps"
+  severity: "Medium"
+  confidence: 60
+  description: |
+    CONVERGENCE of MS-TB-05 + MS-M-02. Both hunters noted the += accumulation but
+    dismissed it because "total is correct." Neither analyzed the FAILURE SCENARIO.
+
+    In ERC-4337 v0.6, the bundle processing is:
+      Phase 1 (validation): for each UserOp, call validatePaymasterUserOp
+      Phase 2 (execution): for each UserOp, call execute then postOp
+
+    With 3 UserOps from the same sender using MagicSpend:
+    - validate(UO1): _withdrawable[sender] += amount1 - maxCost1
+    - validate(UO2): _withdrawable[sender] += amount2 - maxCost2
+    - validate(UO3): _withdrawable[sender] += amount3 - maxCost3
+    - Total _withdrawable = sum(amountI - maxCostI)
+
+    - execute(UO1) + postOp(UO1):
+      withdrawable = _withdrawable[sender] + (maxCost1 - actualCost1)
+                   = [all 3 ops' excess] + [UO1 gas refund]
+      delete _withdrawable[sender]
+      forceSafeTransferETH(sender, withdrawable)
+      → Sender receives ALL 3 ops' excess + UO1's gas refund in first postOp
+
+    - execute(UO2) + postOp(UO2):
+      withdrawable = 0 + (maxCost2 - actualCost2) = only UO2's gas refund
+      → Sender receives only UO2's gas refund
+
+    - execute(UO3) + postOp(UO3):
+      Same — only UO3's gas refund
+
+    Total: sum(amountI - actualCostI) — CORRECT aggregate.
+
+    THE FAILURE SCENARIO nobody analyzed:
+    What if postOp(UO1) FAILS? The EntryPoint calls postOp again with
+    PostOpMode.postOpReverted. MagicSpend reverts on this mode (L157-159).
+    EntryPoint then reverts the ENTIRE inner call for UO1 (execution + postOp).
+
+    BUT: the _withdrawable state was set during VALIDATION (Phase 1), not execution.
+    Validation state persists regardless of execution outcome. So after UO1's execution
+    reverts:
+    - _withdrawable[sender] STILL has the accumulated value from all 3 validations
+    - UO2's postOp now picks up ALL accumulated _withdrawable + UO2's gas refund
+    - The user gets the full accumulated excess via UO2's postOp instead
+
+    Is there fund loss? UO1's execution reverted, so any actions in UO1's callData
+    were undone. The user loses the gas for UO1 (charged by EntryPoint). The ETH
+    excess eventually reaches the user via a later postOp or withdrawGasExcess.
+
+    THE REAL EXPLOIT: What if the attacker INTENTIONALLY makes UO1's execution revert
+    (by having callData that reverts), and UO1's maxCost was very high?
+
+    - UO1: amount=100 ETH, maxCost=99 ETH, callData=revert()
+      _withdrawable += 1 ETH
+    - UO2: amount=2 ETH, maxCost=1 ETH, callData=normal
+      _withdrawable += 1 ETH (total = 2)
+
+    UO1 execution reverts. postOp(UO1) with PostOpMode.opReverted:
+    Wait — this is NOT PostOpMode.postOpReverted. The mode is PostOpMode.opReverted
+    when the user operation execution reverts. This is a DIFFERENT enum value.
+
+    In MagicSpend postOp (L157-159), it only checks for PostOpMode.postOpReverted.
+    PostOpMode.opReverted is NOT rejected — it falls through to the normal flow!
+
+    So for UO1 with opReverted mode:
+    - withdrawable = _withdrawable[sender] + (maxCost1 - actualCost1)
+    - _withdrawable[sender] is the FULL accumulated value from all 3 validations
+    - maxCost1 = 99 ETH, actualCost1 could be small (revert is cheap)
+    - withdrawable = 2 + (99 - small_gas) ≈ 101 ETH - small_gas
+
+    WAIT. That means postOp(UO1) sends ~101 ETH to the user even though UO1's
+    execution reverted! The user's callData didn't execute, but they still get
+    the full _withdrawable + gas refund.
+
+    Is this a problem? The total authorized by the owner is amount1 + amount2 = 102 ETH.
+    The user pays actualCost1 + actualCost2 in gas. They receive ~102 - total_gas.
+    That's CORRECT — the owner signed both amounts.
+
+    BUT: the distribution is wrong. UO1 was supposed to execute something (maybe a swap)
+    with the excess ETH. The swap failed (reverted). But the user STILL gets the ETH.
+    This is actually user-favorable behavior — the paymaster eats the cost of the
+    failed UserOp's gas, and the user still gets their withdrawal.
+
+    From MagicSpend/Coinbase's perspective: they signed for amounts, they pay the gas.
+    The user getting their withdrawal even when execution fails is BY DESIGN for a
+    paymaster — the user's gas is sponsored.
+
+    REVISED CONCERN: The _withdrawable accumulation across multiple UserOps means that
+    if UO1's postOp sends ALL accumulated excess, and then UO2 and UO3 also try to
+    send their shares via postOp, the contract might not have enough ETH.
+
+    Each postOp tries to send: _withdrawable[account] + (maxCostI - actualCostI).
+    After UO1's postOp deletes _withdrawable and sends the big amount, UO2 and UO3's
+    postOps just send their gas refunds. But the total gas refund sum is bounded by
+    sum(maxCostI), which was available at validation time.
+
+    If MagicSpend's balance runs out between postOps due to the oversized first postOp,
+    later postOps might fail. But forceSafeTransferETH doesn't revert on insufficient
+    balance — Solady's implementation deploys a SELFDESTRUCT contract that sends
+    whatever ETH it has (which is 0 if balance is 0). The user gets 0 for those postOps.
+
+    ACTUAL LOSS: User loses (maxCostI - actualCostI) gas refunds for later UserOps
+    if MagicSpend's ETH balance is depleted by the first postOp. The total is LESS
+    than the authorized amount.
+
+    This is a real accounting inconsistency when N>1 UserOps from same sender in same bundle.
+  solidity: |
+    // ERC-4337 v0.6 PostOpMode enum:
+    // enum PostOpMode { opSucceeded, opReverted, postOpReverted }
+
+    // MagicSpend postOp only checks postOpReverted (L157-159):
+    if (mode == PostOpMode.postOpReverted) {
+        revert UnexpectedPostOpRevertedMode();
+    }
+    // PostOpMode.opReverted falls through to normal flow!
+
+    // L165: accumulates from ALL validations, not just this UserOp
+    uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+    delete _withdrawable[account];
+    // First postOp drains everything, later postOps get only gas refund
+  attack_scenario: |
+    1. Attacker has 3 valid WithdrawRequests: WR1(10 ETH), WR2(10 ETH), WR3(10 ETH)
+    2. Submits 3 UserOps in one bundle, all using MagicSpend paymaster
+    3. MagicSpend balance: 35 ETH, maxWithdrawDenominator=4 (maxAllowed ~8.75 per request)
+       Wait - each request for 10 ETH would fail maxAllowed check.
+       With denominator=3, maxAllowed = 35/3 = 11.67, so each 10 ETH request passes.
+    4. Validation: _withdrawable[attacker] accumulates 3 * (10 - maxCost)
+    5. UO1 postOp: sends ALL accumulated _withdrawable + UO1 gas refund
+       This is ~30 ETH - sum(maxCosts) + UO1_gas_refund
+    6. UO2 postOp: _withdrawable=0, sends only UO2_gas_refund
+    7. UO3 postOp: _withdrawable=0, sends only UO3_gas_refund
+    8. If 35 ETH balance - (UO1 big send) < UO2_gas_refund + UO3_gas_refund,
+       later postOps may transfer less than owed (forceSafeTransferETH with 0 balance)
+    9. User receives slightly less than authorized total due to balance depletion
+  impact: |
+    Medium — The _withdrawable accumulation pattern causes unfair distribution across
+    postOps in multi-UserOp bundles from the same sender. The first postOp drains all
+    accumulated excess, potentially depleting the contract's ETH balance and causing
+    later postOps to send less than owed. Net effect: user may receive slightly less
+    than authorized (bounded by gas refund amounts). No profit for attacker but potential
+    for unintended fund distribution. The MagicSpend paymaster's reputation could be
+    harmed if later UserOps' postOps revert due to insufficient balance.
+  status: pending
+
+- id: MS-DD-05
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "postOp with PostOpMode.opReverted still sends full _withdrawable — user gets ETH without executing callData"
+  severity: "Medium"
+  confidence: 65
+  description: |
+    No hunter analyzed PostOpMode.opReverted behavior. MS-TB-04, MS-W-08 only analyzed
+    PostOpMode.postOpReverted.
+
+    ERC-4337 defines three PostOpMode values:
+    - opSucceeded: UserOp execution succeeded
+    - opReverted: UserOp execution reverted (inner call failed)
+    - postOpReverted: first postOp call reverted (second attempt)
+
+    MagicSpend postOp (L157-159) ONLY checks for postOpReverted and reverts.
+    For opReverted, it falls through to the NORMAL flow (L161-171).
+
+    This means: if the UserOp's callData execution reverts (e.g., a swap fails, a mint
+    fails, a call to an external contract fails), postOp STILL sends the full
+    _withdrawable + gas refund to the account.
+
+    Is this a vulnerability? Consider the intended flow:
+    1. User wants to mint an NFT for 5 ETH using MagicSpend paymaster
+    2. WithdrawRequest: amount=6 ETH (5 for mint + 1 for gas), maxCost=1 ETH
+    3. Validation: _withdrawable[user] = 5 ETH
+    4. Execution: user calls withdrawGasExcess() to get 5 ETH, then calls NFT.mint{value: 5 ETH}()
+    5. If NFT.mint() reverts (sold out), the ENTIRE execution reverts
+    6. BUT postOp still runs with PostOpMode.opReverted
+    7. _withdrawable[user] is RESTORED to 5 ETH (execution state reverted)
+    8. postOp sends: 5 ETH + (1 ETH - actualGasCost) = ~6 ETH - gas
+    9. User receives ~6 ETH even though the mint failed
+
+    The user essentially gets a FREE gas-sponsored withdrawal without executing any
+    useful operation. The owner signed for 6 ETH assuming the user would use it for
+    the mint. But the user receives the full 6 ETH (minus gas) even when mint fails.
+
+    FROM THE PROTOCOL'S PERSPECTIVE: This is probably intentional. The owner signed
+    a WithdrawRequest authorizing up to 6 ETH for this user. The paymaster's job is
+    to sponsor gas and deliver funds. If the user's operation fails, the funds still
+    belong to the user — they were authorized.
+
+    BUT: An attacker could INTENTIONALLY submit UserOps with callData that always
+    reverts, purely to extract the WithdrawRequest amounts via postOp. They never
+    need to execute any actual operation.
+
+    Actually — this is even simpler. The user could just call withdraw() directly
+    to get the full amount. The paymaster path is just one way to use the WithdrawRequest.
+    So there's no "extra" extraction — the owner signed for the amount, period.
+
+    HOWEVER: The interesting edge case is when the execution revert RESTORES
+    _withdrawable state. If the user called withdrawGasExcess during execution
+    (which was reverted), _withdrawable is restored. Then postOp sends it.
+    This is correct — the user didn't actually receive the ETH from withdrawGasExcess
+    (it was reverted), so postOp correctly sends it.
+
+    NET ASSESSMENT: Not a vulnerability but a design consideration. Users receive
+    their authorized amounts regardless of execution outcome. This is the correct
+    behavior for a paymaster that pre-authorizes withdrawal amounts.
+
+    The REAL concern is for Coinbase's backend: if they sign WithdrawRequests assuming
+    the user will perform specific actions (e.g., swap, mint), but the user just
+    extracts the ETH without doing those actions, Coinbase loses the gas cost.
+    But this is a business logic concern, not a smart contract vulnerability.
+  solidity: |
+    // PostOpMode enum:
+    // 0 = opSucceeded, 1 = opReverted, 2 = postOpReverted
+
+    function postOp(IPaymaster.PostOpMode mode, bytes calldata context, uint256 actualGasCost)
+        external onlyEntryPoint
+    {
+        // Only rejects postOpReverted (mode == 2)
+        if (mode == PostOpMode.postOpReverted) {   // L157
+            revert UnexpectedPostOpRevertedMode();
+        }
+        // mode == opReverted (1) falls through here:
+        (uint256 maxGasCost, address account) = abi.decode(context, (uint256, address));
+        uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+        delete _withdrawable[account];
+        if (withdrawable > 0) {
+            // Sends FULL amount even when UserOp execution reverted
+            SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+        }
+    }
+  attack_scenario: |
+    1. User gets WithdrawRequest signed for 10 ETH (nonce=1, maxCost=1 ETH)
+    2. User submits UserOp: paymaster=MagicSpend, callData = execute(address(0), 0, "revert")
+    3. Validation: _withdrawable[user] = 9 ETH, nonce burned
+    4. Execution: reverts immediately (callData causes revert)
+    5. postOp(PostOpMode.opReverted, context, actualGasCost):
+       - Passes the mode check (not postOpReverted)
+       - _withdrawable[user] = 9 ETH (execution state was reverted, validation state persists)
+       - withdrawable = 9 + (1 - actualGasCost) ≈ 10 - gas
+       - Sends ~10 ETH to user
+    6. User received ~10 ETH without executing any useful operation
+    7. Gas cost was paid by MagicSpend's EntryPoint deposit
+    8. But: user could have just called withdraw() directly for same result
+  impact: |
+    Low/Info — No unauthorized fund extraction. The user receives what the owner
+    authorized. The user could achieve the same result via direct withdraw() call.
+    The only "cost" is gas from MagicSpend's EntryPoint deposit, which is the
+    expected cost of being a paymaster. The opReverted case is handled correctly
+    from an accounting perspective — user gets their authorized funds.
+  status: pending
+
+- id: MS-DD-06
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "Bundler-level attack: include victim's UserOp with manipulated gas to maximize actualGasCost"
+  severity: "Medium"
+  confidence: 35
+  description: |
+    No hunter fully explored the malicious bundler vector in the ERC-4337 context.
+    MS-TB-03 dismissed it because "bundler pays for wasted gas too." But this misses
+    the economic model.
+
+    In ERC-4337, the bundler receives compensation:
+    - The EntryPoint charges actualGasCost from the paymaster's deposit
+    - The bundler receives this as tx.gasprice * gasUsed from the coinbase reward
+    - The bundler can set the gas price of the bundle transaction
+
+    The victim's loss is: user gets (maxGasCost - actualGasCost) less in their refund.
+    Higher actualGasCost → less refund to user.
+
+    Can a bundler inflate actualGasCost?
+    - The EntryPoint computes actualGasCost based on actual gas consumption
+    - The bundler cannot directly manipulate gas metering
+    - BUT: the bundler controls which UserOps are in the bundle and their ordering
+    - A bundler could place the victim's UserOp after other UserOps that warm up/cool down
+      certain storage slots, affecting the victim's gas costs marginally
+    - More importantly: the bundler sets gasPrice for the entire bundle tx
+    - actualGasCost = actualGasUsed * gasPrice (set by bundler)
+
+    Wait — actually in v0.6, actualGasCost passed to postOp is:
+    actualGasCost = (preGas - gasleft() + preOpGas) * tx.gasprice
+
+    Where tx.gasprice is the ACTUAL gas price of the bundle transaction.
+    The bundler controls this! A malicious bundler could set a very high gasPrice,
+    inflating actualGasCost.
+
+    BUT: the user's UserOperation specifies maxFeePerGas and maxPriorityFeePerGas.
+    The EntryPoint verifies that tx.gasprice <= userOp.maxFeePerGas. So the bundler
+    cannot exceed the user's specified maximum.
+
+    Additionally, the user agreed to maxFeePerGas when signing the UserOp. The bundler
+    using the full maxFeePerGas is within the user's consent.
+
+    REVISED: The bundler can use up to maxFeePerGas (user's specified max), which
+    maximizes actualGasCost but stays within user's consent. The user's refund
+    is minimized but bounded by their own maxFeePerGas setting.
+
+    However, there's a subtlety: in the MagicSpend context, actualGasCost is computed
+    using maxGasCost from the context, which is derived from maxCost (the total
+    maximum cost in wei). The maxCost = verificationGasLimit * maxFeePerGas +
+    callGasLimit * maxFeePerGas + preVerificationGas * maxFeePerGas (simplified).
+
+    A malicious user could set very high gas limits in their UserOp, maximizing maxCost.
+    The WithdrawRequest.amount must be >= maxCost (L129). So a high maxCost means the
+    owner must have signed a high amount. The user then spends minimal gas, and gets
+    back (maxCost - actualCost) as refund plus _withdrawable.
+
+    This is the REVERSE direction — the user benefits from high maxCost, not the bundler.
+
+    NET ASSESSMENT: No profitable bundler attack. The gas price is bounded by user's
+    maxFeePerGas. The gas consumption is bounded by the EVM. The bundler cannot profit
+    at the user's expense beyond what the user agreed to.
+  solidity: |
+    // postOp L165:
+    uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+    // maxGasCost: from validation context (user's maxCost)
+    // actualGasCost: from EntryPoint, based on actual gas * tx.gasprice
+    // tx.gasprice <= userOp.maxFeePerGas (enforced by EntryPoint)
+  attack_scenario: |
+    1. Malicious bundler receives victim's UserOp with maxFeePerGas = 100 gwei
+    2. Bundler sets bundle tx gasPrice = 100 gwei (maximum allowed)
+    3. actualGasCost = gasUsed * 100 gwei (higher than current base fee of 20 gwei)
+    4. Victim's refund: maxGasCost - actualGasCost is SMALLER than expected
+    5. BUT: victim consented to maxFeePerGas = 100 gwei
+    6. Victim should have set a lower maxFeePerGas if they wanted a bigger refund
+    7. Bundler doesn't profit extra — they just execute at the user's max price
+  impact: |
+    Low — No exploit beyond the user's consented gas parameters. The bundler can
+    use the user's full maxFeePerGas but cannot exceed it. This is standard ERC-4337
+    economics, not a MagicSpend vulnerability. The user controls their own gas limits.
+  status: rejected_not_vuln
+
+- id: MS-DD-07
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "State desync between validatePaymasterUserOp and postOp when contract receives ETH mid-bundle"
+  severity: "Low"
+  confidence: 45
+  description: |
+    A vector no hunter considered: what if MagicSpend's ETH balance changes BETWEEN
+    validation and execution phases of a bundle?
+
+    In ERC-4337 v0.6, ALL validations run first, then ALL executions+postOps.
+    During the execution phase of OTHER UserOps in the same bundle, if those UserOps
+    send ETH TO MagicSpend (e.g., a UserOp that calls a DeFi protocol that sends
+    ETH to MagicSpend as part of a swap), MagicSpend's balance increases.
+
+    This doesn't affect _withdrawable (which is storage-tracked per-user), but it
+    COULD affect:
+    - The maxWithdrawDenominator check (uses live balance) — but this only runs
+      during validation, which already completed
+    - forceSafeTransferETH in postOp — more balance means transfers are more likely
+      to succeed
+
+    Receiving ETH mid-bundle is BENEFICIAL for MagicSpend, not harmful.
+
+    REVERSE DIRECTION: What if MagicSpend's balance DECREASES between validation and
+    execution? This happens when earlier UserOps' postOps send ETH out.
+    - First postOp sends large _withdrawable amount
+    - MagicSpend balance drops
+    - Later postOps might not have enough balance for their sends
+
+    forceSafeTransferETH behavior with insufficient balance:
+    Solady's forceSafeTransferETH first tries a normal call (which fails with
+    insufficient balance), then tries SELFDESTRUCT fallback (deploys a contract
+    with CREATE2 that self-destructs, sending its balance to the target).
+    The CREATE2 contract is deployed with value=0 if MagicSpend has no ETH.
+    So the recipient gets 0 ETH from the SELFDESTRUCT.
+
+    WAIT — forceSafeTransferETH sends `amount` wei. If the contract doesn't have
+    `amount` wei, the first call{value: amount} fails. Then the fallback deploys
+    a new contract via CREATE2 with value=amount... but if MagicSpend doesn't have
+    `amount`, the CREATE2 with value also fails.
+
+    Actually, let me reconsider Solady's implementation. forceSafeTransferETH:
+    1. First attempt: call(gas, to, amount, ...) — fails if balance < amount
+    2. Fallback: create a contract at deterministic address, then selfdestruct to `to`
+       The CREATE2 is done with value=amount, which also fails if balance < amount
+
+    If BOTH fail, what happens? Solady's forceSafeTransferETH is designed to NOT revert.
+    Let me check... actually, the Solady docs say "Sends amount (in wei) ETH to to,
+    with a gas stipend. The amount can be 0. Reverts upon failure."
+
+    Wait — that's forceSafeTransferETH. The "force" version has different behavior.
+    From Solady source: forceSafeTransferETH "Force sends amount (in wei) ETH to to,
+    with a gas stipend. If sending via the normal procedure fails, force sends the ETH
+    by creating a temporary contract which uses SELFDESTRUCT to force send the ETH."
+
+    If the contract has insufficient balance for BOTH the normal call AND the CREATE2,
+    the entire operation reverts (EVM rejects value-bearing calls with insufficient balance).
+
+    So: if MagicSpend has less ETH than the withdrawable amount, postOp REVERTS.
+    This triggers PostOpMode.postOpReverted on the second call, which MagicSpend
+    reverts again (L157-159). The EntryPoint then handles this as a failed UserOp
+    but still charges the paymaster for gas.
+
+    NET: In a multi-UserOp bundle where total obligations exceed balance, later postOps
+    fail, and users must recover via withdrawGasExcess in separate transactions.
+    The gas cost of the failed postOps is charged to MagicSpend's EP deposit.
+
+    This is the same conclusion as MS-DD-04 but from a different angle.
+  solidity: |
+    // forceSafeTransferETH reverts if contract has insufficient balance:
+    // Both the primary call and SELFDESTRUCT fallback require sufficient wei
+    SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+    // If withdrawable > address(this).balance → revert
+    // Triggers PostOpMode.postOpReverted → MagicSpend reverts again → EP handles
+  attack_scenario: |
+    1. MagicSpend has 20 ETH. Three UserOps validated: 8 ETH excess each → _withdrawable = 24 ETH
+    2. UO1 postOp: withdrawable = 24 + gas_refund_1 ≈ 24.5 ETH > 20 ETH balance
+    3. forceSafeTransferETH reverts (insufficient balance)
+    4. PostOpMode.postOpReverted → MagicSpend reverts → EntryPoint handles
+    5. _withdrawable[user] persists (validation state not affected by execution revert)
+    6. UO2 postOp: same issue, also fails
+    7. All three postOps fail, user gets 0 ETH from postOps
+    8. Gas still charged to MagicSpend EP deposit
+    9. User recovers 24 ETH via withdrawGasExcess() in separate tx
+    10. User loses the gas refund portion (sum of maxCostI - actualCostI)
+  impact: |
+    Low — User loses gas refund portion when multi-UserOp bundles cause postOp
+    failures due to insufficient balance. The _withdrawable excess is recoverable
+    via withdrawGasExcess(). The maxWithdrawDenominator is designed to mitigate
+    this (keeps each withdrawal to a fraction of balance), but it's imperfect
+    when multiple UserOps accumulate _withdrawable during validation before any
+    postOp sends ETH. No fund theft — just gas cost inefficiency and delayed
+    access to funds.
+  status: pending
+
+- id: MS-DD-08
+  hunter: DeepDiveHunter
+  component: MagicSpend
+  title: "Signature malleability via SignatureCheckerLib.isValidSignatureNow — EIP-1271 path allows multiple valid sigs"
+  severity: "Low"
+  confidence: 40
+  description: |
+    No hunter analyzed what happens when the MagicSpend owner is a CONTRACT (not an EOA).
+
+    SignatureCheckerLib.isValidSignatureNow (Solady) first tries ECDSA recovery, then
+    falls back to EIP-1271 isValidSignature(bytes32,bytes) if the signer is a contract.
+
+    If the MagicSpend owner is a multisig or smart contract:
+    - The owner contract's isValidSignature determines validity
+    - Multiple different byte sequences could return valid for the same hash
+    - This creates "signature malleability" at the EIP-1271 level
+
+    Impact: An attacker who observes one valid signature could craft alternative byte
+    sequences that the owner contract also accepts. Since MagicSpend uses nonces,
+    this doesn't enable replay. But it could enable:
+    - Submitting a UserOp with a modified signature that matches a different
+      owner contract behavior (e.g., if the multisig has a threshold check that
+      can be satisfied with different signer combinations)
+
+    For ECDSA (EOA owner): Solady's SignatureCheckerLib normalizes s-values,
+    preventing ECDSA malleability. This is handled correctly.
+
+    For contract owners: the owner contract is responsible for its own validation.
+    MagicSpend has no control over this.
+
+    NET: This is an informational note about the trust model when owner is a contract.
+    No direct vulnerability in MagicSpend itself.
+  solidity: |
+    // isValidWithdrawSignature (L281-289):
+    function isValidWithdrawSignature(address account, WithdrawRequest memory withdrawRequest)
+        public view returns (bool)
+    {
+        return SignatureCheckerLib.isValidSignatureNow(
+            owner(),      // if owner() is a contract → EIP-1271 path
+            getHash(account, withdrawRequest),
+            withdrawRequest.signature
+        );
+    }
+    // Solady SignatureCheckerLib.isValidSignatureNow:
+    // 1. Try ecrecover → if signer matches, return true
+    // 2. If signer is a contract → call signer.isValidSignature(hash, sig)
+    // 3. Return result
+  attack_scenario: |
+    1. MagicSpend owner is a 2-of-3 multisig contract
+    2. Signers A and B sign a WithdrawRequest → valid signature S1
+    3. Signers A and C sign the same request → different valid signature S2
+    4. Attacker observes S1 in a pending tx
+    5. Attacker submits S2 instead — still valid (same hash, different multisig path)
+    6. Nonce prevents double-use — only one of S1 or S2 can be used
+    7. No exploit: just alternative valid signatures for the same authorization
+  impact: |
+    Informational — No vulnerability. Signature malleability at the EIP-1271 level
+    is the owner contract's responsibility. MagicSpend's nonce system prevents any
+    exploitation of alternative valid signatures. ECDSA malleability is handled by
+    Solady's s-value normalization.
+  status: rejected_not_vuln
+
+summary: |
+  DeepDiveHunter analyzed 8 hypotheses for MagicSpend.sol, focusing on cross-contract
+  interactions, bundle-level attacks, and convergences between prior hunter findings.
+
+  KEY FINDING — MS-DD-01 (Confidence: 50%, Severity: CRITICAL if confirmed):
+  validatePaymasterUserOp credits _withdrawable BEFORE signature validation AND does
+  not revert on sig failure (returns sigFailed=1 via validationData instead). If the
+  EntryPoint v0.6 does NOT revert paymaster storage changes when validationData
+  indicates signature failure during handleOps (not simulation), an attacker can
+  get _withdrawable credit without a valid owner signature, then drain via
+  withdrawGasExcess(). This requires verification against the actual EntryPoint v0.6
+  source code. If confirmed, this is a COMPLETE DRAIN of all MagicSpend ETH.
+
+  SECONDARY FINDINGS:
+  - MS-DD-04 (Medium, 60%): _withdrawable accumulation across multi-UserOp bundles
+    causes first postOp to drain all excess, potentially causing later postOps to fail
+    if contract balance is insufficient. Users lose gas refund portion.
+  - MS-DD-05 (Low, 65%): postOp handles PostOpMode.opReverted same as opSucceeded,
+    sending full _withdrawable + gas refund even when UserOp execution failed.
+    Not a vulnerability but a design consideration.
+  - MS-DD-03 (Low, 55%): Malicious ERC-20 token reentrancy is mitigated by CEI
+    pattern and per-request owner signatures.
+
+  RECOMMENDATION: Immediately verify EntryPoint v0.6 handleOps behavior for paymaster
+  state reversion on sigFailed. The actual EntryPoint contract is at:
+  0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789 (Etherscan-verified).
+  If state persists on sigFailed → MS-DD-01 is a Critical fund theft vulnerability.

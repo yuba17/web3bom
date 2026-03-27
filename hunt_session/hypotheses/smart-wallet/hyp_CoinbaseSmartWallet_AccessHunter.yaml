@@ -1,0 +1,661 @@
+hunter: AccessHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+hypotheses:
+  - id: CSW-A-01
+    title: "Passkey owners no pueden llamar onlyOwner directamente — lockout funcional"
+    severity: medium
+    confidence: 90
+    description: |
+      _checkOwner() solo acepta msg.sender que sea una direccion Ethereum registrada
+      en isOwner. Los owners que son passkeys (secp256r1, 64 bytes) son INCAPACES de
+      llamar directamente addOwnerAddress, removeOwnerAtIndex, removeLastOwner,
+      addOwnerPublicKey, ni upgradeToAndCall. Solo pueden actuar via ERC-4337 UserOp
+      a traves del EntryPoint.
+
+      Si el unico owner de una wallet es un passkey, la wallet queda funcional solo
+      via AA. Si el EntryPoint v0.6 es deprecado sin migracion, el passkey owner
+      queda bloqueado y no puede agregar un EOA de recuperacion.
+
+      La asimetria de poder es real: un EOA co-owner puede invocar funciones owner
+      directamente sin EntryPoint, mientras un passkey co-owner no puede. El passkey
+      no tiene una direccion Ethereum que pueda ser msg.sender.
+    attack_scenario: |
+      Escenario de lockout:
+      1. Wallet creada con solo 1 passkey owner (sin EOA).
+      2. El EntryPoint v0.6 es deprecado / bundlers dejan de servir ops.
+      3. El passkey owner quiere agregar un EOA de emergencia.
+      4. Llama directamente addOwnerAddress(eoa) — la EOA que inicia la tx no es owner.
+         Revierte con Unauthorized.
+      5. La wallet queda locked salvo que el EntryPoint original siga operativo.
+    impact: |
+      Passkey-only wallets dependen 100% del EntryPoint v0.6 para gestion de owners.
+      Si el EntryPoint es deprecado sin migracion, la wallet pierde capacidad de gestion
+      de owners. Los fondos quedan inaccesibles si no se pueden agregar nuevos owners.
+    solidity: |
+      // Test: passkey owner no puede llamar addOwnerAddress directamente
+      // Setup: wallet con solo passkey owner (x, y) -- ownerBytes.length == 64
+      // Un passkey no tiene una direccion Ethereum -- no puede ser msg.sender EOA
+
+      // Invariante: si todos los owners son passkeys (length == 64),
+      // ninguna EOA puede pasar _checkOwner() sin ser address(this)
+      function check_passkeyOwnerCannotDirectCall(address nonOwnerEOA) external {
+          uint256 count = wallet.ownerCount();
+          bool hasEOAOwner = false;
+          uint256 nextIdx = wallet.nextOwnerIndex();
+          for (uint256 i = 0; i < nextIdx; i++) {
+              bytes memory ownerBytes = wallet.ownerAtIndex(i);
+              if (ownerBytes.length == 32) { hasEOAOwner = true; break; }
+          }
+
+          if (!hasEOAOwner && count > 0) {
+              // Ninguna EOA es owner -- toda llamada directa a onlyOwner debe revertir
+              try wallet.addOwnerAddress{gas: 100000}(nonOwnerEOA) {
+                  t(false, "CSW-A-01: passkey-only wallet acepta addOwnerAddress sin EntryPoint");
+              } catch {}
+          }
+      }
+    status: investigate
+
+  - id: CSW-A-02
+    title: "removeOwnerAtIndex cross-chain replay puede borrar owner incorrecto por indice divergente"
+    severity: high
+    confidence: 85
+    description: |
+      executeWithoutChainIdValidation permite ejecutar operaciones de owner management
+      en todas las chains usando una sola firma. removeOwnerAtIndex(index, owner) usa
+      un indice numerico para identificar al owner.
+
+      El problema: los indices de owners pueden DIVERGIR entre chains si se han hecho
+      operaciones de owner management diferentes en cada chain via transacciones locales
+      (no cross-chain). En chain A, el indice 1 puede ser owner X. En chain B, el indice
+      1 puede ser owner Y.
+
+      El finding de Solodit H-01 confirma que este vector fue reportado en el audit C4
+      de Coinbase. La mitigacion fue agregar el campo owner como parametro de verificacion.
+      La version actual incluye esa mitigacion (WrongOwnerAtIndex revert), pero el problema
+      de divergencia de indices entre chains persiste si las operaciones locales y cross-chain
+      no estan perfectamente sincronizadas.
+    attack_scenario: |
+      Escenario de divergencia:
+      1. Wallet tiene owners [A@idx0, B@idx1] en Ethereum y Base.
+      2. En Ethereum (tx local, no cross-chain): addOwner(C) idx2, removeOwner(idx1, B).
+         Estado Ethereum: [A@idx0, _vacío@idx1, C@idx2].
+      3. Usuario firma removeOwner(idx1, B) como cross-chain UserOp para Base.
+         En Base, idx1 sigue siendo B -- la op tiene exito.
+         Estado Base: [A@idx0, _vacío@idx1]. C no existe en Base.
+      4. Las wallets en Ethereum y Base divergen en owners permanentemente.
+
+      Escenario de ataque activo:
+      1. Owner B observa que en chain A tiene indice 1, en chain B tiene indice 0.
+      2. B genera UserOp cross-chain removeOwnerAtIndex(0, A).
+         En chain A: indice 0 es A --> borra A. En chain B: indice 0 puede ser diferente.
+      3. Si en chain B indice 0 es A, tambien lo borra. A pierde control en ambas chains.
+    impact: |
+      Un owner malicioso puede usar operaciones cross-chain para revocar a otros owners
+      selectivamente en chains donde el mapping de indices es diferente al esperado.
+      En el peor caso, un owner puede quedar sin acceso a su propia wallet en algunas
+      chains mientras otro owner mantiene control exclusivo.
+    solidity: |
+      // Invariante: despues de removeOwnerAtIndex, el owner especificado ya no es owner
+      // y el ownerCount disminuyo exactamente en 1
+      function check_removeOwnerCrossChainCorrectness(
+          uint256 index,
+          bytes calldata expectedOwner
+      ) external {
+          bytes memory actualOwner = wallet.ownerAtIndex(index);
+          if (actualOwner.length == 0) return; // ya removido
+
+          bool wasOwner = wallet.isOwnerBytes(expectedOwner);
+          uint256 countBefore = wallet.ownerCount();
+
+          // Si expectedOwner != actualOwner, debe revertir con WrongOwnerAtIndex
+          if (keccak256(actualOwner) != keccak256(expectedOwner)) {
+              try wallet.removeOwnerAtIndex{gas: 100000}(index, expectedOwner) {
+                  t(false, "CSW-A-02: removeOwnerAtIndex con owner incorrecto no revertio");
+              } catch {}
+          }
+
+          // Post-condicion consistencia de contadores
+          uint256 calculatedCount = wallet.nextOwnerIndex() - wallet.removedOwnersCount();
+          eq(wallet.ownerCount(), calculatedCount,
+              "CSW-A-02: ownerCount inconsistente con nextOwnerIndex - removedOwnersCount");
+      }
+    status: investigate
+
+  - id: CSW-A-03
+    title: "initialize con array vacio no sube nextOwnerIndex -- wallet re-inicializable"
+    severity: high
+    confidence: 80
+    description: |
+      La proteccion contra re-inicializacion es: if (nextOwnerIndex() != 0) revert Initialized().
+      Si alguien llama initialize([]) con un array vacio, _initializeOwners no incrementa
+      nextOwnerIndex (el loop no ejecuta). La condicion nextOwnerIndex() == 0 sigue siendo
+      verdadera, por lo que la wallet puede ser inicializada de nuevo.
+
+      Flujo vulnerable:
+      1. Proxy desplegado. nextOwnerIndex == 0.
+      2. Atacante llama initialize([]) -- no hay revert, nextOwnerIndex sigue en 0.
+      3. Victima llama initialize([victimEOA]) -- tiene exito, victimEOA es owner.
+
+      Pero la factory tiene: if (owners.length == 0) revert OwnerRequired() ANTES de
+      initialize. Si alguien llama initialize directamente (no via factory), puede pasar
+      un array vacio y dejar la wallet en estado inicializable-repetidamente.
+
+      La llamada directa a initialize() (saltandose la factory) es posible en la ventana
+      entre el deploy del proxy y la llamada de la factory, o si alguien encuentra la
+      direccion del proxy antes de que la factory la inicialice.
+    attack_scenario: |
+      1. Proxy desplegado en dirección determinista predecible.
+      2. Atacante llama wallet.initialize([]) directamente -- no hay revert (array vacio).
+         nextOwnerIndex sigue en 0.
+      3. Victima (o factory) llama initialize([ownerA]) -- tiene exito.
+         ownerA es owner, nextOwnerIndex == 1.
+      4. Atacante vuelve a llamar initialize([attackerEOA]) -- REVIERTE (nextOwnerIndex != 0).
+      El ataque en este path no es efectivo para robar control. Pero...
+
+      Escenario mas danino:
+      1. Antes de que la factory despliegue, el atacante puede usar initialize([]) para
+         consumir el "primer init" sin asignar owners, si el contrato lo permite.
+      2. Luego initialize([victimOwner]) tiene exito -- pero ahora el atacante puede
+         intentar initialize([]) de nuevo. Si nextOwnerIndex no subio, el contrato
+         permite un segundo initialize.
+    impact: |
+      Posible bypass del guard de inicializacion unica si initialize([]) no incrementa
+      nextOwnerIndex. Requiere verificacion exacta del comportamiento de _initializeOwners
+      con array vacio. Si confirmado, permite multiples inicializaciones.
+    solidity: |
+      // Test: initialize con array vacio no debe dejar la wallet re-inicializable
+      function check_initializeEmptyOwners() external {
+          if (wallet.nextOwnerIndex() != 0) return; // solo si no inicializada
+
+          bytes[] memory emptyOwners = new bytes[](0);
+          wallet.initialize(emptyOwners); // puede o no revertir
+
+          // Despues de llamada con array vacio, si no subio nextOwnerIndex,
+          // la wallet esta en estado inicializable-repetidamente
+          if (wallet.nextOwnerIndex() == 0) {
+              // Intentar segunda inicializacion -- deberia revertir, pero no revertira
+              bytes[] memory realOwners = new bytes[](1);
+              realOwners[0] = abi.encode(address(0x1234));
+              try wallet.initialize{gas: 100000}(realOwners) {
+                  // Si llega aqui, la primera llamada no protegio la re-init
+                  t(false, "CSW-A-03: initialize con array vacio permite re-inicializacion posterior");
+              } catch {}
+          }
+      }
+
+      // Test: initialize no puede ser llamado dos veces con owners reales
+      function check_initializeNotRepeatable(bytes[] calldata newOwners) external {
+          if (wallet.nextOwnerIndex() == 0) return; // solo si ya inicializada
+
+          try wallet.initialize{gas: 100000}(newOwners) {
+              t(false, "CSW-A-03: initialize llamable en wallet ya inicializada");
+          } catch {}
+      }
+    status: investigate
+
+  - id: CSW-A-04
+    title: "ownerAtIndex con slot vacio produce revert en _isValidSignature en lugar de retornar false"
+    severity: medium
+    confidence: 85
+    description: |
+      _isValidSignature recibe un SignatureWrapper con ownerIndex. Llama a
+      ownerAtIndex(sigWrapper.ownerIndex) -- si el indice es de un owner REMOVIDO o
+      nunca asignado, retorna bytes("") con longitud 0.
+
+      Flujo:
+      - Si ownerBytes.length == 32: verifica ECDSA
+      - Si ownerBytes.length == 64: verifica WebAuthn
+      - Else: revert InvalidOwnerBytesLength(ownerBytes) con length == 0
+
+      Cuando la firma contiene ownerIndex de owner REMOVIDO, la funcion REVIERTE en
+      lugar de retornar false. En validateUserOp (ERC-4337), el spec dice que fallos
+      de firma deben retornar 1 (no revertir), para permitir simulacion. Un revert
+      aqui hace que el EntryPoint interprete el fallo como error no-relacionado-con-firma.
+
+      En isValidSignature (ERC-1271), un revert puede romper integraciones con contratos
+      externos que esperan que isValidSignature nunca revierta (ej: Gnosis Safe Guard,
+      marketplaces NFT, etc.). Esto puede bloquear flujos criticos de autorizacion.
+    attack_scenario: |
+      Escenario de DoS en integracion ERC-1271:
+      1. Contrato externo C (ej: marketplace NFT) llama wallet.isValidSignature(hash, sig)
+         donde sig = abi.encode(SignatureWrapper{ownerIndex: 99, signatureData: ...}).
+      2. ownerAtIndex(99) retorna bytes("") -- longitud 0.
+      3. La llamada REVIERTE con InvalidOwnerBytesLength.
+      4. C no maneja el revert -- su propia transaccion falla.
+      5. El usuario no puede ejecutar la operacion autorizada (ej: vender NFT).
+
+      Escenario de griefing en bundler:
+      1. Un actor malicioso envia UserOps con ownerIndex de owners removidos.
+      2. validateUserOp revierte en lugar de retornar 1.
+      3. El bundler puede interpretar esto como fallo de la cuenta, no de la firma.
+      4. Dependiendo del bundler, puede resultar en penalizacion de la cuenta o
+         comportamiento inesperado en el manejo de errores.
+    impact: |
+      DoS en integraciones ERC-1271. Flujos de autorizacion externa pueden quedar
+      bloqueados permanentemente si usan firmas con indices de owners removidos.
+      Griefing potencial de bundlers via UserOps con indices invalidos.
+    solidity: |
+      // Test: isValidSignature con ownerIndex invalido debe retornar 0xffffffff, no revertir
+      function check_invalidOwnerIndexReturnsFalse(uint256 invalidIndex) external {
+          bytes memory ownerAtIdx = wallet.ownerAtIndex(invalidIndex);
+          if (ownerAtIdx.length != 0) return; // indice valido, skip
+
+          // Crear SignatureWrapper con indice invalido
+          bytes memory encodedSig = abi.encode(
+              CoinbaseSmartWallet.SignatureWrapper({
+                  ownerIndex: invalidIndex,
+                  signatureData: new bytes(65) // firma dummy
+              })
+          );
+
+          // isValidSignature NO debe revertir -- debe retornar 0xffffffff
+          try wallet.isValidSignature{gas: 100000}(bytes32(0), encodedSig) returns (bytes4 result) {
+              t(result == 0xffffffff,
+                  "CSW-A-04: isValidSignature retorno magicValue para owner invalido");
+          } catch {
+              t(false,
+                  "CSW-A-04: isValidSignature revertio en lugar de retornar false para ownerIndex invalido");
+          }
+      }
+    status: investigate
+
+  - id: CSW-A-05
+    title: "removeLastOwner permite dejar ownerCount == 0 -- fondos bloqueados permanentemente"
+    severity: high
+    confidence: 95
+    description: |
+      removeLastOwner permite que el UNICO owner restante se remueva a si mismo.
+      Despues de esta operacion:
+      - ownerCount() == 0
+      - _checkOwner() falla para cualquier msg.sender (salvo address(this))
+      - Para llamar address(this), se necesita execute() -- que requiere onlyEntryPointOrOwner
+      - El EntryPoint necesita validateUserOp() -- que requiere firma valida de un owner
+      - No hay owners -- ninguna firma es valida -- _isValidSignature siempre retorna false
+
+      La wallet queda en un estado LOCKED permanente: los fondos son inaccesibles.
+      No hay mecanismo de recuperacion una vez que ownerCount llega a 0.
+
+      Vectores de lock:
+      1. Owner accidental: el ultimo owner se remueve a si mismo por error.
+      2. Griefing entre co-owners: A remueve a B (quedan 2-->1), luego B
+         (si habia firmado un removeLastOwner previamente) puede ejecutar el ultimo remove.
+      3. Cross-chain: removeLastOwner cross-chain aplicado en chain donde solo habia 1 owner.
+    attack_scenario: |
+      Escenario de griefing entre co-owners:
+      1. Wallet con owners [A@idx0, B@idx1].
+      2. A y B estan en disputa. A llama removeOwnerAtIndex(1, B) -- B removido.
+         Solo queda A. ownerCount == 1.
+      3. B habia pre-firmado una UserOp removeLastOwner(0, A) con nonce futuro.
+         Si B puede hacer que esa UserOp se ejecute (via bundler), A es removido.
+         ownerCount == 0. Wallet bloqueada.
+
+      Escenario de auto-lock:
+      1. Unico owner A. Por error firma removeLastOwner(0, A) cross-chain.
+      2. La UserOp se ejecuta en TODAS las chains.
+      3. ownerCount == 0 en todas las chains. Todos los fondos bloqueados.
+
+      Escenario de callback reentrante:
+      1. execute() llama a contrato externo C.
+      2. C hace callback a wallet.removeLastOwner (si C fue llamado con permisos de owner).
+         -- Esto no es posible directamente porque removeLastOwner tiene onlyOwner,
+         no onlyEntryPointOrOwner. Pero si execute() llama a address(this) con data
+         de removeLastOwner, el msg.sender es address(this) -- pasa _checkOwner.
+    impact: |
+      Perdida permanente e irreversible de acceso a todos los fondos en la wallet.
+      No hay mecanismo de recuperacion una vez que ownerCount == 0. Alta severidad.
+    solidity: |
+      // Invariante CRITICO: ownerCount nunca debe ser 0 despues de cualquier operacion
+      function invariant_atLeastOneOwner() external view {
+          t(wallet.ownerCount() > 0,
+              "CSW-A-05: wallet sin owners -- fondos bloqueados permanentemente");
+      }
+
+      // Test: removeLastOwner con ownerCount > 1 debe revertir con NotLastOwner
+      function check_removeLastOwnerRequiresSingleOwner(
+          uint256 index,
+          bytes calldata ownerBytes
+      ) external {
+          uint256 count = wallet.ownerCount();
+          if (count <= 1) return; // solo testear cuando hay mas de 1
+
+          try wallet.removeLastOwner{gas: 100000}(index, ownerBytes) {
+              t(false, "CSW-A-05: removeLastOwner exitoso con ownerCount > 1");
+          } catch {}
+      }
+
+      // Test: despues de removeLastOwner exitoso, ownerCount == 0 (locked)
+      function check_removeLastOwnerLocksWallet(
+          uint256 lastIndex,
+          bytes calldata lastOwnerBytes
+      ) external {
+          if (wallet.ownerCount() != 1) return;
+          if (wallet.ownerAtIndex(lastIndex).length == 0) return;
+
+          try wallet.removeLastOwner{gas: 100000}(lastIndex, lastOwnerBytes) {
+              uint256 ownersAfter = wallet.ownerCount();
+              t(ownersAfter > 0, "CSW-A-05: removeLastOwner exitoso dejo ownerCount == 0 -- wallet LOCKED");
+          } catch {}
+      }
+    status: investigate
+
+  - id: CSW-A-06
+    title: "upgradeToAndCall cross-chain: una sola firma compromete todas las chains simultáneamente"
+    severity: high
+    confidence: 70
+    description: |
+      upgradeToAndCall esta en la whitelist de canSkipChainIdValidation, lo que significa
+      que un owner puede hacer upgrade de TODAS las instancias cross-chain de la wallet
+      con una sola firma.
+
+      La validacion en validateUserOp solo verifica que newImplementation.code.length > 0.
+      No verifica:
+      1. Que la nueva implementacion sea CoinbaseSmartWallet o compatible.
+      2. Que la nueva implementacion preserve los invariantes de MultiOwnable.
+      3. Que la nueva implementacion no tenga backdoor en execute().
+
+      Un owner comprometido puede hacer upgrade a una implementacion maliciosa que elimine
+      todos los checks de access control, dando al atacante control total sobre la wallet
+      en todas las chains con una sola operacion.
+
+      La check code.length > 0 es superficial: cualquier contrato con codigo pasa,
+      incluyendo uno que tiene execute(address, uint256, bytes) sin modificadores.
+    attack_scenario: |
+      1. Atacante despliega MaliciousImpl con:
+         function execute(address t, uint256 v, bytes calldata d) external payable {
+             t.call{value: v}(d); // sin access control
+         }
+         MaliciousImpl.code.length > 0 -- pasa la validacion.
+      2. Atacante compromete clave de 1 owner de la wallet.
+      3. Atacante firma UserOp cross-chain con REPLAYABLE_NONCE_KEY:
+         executeWithoutChainIdValidation([upgradeToAndCall(maliciousImpl, "")])
+      4. validateUserOp: maliciousImpl.code.length > 0 OK, firma del owner OK.
+      5. Upgrade ejecutado en Ethereum, Base, Optimism SIMULTANEAMENTE.
+      6. Atacante llama execute() en cualquier chain sin restriccion -- drena fondos.
+    impact: |
+      Perdida total de fondos en TODAS las chains donde la wallet existe.
+      Un solo owner comprometido puede comprometer todas las cadenas con una firma.
+      El unico mitigante es que requiere clave de owner valida.
+    solidity: |
+      // Test: upgradeToAndCall solo puede ser llamado por owner o address(this)
+      function check_upgradeAuthorizationIsStrict(address newImpl, address nonOwner) external {
+          if (wallet.isOwnerAddress(nonOwner)) return;
+          if (nonOwner == address(wallet)) return;
+
+          vm.prank(nonOwner);
+          try wallet.upgradeToAndCall{gas: 100000}(newImpl, "") {
+              t(false, "CSW-A-06: upgradeToAndCall ejecutado por no-owner");
+          } catch {}
+      }
+
+      // Test: la implementacion actual tiene codigo (no es address(0))
+      function check_implementationHasCode() external view {
+          address impl = wallet.implementation();
+          t(impl != address(0), "CSW-A-06: implementacion es address(0)");
+          t(impl.code.length > 0, "CSW-A-06: implementacion sin codigo");
+      }
+
+      // Test: validateUserOp con upgradeToAndCall a contrato sin codigo debe revertir
+      // Este test es conceptual -- en fork test verificar que InvalidImplementation se lanza
+      // cuando newImplementation.code.length == 0
+      function check_validateUserOpRejectsEmptyCodeUpgrade() external {
+          // La validacion de code.length > 0 en validateUserOp es correcta para
+          // prevenir upgrade a address(0), pero no previene upgrade a implementacion maliciosa.
+          // Documentar como diseno: la responsabilidad de verificar la implementacion
+          // es del owner que firma, no del contrato.
+          t(true, "CSW-A-06: upgrade validation solo verifica code.length, no correctness");
+      }
+    status: investigate
+
+  - id: CSW-A-07
+    title: "isOwner solo verifica EOA addresses -- passkey owners no pueden ser verificados como isOwnerAddress"
+    severity: low
+    confidence: 85
+    description: |
+      isOwnerAddress(account) verifica isOwner[abi.encode(account)] -- busca por los
+      32 bytes de la address. Los passkey owners se almacenan como 64 bytes (x, y).
+
+      Si alguien llama isOwnerAddress(someAddress) donde someAddress corresponde a
+      la primera mitad de un passkey (x-coordinate interpretado como address), retorna
+      false correctamente. No hay confusion entre los tipos.
+
+      Sin embargo: _checkOwner() solo verifica isOwnerAddress(msg.sender). Los passkey
+      owners NUNCA pueden pasar _checkOwner() directamente. Esto es by-design, pero
+      crea una confusion de API:
+
+      - isOwnerAddress: solo para EOA owners
+      - isOwnerPublicKey: para passkey owners
+      - isOwnerBytes: para cualquier tipo
+
+      Si un integrador llama isOwnerAddress() para verificar si alguien tiene control
+      de la wallet, obtendra false para wallets con solo passkey owners, pero los
+      fondos pueden ser controlados via AA por el passkey. El integrador puede
+      implementar logica erronea basada en este false negative.
+    attack_scenario: |
+      Escenario de confusion de API:
+      1. Contrato externo Guardian usa isOwnerAddress(userAddress) para verificar
+         si el usuario controla su wallet antes de aprobar una operacion.
+      2. La wallet del usuario tiene solo un passkey owner.
+      3. isOwnerAddress(userAddress) retorna false -- userAddress no es owner de tipo address.
+      4. Guardian rechaza la operacion incorrectamente.
+      5. Alternativamente: Guardian aprueba operaciones de alguien que NO es owner
+         porque no verifico correctamente el tipo de owner.
+    impact: |
+      Confusion de API para integradores. No hay perdida directa de fondos desde la
+      wallet, pero puede causar logica incorrecta en contratos externos que asumen
+      que isOwnerAddress es suficiente para verificar ownership.
+    solidity: |
+      // Test: consistencia entre isOwnerBytes e isOwnerAddress/isOwnerPublicKey
+      function check_ownerCheckConsistency(address checkAddr) external view {
+          bool byAddress = wallet.isOwnerAddress(checkAddr);
+          bool byBytes = wallet.isOwnerBytes(abi.encode(checkAddr));
+
+          // Deben ser consistentes
+          t(byAddress == byBytes,
+              "CSW-A-07: isOwnerAddress e isOwnerBytes inconsistentes para la misma address");
+      }
+
+      // Test: si el unico owner es passkey, isOwnerAddress retorna false para toda address
+      function check_passkeyOwnerNotDetectedByAddress(address anyAddr) external {
+          uint256 count = wallet.ownerCount();
+          bool hasEOAOwner = false;
+          uint256 nextIdx = wallet.nextOwnerIndex();
+          for (uint256 i = 0; i < nextIdx && i < 20; i++) {
+              bytes memory ownerBytes = wallet.ownerAtIndex(i);
+              if (ownerBytes.length == 32) { hasEOAOwner = true; break; }
+          }
+
+          if (!hasEOAOwner && count > 0) {
+              // Wallet passkey-only: isOwnerAddress debe retornar false para cualquier address
+              t(!wallet.isOwnerAddress(anyAddr),
+                  "CSW-A-07: isOwnerAddress retorna true para passkey-only wallet");
+          }
+      }
+    status: investigate
+
+  - id: CSW-A-08
+    title: "addOwnerAddress acepta address(0) como owner valido si pasa la validacion de bytes"
+    severity: low
+    confidence: 60
+    description: |
+      _initializeOwners verifica que owners[i] de longitud 32 tenga uint256 <= type(uint160).max.
+      address(0) = uint256(0) -- pasa este check.
+
+      En el constructor, el implementation se auto-inicializa con address(0) como owner:
+        owners[0] = abi.encode(address(0));
+        _initializeOwners(owners);
+
+      Esto es intencional para bloquear la implementacion (impedir que sea inicializada
+      directamente). Pero abi.encode(address(0)) pasa AlreadyOwner check en _addOwnerAtIndex
+      porque isOwner[abi.encode(address(0))] = true solo en la implementacion.
+
+      Los proxies tienen storage separado -- en un proxy, address(0) NO es owner
+      inicialmente. Si alguien llama addOwnerAddress(address(0)) en un proxy, address(0)
+      se convierte en owner. Luego, cualquier contrato podria llamar a funciones
+      protegidas por onlyOwner haciendo que msg.sender sea address(0) -- lo cual es
+      imposible en EVM (msg.sender nunca es address(0) en llamadas normales).
+
+      El riesgo es bajo: address(0) como owner no crea un vector de escalada practica
+      porque msg.sender nunca puede ser address(0). Pero podria causar confusion en
+      herramientas de auditoria y contadores de owners.
+    attack_scenario: |
+      1. Owner A llama addOwnerAddress(address(0)) en el proxy.
+      2. ownerCount() sube a 2 (A y address(0)).
+      3. Nadie puede llamar funciones como address(0) -- msg.sender nunca es 0x0.
+      4. Para remover a address(0), alguien debe llamar removeOwnerAtIndex(idx, abi.encode(address(0))).
+      5. Si se olvida el indice de address(0), queda como owner fantasma permanente
+         que incrementa ownerCount pero no puede hacer nada.
+    impact: |
+      Owner fantasma que infla ownerCount. No hay perdida de fondos pero puede
+      confundir a herramientas que cuentan owners o a interfaces de usuario.
+      Adicionalmente, address(0) como owner es confuso y potencialmente un error.
+    solidity: |
+      // Test: addOwnerAddress(address(0)) debe revertir o ser prevenido
+      function check_zeroAddressOwnerPrevented() external {
+          if (wallet.isOwnerAddress(address(0))) return; // ya es owner, skip
+
+          try wallet.addOwnerAddress{gas: 100000}(address(0)) {
+              // Si llega aqui, address(0) fue anadido como owner
+              // Verificar que ownerCount subio y que address(0) es owner
+              t(wallet.isOwnerAddress(address(0)),
+                  "CSW-A-08: addOwnerAddress(0) exitoso pero isOwnerAddress(0) false");
+              // address(0) como owner es un owner fantasma -- nadie puede actuar como el
+              t(false, "CSW-A-08: address(0) aceptado como owner -- owner fantasma creado");
+          } catch {}
+      }
+    status: investigate
+
+  - id: CSW-A-09
+    title: "ERC-1271 isValidSignature no protege contra cross-account signature replay en contextos sin EIP-712"
+    severity: medium
+    confidence: 65
+    description: |
+      ERC1271.sol implementa una capa anti cross-account-replay: replaySafeHash(hash)
+      re-hashea el input usando EIP-712 con el domainSeparator que incluye chainId y
+      address(this). Esto previene que una firma valida en wallet A sea usada en wallet B.
+
+      Sin embargo: la proteccion solo aplica cuando se usa isValidSignature (ERC-1271).
+      En validateUserOp (ERC-4337), el hash es el userOpHash provisto por el EntryPoint
+      -- que ya incluye el sender (la wallet address) y chainId, por lo que hay proteccion
+      inherente.
+
+      El vector potencial esta en aplicaciones que usan isValidSignature directamente
+      con hashes RAW (sin EIP-712 wrapping) de mensajes que no incluyen la wallet address.
+      En ese caso, replaySafeHash protege. Pero si una aplicacion pasa un hash que ya
+      es un userOpHash (que incluye la wallet address y chainId), el doble-wrapping
+      puede crear confusion sobre que exactamente se esta firmando.
+
+      Mas concreto: validateUserOp llama _isValidSignature(userOpHash, sig) directamente
+      -- SIN pasar por replaySafeHash(). Esto es correcto porque userOpHash ya incluye
+      proteccion. Pero si alguien usa el mismo SignatureWrapper que funciona en
+      validateUserOp para llamar isValidSignature, fallara porque isValidSignature
+      aplica replaySafeHash al hash antes de verificar.
+
+      Esta asimetria no es un bug directo, pero puede causar confusion en integradores.
+    attack_scenario: |
+      Escenario de confusion de hashing:
+      1. Un integrador quiere verificar que el wallet aprueba una operacion.
+      2. Usa la firma generada para una UserOp (firma sobre userOpHash).
+      3. Llama isValidSignature(userOpHash, signature).
+      4. isValidSignature aplica replaySafeHash(userOpHash) --> nuevo hash diferente.
+      5. La verificacion FALLA aunque la firma sea valida para la UserOp.
+      6. El integrador concluye incorrectamente que la operacion no esta aprobada.
+    impact: |
+      Confusion en integradores que mezclan firmas ERC-4337 y ERC-1271.
+      No hay perdida directa de fondos, pero puede bloquear flujos de verificacion
+      externa o causar falsos negativos en sistemas de autorizacion.
+    solidity: |
+      // Test: isValidSignature con hash directo retorna 0xffffffff si la firma es para userOpHash
+      // (porque isValidSignature aplica replaySafeHash antes de verificar)
+      function check_erc1271VsERC4337HashingDifference(
+          bytes32 userOpHash,
+          bytes calldata signature
+      ) external view {
+          bytes32 replaySafe = wallet.replaySafeHash(userOpHash);
+
+          // Si la firma es valida para userOpHash directamente (como en validateUserOp):
+          // Verificar que isValidSignature con el MISMO hash retorna diferente
+          // porque aplica replaySafeHash internamente
+          // Esto es un test de documentacion -- el comportamiento es by-design
+
+          // La firma para replaySafeHash debe funcionar en isValidSignature
+          // La firma para userOpHash solo debe funcionar en validateUserOp
+          t(replaySafe != userOpHash, "CSW-A-09: replaySafeHash igual al hash original");
+      }
+    status: investigate
+
+  - id: CSW-A-10
+    title: "ownerCount() inconsistente si removedOwnersCount supera nextOwnerIndex por underflow"
+    severity: informational
+    confidence: 40
+    description: |
+      ownerCount() = nextOwnerIndex - removedOwnersCount. Ambos son uint256.
+
+      Si por algun mecanismo removedOwnersCount pudiera superar nextOwnerIndex,
+      habria un underflow. En Solidity 0.8+, esto reverteria. Sin embargo, la logica
+      de addOwner (incrementa nextOwnerIndex) y removeOwner (incrementa removedOwnersCount)
+      deberia mantener que removedOwnersCount <= nextOwnerIndex.
+
+      El invariante se mantiene si:
+      - Solo removeOwnerAtIndex y removeLastOwner incrementan removedOwnersCount
+      - Ambas funciones tienen onlyOwner
+      - addOwner incrementa nextOwnerIndex antes de que remove lo incremente
+
+      La unica forma de romperlo seria si:
+      1. Un bug en _initializeOwners no incrementa nextOwnerIndex correctamente.
+      2. Un upgrade a implementacion con bug en el contador.
+      3. Acceso directo al storage slot (imposible sin bug grave).
+
+      Con el codigo actual, el underflow no parece alcanzable. Documentado como
+      invariante de verificacion formal.
+    attack_scenario: |
+      No hay un ataque practico identificado. El underflow reverteria antes de producir
+      daño. El riesgo es principalmente para versiones futuras del contrato que podrian
+      cambiar la logica de contadores.
+    solidity: |
+      // Invariante: removedOwnersCount nunca supera nextOwnerIndex
+      function invariant_ownerCounterConsistency() external view {
+          uint256 nextIdx = wallet.nextOwnerIndex();
+          uint256 removedCount = wallet.removedOwnersCount();
+          uint256 count = wallet.ownerCount();
+
+          // removedOwnersCount debe ser <= nextOwnerIndex
+          t(removedCount <= nextIdx,
+              "CSW-A-10: removedOwnersCount supera nextOwnerIndex -- underflow en ownerCount");
+
+          // ownerCount debe ser consistente
+          eq(count, nextIdx - removedCount,
+              "CSW-A-10: ownerCount inconsistente con nextOwnerIndex - removedOwnersCount");
+
+          // ownerCount debe ser >= 0 (siempre verdadero en uint256, pero documentar)
+          // El invariante real es que count > 0 en estado normal (ver CSW-A-05)
+      }
+    status: investigate
+
+false_positives:
+  - id: CSW-FP-01
+    description: |
+      "La wallet no tiene reentrancy guard en execute/executeBatch" -- esto es by design.
+      La wallet es el sender en las calls y no hay estado de accounting que pueda ser
+      manipulado via reentrancy. Los modifiers onlyEntryPointOrOwner previenen que un
+      callback re-entre con permisos elevados (el callback vendria de address(target),
+      no de un owner ni del EntryPoint).
+    lesson: "En account abstraction wallets sin accounting interno, reentrancy no es vector primario."
+
+  - id: CSW-FP-02
+    description: |
+      "createAccount es llamable por cualquiera sin restricciones" -- esto es intencional.
+      La factory es permisionless. La proteccion es que la salt incluye los owners exactos,
+      por lo que un atacante no puede inicializar la wallet del usuario con owners diferentes.
+      El front-running de createAccount con los mismos owners produce el mismo resultado
+      que el usuario esperaba.
+    lesson: "Factory permisionless con salt que incluye owners es seguro para AA wallets."
+
+  - id: CSW-FP-03
+    description: |
+      "El constructor de la implementacion se inicializa con address(0) como owner" --
+      esto es una tecnica de bloqueo de la implementacion base para prevenir que sea
+      inicializada directamente. El proxy tiene storage separado, por lo que esta
+      inicializacion no afecta a los wallets de usuarios.
+    lesson: "Inicializar la implementacion con dummy owners es un patron comun para bloquear implementaciones UUPS."

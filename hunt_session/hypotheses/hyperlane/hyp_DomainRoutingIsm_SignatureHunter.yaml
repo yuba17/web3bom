@@ -1,0 +1,282 @@
+hunter: SignatureHunter
+component: DomainRoutingIsm
+date: "2026-03-27"
+contracts_analyzed:
+  - DomainRoutingIsm.sol
+  - AbstractRoutingIsm.sol
+  - DefaultFallbackRoutingIsm.sol
+  - AbstractMultisigIsm.sol
+  - AbstractMessageIdMultisigIsm.sol
+  - CheckpointLib.sol
+  - TrustedRelayerIsm.sol
+  - Mailbox.sol
+
+hypotheses:
+  - id: DRI-SIG-01
+    title: "Cross-domain metadata replay blocked by origin-bound digest in MultisigIsm"
+    description: |
+      DomainRoutingIsm delegates verify() entirely to child ISMs via route(_message).verify(_metadata, _message).
+      The metadata blob is passed unchanged. If domain A and domain B share overlapping validators (e.g.,
+      [V1, V2, V3] vs [V1, V2, V4] with threshold 2), metadata signed by [V1, V2] for domain A's message
+      could theoretically be replayed for domain B.
+
+      HOWEVER, the digest in AbstractMessageIdMultisigIsm.digest() includes:
+      - _message.origin() — the origin domain
+      - _metadata.originMerkleTreeHook() — the merkle tree hook address on the origin chain
+      - _metadata.root() — the merkle root
+      - _metadata.index() — the checkpoint index
+      - _message.id() — the message ID (hash of full message including origin, sender, destination, body)
+
+      CheckpointLib.domainHash() = keccak256(origin, merkleTreeHook, "HYPERLANE")
+
+      The message ID is derived from the full message content including origin domain. So even if
+      the same validators sign checkpoints for both domains, the digest is different because:
+      1. origin is different → domainHash is different
+      2. merkleTreeHook is different (each chain has its own) → domainHash is different
+      3. messageId is different (contains origin domain)
+
+      Cross-domain replay is PREVENTED by design. The domain separation is robust.
+    confidence: 95
+    severity: info
+    status: safe
+    attack_scenario: |
+      1. Domain A (origin=1) has MultisigIsm with validators [V1, V2, V3], threshold=2
+      2. Domain B (origin=2) has MultisigIsm with validators [V1, V2, V4], threshold=2
+      3. Legitimate message M_A dispatched from domain A, checkpoint signed by [V1, V2]
+      4. Attacker tries to craft message M_B from domain B using M_A's metadata
+      5. digest(M_B) = keccak256(domainHash(2, hookB), root, index, idB) ≠ digest(M_A)
+      6. Signatures from [V1, V2] don't match M_B's digest → ECDSA.recover returns wrong addresses
+      7. Verification fails — replay blocked
+    solidity: |
+      // INVARIANT: Metadata from domain A must not verify for domain B
+      function invariant_cross_domain_replay_blocked() public {
+          // Setup: two domains with overlapping validators
+          bytes memory metadataA = _buildValidMetadata(DOMAIN_A, messageA);
+          // Try to verify metadataA against a message from DOMAIN_B
+          bytes memory messageB = MessageUtils.build(DOMAIN_B);
+          // This should fail because digest is domain-bound
+          bool result = routingIsm.verify(metadataA, messageB);
+          t(!result, "Cross-domain replay must be rejected");
+      }
+
+  - id: DRI-SIG-02
+    title: "DefaultFallbackRoutingIsm security downgrade for unconfigured domains"
+    description: |
+      DefaultFallbackRoutingIsm.module() returns mailbox.defaultIsm() for unconfigured domains.
+      This is the most significant signature/verification concern in this component:
+
+      The defaultIsm could be:
+      - A TrustedRelayerIsm (only checks msg.sender == trustedRelayer in Mailbox.process context,
+        but actually checks processor(messageId) == trustedRelayer, meaning ANY relayer that calls
+        process() gets recorded, and verify() checks if that processor is the trusted one)
+      - A MultisigIsm with different (potentially weaker) validator set
+      - Any ISM the Mailbox owner configured
+
+      The attack: a recipient deploys a DefaultFallbackRoutingIsm expecting strict per-domain
+      security. An attacker sends a message from an unconfigured domain. The message gets verified
+      by the weaker defaultIsm instead of a strict domain-specific ISM.
+
+      However, the attacker cannot choose which origin domain the message claims to come from
+      without actually having it dispatched from that chain's Mailbox (which records it in the
+      merkle tree). The defaultIsm still needs to verify the message — it's not a free bypass.
+
+      The real risk is if defaultIsm is a TrustedRelayerIsm and the trusted relayer is compromised,
+      or if defaultIsm has lower security thresholds than domain-specific ISMs.
+
+      Severity: Medium design concern. Not a direct code bug but a trust model subtlety that
+      could lead to security degradation if misconfigured.
+    confidence: 40
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Recipient uses DefaultFallbackRoutingIsm with strict 5-of-7 MultisigIsm per domain
+      2. mailbox.defaultIsm() is a 2-of-3 MultisigIsm (lower threshold for general use)
+      3. New chain/domain 99 connects to Hyperlane but is not yet configured in the routing ISM
+      4. Attacker dispatches message from domain 99 to this recipient
+      5. DefaultFallbackRoutingIsm.module(99) → not found → returns mailbox.defaultIsm()
+      6. Message verified by 2-of-3 instead of 5-of-7
+      7. If 2 of the 3 validators for defaultIsm are compromised, forged message is delivered
+      Impact: security downgrade from N-of-M to weaker threshold for unconfigured origins
+    solidity: |
+      // INVARIANT: Unconfigured domains must not silently downgrade security
+      function invariant_no_silent_downgrade() public view returns (bool) {
+          DefaultFallbackRoutingIsm ism = DefaultFallbackRoutingIsm(ISM_ADDR);
+          IInterchainSecurityModule fallbackIsm = mailbox.defaultIsm();
+          // The fallback ISM should have AT LEAST the same security guarantees
+          // as the weakest configured domain ISM
+          // This is a monitoring check — in practice, verify moduleType and thresholds
+          return address(fallbackIsm) != address(0);
+      }
+
+  - id: DRI-SIG-03
+    title: "Metadata format mismatch — routing ISM reports ROUTING moduleType but child expects different format"
+    description: |
+      AbstractRoutingIsm reports moduleType = ROUTING (uint8). The off-chain relayer uses moduleType
+      to determine what metadata format to prepare:
+      - ROUTING → just needs to know the child ISM type, prepares metadata for the child
+      - MULTISIG → validator signatures + merkle proof
+      - AGGREGATION → packed metadata for multiple ISMs
+
+      The relayer queries route(message) to discover the child ISM, then queries the child's
+      moduleType to prepare the correct metadata format. This is handled off-chain.
+
+      On-chain, verify() simply passes metadata through: route(_message).verify(_metadata, _message).
+      There is NO on-chain validation that the metadata format matches the child ISM's expectations.
+
+      If the child ISM changes between when the relayer prepares metadata and when process() is called
+      (e.g., owner calls set() between these events), the metadata format may be wrong for the new ISM.
+      Result: verify() reverts or returns false → message is NOT delivered (fail-closed).
+
+      This is SAFE from a security perspective. The worst case is denial-of-service (message not
+      delivered), not a bypass. The relayer would need to re-query and re-prepare metadata.
+
+      The only concern would be if a child ISM has a verify() that returns true for ANY metadata
+      format (e.g., a TrustedRelayerIsm that ignores metadata entirely). In that case, a metadata
+      mismatch wouldn't cause a revert — but TrustedRelayerIsm's security doesn't depend on metadata
+      anyway (it checks the processor address).
+    confidence: 70
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. DomainRoutingIsm configured: domain 1 → MultisigIsm (requires signatures)
+      2. Relayer prepares MultisigIsm metadata (signatures + merkle proof) for message from domain 1
+      3. Owner calls set(1, trustedRelayerIsm) — changes domain 1 ISM
+      4. Relayer submits process() with MultisigIsm-format metadata
+      5. DomainRoutingIsm routes to TrustedRelayerIsm.verify(multisigMetadata, message)
+      6. TrustedRelayerIsm ignores metadata, checks processor(messageId) == trustedRelayer
+      7. If the relayer IS the trustedRelayer, verification passes regardless of metadata format
+      Impact: The ISM swap changes the security model, but this is owner-authorized behavior.
+      If owner swaps to a weaker ISM, that's an owner trust issue, not a code bug.
+    solidity: |
+      // INVARIANT: Metadata format mismatch should fail-closed (revert or false)
+      function invariant_metadata_mismatch_fail_closed() public {
+          // Configure domain 1 with MultisigIsm
+          routingIsm.set(1, multisigIsm);
+          // Build metadata for AggregationIsm (wrong format)
+          bytes memory wrongMetadata = abi.encodePacked(bytes32(0));
+          bytes memory message = MessageUtils.build(1);
+          // Should revert or return false, never return true
+          try routingIsm.verify(wrongMetadata, message) returns (bool result) {
+              t(!result, "Wrong metadata format must not pass verification");
+          } catch {
+              // Revert is also acceptable (fail-closed)
+          }
+      }
+
+  - id: DRI-SIG-04
+    title: "No signature/verification performed by routing ISM itself — pure delegation"
+    description: |
+      DomainRoutingIsm and AbstractRoutingIsm perform ZERO signature verification themselves.
+      The entire verify() implementation is: return route(_message).verify(_metadata, _message).
+
+      This is by design — the routing ISM is a dispatcher, not a verifier. The security entirely
+      depends on the child ISMs being correctly configured and secure.
+
+      There are no cryptographic operations in the routing ISM code:
+      - No ecrecover / ECDSA
+      - No merkle proof verification
+      - No domain separator / EIP-712
+      - No nonce management
+      - No signature replay protection
+
+      All of these responsibilities are delegated to child ISMs. The routing ISM's security
+      contribution is limited to: (1) correct origin → ISM mapping, and (2) requiring that a
+      mapping exists (reverting for unknown domains in DomainRoutingIsm, falling back in
+      DefaultFallbackRoutingIsm).
+
+      The delegation pattern is sound. The verify() call includes the full message, so child ISMs
+      have all context needed to validate. The metadata passthrough is also correct — child ISMs
+      parse their expected format from the raw bytes.
+    confidence: 95
+    severity: info
+    status: safe
+    attack_scenario: |
+      N/A — This is a design documentation, not a vulnerability.
+      The routing ISM is a pure dispatcher with no signature surface of its own.
+      All signature verification is correctly delegated to child ISMs.
+    solidity: |
+      // INVARIANT: DomainRoutingIsm delegates verify() entirely to child ISM
+      function invariant_verify_delegates_to_child() public {
+          TestIsm childIsm = new TestIsm(abi.encode(bytes32("valid")));
+          routingIsm.set(DOMAIN, childIsm);
+          bytes memory metadata = abi.encode(bytes32("valid"));
+          bytes memory message = MessageUtils.build(DOMAIN);
+          // The routing ISM's verify result must match the child's verify result
+          bool routingResult = routingIsm.verify(metadata, message);
+          bool childResult = childIsm.verify(metadata, message);
+          t(routingResult == childResult, "Routing ISM must delegate correctly");
+      }
+
+  - id: DRI-SIG-05
+    title: "Recursive routing ISM nesting could cause gas exhaustion but not verification bypass"
+    description: |
+      DomainRoutingIsm.set() accepts any IInterchainSecurityModule as a child ISM.
+      An owner could set a child ISM that is itself another DomainRoutingIsm, creating recursion:
+        RoutingIsm_A.route(msg) → RoutingIsm_B.route(msg) → RoutingIsm_C.route(msg) → ...
+
+      Each level of nesting adds gas overhead for the DELEGATECALL/STATICCALL chain.
+      Deep nesting could cause:
+      1. Gas exhaustion → revert → fail-closed (safe)
+      2. Stack depth exceeded → revert → fail-closed (safe)
+
+      There is no risk of verification bypass from nesting. At the end of the chain, some non-routing
+      ISM must actually verify the message. If the chain never terminates (circular reference),
+      execution runs out of gas and reverts.
+
+      A circular reference (A → B → A) would cause infinite recursion and guaranteed revert.
+      This is a DoS concern (messages can't be delivered through this ISM) but not a security
+      bypass. Owner misconfiguration would be required.
+    confidence: 80
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Owner creates RoutingIsm_A and RoutingIsm_B
+      2. Owner sets RoutingIsm_A.set(domain, RoutingIsm_B)
+      3. Owner sets RoutingIsm_B.set(domain, RoutingIsm_A) — circular reference
+      4. Message from domain arrives, Mailbox calls RoutingIsm_A.verify()
+      5. RoutingIsm_A.route() → RoutingIsm_B.verify() → RoutingIsm_B.route() → RoutingIsm_A.verify() → ...
+      6. Infinite recursion → out of gas → revert
+      7. Message NOT delivered — fail-closed, no bypass
+      Impact: DoS for messages from affected domain. Owner action required to fix.
+    solidity: |
+      // INVARIANT: Circular ISM references must fail-closed (revert), never pass
+      function invariant_circular_routing_reverts() public {
+          DomainRoutingIsm ismA = new DomainRoutingIsm();
+          ismA.initialize(address(this));
+          DomainRoutingIsm ismB = new DomainRoutingIsm();
+          ismB.initialize(address(this));
+          ismA.set(DOMAIN, IInterchainSecurityModule(address(ismB)));
+          ismB.set(DOMAIN, IInterchainSecurityModule(address(ismA)));
+          bytes memory message = MessageUtils.build(DOMAIN);
+          // Must revert from infinite recursion
+          vm.expectRevert();
+          ismA.verify(hex"", message);
+      }
+
+summary: |
+  DomainRoutingIsm no realiza ninguna verificacion criptografica por si mismo — es un
+  dispatcher puro que delega verify() completamente al child ISM basado en el origin domain.
+
+  Analisis de superficie de firma/verificacion:
+
+  1. **Cross-domain replay (DRI-SIG-01)**: SEGURO. CheckpointLib.digest() incluye origin domain
+     y merkleTreeHook address en el domainHash. El messageId tambien incluye origin. Las firmas
+     son domain-bound y no pueden reutilizarse entre dominios.
+
+  2. **DefaultFallback security downgrade (DRI-SIG-02)**: INVESTIGAR. El fallback a
+     mailbox.defaultIsm() para dominios no configurados puede resultar en verificacion mas debil
+     si el defaultIsm tiene umbrales inferiores. No es un bug de codigo sino un riesgo de
+     configuracion y trust model. Severidad medium.
+
+  3. **Metadata format mismatch (DRI-SIG-03)**: SEGURO. El peor caso es fail-closed (revert).
+     Si el owner cambia el child ISM mid-flight, el metadata formato puede no coincidir, pero
+     esto causa revert, no bypass.
+
+  4. **Pure delegation pattern (DRI-SIG-04)**: Correcto por diseno. El routing ISM no tiene
+     superficie criptografica propia.
+
+  5. **Recursive nesting (DRI-SIG-05)**: Fail-closed por gas exhaustion. No permite bypass.
+
+  El unico finding con potencial reportable es DRI-SIG-02 (DefaultFallback downgrade), que
+  coincide con DRI-AC-04 del AccessHunter. Es un issue de diseno/trust model, no un bug de
+  implementacion.

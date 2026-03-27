@@ -1,0 +1,263 @@
+component: DomainRoutingIsm
+hunter: DoSHunter
+date: "2026-03-27"
+contract: DomainRoutingIsm.sol
+file: hyperlane-monorepo/solidity/contracts/isms/routing/DomainRoutingIsm.sol
+
+hypotheses:
+
+  - id: DRI-DOS-01
+    title: "Owner remove() permanently blocks message delivery for a domain"
+    description: |
+      DomainRoutingIsm.remove(domain) deletes the ISM mapping for a given origin domain.
+      After removal, module(origin) calls _modules.tryGet(origin) which returns contained=false,
+      causing a revert with "No ISM found for origin: X". Since AbstractRoutingIsm.verify()
+      calls route(_message) which calls module(origin), the revert propagates up through
+      Mailbox.process() at line 236: require(ism.verify(_metadata, _message)).
+      Any in-flight or future messages from that origin become permanently undeliverable.
+      No recovery mechanism exists short of deploying a new DomainRoutingIsm instance.
+      IncrementalDomainRoutingIsm mitigates this by overriding _remove() to always revert.
+    confidence: 85
+    severity: medium
+    status: confirmed_by_code
+    attack_scenario: |
+      1. DomainRoutingIsm is the ISM for a recipient on destination chain
+      2. Messages from origin domain X are in transit (dispatched but not yet processed)
+      3. Owner calls remove(X) on the DomainRoutingIsm
+      4. Relayer attempts Mailbox.process() for those messages
+      5. verify() -> route() -> module(X) reverts "No ISM found for origin: X"
+      6. Messages are permanently stuck - cannot be delivered
+      7. If messages carry value (e.g., interchain account calls with ETH), funds are locked
+    excluded: |
+      Owner-initiated action. Immunefi typically excludes owner/admin attacks.
+      However, the lack of a timelock or grace period means in-flight messages
+      have no protection. Worth noting as design risk.
+    solidity:
+      location: "DomainRoutingIsm.sol:81-83, 89-97"
+      vulnerable_code: |
+        function remove(uint32 _domain) external onlyOwner {
+            _remove(_domain);
+        }
+
+        function module(uint32 origin) public view virtual returns (IInterchainSecurityModule) {
+            (bool contained, bytes32 _module) = _modules.tryGet(origin);
+            if (contained) {
+                return IInterchainSecurityModule(_module.bytes32ToAddress());
+            }
+            revert(_originNotFoundError(origin));
+        }
+      related_contracts:
+        - "AbstractRoutingIsm.sol:38-43 (verify delegates to route().verify())"
+        - "Mailbox.sol:236 (require(ism.verify(...)) - revert propagates)"
+        - "IncrementalDomainRoutingIsm.sol:37-39 (mitigates by blocking removal)"
+
+  - id: DRI-DOS-02
+    title: "Child ISM revert in verify() blocks message delivery (revert vs false)"
+    description: |
+      AbstractRoutingIsm.verify() at line 42 calls route(_message).verify(_metadata, _message).
+      If the child ISM's verify() reverts (as opposed to returning false), the revert propagates
+      up through AbstractRoutingIsm.verify() and into Mailbox.process(). There is no try/catch
+      wrapper around the child ISM call. A reverting child ISM is functionally equivalent to
+      DoS on all messages routed through it. This is distinct from verify() returning false,
+      which Mailbox handles gracefully with the "ISM verification failed" error message.
+      The distinction matters: a revert could be caused by a bug in the child ISM, an
+      out-of-gas condition, or a state dependency that makes the child ISM temporarily
+      or permanently non-functional.
+    confidence: 80
+    severity: medium
+    status: confirmed_by_code
+    attack_scenario: |
+      1. DomainRoutingIsm routes domain X to childISM_X
+      2. childISM_X has a bug or state condition that causes verify() to revert
+         (e.g., uninitialized storage, external call to destroyed contract, OOG)
+      3. Any message from domain X triggers: Mailbox.process() -> ism.verify() ->
+         AbstractRoutingIsm.verify() -> route().verify() -> childISM_X.verify() -> REVERT
+      4. The revert propagates all the way up - message cannot be delivered
+      5. Unlike returning false, there is no graceful handling path
+      6. If owner is slow to react (multisig, timelock), messages accumulate
+    excluded: |
+      Depends on child ISM behavior which is outside DomainRoutingIsm's control.
+      Design choice - wrapping in try/catch would hide verification failures.
+      Informational/design-level concern.
+    solidity:
+      location: "AbstractRoutingIsm.sol:38-43"
+      vulnerable_code: |
+        function verify(
+            bytes calldata _metadata,
+            bytes calldata _message
+        ) public returns (bool) {
+            return route(_message).verify(_metadata, _message);
+            // No try/catch - revert in child ISM propagates
+        }
+      related_contracts:
+        - "DomainRoutingIsm.sol:106-110 (route() calls module())"
+        - "Mailbox.sol:236 (require wrapping verify)"
+
+  - id: DRI-DOS-03
+    title: "Owner set() can replace ISM with reverting contract mid-flight"
+    description: |
+      Owner can call set(domain, newISM) at any time to replace the ISM for a domain.
+      If newISM.verify() always reverts, all messages from that domain become undeliverable.
+      There is no timelock, no grace period, and no way for in-flight messages to use
+      the old ISM. The _set() function only checks isContract() - it does not verify
+      that the new ISM actually implements verify() correctly or that it can process
+      messages. Combined with the lack of a two-step ownership transfer pattern
+      (OwnableUpgradeable does have transferOwnership but no 2-step), a compromised
+      owner key can instantly DoS all message verification.
+    confidence: 75
+    severity: low
+    status: confirmed_by_code
+    attack_scenario: |
+      1. Owner's key is compromised (or owner is malicious)
+      2. Attacker calls set(domainX, maliciousISM) where maliciousISM.verify() always reverts
+      3. All pending and future messages from domainX cannot be verified
+      4. Since there's no timelock, the effect is immediate
+      5. Recovery requires owner to call set() again with a valid ISM
+         (impossible if attacker transferred ownership)
+    excluded: |
+      Owner/admin attack - excluded by most bounty programs including Immunefi.
+      Noted as design consideration. IncrementalDomainRoutingIsm only partially
+      mitigates (blocks set on existing domains but not initial set).
+    solidity:
+      location: "DomainRoutingIsm.sol:70-75, 133-136"
+      vulnerable_code: |
+        function set(uint32 _domain, IInterchainSecurityModule _module) external onlyOwner {
+            _set(_domain, address(_module));
+        }
+
+        function _set(uint32 _domain, address _module) internal virtual {
+            require(_module.isContract(), "ISM must be a contract");
+            // Only checks isContract - no interface or functionality verification
+            _modules.set(_domain, _module.addressToBytes32());
+        }
+      related_contracts:
+        - "IncrementalDomainRoutingIsm.sol:22-31 (blocks overwrite of existing domains)"
+
+  - id: DRI-DOS-04
+    title: "Uninitialized factory implementation can be hijacked"
+    description: |
+      DomainRoutingIsmFactory deploys a DomainRoutingIsm as implementation in its constructor
+      (line 49). This implementation contract is never initialized - initialize() is only
+      called on the minimal proxies created by deploy(). Anyone can call initialize() on
+      the implementation contract to become its owner, then call set()/remove() to configure
+      it arbitrarily. If any system mistakenly references the implementation directly
+      (instead of a properly deployed proxy), the attacker controls verification.
+      The practical impact is low because: (1) the implementation is only meant as a
+      template for MinimalProxy.create(), (2) proxies delegatecall to it but use their
+      own storage, (3) changes to the implementation's storage don't affect proxies.
+      However, the implementation itself could be used directly if misconfigured.
+    confidence: 40
+    severity: low
+    status: needs_investigation
+    attack_scenario: |
+      1. DomainRoutingIsmFactory is deployed, creating an uninitialized implementation
+      2. Attacker calls implementation() to get the address
+      3. Attacker calls initialize(attacker) on the implementation contract
+      4. Attacker is now owner of the implementation
+      5. If any recipient or system references this implementation address directly
+         as its ISM (misconfiguration), the attacker controls verification
+      6. Attacker calls set(domain, maliciousISM) to DoS or bypass verification
+    excluded: |
+      Requires misconfiguration - proxies are not affected since they have their own
+      storage. Standard pattern in many proxy factories. Low practical risk but
+      defense-in-depth suggests calling initialize in the constructor.
+    solidity:
+      location: "DomainRoutingIsmFactory.sol:48-49"
+      vulnerable_code: |
+        constructor() {
+            _implementation = address(new DomainRoutingIsm());
+            // DomainRoutingIsm.initialize() is never called on implementation
+            // Anyone can call it to become owner
+        }
+      related_contracts:
+        - "DomainRoutingIsm.sol:40-43 (initialize with just owner)"
+        - "IncrementalDomainRoutingIsmFactory.sol:17-18 (same pattern)"
+
+  - id: DRI-DOS-05
+    title: "domains() view function O(n) iteration - gas DoS for off-chain consumers"
+    description: |
+      The domains() function calls _modules.keys() which iterates over all entries
+      in the EnumerableMapExtended to build a uint256[] array. With thousands of domains,
+      this becomes extremely gas-expensive for on-chain callers and may timeout for
+      off-chain view calls via eth_call. However, this is a view function and does NOT
+      affect verify() or route() which use O(1) tryGet() lookups. The DoS is limited
+      to enumeration functionality, not core verification. Practical impact: UI dashboards
+      or monitoring tools calling domains() may fail, but message processing is unaffected.
+    confidence: 90
+    severity: informational
+    status: confirmed_by_code
+    attack_scenario: |
+      1. Over time, owner adds thousands of domains via set()
+      2. domains() allocates uint256[] of size N and iterates all entries
+      3. Off-chain tools calling domains() via eth_call may timeout or hit gas limits
+      4. No impact on verify()/route() which use O(1) map lookups
+      5. Pure availability issue for enumeration, not for core functionality
+    excluded: |
+      Informational only. Does not affect core verify/route functionality.
+      EnumerableMap is O(1) for get/set/remove/contains.
+      Only keys()/domains() is O(n).
+    solidity:
+      location: "DomainRoutingIsm.sol:85-87, EnumerableMapExtended.sol:19-27"
+      vulnerable_code: |
+        function domains() external view returns (uint256[] memory) {
+            return _modules.keys();
+        }
+
+        // EnumerableMapExtended.keys() - O(n) iteration
+        function keys(UintToBytes32Map storage map) internal view returns (uint256[] memory _keys) {
+            uint256 _length = map._inner.length();
+            _keys = new uint256[](_length);
+            for (uint256 i = 0; i < _length; i++) {
+                _keys[i] = uint256(map._inner._keys.at(i));
+            }
+        }
+      related_contracts:
+        - "EnumerableMapExtended.sol:19-27 (O(n) key enumeration)"
+
+  - id: DRI-DOS-06
+    title: "Race condition: set() during in-flight message processing"
+    description: |
+      There is no locking mechanism between set() and verify(). If owner calls
+      set(domain, newISM) while a relayer is constructing metadata for the old ISM
+      and then submits Mailbox.process(), the verify() call will use the NEW ISM
+      but with metadata formatted for the OLD ISM. This will likely cause verify()
+      to return false or revert, depending on the new ISM's implementation.
+      The message would need to be re-relayed with correct metadata for the new ISM.
+      This is a transient DoS - messages are not permanently lost, just delayed.
+    confidence: 70
+    severity: informational
+    status: confirmed_by_code
+    attack_scenario: |
+      1. Domain X routes to MultisigIsm with validators [A, B, C]
+      2. Relayer fetches route for message, gets MultisigIsm address
+      3. Relayer gathers signatures from validators A, B, C
+      4. Owner calls set(X, newMultisigIsm) with validators [D, E, F]
+      5. Relayer submits process() with metadata signed by A, B, C
+      6. verify() now calls newMultisigIsm which expects D, E, F signatures
+      7. Verification fails - message must be re-relayed with new metadata
+      8. Transient DoS, not permanent - message can be retried
+    excluded: |
+      By design - no smart contract can prevent TOCTOU between view calls
+      and state-changing transactions. Standard blockchain race condition.
+      Owner is expected to coordinate ISM changes with relayers.
+    solidity:
+      location: "DomainRoutingIsm.sol:70-75, AbstractRoutingIsm.sol:38-43"
+      vulnerable_code: |
+        // No atomicity between route() query and verify() execution
+        function verify(bytes calldata _metadata, bytes calldata _message) public returns (bool) {
+            return route(_message).verify(_metadata, _message);
+            // route() result can change between relayer's off-chain query and on-chain execution
+        }
+      related_contracts:
+        - "DomainRoutingIsm.sol:70-75 (set can be called anytime)"
+
+summary: |
+  DomainRoutingIsm tiene 6 vectores DoS identificados. Los 2 mas relevantes (DRI-DOS-01 y DRI-DOS-02)
+  son de severidad medium pero ambos dependen de acciones del owner o del comportamiento del child ISM,
+  lo que los coloca en zona gris para bounty programs que excluyen ataques de admin.
+  IncrementalDomainRoutingIsm mitiga correctamente DRI-DOS-01 al bloquear remove() y parcialmente
+  DRI-DOS-03 al bloquear overwrite de dominios existentes. El vector mas interesante para bounty
+  seria DRI-DOS-02 (child ISM revert propagation) si se puede demostrar un escenario donde un
+  child ISM legítimo revierte por condiciones externas no controladas por el owner.
+  DRI-DOS-04 (implementation hijack) es bajo pero merece investigacion adicional para ver
+  si algún deployment real referencia la implementation directamente.

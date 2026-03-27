@@ -1,0 +1,360 @@
+component: Transfers
+hunter: AccessHunter
+status: complete
+date: 2026-03-27
+
+trust_boundary_mapping:
+  registerOperator:
+    caller_trust: "NONE — anyone can register as operator. By design: operators prove identity via intent signatures."
+    admin_trust: "Owner has NO control over operator registration. Cannot block malicious operators."
+    state_trust: "Overwrites existing feeDestination silently if called twice."
+  registerOperatorWithFeeDestination:
+    caller_trust: "NONE — anyone can call. No validation on _feeDestination parameter."
+    value_trust: "NO zero-address check on _feeDestination — allows setting to address(0), effectively self-unregistering."
+  unregisterOperator:
+    caller_trust: "Only operator themselves. Can grief pending intents by front-running unregistration."
+    state_trust: "Deletes feeDestination. All pending valid intents for this operator become unusable."
+  transferNative:
+    caller_trust: "Anyone with a valid operator-signed intent. Sender is bound in signature."
+    callee_trust: "sendNative() uses low-level call to recipient and feeDestination — trusts them not to revert (nonReentrant protects)."
+  transferToken:
+    caller_trust: "Anyone with valid intent + permit2 signature. Sender bound in intent signature."
+    token_trust: "Rejects fee-on-transfer tokens via revertIfInexactTransfer. Does NOT reject rebasing tokens explicitly."
+  subsidizedTransferToken:
+    caller_trust: "ANY relayer can call — sender is _signatureTransferData.owner, NOT msg.sender. By design for gasless."
+    state_trust: "Relies on EIP-2612 permit succeeding. If token doesn't support permit, reverts."
+  swapAndTransferUniswapV3Native:
+    caller_trust: "Anyone with valid intent. No exactValueSent modifier — excess ETH goes to Uniswap refund flow."
+    callee_trust: "Trusts Uniswap router to execute swap correctly and refund excess."
+  pause_unpause:
+    caller_trust: "onlyOwner. Standard Ownable pattern."
+  sweepETH_sweepToken:
+    caller_trust: "onlySweeper. Separate role from owner. Owner sets sweeper via setSweeper."
+    admin_trust: "Sweeper can drain ALL contract balances (ETH + any token). High trust role."
+
+hypotheses:
+  - id: T-AC-01
+    title: "registerOperatorWithFeeDestination allows address(0) — operator self-DoS via accidental unregistration"
+    target_function: "Transfers.registerOperatorWithFeeDestination(address)"
+    severity: Low
+    tier: 2
+    type: property
+    confidence: 85
+    validated: true
+    description: |
+      registerOperatorWithFeeDestination() does NOT validate that _feeDestination != address(0).
+      If an operator calls registerOperatorWithFeeDestination(address(0)), their feeDestination
+      is set to address(0). The operatorIsRegistered modifier checks
+      feeDestinations[_intent.operator] != address(0), so ALL subsequent transfer intents
+      signed by this operator will revert with OperatorNotRegistered.
+      This is inconsistent with registerOperator() which safely uses msg.sender as destination,
+      and with Sweepable.setSweeper which HAS a notZero check.
+    attack_scenario: |
+      1. Operator calls registerOperatorWithFeeDestination(address(0)) by mistake or malicious input
+      2. feeDestinations[operator] = address(0)
+      3. Payer tries to execute a valid intent signed by this operator
+      4. operatorIsRegistered modifier reverts: all intents for this operator are bricked
+      5. Payer's transaction reverts, payment fails, commerce flow broken
+      Even if intentional self-DoS, the operator may have already distributed signed intents
+      to merchants who will fail to collect payments.
+    solidity: |
+      // Register operator with zero fee destination
+      transfers.registerOperatorWithFeeDestination(address(0));
+      // Verify the operator is effectively unregistered
+      try transfers.transferNative{value: 1 ether}(validIntent) {
+          t(false, "T-AC-01: transfer succeeded with zero feeDestination operator");
+      } catch (bytes memory reason) {
+          // Expected: OperatorNotRegistered revert
+          // This confirms the bug — zero feeDestination silently bricks the operator
+      }
+    priority: medium
+
+  - id: T-AC-02
+    title: "Operator front-run unregistration griefs payer's pending transactions"
+    target_function: "Transfers.unregisterOperator()"
+    severity: Low
+    tier: 2
+    type: property
+    confidence: 75
+    validated: true
+    description: |
+      An operator can call unregisterOperator() at any time, instantly invalidating ALL
+      pending transfer intents they signed. There is no grace period or cooldown.
+      If a payer has already submitted a transaction to the mempool with a valid intent,
+      the operator can front-run with unregisterOperator(), causing the payer's tx to revert.
+      The payer loses gas fees and the payment fails.
+    attack_scenario: |
+      1. Operator signs intent for $10,000 USDC payment, sends to merchant
+      2. Payer submits transferToken tx with the intent
+      3. Operator sees payer's tx in mempool, front-runs with unregisterOperator()
+      4. Payer's tx hits operatorIsRegistered modifier → reverts
+      5. Operator re-registers immediately after, can claim they had a "technical issue"
+      6. Payer wasted gas, merchant doesn't receive payment, operator can repeat
+    solidity: |
+      // Operator registers
+      vm.prank(operator);
+      transfers.registerOperator();
+      // Operator signs intent (simulated)
+      // Operator unregisters — should invalidate all pending intents
+      vm.prank(operator);
+      transfers.unregisterOperator();
+      // Payer tries to use the intent
+      try transfers.transferNative{value: 1 ether}(intentSignedByOperator) {
+          t(false, "T-AC-02: transfer succeeded after operator unregistered");
+      } catch {}
+      // Invariant: unregistered operator's intents MUST revert
+    priority: low
+
+  - id: T-AC-03
+    title: "subsidizedTransferToken allows ANY relayer — front-running permit to grief token owner"
+    target_function: "Transfers.subsidizedTransferToken(TransferIntent, EIP2612SignatureTransferData)"
+    severity: Medium
+    tier: 1
+    type: property
+    confidence: 70
+    validated: true
+    description: |
+      subsidizedTransferToken uses _signatureTransferData.owner as the sender (not msg.sender).
+      The validIntent modifier is called with _signatureTransferData.owner as sender, meaning
+      the intent signature binds the owner address but NOT the relayer. Any address can call
+      this function and relay the payment on behalf of the owner.
+
+      The EIP-2612 permit call sets allowance for address(this) from owner. If the permit
+      signature is a one-time nonce-based permit, a malicious relayer could front-run the
+      legitimate relayer, causing the legitimate relayer's tx to revert (nonce consumed).
+
+      More critically: if the owner also planned to call transferTokenPreApproved directly
+      (without a relayer), the relayer could front-run by calling subsidizedTransferToken,
+      consuming the permit signature and executing the transfer before the owner intended.
+    attack_scenario: |
+      1. Owner signs EIP-2612 permit + operator signs intent for payment
+      2. Owner shares permit sig with trusted relayer R1
+      3. Malicious actor R2 intercepts or discovers the permit sig (e.g., from mempool)
+      4. R2 calls subsidizedTransferToken with the same intent + permit sig
+      5. Transfer executes — owner's funds are moved and permit nonce consumed
+      6. R1's legitimate relay tx reverts (permit nonce already used)
+      7. While funds went to correct recipient, owner lost control of timing
+    solidity: |
+      // Any address can be the relayer
+      address relayer1 = address(0xBEEF);
+      address relayer2 = address(0xDEAD);
+      // Both relayers try to submit the same subsidized transfer
+      vm.prank(relayer1);
+      transfers.subsidizedTransferToken(intent, sigData);
+      // Second relayer should fail (permit consumed)
+      vm.prank(relayer2);
+      try transfers.subsidizedTransferToken(intent, sigData) {
+          t(false, "T-AC-03: same subsidized transfer executed twice");
+      } catch {}
+    priority: high
+
+  - id: T-AC-04
+    title: "Owner can set sweeper who can drain all contract funds — no timelock or multisig"
+    target_function: "Sweepable.setSweeper(address) + sweepETH/sweepToken"
+    severity: Medium
+    tier: 2
+    type: property
+    confidence: 80
+    validated: true
+    description: |
+      The owner can set ANY address as sweeper via setSweeper(). The sweeper can then
+      immediately call sweepETH/sweepToken to drain ALL funds from the contract.
+      There is no timelock, no multisig requirement, no delay. If the owner key is
+      compromised, an attacker can set sweeper and drain everything in one block.
+
+      While the contract shouldn't hold funds long-term (it's a pass-through), during
+      swap operations (swapAndTransfer*) there is a brief window where tokens are held
+      by the contract before being forwarded to Uniswap. Additionally, any stuck funds
+      (from failed transfers or accumulated dust) are sweepable.
+    attack_scenario: |
+      1. Owner's private key compromised
+      2. Attacker calls setSweeper(attackerAddress)
+      3. Attacker calls sweepETH(attackerWallet) — drains all ETH
+      4. Attacker calls sweepToken(USDC, attackerWallet) — drains all tokens
+      5. All stuck funds lost. No recovery mechanism.
+    solidity: |
+      // Owner sets sweeper
+      vm.prank(owner);
+      transfers.setSweeper(attacker);
+      // Sweeper drains everything
+      uint256 ethBal = address(transfers).balance;
+      vm.prank(attacker);
+      if (ethBal > 0) {
+          transfers.sweepETH(payable(attacker));
+      }
+      // Verify funds moved
+      eq(address(transfers).balance, 0, "T-AC-04: contract still has ETH after sweep");
+    priority: medium
+
+  - id: T-AC-05
+    title: "Operator can re-register with different feeDestination — redirects fees from pending intents"
+    target_function: "Transfers.registerOperatorWithFeeDestination(address)"
+    severity: Medium
+    tier: 1
+    type: property
+    confidence: 75
+    validated: true
+    description: |
+      feeDestinations mapping is mutable — an operator can call registerOperatorWithFeeDestination()
+      multiple times, overwriting their feeDestination. The TransferIntent struct includes the
+      operator address, and the intent signature binds the operator. But the feeDestination is
+      looked up from storage at execution time, NOT from the intent.
+
+      This means: operator signs intent with feeDestination=A in mind, then changes feeDestination
+      to B before the payer executes. The fees go to B, not A. If the operator and merchant
+      agreed on a specific fee destination, the operator can redirect fees.
+
+      More critically: if the operator's key is compromised, the attacker can change the
+      feeDestination to their own address and collect all fees from ALL pending intents.
+    attack_scenario: |
+      1. Operator registers with feeDestination = merchantFeeWallet
+      2. Operator signs 100 payment intents, distributes to merchants
+      3. Operator's key compromised (or operator goes rogue)
+      4. Attacker calls registerOperatorWithFeeDestination(attackerWallet)
+      5. All 100 pending intents still execute (signature is valid, operator is registered)
+      6. But fees (feeAmount for each intent) go to attackerWallet instead of merchantFeeWallet
+      7. recipientAmount still goes to correct recipient — only fees are stolen
+    solidity: |
+      // Operator registers with legitimate fee destination
+      vm.prank(operator);
+      transfers.registerOperatorWithFeeDestination(legitimateFeeWallet);
+      // Operator signs intent (feeAmount = 100 USDC)
+      // Operator changes fee destination
+      vm.prank(operator);
+      transfers.registerOperatorWithFeeDestination(attackerWallet);
+      // Payer executes intent — fees go to attackerWallet
+      uint256 attackerBefore = token.balanceOf(attackerWallet);
+      vm.prank(payer);
+      transfers.transferTokenPreApproved(intent);
+      uint256 attackerAfter = token.balanceOf(attackerWallet);
+      // Fees were redirected
+      eq(attackerAfter - attackerBefore, intent.feeAmount, "T-AC-05: fees redirected to new destination");
+    priority: high
+
+  - id: T-AC-06
+    title: "No owner control over operator registration — malicious operators cannot be blocked"
+    target_function: "Transfers.registerOperator() / registerOperatorWithFeeDestination()"
+    severity: Low
+    tier: 2
+    type: property
+    confidence: 70
+    validated: true
+    description: |
+      The contract owner (Coinbase) has NO ability to block or blacklist operators.
+      registerOperator() is fully permissionless. If a malicious operator signs intents
+      with harmful parameters (e.g., extremely high feeAmount relative to recipientAmount),
+      the owner cannot prevent those intents from being executed.
+
+      However, the operator must sign the intent which includes all amounts, and the payer
+      must consent by submitting the transaction. So the practical attack surface is limited
+      to social engineering scenarios.
+    attack_scenario: |
+      1. Malicious actor registers as operator
+      2. Creates intents with feeAmount = 99% of total, recipientAmount = 1%
+      3. Tricks users into paying via phishing website that uses this contract
+      4. Contract owner cannot block this operator — no blacklist mechanism
+      5. Owner can only pause() the ENTIRE contract, affecting all legitimate operators
+    solidity: |
+      // Anyone can register
+      vm.prank(maliciousActor);
+      transfers.registerOperator();
+      // Owner cannot unregister them
+      // Only the operator themselves can call unregisterOperator
+      vm.prank(owner);
+      // No function exists to remove another operator
+      // The only recourse is pause() which blocks everyone
+    priority: low
+
+  - id: T-AC-07
+    title: "Custom signature prefix enables non-standard signature schemes — potential cross-contract replay"
+    target_function: "Transfers.validIntent modifier (L97-103)"
+    severity: Medium
+    tier: 1
+    type: property
+    confidence: 60
+    validated: false
+    description: |
+      The validIntent modifier allows intents with a custom prefix (intent.prefix.length > 0).
+      Instead of using ECDSA.toEthSignedMessageHash (which prepends "\x19Ethereum Signed Message:\n32"),
+      it uses keccak256(abi.encodePacked(_intent.prefix, hash)).
+
+      If two different Transfers contract deployments are on the same chain, and an operator
+      signs an intent with a custom prefix, the intent includes address(this) in the hash,
+      so cross-contract replay is prevented. However, the custom prefix opens a theoretical
+      vector: if the prefix is crafted to produce a hash collision with a different message
+      format, it could enable signature reuse from other signing contexts.
+
+      The prefix is fully operator-controlled (they sign the intent), so this is mainly
+      a concern if the operator's signing infrastructure is compromised.
+    attack_scenario: |
+      1. Operator uses custom prefix for their signing infrastructure
+      2. Attacker finds that operator signed a message in another context with same hash
+      3. If prefix can be crafted such that keccak256(prefix, hash) = keccak256(otherContext, otherHash)
+      4. Attacker constructs a valid intent using the operator's other-context signature
+      5. Extremely unlikely due to keccak256 collision resistance, but the design opens the surface
+    solidity: |
+      // With default prefix — uses EIP-191
+      TransferIntent memory intentDefault;
+      intentDefault.prefix = "";
+      // Signature verification uses toEthSignedMessageHash
+
+      // With custom prefix — attacker-controlled hash construction
+      TransferIntent memory intentCustom;
+      intentCustom.prefix = hex"1234";
+      // keccak256(abi.encodePacked(hex"1234", hash))
+      // Verify both paths lead to correct signer recovery
+      // Invariant: custom prefix must NOT allow replaying signatures from other contexts
+    priority: medium
+
+  - id: T-AC-08
+    title: "processedTransferIntents is per-operator — intent ID reuse across operators"
+    target_function: "Transfers.validIntent modifier (L119-121)"
+    severity: Info
+    tier: 3
+    type: property
+    confidence: 90
+    validated: true
+    description: |
+      processedTransferIntents is keyed as mapping(operator => mapping(id => bool)).
+      The same intent ID (bytes16) can be used by different operators without conflict.
+      This is by design but worth documenting: if a merchant works with multiple operators
+      and uses the same payment ID for tracking, the ID will NOT be marked as processed
+      across operators. However, since the signature includes the operator address, the
+      same intent cannot be replayed with a different operator — this is safe.
+    attack_scenario: |
+      Not a vulnerability. The signature binding prevents cross-operator replay.
+      The intent hash includes: operator, sender, address(this), chainid — all bound.
+    solidity: |
+      // Operator A processes intent with id=0x01
+      vm.prank(payer);
+      transfers.transferNative{value: 1 ether}(intentOperatorA);
+      // Operator B can still use id=0x01 — independent namespace
+      // This is safe because the signature binds the operator
+      vm.prank(payer);
+      transfers.transferNative{value: 1 ether}(intentOperatorB);
+      // Both succeed — independent processing maps
+    priority: low
+
+false_positives:
+  - id: T-FP-01
+    title: "subsidizedTransferToken any-relayer is by design"
+    reason: |
+      The gasless/meta-tx pattern intentionally allows any relayer. The owner's funds
+      are only moved per the signed intent (bound to owner address). The relayer
+      cannot change the destination or amounts. Front-running is a minor grief, not theft.
+
+  - id: T-FP-02
+    title: "Operator self-registration is by design — not a missing modifier"
+    reason: |
+      The permissionless operator model is intentional for commerce-payments. Operators
+      prove their identity through intent signatures, not through registration access control.
+      The contract verifies operator signatures on every transfer, so rogue operators cannot
+      force unauthorized transfers.
+
+  - id: T-FP-03
+    title: "Replay protection is comprehensive"
+    reason: |
+      Intent hash includes: recipientAmount, deadline, recipient, recipientCurrency,
+      refundDestination, feeAmount, id, operator, block.chainid, sender, address(this).
+      Cross-chain, cross-contract, cross-sender, and cross-operator replay all prevented.
+      processedTransferIntents prevents same-intent replay.

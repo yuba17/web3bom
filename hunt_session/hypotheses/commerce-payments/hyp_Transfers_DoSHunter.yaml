@@ -1,0 +1,404 @@
+# DoSHunter Analysis — Transfers.sol
+# Contract: commerce-payments/contracts/transfers/Transfers.sol
+# Focus: denial of service, gas griefing, revert-based DoS, blocked payments, resource exhaustion
+# Analyst: DoSHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: TR-DOS-01
+    title: "Reverting recipient contract blocks native currency payments permanently"
+    description: |
+      En transferNative() y unwrapAndTransfer*(), los fondos nativos se envían al recipient vía
+      sendNative() (L762) que usa `payable(destination).call{value: amount}("")`. Si el recipient
+      es un contrato que revierte en receive()/fallback(), TODA la transacción revierte. El intent
+      ya fue firmado por el operador con ese recipient fijo — no se puede cambiar. El pago queda
+      permanentemente bloqueado porque el intent ID no puede re-usarse (processedTransferIntents
+      no se marca en caso de revert) PERO el recipient tampoco puede cambiar sin nueva firma.
+
+      Impacto: El merchant (recipient) que deploya un contrato sin receive() o que revierte
+      nunca puede recibir pagos nativos. Si el operador firmó intents para ese recipient,
+      los pagadores no pueden completar esos pagos. Los fondos del pagador no se pierden (tx revierte)
+      pero el servicio/producto no se entrega.
+    confidence: 85
+    severity: medium
+    status: active
+    attack_scenario: |
+      1. Merchant configura recipient como un contrato (multisig, vault, etc.) sin receive() payable
+      2. Operador firma TransferIntent con recipientCurrency = NATIVE_CURRENCY
+      3. Pagador llama transferNative() con el ETH correcto
+      4. transferFundsToDestinations() → sendNative(recipient, amount, false) → .call{value}("")
+      5. Recipient contrato revierte → NativeTransferFailed → TODA la tx revierte
+      6. El pago nunca se completa. No hay fallback a wrapped token.
+
+      Variante griefing: Un atacante no puede elegir el recipient (lo firma el operador), pero si
+      el operador firma intents para un recipient que LUEGO se convierte en un contrato que revierte
+      (via CREATE2 redeploy o proxy upgrade), todos los intents pendientes quedan bloqueados.
+    solidity: |
+      // Invariant: native payment to reverting contract is blocked
+      function property_TR_DOS_01() public {
+          // Deploy a contract that reverts on receive
+          RevertOnReceive blocker = new RevertOnReceive();
+          // Create intent with blocker as recipient, native currency
+          TransferIntent memory intent = _createNativeIntent(address(blocker), 1 ether, 0);
+          // Sign with operator
+          _signIntent(intent);
+          // Attempt payment
+          try transfers.transferNative{value: 1 ether}(intent) {
+              t(false, "TR-DOS-01: payment to reverting recipient should fail");
+          } catch {
+              // Expected: payment blocked. No fallback mechanism exists.
+              // This IS a DoS — merchant can never receive native payments
+          }
+      }
+
+  - id: TR-DOS-02
+    title: "Reverting feeDestination blocks ALL payments for an operator"
+    description: |
+      En transferFundsToDestinations() L726, si feeAmount > 0 y recipientCurrency == NATIVE_CURRENCY,
+      se llama sendNative(feeDestinations[_intent.operator], feeAmount, false). Si el feeDestination
+      es un contrato que revierte, TODOS los pagos nativos con fee > 0 para ese operador quedan bloqueados.
+
+      A diferencia del recipient (que varía por intent), el feeDestination es GLOBAL para el operador.
+      Si el operador registró un feeDestination problemático, TODOS sus intents nativos fallan.
+
+      El operador puede arreglarlo llamando registerOperatorWithFeeDestination() con una nueva dirección,
+      pero los intents ya firmados con la firma vieja seguirán fallando si el operador cambió de dirección
+      (la firma incluye el operator address, no el feeDestination).
+    confidence: 80
+    severity: medium
+    status: active
+    attack_scenario: |
+      1. Operador llama registerOperatorWithFeeDestination(contractoMalicioso)
+      2. contractoMalicioso tiene receive() que revierte
+      3. Cualquier transferNative/unwrapAndTransfer con feeAmount > 0 para este operador revierte
+      4. El operador puede cambiar feeDestination, pero si es un error (no malicioso), puede pasar
+         tiempo antes de detectarlo, bloqueando todos los pagos nativos en ese período
+
+      Nota: El operador se hace DoS a sí mismo. No es un ataque externo directo. Pero si el
+      feeDestination es un multisig que se upgradea/destruye, el DoS es involuntario y afecta
+      a todos los pagadores de ese operador.
+    solidity: |
+      function property_TR_DOS_02() public {
+          RevertOnReceive blocker = new RevertOnReceive();
+          // Operator registers reverting fee destination
+          vm.prank(operator);
+          transfers.registerOperatorWithFeeDestination(address(blocker));
+          // Create intent with fee
+          TransferIntent memory intent = _createNativeIntent(recipient, 1 ether, 0.01 ether);
+          _signIntent(intent);
+          try transfers.transferNative{value: 1.01 ether}(intent) {
+              t(false, "TR-DOS-02: payment should fail with reverting feeDestination");
+          } catch {
+              // Confirmed: ALL native payments for this operator are blocked
+          }
+      }
+
+  - id: TR-DOS-03
+    title: "Operator front-run unregister griefs in-flight payments"
+    description: |
+      El modifier operatorIsRegistered (L128-132) verifica que feeDestinations[_intent.operator] != address(0).
+      Un operador puede llamar unregisterOperator() (L794) en cualquier momento, eliminando su feeDestination.
+
+      Si un pagador tiene un intent firmado válido y el operador llama unregisterOperator() justo antes
+      de que el pagador ejecute su tx, la tx del pagador revierte con OperatorNotRegistered().
+
+      El operador controla sus propias firmas, así que normalmente no haría esto intencionalmente.
+      PERO: si el operador key se compromete, el dueño legítimo querría unregister para invalidar
+      intents pendientes. Esto es un feature, no un bug. Sin embargo, un operador malicioso podría
+      firmar intents, cobrar el servicio off-chain, y luego unregister para que el pago on-chain nunca
+      se complete — grief al pagador que pierde gas.
+    confidence: 60
+    severity: low
+    status: active
+    attack_scenario: |
+      1. Operador firma intent para pagador (cobro de $100 por servicio)
+      2. Pagador envía tx con el intent firmado
+      3. Operador ve la tx en mempool, front-runs con unregisterOperator()
+      4. La tx del pagador revierte — OperatorNotRegistered()
+      5. Operador re-registra inmediatamente, puede repetir el grief
+      6. Pagador pierde gas cada vez. Servicio nunca se paga on-chain.
+    solidity: |
+      function property_TR_DOS_03() public {
+          // Operator unregisters
+          vm.prank(operator);
+          transfers.unregisterOperator();
+          // Payment with valid signed intent should fail
+          TransferIntent memory intent = _createNativeIntent(recipient, 1 ether, 0);
+          _signIntent(intent);
+          try transfers.transferNative{value: 1 ether}(intent) {
+              t(false, "TR-DOS-03: should revert after operator unregister");
+          } catch (bytes memory reason) {
+              // Confirm it's OperatorNotRegistered
+              // This is a griefing vector if operator is malicious
+          }
+      }
+
+  - id: TR-DOS-04
+    title: "Uniswap swap failure blocks swap-based payments with no fallback"
+    description: |
+      En swapTokens() L667, el swap a Uniswap se ejecuta con try/catch. Si el swap falla
+      (slippage, pool inexistente, liquidez insuficiente, pool manipulado), se revert con
+      SwapFailedString o SwapFailedBytes. NO hay fallback: el pago se cancela completamente.
+
+      Un atacante podría manipular el pool de Uniswap justo antes de la tx del pagador
+      (sandwich attack) para causar que el swap falle. El pagador pierde gas, el pago no
+      se completa. El atacante puede repetir esto indefinidamente si monitorea el mempool.
+
+      Además, si el poolFeesTier especificado no corresponde a un pool existente, el swap
+      siempre fallará. Esto es un parámetro del pagador, no del intent, así que un pagador
+      informado puede corregirlo, pero la UX es mala.
+    confidence: 70
+    severity: low
+    status: active
+    attack_scenario: |
+      1. Pagador quiere pagar con ETH, merchant quiere USDC
+      2. Pagador llama swapAndTransferUniswapV3Native con 1 ETH
+      3. Atacante front-runs: drena liquidez del pool WETH/USDC en ese fee tier
+      4. Swap falla → SwapFailedString("V3TooLittleReceived") → tx revierte
+      5. Atacante restaura liquidez. Pagador pierde gas.
+      6. Si el atacante repite, el pagador nunca puede completar el pago vía swap
+
+      Mitigación natural: pagador puede usar un fee tier diferente o hacer la swap
+      manualmente y luego usar transferToken. No es un bloqueo permanente, pero sí griefing.
+    solidity: |
+      function property_TR_DOS_04() public {
+          // Simulate swap failure by manipulating pool
+          // In fork test: drain Uniswap pool liquidity
+          TransferIntent memory intent = _createTokenIntent(recipient, 1000e6, 10e6, USDC);
+          _signIntent(intent);
+          uint256 gasBefore = gasleft();
+          try transfers.swapAndTransferUniswapV3Native{value: 2 ether}(intent, 3000) {
+              // Swap succeeded — no DoS
+          } catch {
+              uint256 gasUsed = gasBefore - gasleft();
+              // Confirm: payment blocked, gas wasted
+              // This is griefing if swap can be manipulated
+              t(gasUsed < 500_000, "TR-DOS-04: swap failure wastes excessive gas");
+          }
+      }
+
+  - id: TR-DOS-05
+    title: "Returnbomb via malicious recipient on native transfer"
+    description: |
+      sendNative() (L762) usa `payable(destination).call{value: amount}("")` y captura el
+      return data en `bytes memory data`. Si el destination es un contrato malicioso que retorna
+      datos enormes (ej: 2MB) en su receive()/fallback(), el gas del caller se consume copiando
+      esos datos a memory. Esto es el ataque "returnbomb".
+
+      Sin embargo, en este contrato, `data` solo se usa en el revert (L764). Si el call
+      TIENE éxito (success == true), `data` se captura pero no se usa — el gas ya se consumió
+      en la copia a memory. Si el call FALLA, el data se pasa al revert.
+
+      El impacto real depende de cuánto gas queda cuando se llama sendNative. Como sendNative
+      se llama dentro de transferFundsToDestinations, que a su vez se llama dentro de funciones
+      con nonReentrant, el gas forwarded al .call es todo el gas restante menos reservas de EVM.
+      Un returnbomb podría consumir todo el gas restante, causando un OOG en la tx del pagador.
+    confidence: 55
+    severity: low
+    status: active
+    attack_scenario: |
+      1. Merchant configura recipient como contrato con fallback() que retorna 50KB+ de datos
+      2. Pagador llama transferNative() con gas normal (~300K)
+      3. sendNative() hace .call{value}("") al recipient
+      4. Recipient retorna datos enormes → gas se consume copiando bytes memory data
+      5. Si success == true: el gas se desperdició pero la tx podría completar si hay suficiente
+      6. Si success == false: el revert incluye esos datos enormes, amplificando el gas waste
+
+      Nota: El recipient elegido en el intent es firmado por el operador, no por un atacante
+      externo. El operador tendría que ser cómplice o el recipient tendría que ser comprometido.
+      Confidence bajo porque el vector requiere recipient malicioso que el operador aprobó.
+    solidity: |
+      function property_TR_DOS_05() public {
+          // Deploy returnbomb contract
+          ReturnBomb bomb = new ReturnBomb(50000); // returns 50KB
+          TransferIntent memory intent = _createNativeIntent(address(bomb), 1 ether, 0);
+          _signIntent(intent);
+          uint256 gasBefore = gasleft();
+          try transfers.transferNative{value: 1 ether, gas: 300_000}(intent) {
+              uint256 gasUsed = gasBefore - gasleft();
+              // If it succeeds, check gas consumption
+              t(gasUsed < 200_000, "TR-DOS-05: returnbomb wastes excessive gas");
+          } catch {
+              // OOG or revert — returnbomb effective
+              t(false, "TR-DOS-05: returnbomb caused tx failure");
+          }
+      }
+
+  - id: TR-DOS-06
+    title: "Blocklisted token (USDC/USDT) blocks payment permanently"
+    description: |
+      Si el recipientCurrency es un token con blocklist (USDC, USDT) y el recipient o
+      feeDestination está en la blocklist, safeTransfer revierte y el pago se bloquea.
+
+      En transferFundsToDestinations() L731: requestedCurrency.safeTransfer(_intent.recipient, amount)
+      Si el recipient fue añadido a la blocklist de USDC después de que el operador firmó el intent,
+      el pago ya no puede completarse. El intent ID no se puede reusar porque la tx completa revierte
+      (processedTransferIntents no se marca).
+
+      Mismo problema en L734 para feeDestination.
+    confidence: 75
+    severity: medium
+    status: active
+    attack_scenario: |
+      1. Operador firma intent: pagar 1000 USDC al merchant (recipient)
+      2. Circle (issuer de USDC) blocklists la dirección del merchant
+      3. Pagador llama transferTokenPreApproved() con el intent
+      4. transferFundsToDestinations() → safeTransfer al recipient → USDC.transfer revierte
+      5. Pago bloqueado. El pagador no puede completar la compra.
+      6. No hay mecanismo para que el operador emita un nuevo intent con recipient diferente
+         usando el mismo ID (el ID está en la firma).
+
+      Nota: Esto es un riesgo inherente a tokens con blocklist. No es un bug del contrato
+      per se, pero el contrato no ofrece ningún mecanismo de recovery (ej: enviar a escrow,
+      permitir al operador redirigir fondos, etc.)
+    solidity: |
+      function property_TR_DOS_06() public {
+          // Fork test: use real USDC with blocklist
+          address blockedRecipient = makeAddr("blocked");
+          // Simulate USDC blocklisting
+          vm.prank(USDC_ADMIN);
+          IUSDC(USDC).blacklist(blockedRecipient);
+          TransferIntent memory intent = _createTokenIntent(blockedRecipient, 1000e6, 10e6, USDC);
+          _signIntent(intent);
+          // Approve and attempt payment
+          vm.prank(payer);
+          IERC20(USDC).approve(address(transfers), 1010e6);
+          try transfers.transferTokenPreApproved(intent) {
+              t(false, "TR-DOS-06: should fail for blocklisted recipient");
+          } catch {
+              // Confirmed: blocklisted recipient permanently blocks payment
+          }
+      }
+
+  - id: TR-DOS-07
+    title: "Pause/unpause es seguro — owner-only, no bloquea fondos existentes"
+    description: |
+      pause() y unpause() son onlyOwner (L801-808). El modifier whenNotPaused está en todas
+      las funciones de pago. Cuando se pausa, ningún pago nuevo puede procesarse.
+
+      Esto es safe porque: (1) el contrato no retiene fondos entre transacciones (los fondos
+      se transfieren en la misma tx), (2) unpause() existe y es funcional, (3) solo owner puede
+      pausar/despausar.
+
+      No hay fondos atrapados por el pause porque el contrato no tiene balances persistentes
+      de usuarios. El peor caso es que los pagos se retrasen hasta que se despause.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Owner pausa el contrato. Todos los pagos nuevos reviertan con "Pausable: paused".
+      Los intents firmados que no se procesaron siguen siendo válidos (si no expiran) y pueden
+      ejecutarse después de unpause. No hay pérdida de fondos.
+    solidity: |
+      function property_TR_DOS_07() public view returns (bool) {
+          // Pause mechanism is owner-only and doesn't trap funds
+          // Contract doesn't hold user balances persistently
+          return true;
+      }
+
+  - id: TR-DOS-08
+    title: "processedTransferIntents crece sin límite pero no causa gas DoS"
+    description: |
+      El mapping processedTransferIntents (L37) crece con cada pago procesado y nunca se limpia.
+      Sin embargo, como es un mapping (no array), el acceso es O(1) y no hay iteración.
+      No hay función que itere sobre los intents procesados.
+
+      Storage bloat sí existe (cada intent = 1 SSTORE de 32 bytes = 20K gas first time),
+      pero no afecta la funcionalidad. No es un vector de DoS.
+    confidence: 95
+    severity: informational
+    status: safe
+    attack_scenario: |
+      No hay ataque viable. El mapping crece pero el acceso es O(1).
+      No hay función que itere sobre processedTransferIntents.
+    solidity: |
+      function property_TR_DOS_08() public view returns (bool) {
+          // Mapping access is O(1), no iteration, no gas DoS
+          return true;
+      }
+
+  - id: TR-DOS-09
+    title: "subsidizedTransferToken — relayer paga gas, payer no pierde gas en DoS"
+    description: |
+      En subsidizedTransferToken() (L505), el msg.sender es el relayer, no el payer.
+      El payer solo firma un EIP-2612 permit. Si la tx revierte (por cualquiera de los
+      vectores anteriores), es el relayer quien pierde gas, no el payer.
+
+      Sin embargo, si un atacante grief-ea repetidamente las txs del relayer (manipulando
+      pool, blocklisting, etc.), el relayer podría dejar de servir ese intent, bloqueando
+      el pago subsidiado. El payer tendría que usar otro método de pago.
+
+      El permit firmado tiene deadline = intent.deadline, así que eventualmente expira.
+      No hay fondos atrapados.
+    confidence: 85
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Relayer envía subsidizedTransferToken para payer. Si recipient está blocklisted o revierte,
+      el relayer pierde gas. Si esto se repite, el relayer deja de servir ese intent.
+      El payer puede usar transferTokenPreApproved directamente (pagando su propio gas).
+    solidity: |
+      function property_TR_DOS_09() public view returns (bool) {
+          // subsidizedTransferToken: relayer bears gas cost, not payer
+          // DoS on relayer doesn't trap payer's funds
+          return true;
+      }
+
+  - id: TR-DOS-10
+    title: "Sweepable permite recovery de tokens atrapados — no hay fondos permanentemente bloqueados"
+    description: |
+      El contrato hereda Sweepable, que presumiblemente permite al owner recuperar tokens
+      o ETH atrapados en el contrato. Esto mitiga el riesgo de fondos permanentemente bloqueados
+      en caso de un bug o edge case que deje fondos en el contrato.
+
+      Verificar que sweep funciona para ETH nativo también (el receive() solo acepta WETH).
+    confidence: 75
+    severity: informational
+    status: safe
+    attack_scenario: |
+      Si por algún edge case quedan tokens en el contrato (ej: swap deja residuo),
+      el owner puede usar sweep para recuperarlos. No hay fondos permanentemente atrapados.
+    solidity: |
+      function property_TR_DOS_10() public view returns (bool) {
+          // Sweepable provides recovery mechanism for trapped funds
+          // Verify sweep works for both ERC20 and native
+          return true;
+      }
+
+false_positives:
+  - id: TR-DOS-FP-01
+    description: |
+      "reentrancy en sendNative" — No es viable. nonReentrant modifier protege todas las
+      funciones públicas. El .call{value} en sendNative puede invocar receive() del recipient,
+      pero nonReentrant bloquea re-entrada a cualquier función de Transfers.
+    lesson: "nonReentrant + no estado mutable post-call = safe contra reentrancy"
+
+  - id: TR-DOS-FP-02
+    description: |
+      "exactValueSent overflow en recipientAmount + feeAmount" — Solidity 0.8+ tiene
+      checked arithmetic. Si recipientAmount + feeAmount overflow, revierte con panic.
+      No es un DoS explotable — el operador firmó esos amounts, son pre-validados off-chain.
+    lesson: "Checked arithmetic en 0.8+ previene overflow silencioso"
+
+summary:
+  total_hypotheses: 10
+  active:
+    - TR-DOS-01 — Reverting recipient blocks native payments (Medium, 85%)
+    - TR-DOS-02 — Reverting feeDestination blocks ALL operator payments (Medium, 80%)
+    - TR-DOS-03 — Operator front-run unregister griefs payments (Low, 60%)
+    - TR-DOS-04 — Uniswap swap failure with no fallback (Low, 70%)
+    - TR-DOS-05 — Returnbomb via malicious recipient (Low, 55%)
+    - TR-DOS-06 — Blocklisted token blocks payment permanently (Medium, 75%)
+  safe:
+    - TR-DOS-07 — Pause/unpause is safe, no trapped funds
+    - TR-DOS-08 — processedTransferIntents mapping is O(1), no gas DoS
+    - TR-DOS-09 — subsidizedTransferToken relayer absorbs gas, payer safe
+    - TR-DOS-10 — Sweepable provides fund recovery
+  key_insight: |
+    El patrón más peligroso es sendNative() L762 con .call{value} a recipient/feeDestination
+    que puede revertir. Como el contrato no ofrece fallback (ej: escrowed payment, wrapped token
+    alternative), los pagos nativos son vulnerables a DoS por reverting recipients. Los pagos
+    ERC20 tienen el riesgo análogo con tokens blocklisted (USDC/USDT). La mitigación natural es
+    que el operador controla qué recipients aparecen en los intents firmados, pero no controla
+    si un recipient se vuelve problemático después de firmar.

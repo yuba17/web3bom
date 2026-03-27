@@ -1,0 +1,408 @@
+hunter: OracleHunter
+component: Flywheel
+date: "2026-03-27"
+hypotheses:
+
+  - id: OH-FW-01
+    title: "CashbackRewards: refund after allocation inflates max reward cap via stale refundableAmount"
+    description: |
+      CashbackRewards._validatePaymentReward reads ESCROW.paymentState() to get refundableAmount,
+      which is used as `paymentAmount` for SEND/DISTRIBUTE operations to compute the max allowed reward
+      (line 324: `uint120 paymentAmount = refundableAmount`). If a partial refund occurs in the escrow
+      AFTER a reward was allocated but BEFORE distribution, the refundableAmount decreases. This means
+      the max reward percentage check becomes stricter, potentially blocking a legitimate distribution.
+
+      However the inverse is more interesting: during ALLOCATE, both capturableAmount AND refundableAmount
+      are summed (line 329: `paymentAmount += capturableAmount`). If the escrow captures funds between
+      allocate and distribute calls, capturableAmount drops to 0 and refundableAmount increases by the
+      same amount. The net paymentAmount used for max reward check stays roughly the same for the full
+      lifecycle. But a PARTIAL capture followed by a PARTIAL refund reduces the total, meaning previously
+      allocated rewards could exceed the max percentage at distribution time -- but _validatePaymentReward
+      at DISTRIBUTE time does NOT re-check the max percentage (line 241-246 only checks allocated >= amount).
+
+      Wait -- re-reading: for DISTRIBUTE, the code at line 316 returns early before the percentage check
+      only for DEALLOCATE. For SEND and DISTRIBUTE, the percentage check IS executed (lines 320-343).
+      So if refundableAmount shrinks after allocation, the maxAllowedRewardAmount shrinks, and the
+      distribution of the previously allocated amount could revert with RewardExceedsMaxPercentage.
+
+      This means: allocate reward -> partial refund in escrow -> distribute reverts. Funds locked.
+    severity: medium
+    confidence: 65
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward (lines 292-345)"
+      - "CashbackRewards._onDistribute (lines 219-261)"
+    attack_scenario: |
+      1. Buyer makes payment of 100 USDC, fully captured (refundableAmount=100, capturableAmount=0)
+      2. Campaign manager allocates 10 USDC reward (10% of 100) with maxRewardBasisPoints=1000 (10%)
+      3. Operator issues partial refund of 50 USDC via escrow (refundableAmount=50)
+      4. Manager tries to distribute the 10 USDC reward
+      5. _validatePaymentReward computes: maxAllowedRewardAmount = 50 * 1000 / 10000 = 5
+      6. totalRewardAmount = 0 (distributed) + 10 (amount) = 10 > 5 -> RewardExceedsMaxPercentage
+      7. Distribution reverts. The 10 USDC remains allocated in Flywheel but cannot be distributed.
+      8. Manager must deallocate to recover, but funds were already reserved from campaign balance.
+    solidity_invariant: |
+      // INV: allocated rewards must always be distributable (no stuck allocations)
+      // After allocate succeeds, distribute with same amount must not revert due to percentage check
+      function invariant_allocated_rewards_distributable(
+          address campaign, bytes32 paymentHash, uint120 allocatedAmount
+      ) external view {
+          (uint120 allocated, ) = cashbackRewards.rewards(campaign, paymentHash);
+          // If there's an allocation, verify the current payment state still allows distribution
+          if (allocated > 0) {
+              (, , uint120 refundableAmount) = escrow.paymentState(paymentHash);
+              uint256 maxBps = cashbackRewards.maxRewardBasisPoints(campaign);
+              if (maxBps > 0) {
+                  uint120 maxReward = uint120(refundableAmount * maxBps / 10000);
+                  // This can be violated after partial refund
+                  assert(allocated <= maxReward);
+              }
+          }
+      }
+
+  - id: OH-FW-02
+    title: "CashbackRewards: escrow paymentState is a point-in-time read -- no locking between allocate and distribute"
+    description: |
+      The escrow's paymentState() is read at the moment of each Flywheel operation (send/allocate/distribute).
+      Between allocate() and distribute(), the escrow state can change arbitrarily (captures, refunds).
+      There is no lock or commitment to the payment state at allocation time. This is a TOCTOU pattern.
+
+      Specifically for ALLOCATE: paymentAmount = refundableAmount + capturableAmount (full payment).
+      For DISTRIBUTE: paymentAmount = refundableAmount only (captured portion minus refunds).
+
+      If the payment is never fully captured, or if refunds happen, the distribute check uses a
+      smaller denominator than allocate, causing the percentage check to fail.
+    severity: low
+    confidence: 75
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward (lines 320-335)"
+    attack_scenario: |
+      1. Payment authorized for 100 USDC. capturableAmount=100, refundableAmount=0, hasCollectedPayment=true
+      2. Allocate: paymentAmount = 0 + 100 = 100. maxReward at 10% = 10. Allocate 10 OK.
+      3. Operator captures only 50 USDC. Now capturableAmount=50, refundableAmount=50.
+      4. Distribute: paymentAmount = 50 (refundableAmount only). maxReward = 5.
+         totalRewardAmount = 0 + 10 = 10 > 5. REVERTS.
+      5. Allocated reward is stuck until deallocated manually.
+    solidity_invariant: |
+      // INV: TOCTOU -- payment state read at allocate time must remain valid at distribute time
+      // This invariant will break if escrow state changes between allocate and distribute
+      function invariant_allocate_distribute_consistency() external {
+          // Snapshot payment state at allocate, verify it hasn't degraded at distribute
+          // (Cannot be expressed as on-chain invariant without snapshotting)
+      }
+
+  - id: OH-FW-03
+    title: "BridgeReferralFees: bridgedAmount calculation uses live balance minus only totalAllocatedFees"
+    description: |
+      In BridgeReferralFees._onSend (line 78), bridgedAmount is computed as:
+        campaign.balance (or IERC20.balanceOf) - FLYWHEEL.totalAllocatedFees(campaign, token)
+
+      This does NOT subtract totalAllocatedPayouts. If there are pending allocated payouts from
+      another hook or a previous operation, the bridgedAmount would be inflated, causing the user
+      to receive more than actually bridged.
+
+      However, BridgeReferralFees only uses `send` (not allocate/distribute), so totalAllocatedPayouts
+      should normally be 0 for this campaign. And Flywheel enforces solvency after each operation.
+
+      But: if someone directly sends tokens to the campaign address without going through `send`,
+      those tokens inflate the balance. The next `send` call would compute bridgedAmount including
+      those extra tokens. This is documented behavior ("anyone can take them") -- so this is by design.
+
+      The real risk: if fee-on-transfer tokens are used, the actual balance is less than what was sent.
+      bridgedAmount would be computed from the actual (reduced) balance, but the payout amount is
+      (bridgedAmount - feeAmount). After the payout, the solvency check would fail because the
+      campaign sent more than it actually received.
+
+      Actually no -- the solvency check is: balance >= totalAllocatedPayouts + totalAllocatedFees.
+      For send(), tokens leave the campaign, reducing balance. The solvency check verifies balance
+      is still enough for remaining allocations. Since send doesn't create allocations (only fees),
+      and if sendFeesNow=true the fees are also sent, the solvency should pass.
+
+      But with fee-on-transfer: Campaign.sendTokens calls safeTransfer. The recipient gets less
+      than `amount`. But the campaign's balance decreases by `amount` (full). So the user receives
+      less than bridgedAmount - feeAmount. Loss is on the user, not the protocol.
+    severity: low
+    confidence: 40
+    affected_functions:
+      - "BridgeReferralFees._onSend (lines 69-108)"
+      - "Flywheel._campaignTokenBalance (lines 670-672)"
+    attack_scenario: |
+      1. Fee-on-transfer token used as campaign token (2% transfer fee)
+      2. 100 tokens sent to campaign. Campaign balance = 98 (after fee).
+      3. send() called. bridgedAmount = 98 - 0 (no allocated fees) = 98.
+      4. feeAmount = safePercent(98, feeBps). User payout = 98 - feeAmount.
+      5. Campaign.sendTokens(token, user, 98 - feeAmount) -- actual received by user is less 2%.
+      6. User loses ~2% twice: once on deposit, once on withdrawal.
+    solidity_invariant: |
+      // INV: bridgedAmount calculation must account for fee-on-transfer discrepancy
+      // For standard ERC20: campaign.balanceOf(token) == actual tokens available
+      function invariant_balance_reflects_actual_tokens(address campaign, address token) external view {
+          uint256 reported = IERC20(token).balanceOf(campaign);
+          // For fee-on-transfer tokens, this may not equal tokens actually transferable
+          // No on-chain way to detect this without pre/post transfer comparison
+      }
+
+  - id: OH-FW-04
+    title: "AdConversion: publisher payoutAddress read at send-time allows TOCTOU address swap"
+    description: |
+      In AdConversion._onSend (line 456), when payoutRecipient is address(0), the code calls
+      BUILDER_CODES.payoutAddress(publisherRefCode) to resolve the payout destination. This read
+      happens at send-time. If the publisher (or whoever controls the BuilderCodes NFT) changes
+      their payoutAddress between when the attribution provider prepares the transaction and when
+      it executes, the funds go to the NEW address.
+
+      This is actually by design -- the publisher controls their own payout address. But consider:
+      if the BuilderCodes NFT is transferred (sold), the new owner can change the payoutAddress.
+      An attribution provider might intend to pay the original publisher, but the new NFT owner
+      receives the funds instead.
+
+      Severity is low because: (1) the attribution provider can set payoutRecipient explicitly
+      to avoid this, (2) this is standard NFT ownership behavior, (3) the attribution provider
+      submits the tx so they can verify the current state.
+    severity: low
+    confidence: 55
+    affected_functions:
+      - "AdConversion._onSend (lines 449-458)"
+      - "BridgeReferralFees._processBuilderCode (lines 175-191)"
+    attack_scenario: |
+      1. Publisher "alice" registers code "ALICE1" with payoutAddress = alice_wallet
+      2. Advertiser runs campaign, attribution provider attributes conversions to "ALICE1"
+      3. Alice transfers her BuilderCodes NFT to Bob (or Bob buys it)
+      4. Bob changes payoutAddress to bob_wallet
+      5. Attribution provider's pending send() transaction executes
+      6. BUILDER_CODES.payoutAddress("ALICE1") now returns bob_wallet
+      7. Bob receives the payout intended for Alice
+    solidity_invariant: |
+      // INV: payoutAddress at send time must equal payoutAddress at attribution time
+      // This cannot be enforced on-chain without snapshotting at attribution time
+      // Design choice: publisher controls their address, TOCTOU is accepted risk
+
+  - id: OH-FW-05
+    title: "BridgeReferralFees: _safePercent rounding loses up to (basisPoints - 1) wei per operation"
+    description: |
+      The _safePercent function (line 199-201) uses a split calculation to avoid overflow:
+        (amount / 1e4) * basisPoints + ((amount % 1e4) * basisPoints) / 1e4
+
+      The first term loses up to (basisPoints - 1) wei due to integer division truncation.
+      For small amounts (< 1e4) the first term is 0 and only the second term applies.
+      For MAX_FEE_BASIS_POINTS = 250, the maximum rounding loss per operation is ~249 wei.
+
+      This is dust-level and by design (safe math to prevent overflow), but it systematically
+      underpays the builder and overpays the user by a tiny amount.
+    severity: informational
+    confidence: 90
+    affected_functions:
+      - "BridgeReferralFees._safePercent (lines 199-201)"
+    attack_scenario: |
+      Not exploitable for profit. Rounding consistently favors the user over the builder by
+      at most 249 wei per operation. Over millions of operations this could accumulate but
+      is economically insignificant.
+    solidity_invariant: |
+      // INV: _safePercent always rounds down (builder never overcharged)
+      function invariant_safePercent_rounds_down(uint256 amount, uint8 bps) external pure {
+          uint256 safe = (amount / 1e4) * bps + ((amount % 1e4) * bps) / 1e4;
+          uint256 exact = (amount * bps) / 1e4;
+          // safe <= exact always (safe may lose precision from splitting)
+          assert(safe <= exact);
+      }
+
+  - id: OH-FW-06
+    title: "Flywheel: trySafeTransfer returning false for fees creates phantom allocated fees"
+    description: |
+      In Flywheel._processFees (lines 622-653), when sendFeesNow=true but the transfer fails
+      (sendSucceess=false at line 634), the code falls through to allocate the fee instead
+      (lines 643-648). This is the intended fallback behavior.
+
+      However, in Flywheel.distributeFees (lines 448-483), when a fee distribution fails
+      (success=false at line 467), the totalAmount is NOT incremented (only on success, line 470),
+      but the allocatedFee[key] is also NOT decremented. The fee remains "allocated" but the
+      distribution failed. The hook's onDistributeFees returned the distribution instruction,
+      but the actual transfer failed.
+
+      The fee remains in allocatedFee storage and totalAllocatedFees. It can be retried by
+      calling distributeFees again (the hook will return the same amount from storage). This is
+      correct behavior -- the fee is not lost, just not yet delivered.
+
+      But: if the recipient is a contract that permanently reverts (e.g., self-destructed, or
+      a contract without receive()), the fee is permanently stuck in accounting. The campaign
+      cannot withdraw those funds because solvency check requires balance >= totalAllocatedFees.
+
+      For BridgeReferralFees, if the builder's payoutAddress is a reverting contract, the fee
+      is stuck forever. The builder code owner would need to change their payoutAddress, but
+      the fallbackKey is bytes32(tokenId) -- and _onDistributeFees reads the current payoutAddress.
+      So if they fix the address, the next distributeFees call should work.
+
+      For AdConversion, the attribution provider's fee key is bytes32(bytes20(attributionProvider)).
+      If the attribution provider becomes a reverting contract, their fees are stuck. But they
+      can specify a different recipient via hookData in distributeFees.
+    severity: low
+    confidence: 70
+    affected_functions:
+      - "Flywheel._processFees (lines 622-653)"
+      - "Flywheel.distributeFees (lines 448-483)"
+      - "Campaign.sendTokens (lines 44-51)"
+    attack_scenario: |
+      1. BridgeReferralFees: builder registers code with payoutAddress = reverting contract
+      2. User bridges tokens through campaign with builder code
+      3. sendFeesNow=true, Campaign.sendTokens fails for builder fee -> fee gets allocated
+      4. totalAllocatedFees increases, reducing withdrawable balance
+      5. Builder changes payoutAddress. distributeFees called with new address via hookData.
+      6. If builder never changes address, fee is permanently stuck in accounting.
+      7. Campaign can only be finalized (for AdConversion) or funds are locked (for BridgeReferralFees
+         which is perpetual and never finalizes -- cannot even withdrawFunds without FINALIZED status).
+    solidity_invariant: |
+      // INV: allocated fees must eventually be distributable or deallocatable
+      // If a fee recipient permanently reverts, fees are stuck
+      function invariant_no_permanently_stuck_fees(
+          address campaign, address token
+      ) external view {
+          uint256 totalFees = flywheel.totalAllocatedFees(campaign, token);
+          // totalFees should be distributable or the campaign should have a way to clear them
+          // BridgeReferralFees has no deallocation mechanism for fees
+      }
+
+  - id: OH-FW-07
+    title: "BridgeReferralFees: no access control on send() allows front-running bridge deposits"
+    description: |
+      BridgeReferralFees._onSend has NO access control -- anyone can call send() on the campaign.
+      The bridgedAmount is computed from the campaign's current balance minus allocated fees.
+
+      If a bridge operator sends tokens to the campaign and then calls send() in a separate
+      transaction, an attacker can front-run the send() call with their own send() call,
+      draining the campaign balance to themselves with a different user/code.
+
+      This is explicitly documented: "If tokens are sent into the campaign outside of this scope
+      on accident, anyone can take them (no access control for onSend hook)".
+
+      The design assumes atomic deposit+send (e.g., via multicall or the bridge contract itself).
+      But if the bridge sends tokens to the campaign in one tx and calls send() in another,
+      the window exists.
+    severity: medium
+    confidence: 50
+    affected_functions:
+      - "BridgeReferralFees._onSend (lines 69-108)"
+    attack_scenario: |
+      1. Bridge deposits 100 USDC to campaign in tx1
+      2. Bridge prepares to call flywheel.send(campaign, usdc, hookData) with user=alice in tx2
+      3. Attacker sees tx2 in mempool, front-runs with their own send() call:
+         hookData = (attacker, "", 0) -- no builder code, no fee
+      4. bridgedAmount = 100 - 0 = 100. Attacker receives 100 USDC as "user" payout.
+      5. Bridge's tx2 executes. bridgedAmount = 0 - 0 = 0. User gets nothing (or reverts).
+    solidity_invariant: |
+      // INV: bridgedAmount should only be claimable by the intended recipient
+      // Without access control, this invariant cannot be enforced
+      // Design relies on atomic deposit+send pattern
+
+  - id: OH-FW-08
+    title: "CashbackRewards: hasCollectedPayment check is necessary but insufficient -- voided payments"
+    description: |
+      CashbackRewards checks hasCollectedPayment from ESCROW.paymentState(). The escrow's
+      hasCollectedPayment returns true once the payment has been authorized/charged, even if
+      it's later fully refunded.
+
+      After a full refund: hasCollectedPayment=true, capturableAmount=0, refundableAmount=0.
+
+      For SEND: paymentAmount = refundableAmount = 0. maxAllowedRewardAmount = 0.
+      If maxRewardBps > 0: any reward amount > 0 would fail RewardExceedsMaxPercentage.
+      If maxRewardBps == 0 (unlimited): the percentage check is skipped (line 321), so
+      the manager CAN send rewards for fully refunded payments on unlimited campaigns.
+
+      This means: on unlimited campaigns, rewards can be sent for payments that were fully
+      refunded. The buyer gets both the refund AND the cashback reward. Loss is to the
+      campaign funder.
+    severity: medium
+    confidence: 70
+    affected_functions:
+      - "CashbackRewards._validatePaymentReward (lines 309-313, 319-321)"
+      - "CashbackRewards._onSend (lines 102-135)"
+    attack_scenario: |
+      1. Campaign with maxRewardBasisPoints = 0 (unlimited rewards, no cap)
+      2. Buyer makes payment of 100 USDC. Payment captured.
+      3. Manager allocates 20 USDC cashback reward.
+      4. Operator fully refunds the 100 USDC payment via escrow.
+      5. Manager distributes the 20 USDC reward. hasCollectedPayment=true.
+         refundableAmount=0, but for unlimited campaigns the percentage check is skipped.
+      6. Buyer received: 100 USDC refund + 20 USDC cashback = net profit of 20 USDC.
+
+      Note: The manager is trusted and controls reward distribution. This requires a
+      malicious or negligent manager. But the escrow state should prevent rewarding
+      voided payments regardless of manager intent.
+    solidity_invariant: |
+      // INV: rewards should not be distributable for fully refunded payments
+      function invariant_no_rewards_for_refunded_payments(
+          address campaign, bytes32 paymentHash
+      ) external view {
+          (, uint120 capturableAmount, uint120 refundableAmount) = escrow.paymentState(paymentHash);
+          (uint120 allocated, uint120 distributed) = cashbackRewards.rewards(campaign, paymentHash);
+          // If payment is fully refunded (both amounts are 0), no rewards should exist
+          if (capturableAmount == 0 && refundableAmount == 0) {
+              // allocated or distributed being > 0 means rewards exist for a voided payment
+              assert(allocated == 0 && distributed == 0);
+          }
+      }
+
+  - id: OH-FW-09
+    title: "BridgeReferralFees: builder payoutAddress(tokenId) returns address(0) causes fee loss"
+    description: |
+      In _processBuilderCode (line 183), if BUILDER_CODES.payoutAddress(tokenId) returns
+      address(0), the function returns (true, key, address(0)). Then in _onSend, fees are
+      calculated and sendFeesNow=true with recipient=address(0).
+
+      Campaign.sendTokens with recipient=address(0) for ERC20: SafeERC20.trySafeTransfer
+      to address(0) will likely revert (most ERC20s reject transfer to address(0)).
+      trySafeTransfer returns false on revert. So sendFeesNow fails, fee gets allocated.
+
+      For native token: payable(address(0)).call{value: amount}("") -- this sends ETH to
+      address(0). The ETH is effectively burned. The fee is lost.
+
+      The comment says "if payoutAddress misconfigured, builder loses their fee" -- so this
+      is acknowledged behavior. But burning ETH to address(0) is permanent loss.
+    severity: low
+    confidence: 60
+    affected_functions:
+      - "BridgeReferralFees._processBuilderCode (lines 175-191)"
+      - "BridgeReferralFees._onSend (line 103)"
+      - "Campaign.sendTokens (lines 44-51)"
+    attack_scenario: |
+      1. Builder registers code but payoutAddress resolves to address(0) (NFT burned or
+         payoutAddress set to 0 in BuilderCodes)
+      2. User bridges native ETH with this builder code
+      3. sendFeesNow=true, recipient=address(0), Campaign sends ETH to address(0)
+      4. ETH is permanently burned. Fee deducted from user's bridged amount.
+      5. User receives less than expected, builder gets nothing, ETH is destroyed.
+    solidity_invariant: |
+      // INV: fee recipient must not be address(0) when sendFeesNow=true
+      function invariant_no_fee_to_zero_address(address recipient) external pure {
+          // If fees are being sent, recipient must be valid
+          assert(recipient != address(0));
+      }
+
+  - id: OH-FW-10
+    title: "Flywheel: native token balance includes gas refunds and self-destruct proceeds"
+    description: |
+      _campaignTokenBalance uses `campaign.balance` for native token. This includes:
+      1. ETH sent via receive()
+      2. ETH from selfdestruct (deprecated but still functional in some contexts)
+      3. Coinbase rewards / block rewards (if campaign address is coinbase)
+      4. Gas refunds do NOT increase account balance (they reduce tx cost)
+
+      In practice, unexpected ETH arriving at the campaign (e.g., via selfdestruct or
+      pre-deployment balance) inflates the perceived balance. For BridgeReferralFees,
+      this would inflate bridgedAmount and allow someone to claim the extra ETH.
+
+      This is low risk because: BridgeReferralFees has no access control on send (by design),
+      and extra funds are considered claimable by anyone. For other hooks like SimpleRewards,
+      the manager controls payouts so extra balance is just extra runway.
+    severity: informational
+    confidence: 80
+    affected_functions:
+      - "Flywheel._campaignTokenBalance (lines 670-672)"
+    attack_scenario: |
+      1. Campaign address is known before creation (predictable via CREATE2)
+      2. Attacker sends ETH to campaign address before it's deployed
+      3. Campaign is created and activated
+      4. The pre-existing ETH is included in _campaignTokenBalance
+      5. For BridgeReferralFees, the next send() would include this as bridgedAmount
+      6. Attacker (or anyone) can claim it via send()
+    solidity_invariant: |
+      // INV: campaign balance should only reflect intentional deposits
+      // Cannot enforce on-chain -- ETH can arrive via selfdestruct

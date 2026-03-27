@@ -1,0 +1,483 @@
+# DomainHunter Analysis — Transfers.sol
+# Contract: commerce-payments/contracts/transfers/Transfers.sol
+# Focus: payment domain invariants, exact settlement, operator/merchant trust, permit2 vs pre-approved consistency
+# Analyst: DomainHunter
+# Date: 2026-03-27
+
+hypotheses:
+
+  - id: T-D-01
+    title: "Custom signature prefix bypasses EIP-191 to forge operator signatures"
+    description: |
+      The validIntent modifier allows a custom prefix (intent.prefix) instead of the
+      standard EIP-191 "\x19Ethereum Signed Message:\n32" prefix. When prefix is non-empty,
+      signedMessageHash = keccak256(abi.encodePacked(_intent.prefix, hash)). An attacker
+      who controls prefix could craft a prefix that, when concatenated with the hash,
+      collides with a different valid signed message from the operator — essentially
+      a signature reuse / cross-context attack.
+    confidence: 40
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Operator signs intent A with standard EIP-191 prefix for a $100 payment.
+      2. Attacker constructs intent B with a custom prefix such that
+         keccak256(prefix || hash_B) == ECDSA.toEthSignedMessageHash(hash_A).
+      3. Attacker reuses operator's signature from intent A on intent B.
+      4. This requires finding prefix+hash_B that produces the same signed hash — a
+         second preimage on keccak256. Computationally infeasible for keccak256.
+      5. However, the custom prefix opens the door to cross-protocol signature replay
+         if the same operator key signs messages for other systems using the same format.
+    solidity: |
+      // Invariant: custom prefix does not enable signature reuse across different intents
+      // This is a design-level concern — cannot be trivially tested with a property
+      // but the pattern of allowing arbitrary prefix is unusual and worth flagging
+      bytes32 hash1 = keccak256(abi.encodePacked(intent1Fields));
+      bytes32 hash2 = keccak256(abi.encodePacked(intent2Fields));
+      bytes32 signed1 = ECDSA.toEthSignedMessageHash(hash1);
+      bytes32 signed2 = keccak256(abi.encodePacked(customPrefix, hash2));
+      t(signed1 != signed2, "T-D-01: prefix collision found");
+    validated: false
+    priority: medium
+    confidence: 40
+
+  - id: T-D-02
+    title: "recipientAmount + feeAmount overflow silently allows zero-value payment"
+    description: |
+      neededAmount = _intent.recipientAmount + _intent.feeAmount is used across all
+      transfer functions. In Solidity 0.8.17, this addition is checked and will revert
+      on overflow. However, if both values are 0, neededAmount=0 and the `if (neededAmount > 0)`
+      guard skips all transfers, but succeedPayment still marks the intent as processed.
+      An operator could sign a zero-value intent, and it would be marked processed without
+      any actual transfer — the event still emits spentAmount=0.
+    confidence: 85
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Operator signs intent with recipientAmount=0, feeAmount=0.
+      2. Anyone calls transferNative/transferToken with this intent.
+      3. No funds move, but the intent is marked as processed via succeedPayment.
+      4. Impact: informational — operator controls the intent signing so this is
+         self-inflicted. No external attacker can force zero amounts.
+    solidity: |
+      // Invariant: a successfully processed intent always transfers funds
+      uint256 neededAmount = intent.recipientAmount + intent.feeAmount;
+      if (processedTransferIntents[intent.operator][intent.id]) {
+        t(neededAmount > 0, "T-D-02: zero-value intent was processed");
+      }
+    validated: true
+    priority: low
+    confidence: 85
+
+  - id: T-D-03
+    title: "Operator can register feeDestination=address(this) to trap funds in contract"
+    description: |
+      registerOperatorWithFeeDestination allows any address to register as an operator
+      with ANY feeDestination, including address(this) (the Transfers contract itself).
+      When a payment is processed, feeAmount is sent to the contract itself. For ERC20,
+      these funds accumulate in the contract and can only be retrieved by the sweeper.
+      For native currency, the receive() function only allows msg.sender == wrappedNativeCurrency,
+      so native fees to address(this) would revert.
+    confidence: 75
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Malicious operator registers with feeDestination = address(Transfers).
+      2. Operator signs an intent with feeAmount = 1000 USDC.
+      3. Payer calls transferToken — 1000 USDC fee is sent to Transfers contract.
+      4. For ERC20: funds are stuck until sweeper retrieves them. If sweeper is not set
+         or is compromised, funds are permanently locked.
+      5. For native: sendNative to address(this) reverts because receive() requires
+         msg.sender == wrappedNativeCurrency. Payment fails entirely.
+      6. Operator trust model: operator is trusted by the merchant, but the payer
+         trusts the operator to route fees correctly. A rogue operator can trap payer funds.
+    solidity: |
+      // Invariant: feeDestination should never be address(this)
+      address feeDest = feeDestinations[intent.operator];
+      t(feeDest != address(this), "T-D-03: feeDestination is the contract itself");
+    validated: true
+    priority: medium
+    confidence: 75
+
+  - id: T-D-04
+    title: "Operator unregistration does not invalidate pending signed intents"
+    description: |
+      An operator can call unregisterOperator() which deletes feeDestinations[operator].
+      However, if there are pending signed intents from this operator that haven't been
+      processed yet, they will now revert with OperatorNotRegistered. The operator can
+      then re-register with a DIFFERENT feeDestination and the old intents become
+      processable again but with fees routed to the new destination.
+    confidence: 70
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Operator A registers with feeDestination = merchantFeeWallet.
+      2. Operator A signs intent for $1000 payment with feeAmount = $50.
+      3. Before payer submits: operator unregisters, then re-registers with
+         feeDestination = attackerWallet.
+      4. Payer submits the original intent — $50 fee goes to attackerWallet instead
+         of merchantFeeWallet.
+      5. The signature is still valid because it doesn't include feeDestination.
+      6. Impact: fee theft. The operator IS the signer so this is self-inflicted,
+         but in a marketplace model the merchant may be a different party than the operator.
+    solidity: |
+      // Invariant: fee destination at signing time == fee destination at execution time
+      // Cannot be tested purely on-chain without ghost variables tracking signing-time state
+      // Ghost approach:
+      address feeDestAtSign = ghost_feeDestAtSign[intent.operator][intent.id];
+      address feeDestAtExec = feeDestinations[intent.operator];
+      t(feeDestAtSign == feeDestAtExec, "T-D-04: fee destination changed between sign and exec");
+    validated: false
+    priority: high
+    confidence: 70
+
+  - id: T-D-05
+    title: "subsidizedTransferToken sender != owner — relayer can front-run or replay"
+    description: |
+      subsidizedTransferToken uses _signatureTransferData.owner as the payer (not
+      msg.sender). The validIntent modifier receives owner as the sender parameter.
+      This means anyone can submit the transaction on behalf of the owner (gasless/meta-tx).
+      The EIP-2612 permit signature authorizes the contract to spend owner's tokens.
+      If the permit signature is intercepted from the mempool, a front-runner can
+      execute the payment before the intended relayer.
+    confidence: 60
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Owner signs EIP-2612 permit + operator signs TransferIntent for owner.
+      2. Relayer submits subsidizedTransferToken to mempool.
+      3. Front-runner sees the tx, extracts both signatures, submits their own tx
+         with higher gas.
+      4. Front-runner's tx executes first — payment completes, intent marked processed.
+      5. Relayer's tx reverts with AlreadyProcessed.
+      6. Impact: the payment still goes through correctly (recipient gets funds), but the
+         relayer loses gas. The front-runner gains nothing except griefing the relayer.
+      7. However, if the front-runner is the operator themselves, they could potentially
+         time the re-registration of feeDestination (T-D-04) to redirect fees.
+    solidity: |
+      // Invariant: subsidizedTransferToken delivers exact amounts regardless of caller
+      uint256 recipientBefore = erc20.balanceOf(intent.recipient);
+      uint256 feeBefore = erc20.balanceOf(feeDestinations[intent.operator]);
+      // ... execute subsidizedTransferToken ...
+      uint256 recipientAfter = erc20.balanceOf(intent.recipient);
+      uint256 feeAfter = erc20.balanceOf(feeDestinations[intent.operator]);
+      eq(recipientAfter - recipientBefore, intent.recipientAmount, "T-D-05: recipient underpaid");
+      eq(feeAfter - feeBefore, intent.feeAmount, "T-D-05: fee underpaid");
+    validated: true
+    priority: medium
+    confidence: 60
+
+  - id: T-D-06
+    title: "Exact settlement invariant: recipient ALWAYS receives recipientAmount"
+    description: |
+      The core payment invariant. For every successful payment (non-swap path),
+      the recipient must receive exactly recipientAmount and the feeDestination must
+      receive exactly feeAmount. Fee-on-transfer tokens are explicitly rejected via
+      revertIfInexactTransfer. For swap paths, the Uniswap V3_SWAP_EXACT_OUT ensures
+      exact output. This invariant should hold across all 10 transfer functions.
+    confidence: 90
+    severity: critical
+    status: safe
+    attack_scenario: |
+      1. Attacker finds a token that passes revertIfInexactTransfer but actually
+         delivers less (e.g., a token with conditional fee-on-transfer based on
+         sender/recipient whitelist).
+      2. Contract receives neededAmount (passes check), then transfers recipientAmount
+         to recipient — but only has less than neededAmount actually received.
+      3. The revertIfInexactTransfer check at L210/L255/L447/L494/L552 catches this
+         by comparing balanceBefore + expectedDiff == balanceAfter. This is solid.
+      4. Edge case: if the token rebases DOWN between the two balanceOf calls,
+         the check would fail (revert) — which is the correct behavior (safe).
+    solidity: |
+      // Core invariant: exact settlement
+      IERC20 token = IERC20(intent.recipientCurrency);
+      uint256 recipientBefore = token.balanceOf(intent.recipient);
+      uint256 feeBefore = token.balanceOf(feeDestinations[intent.operator]);
+      // ... execute transfer ...
+      uint256 recipientAfter = token.balanceOf(intent.recipient);
+      uint256 feeAfter = token.balanceOf(feeDestinations[intent.operator]);
+      eq(recipientAfter - recipientBefore, intent.recipientAmount, "T-D-06: recipient settlement inexact");
+      eq(feeAfter - feeBefore, intent.feeAmount, "T-D-06: fee settlement inexact");
+    validated: true
+    priority: critical
+    confidence: 90
+
+  - id: T-D-07
+    title: "swapAndTransferUniswapV3Native does not enforce exactValueSent — excess ETH lost"
+    description: |
+      transferNative and wrapAndTransfer use the exactValueSent modifier to ensure
+      msg.value == recipientAmount + feeAmount. But swapAndTransferUniswapV3Native
+      does NOT have this modifier. The payer sends ETH that gets swapped, and excess
+      is returned via SWEEP. However, if the swap consumes less than msg.value, the
+      remainder is swept back to the payer via Uniswap's UNWRAP_WETH + SWEEP commands.
+      The question is whether the SWEEP correctly returns all unused ETH to the payer.
+    confidence: 55
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Payer sends 10 ETH for a swap that only needs 5 ETH worth of output token.
+      2. Uniswap V3_SWAP_EXACT_OUT uses only 5 ETH worth.
+      3. UNWRAP_WETH unwraps remaining WETH to ETH at the router.
+      4. SWEEP sends remaining ETH to payer (L622: SWEEP to _msgSender() with amount 0 = all).
+      5. If the router has pre-existing ETH/WETH balance, the payer gets MORE back than expected.
+      6. Conversely, if SWEEP fails silently (amount=0 means sweep all), payer gets refund.
+      7. The return value calculation (L699) accounts for router pre-existing balance.
+      8. Risk: if another tx deposits ETH to router in same block, the accounting breaks.
+    solidity: |
+      // Invariant: payer does not lose excess ETH in swap path
+      // amountSwapped (return value) should equal the actual ETH consumed
+      uint256 payerBefore = msg.sender.balance + msg.value;
+      // ... execute swapAndTransferUniswapV3Native ...
+      uint256 payerAfter = msg.sender.balance;
+      uint256 consumed = payerBefore - payerAfter;
+      // consumed should equal exactly what was needed for the swap
+      t(consumed <= msg.value, "T-D-07: payer lost more than msg.value");
+    validated: false
+    priority: high
+    confidence: 55
+
+  - id: T-D-08
+    title: "Permit2 vs PreApproved path asymmetry — fee-on-transfer check missing in unwrapAndTransfer"
+    description: |
+      Comparing permit2-based and pre-approved paths reveals an asymmetry.
+      transferToken (permit2, L199-210) checks fee-on-transfer via revertIfInexactTransfer.
+      transferTokenPreApproved (L248-255) also checks fee-on-transfer.
+      unwrapAndTransfer (permit2, L315-333) does NOT check fee-on-transfer — it skips
+      revertIfInexactTransfer after permit2.permitTransferFrom.
+      unwrapAndTransferPreApproved (L368-370) also does NOT check.
+      This is intentional because WETH is not a fee-on-transfer token, but if the
+      wrappedNativeCurrency is ever set to a non-standard wrapper with fees, this breaks.
+    confidence: 45
+    severity: low
+    status: safe
+    attack_scenario: |
+      1. Deploy Transfers with a wrappedNativeCurrency that has transfer fees.
+      2. Call unwrapAndTransfer — permit2 transfers WETH to contract.
+      3. No revertIfInexactTransfer check — contract thinks it has neededAmount.
+      4. unwrapAndTransferFundsToDestinations tries to withdraw neededAmount but only
+         received neededAmount - fee. Withdrawal may succeed if WETH has that much,
+         but the accounting is wrong.
+      5. Constructor validates wrappedNativeCurrency != address(0) but not that it's
+         fee-free. However, WETH is canonical and immutable, so this is safe in practice.
+    solidity: |
+      // Invariant: unwrap paths deliver exact native amounts
+      uint256 recipientBefore = intent.recipient.balance;
+      uint256 feeBefore = feeDestinations[intent.operator].balance;
+      // ... execute unwrapAndTransfer ...
+      uint256 recipientAfter = intent.recipient.balance;
+      uint256 feeAfter = feeDestinations[intent.operator].balance;
+      eq(recipientAfter - recipientBefore, intent.recipientAmount, "T-D-08: native recipient underpaid");
+      eq(feeAfter - feeBefore, intent.feeAmount, "T-D-08: native fee underpaid");
+    validated: true
+    priority: low
+    confidence: 45
+
+  - id: T-D-09
+    title: "abi.encodePacked hash collision on TransferIntent fields enables intent forgery"
+    description: |
+      validIntent hashes intent fields using abi.encodePacked (L80-93). The packed encoding
+      of adjacent dynamic-length or variable-width fields can produce collisions. However,
+      examining the fields: recipientAmount (uint256), deadline (uint256), recipient (address),
+      recipientCurrency (address), refundDestination (address), feeAmount (uint256),
+      id (bytes16), operator (address), chainid (uint256), sender (address), address(this).
+      All fields are fixed-size (uint256=32B, address=20B, bytes16=16B). With abi.encodePacked,
+      fixed-size types are packed without padding between addresses/bytes16.
+      Key concern: address (20B) + bytes16 (16B) + address (20B) = 56 bytes packed.
+      An attacker could potentially craft different (refundDestination, id, operator) tuples
+      that produce the same 56 packed bytes.
+    confidence: 65
+    severity: high
+    status: investigate
+    attack_scenario: |
+      1. Packed layout: ...refundDestination(20B) | feeAmount(32B) | id(16B) | operator(20B)...
+      2. feeAmount is 32B (uint256), which acts as a separator between refundDestination and id.
+      3. So the sequence is: 20B | 32B | 16B | 20B — total 88B.
+      4. For a collision, attacker needs: refundDest_A || feeAmt_A || id_A || operator_A
+         == refundDest_B || feeAmt_B || id_B || operator_B with different field values.
+      5. Because feeAmount is 32B, shifting bytes between refundDestination and feeAmount
+         is not feasible (different widths before the 32B boundary).
+      6. However, id(16B) || operator(20B) = 36B. Could an attacker shift bytes between
+         id and operator? id_A || op_A = id_B || op_B where (id_A != id_B, op_A != op_B)?
+         YES: take last 4 bytes of id_A and prepend to operator, creating id_B(12B+4B) || op_B(4B+16B).
+         But id is bytes16 and operator is address(20B) — both fixed, so the split is fixed.
+         Wait — abi.encodePacked(bytes16, address) packs 16B then 20B = 36B with fixed boundary.
+         id_A[0:16] || op_A[0:20] = id_B[0:16] || op_B[0:20] requires id_A=id_B AND op_A=op_B.
+      7. SAFE: fixed-size types with abi.encodePacked have deterministic boundaries.
+         Collision requires all individual fields to be identical.
+    solidity: |
+      // Invariant: different intent parameters produce different hashes
+      bytes32 hash1 = keccak256(abi.encodePacked(
+        intent1.recipientAmount, intent1.deadline, intent1.recipient,
+        intent1.recipientCurrency, intent1.refundDestination, intent1.feeAmount,
+        intent1.id, intent1.operator, block.chainid, sender1, address(this)
+      ));
+      bytes32 hash2 = keccak256(abi.encodePacked(
+        intent2.recipientAmount, intent2.deadline, intent2.recipient,
+        intent2.recipientCurrency, intent2.refundDestination, intent2.feeAmount,
+        intent2.id, intent2.operator, block.chainid, sender2, address(this)
+      ));
+      // If any field differs, hashes must differ
+      t(hash1 != hash2, "T-D-09: hash collision on different intents");
+    validated: true
+    priority: medium
+    confidence: 65
+
+  - id: T-D-10
+    title: "Sweeper can front-run payments to steal funds mid-transfer"
+    description: |
+      Transfers inherits Sweepable which allows a sweeper to sweep all ERC20 or ETH
+      from the contract. The transfer flow is: (1) receive funds to contract,
+      (2) transferFundsToDestinations sends to recipient + feeDestination. If sweeper
+      calls sweepToken between step 1 and step 2, the funds would be stolen. However,
+      nonReentrant prevents re-entrancy within the same tx. The sweeper would need to
+      front-run between the two internal calls, which is impossible within a single
+      atomic transaction. Between separate transactions, the contract should hold zero
+      balance (all funds are forwarded in the same tx).
+    confidence: 80
+    severity: medium
+    status: safe
+    attack_scenario: |
+      1. Normal flow: funds IN → funds OUT happens atomically in one tx (nonReentrant).
+      2. Sweeper cannot call sweepToken during the transfer due to nonReentrant.
+      3. After the transfer completes, contract balance should be 0 (exact in = exact out).
+      4. Edge case: if a transfer reverts AFTER receiving funds but BEFORE forwarding,
+         the entire tx reverts (Solidity 0.8 checked arithmetic), so no funds are stuck.
+      5. Only risk: if contract somehow accumulates dust (rounding, direct sends to contract
+         bypassing receive() — not possible for ETH due to receive() restriction).
+      6. For ERC20: anyone can send tokens directly to the contract. Sweeper can take those.
+         This is by design (stuck fund recovery).
+    solidity: |
+      // Invariant: contract holds zero balance after each successful transfer
+      uint256 ethBalance = address(this).balance;
+      uint256 tokenBalance = erc20.balanceOf(address(this));
+      eq(ethBalance, 0, "T-D-10: ETH stuck in contract after transfer");
+      eq(tokenBalance, 0, "T-D-10: tokens stuck in contract after transfer");
+    validated: true
+    priority: medium
+    confidence: 80
+
+  - id: T-D-11
+    title: "wrapAndTransfer sends WETH fees to feeDestination but event reports NATIVE_CURRENCY"
+    description: |
+      wrapAndTransfer wraps ETH into WETH, then calls transferFundsToDestinations
+      which checks recipientCurrency. Since recipientCurrency = address(wrappedNativeCurrency)
+      (L277 check), transferFundsToDestinations enters the ERC20 branch (L728-735)
+      and sends WETH to recipient and feeDestination. However, succeedPayment (L289)
+      reports spentCurrency = NATIVE_CURRENCY (address(0)). The event is misleading —
+      the payer spent ETH but the recipient/fee received WETH. This is by design
+      (event tracks what payer sent, not what recipient received), but could confuse
+      off-chain accounting systems.
+    confidence: 85
+    severity: informational
+    status: safe
+    attack_scenario: |
+      1. Payer sends 1 ETH via wrapAndTransfer.
+      2. Recipient receives 1 WETH. FeeDestination receives fee in WETH.
+      3. Event emits spentCurrency = address(0) (NATIVE_CURRENCY).
+      4. Off-chain system sees ETH payment but recipient got WETH.
+      5. No loss of funds, but potential confusion in accounting/reconciliation.
+    solidity: |
+      // Informational: event currency vs actual received currency mismatch
+      // In wrapAndTransfer, the emitted spentCurrency is NATIVE_CURRENCY
+      // but the actual transferred currency is wrappedNativeCurrency
+      // This is by design but worth documenting
+      t(true, "T-D-11: informational - event reports input currency not output");
+    validated: true
+    priority: low
+    confidence: 85
+
+  - id: T-D-12
+    title: "Recipient == feeDestination causes double-counting in revertIfInexactTransfer during swaps"
+    description: |
+      In swapTokens, after Uniswap execution, the code checks fee-on-transfer for both
+      feeDestination (L670-675) and recipient (L676-681) separately. If recipient ==
+      feeDestinations[operator], both checks measure the balance change of the SAME address.
+      The first check expects feeAmount increase, finds recipientAmount + feeAmount increase
+      (both transfers went to same address), and would see a LARGER increase than expected.
+      revertIfInexactTransfer checks balanceAfter - balanceBefore != expectedDiff — so
+      if the diff is recipientAmount + feeAmount but expected is feeAmount, it would REVERT.
+      This means payments where recipient == feeDestination would always fail in swap paths.
+    confidence: 75
+    severity: medium
+    status: investigate
+    attack_scenario: |
+      1. Operator registers with feeDestination = merchantAddress.
+      2. Operator signs intent with recipient = merchantAddress (same as feeDestination).
+      3. Payer calls swapAndTransferUniswapV3Token.
+      4. Uniswap TRANSFER sends feeAmount to merchantAddress, then recipientAmount to merchantAddress.
+      5. revertIfInexactTransfer for fee: balanceAfter - balanceBefore = feeAmount + recipientAmount.
+         Expected: feeAmount. feeAmount + recipientAmount != feeAmount → REVERT with InexactTransfer.
+      6. Payment fails even though funds were correctly delivered.
+      7. Non-swap paths (transferFundsToDestinations) do NOT have this check, so they work fine.
+      8. This is a real functional bug for the swap path when recipient == feeDestination.
+    solidity: |
+      // Invariant: swap path works when recipient == feeDestination
+      // This would fail if the hypothesis is correct
+      address feeDest = feeDestinations[intent.operator];
+      if (intent.recipient == feeDest && intent.recipientAmount > 0 && intent.feeAmount > 0) {
+        // swapAndTransferUniswapV3Token should succeed
+        // but revertIfInexactTransfer will fail because it measures
+        // the combined balance change against individual expected amounts
+        t(false, "T-D-12: swap fails when recipient == feeDestination");
+      }
+    validated: false
+    priority: high
+    confidence: 75
+
+# Symmetric Inspection
+# Pairs identified:
+# - register/unregister operator: registerOperator sets feeDestinations, unregisterOperator deletes.
+#   Asymmetry: no check that pending intents exist before unregister (see T-D-04).
+# - transferToken (permit2) / transferTokenPreApproved: parallel flows.
+#   Asymmetry: transferToken validates transferDetails.to and requestedAmount,
+#   transferTokenPreApproved relies on allowance check instead. Both check fee-on-transfer. SYMMETRIC.
+# - unwrapAndTransfer (permit2) / unwrapAndTransferPreApproved: parallel flows.
+#   Asymmetry: neither checks fee-on-transfer (WETH is trusted). SYMMETRIC.
+# - wrapAndTransfer / unwrapAndTransfer: inverse operations (ETH→WETH, WETH→ETH).
+#   Asymmetry: wrapAndTransfer uses exactValueSent modifier, unwrapAndTransfer does not
+#   (it checks balance/allowance instead). Both handle neededAmount=0 consistently. SYMMETRIC.
+# - pause/unpause: standard OZ Pausable, owner-only. SYMMETRIC.
+
+# Constraint Inference (0xRajeev)
+# Validation consistency across 10 transfer functions:
+# - All check: nonReentrant, whenNotPaused, validIntent, operatorIsRegistered ✓
+# - Native paths (transferNative, wrapAndTransfer): exactValueSent ✓
+# - Swap paths: NO exactValueSent (by design — amount is determined by swap)
+# - ERC20 paths: balance check + fee-on-transfer check ✓
+# - Unwrap paths: NO fee-on-transfer check (WETH trusted) — see T-D-08
+# - Missing: none of the functions validate _intent.refundDestination is used
+#   (refundDestination is included in the signature hash but NEVER used in the contract)
+
+# Traza Hacia Atrás (samczsun)
+# Exit points for value:
+# 1. transferFundsToDestinations → sendNative / safeTransfer to recipient + feeDestination
+# 2. unwrapAndTransferFundsToDestinations → withdraw WETH then sendNative
+# 3. Uniswap TRANSFER commands inside swapTokens → transfers within Uniswap router
+# 4. Uniswap SWEEP → returns excess to payer
+# 5. Sweepable → sweeper can extract any stuck funds
+# All paths 1-4 are within nonReentrant + atomic tx. Path 5 is admin-only.
+
+summary:
+  total_hypotheses: 12
+  investigate:
+    - T-D-01 — Custom prefix signature cross-context replay risk
+    - T-D-04 — Operator re-registration redirects fees from pending intents
+    - T-D-05 — subsidizedTransferToken front-running / relay griefing
+    - T-D-07 — swapAndTransferUniswapV3Native excess ETH handling
+    - T-D-12 — Swap path reverts when recipient == feeDestination (potential functional bug)
+  safe:
+    - T-D-02 — Zero-value intent processing (operator self-inflicted, informational)
+    - T-D-03 — feeDestination=address(this) traps funds (operator trust)
+    - T-D-06 — Exact settlement invariant holds across all non-swap paths
+    - T-D-08 — Unwrap path skips fee-on-transfer check (WETH trusted, safe)
+    - T-D-09 — abi.encodePacked collision infeasible with fixed-size types
+    - T-D-10 — Sweeper cannot front-run atomic transfers
+    - T-D-11 — Event reports input currency not output (informational, by design)
+  highest_priority: T-D-12
+  notes: |
+    T-D-12 is the strongest finding. When recipient == feeDestination in swap paths,
+    revertIfInexactTransfer measures the same address twice with individual expected amounts,
+    but the actual balance change is the sum. This causes legitimate payments to revert.
+    Non-swap paths are unaffected because they don't have post-transfer balance checks.
+    T-D-04 (fee destination change) is notable but relies on operator being malicious
+    against their own merchants — within the trust model, operator is trusted.
+    refundDestination is signed but NEVER used anywhere in the contract — dead field.

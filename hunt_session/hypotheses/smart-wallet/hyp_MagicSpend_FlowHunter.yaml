@@ -1,0 +1,636 @@
+hunter: FlowHunter
+component: MagicSpend
+contract: MagicSpend.sol
+date: "2026-03-27"
+
+state_machine:
+  states:
+    - IDLE: "No active UserOp, _withdrawable[user] == 0"
+    - VALIDATED: "validatePaymasterUserOp returned, _withdrawable[user] > 0, nonce consumed"
+    - EXECUTING: "UserOp callData executing, user can call withdrawGasExcess/withdraw"
+    - POST_OP: "postOp called, _withdrawable deleted, ETH sent to user"
+    - DIRECT_WITHDRAW: "withdraw() called standalone, no _withdrawable interaction"
+  transitions:
+    - "IDLE -> VALIDATED: EntryPoint calls validatePaymasterUserOp"
+    - "VALIDATED -> EXECUTING: EntryPoint executes userOp.callData on sender"
+    - "EXECUTING -> POST_OP: EntryPoint calls postOp(opSucceeded or opReverted)"
+    - "IDLE -> DIRECT_WITHDRAW -> IDLE: Anyone calls withdraw() with valid sig"
+  critical_observation: |
+    Between VALIDATED and POST_OP, _withdrawable[user] holds funds.
+    During EXECUTING, user code runs and can call withdrawGasExcess() to drain
+    _withdrawable BEFORE postOp runs. This is INTENDED behavior (line 176-177 comment).
+    postOp then computes withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost).
+    If withdrawGasExcess was called, _withdrawable[account] == 0, so user gets only gas refund.
+    If NOT called, user gets full amount in postOp. Either way total = withdrawAmount - actualGasCost.
+
+hypotheses:
+
+- id: MS-F-01
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "Multiple UserOps in same bundle accumulate _withdrawable before any postOp runs"
+  severity: "Medium"
+  confidence: 40
+  description: |
+    In ERC-4337 v0.6, the EntryPoint processes a bundle by first calling
+    validatePaymasterUserOp for ALL UserOps in the bundle, then executing them
+    sequentially (callData + postOp for each). However, validation of all ops
+    happens in the VALIDATION PHASE before execution.
+
+    If a bundler includes two UserOps from the same user both using MagicSpend
+    as paymaster, validatePaymasterUserOp is called twice. Each call does:
+      _withdrawable[sender] += withdrawAmount - maxCost
+
+    This means _withdrawable accumulates across validations. When the first
+    postOp runs, it reads the accumulated value and sends it all. The second
+    postOp then reads _withdrawable = 0 (deleted by first postOp) and only
+    refunds gas difference.
+
+    Actually, re-analyzing: EntryPoint v0.6 validates each op individually and
+    runs execution+postOp sequentially per op. The issue is whether two ops from
+    the same sender can both pass validation. Both nonces would need to be different.
+    Each validate adds to _withdrawable. First postOp deletes it and sends all.
+    Second postOp: _withdrawable[account] is 0, withdrawable = 0 + (maxGasCost2 - actualGasCost2).
+    User gets gas refund from second op, but loses (withdrawAmount2 - maxCost2) that was
+    added during second validate but consumed by first postOp.
+
+    Wait - EntryPoint v0.6 actually validates+executes one op at a time in handleOps inner loop.
+    Let me reconsider: in v0.6, the flow is:
+    1. Validate ALL ops (validation phase)
+    2. Execute ALL ops (execution phase: callData + postOp per op)
+
+    So yes, both validates run first, _withdrawable accumulates, then first postOp
+    takes everything including second op's credited amount.
+  solidity: |
+    // In validatePaymasterUserOp (called twice in validation phase):
+    // First call: _withdrawable[sender] += withdrawAmount1 - maxCost1
+    // Second call: _withdrawable[sender] += withdrawAmount2 - maxCost2
+    // Total: _withdrawable[sender] = (withdrawAmount1 - maxCost1) + (withdrawAmount2 - maxCost2)
+    //
+    // In first postOp:
+    // withdrawable = _withdrawable[sender] + (maxGasCost1 - actualGasCost1)
+    //              = (wA1-mC1) + (wA2-mC2) + (mC1-aCost1)
+    //              = wA1 - aCost1 + wA2 - mC2   <-- includes second op's funds!
+    // delete _withdrawable[sender]
+    // forceSafeTransferETH(sender, withdrawable)
+    //
+    // In second postOp:
+    // withdrawable = 0 + (maxGasCost2 - actualGasCost2) = mC2 - aCost2
+    // User gets only gas refund for second op, loses (wA2 - mC2) portion
+  attack_scenario: |
+    1. Attacker obtains two valid WithdrawRequests (nonce 1: 1 ETH, nonce 2: 1 ETH)
+    2. Constructs two UserOps both using MagicSpend as paymaster
+    3. Both ops enter same bundle
+    4. Validation phase: both validatePaymasterUserOp calls succeed
+       _withdrawable[attacker] = (1e18 - maxCost1) + (1e18 - maxCost2)
+    5. First postOp: sends all accumulated _withdrawable + gas refund to user
+    6. Second postOp: only sends gas refund (maxCost2 - actualCost2)
+    7. NET: User receives total of ~2 ETH minus actual gas. No loss.
+
+    REASSESSMENT: Actually this doesn't cause loss — the user receives the correct
+    total across both postOps. The first postOp over-sends, but the second under-sends
+    by the same amount. The risk is if the first postOp's forceSafeTransferETH fails
+    because the contract doesn't have enough balance (it has to pay out both ops'
+    worth in the first postOp).
+  impact: |
+    If MagicSpend contract balance is insufficient to cover the inflated first postOp
+    transfer, the ETH transfer reverts. Due to EntryPoint v0.6 bug (PR #293 referenced
+    in code), this could cause the entire bundle to revert, griefing the bundler.
+    No direct fund loss to users, but potential DoS on bundler.
+    Likely LOW severity — requires same-user multi-op bundle which bundlers typically reject.
+  status: pending
+
+- id: MS-F-02
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "withdrawGasExcess + postOp double-spend via _withdrawable during execution"
+  severity: "Medium"
+  confidence: 25
+  description: |
+    During UserOp execution (between validate and postOp), the user's smart wallet
+    executes callData. The user could have callData that calls MagicSpend.withdrawGasExcess().
+    This is explicitly INTENDED per the code comment on line 176-177.
+
+    Flow:
+    1. validatePaymasterUserOp: _withdrawable[user] = withdrawAmount - maxCost
+    2. UserOp execution: user calls withdrawGasExcess() -> sends _withdrawable, sets to 0
+    3. postOp: withdrawable = _withdrawable[user] + (maxCost - actualGasCost) = 0 + gasRefund
+    4. User gets: (withdrawAmount - maxCost) from step 2 + (maxCost - actualGasCost) from step 3
+    5. Total: withdrawAmount - actualGasCost = CORRECT
+
+    This is NOT a vulnerability - the accounting is correct. The _withdrawable design
+    explicitly supports this pattern. Total payout = withdrawAmount - actualGasCost regardless
+    of whether withdrawGasExcess is called during execution or not.
+  solidity: |
+    // validatePaymasterUserOp:
+    // _withdrawable[sender] += withdrawAmount - maxCost;  // line 143
+    //
+    // If user calls withdrawGasExcess during execution:
+    // amount = _withdrawable[msg.sender];  // = withdrawAmount - maxCost
+    // delete _withdrawable[msg.sender];    // = 0
+    // _withdraw(address(0), msg.sender, amount);
+    //
+    // postOp:
+    // withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost)
+    //              = 0 + (maxCost - actualGasCost)
+    // Total to user: (withdrawAmount - maxCost) + (maxCost - actualGasCost)
+    //              = withdrawAmount - actualGasCost  ✓ CORRECT
+  attack_scenario: |
+    No attack — this is the intended design. withdrawGasExcess allows the user to
+    access funds during execution for swaps/mints, and postOp handles the gas refund.
+  impact: |
+    None. Accounting is sound. The split between withdrawGasExcess and postOp
+    always sums to withdrawAmount - actualGasCost.
+  status: disproved
+
+- id: MS-F-03
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "TOCTOU in _validateRequest: balance check vs actual withdrawal timing"
+  severity: "Medium"
+  confidence: 35
+  description: |
+    In validatePaymasterUserOp, _validateRequest checks:
+      uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+      if (withdrawRequest.amount > maxAllowed) revert;
+
+    This check uses address(this).balance at VALIDATION TIME. Between validation
+    and postOp (when actual ETH transfer happens), the contract's balance could change
+    if other operations in the same bundle reduce it.
+
+    In the paymaster flow: validate checks balance, but doesn't reserve/lock funds.
+    The actual transfer happens in postOp via forceSafeTransferETH. If the balance
+    dropped between validate and postOp (e.g., another user's postOp already sent ETH),
+    the transfer could fail.
+
+    However, forceSafeTransferETH uses a CREATE-based force send, which should not
+    revert. Let me check — actually SafeTransferLib.forceSafeTransferETH with
+    GAS_STIPEND_NO_STORAGE_WRITES will attempt force transfer. If the contract
+    truly doesn't have enough ETH, it WILL revert.
+
+    For the standalone withdraw() path: _validateRequest checks balance, then
+    immediately calls _withdraw which sends ETH. No TOCTOU here — atomic.
+
+    For the paymaster path: the gap between validate (balance check) and postOp
+    (actual send) is the TOCTOU window. Multiple UserOps from different users
+    in the same bundle could each pass the balance check but collectively exceed
+    the available balance.
+  solidity: |
+    // _validateRequest (called during validation phase):
+    uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+    // ^ balance at validation time, NOT execution time
+
+    // postOp (called during execution phase, potentially after other postOps drained balance):
+    uint256 withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost);
+    delete _withdrawable[account];
+    if (withdrawable > 0) {
+        SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+        // ^ reverts if contract balance < withdrawable
+    }
+  attack_scenario: |
+    1. MagicSpend has 10 ETH, maxWithdrawDenominator = 2 (max 5 ETH per request)
+    2. Bundler includes 3 UserOps from different users, each requesting 4 ETH
+    3. Validation phase: all 3 pass balance check (10/2 = 5, 4 < 5)
+    4. Execution phase:
+       - First postOp: sends ~4 ETH. Balance: ~6 ETH
+       - Second postOp: sends ~4 ETH. Balance: ~2 ETH
+       - Third postOp: tries to send ~4 ETH. Balance insufficient → REVERT
+    5. Due to EntryPoint behavior, this could cause bundle issues
+
+    MITIGATION IN CODE: maxWithdrawDenominator exists precisely to prevent this.
+    With denominator=2, max per request is balance/2. After first withdrawal of
+    balance/2, next validate would see reduced balance. But validates all run FIRST
+    against the SAME initial balance.
+  impact: |
+    The maxWithdrawDenominator mitigates but doesn't fully prevent this in bundles
+    with many same-paymaster ops. With denominator=2, max 1 op can safely pass.
+    With denominator=10, up to ~9 ops. The code comment on line 153-154 acknowledges
+    this: "can only revert if there are > maxWithdrawDenominator withdraws in same tx."
+    This is a KNOWN LIMITATION, not a bug. Severity Low at best.
+  status: known_limitation
+
+- id: MS-F-04
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "withdraw() callable during UserOp execution to extract additional ETH beyond _withdrawable"
+  severity: "High"
+  confidence: 45
+  description: |
+    During UserOp execution, the smart wallet runs arbitrary callData. The user could
+    call MagicSpend.withdraw() with a DIFFERENT WithdrawRequest (different nonce) during
+    execution. This is a separate nonce from the one used in validatePaymasterUserOp.
+
+    Flow:
+    1. validatePaymasterUserOp: uses nonce A, sets _withdrawable[user] = withdrawAmount_A - maxCost
+    2. UserOp execution: smart wallet calls MagicSpend.withdraw(requestB) with nonce B
+       - This sends withdrawAmount_B directly to the wallet
+       - _withdrawable is NOT modified by withdraw()
+    3. postOp: sends _withdrawable[user] + gas refund to user
+
+    This is LEGITIMATE — withdraw() is a standalone function. Using two different
+    signed requests (one for paymaster, one for direct withdraw) is fine. Each nonce
+    is consumed once. The user is entitled to both amounts.
+
+    However, there's an interaction: if withdraw() in step 2 reduces MagicSpend balance
+    significantly, postOp's forceSafeTransferETH could fail if balance is insufficient.
+    The maxWithdrawDenominator check in both paths limits this.
+  solidity: |
+    // During UserOp execution, user calls:
+    MagicSpend(paymaster).withdraw(requestB);
+    // This goes through: expiry check, signature check, _validateRequest (nonce B),
+    // then _withdraw sends ETH directly.
+    //
+    // Later, postOp runs and sends _withdrawable (from nonce A) + gas refund.
+    // Both are legitimate, separate signed requests.
+  attack_scenario: |
+    1. User gets two signed WithdrawRequests from owner: nonce 1 (1 ETH), nonce 2 (1 ETH)
+    2. Uses nonce 1 for paymaster in UserOp
+    3. UserOp callData calls withdraw(nonce 2) for 1 ETH direct
+    4. postOp sends remaining _withdrawable + gas refund
+    5. User gets total ~2 ETH minus gas — this is correct, two valid requests
+  impact: |
+    No vulnerability. Each WithdrawRequest is independently signed by the owner
+    and nonce-protected. Using one in paymaster flow and another in direct withdraw
+    is expected behavior. The owner authorized both amounts.
+  status: disproved
+
+- id: MS-F-05
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "postOp with mode=opReverted still has _withdrawable set, funds locked"
+  severity: "Low"
+  confidence: 60
+  description: |
+    When a UserOp's execution (callData) reverts, the EntryPoint calls postOp with
+    PostOpMode.opReverted. In this case, MagicSpend's postOp flow is:
+    - mode check: opReverted != postOpReverted, so it passes
+    - Computes withdrawable = _withdrawable[account] + (maxGasCost - actualGasCost)
+    - Deletes _withdrawable[account]
+    - Sends ETH to user
+
+    This means even if the UserOp reverts, the user STILL receives the withdrawable
+    funds. This is by design — the paymaster already committed during validation.
+
+    BUT: what if forceSafeTransferETH fails in postOp (e.g., contract out of ETH)?
+    Then postOp itself reverts. EntryPoint calls postOp again with PostOpMode.postOpReverted.
+    MagicSpend reverts with UnexpectedPostOpRevertedMode(). EntryPoint handles this by...
+    reverting the entire bundle? Actually in v0.6, if postOp reverts the first time,
+    the EntryPoint re-calls with postOpReverted. If that ALSO reverts, per the EntryPoint
+    code, the execution is still charged but funds handling is undefined.
+
+    The _withdrawable was NOT deleted because postOp reverted. So _withdrawable[user]
+    still has the credited amount. The user can later call withdrawGasExcess() to
+    retrieve these funds. However, the nonce is already consumed, so the user got
+    their request "used up" from the nonce perspective.
+
+    Key question: does the _withdrawable persist after a reverted postOp?
+    In ERC-4337 v0.6, if postOp reverts (first call), the EntryPoint reverts the
+    inner execution including the postOp state changes, then calls postOp again
+    with postOpReverted mode. So _withdrawable changes from the FIRST postOp call
+    are reverted. The _withdrawable set during validation phase persists because
+    validation is in a separate context.
+
+    Actually - in v0.6, validation and execution share the same storage context.
+    So _withdrawable set in validate persists. First postOp attempt: reads it, deletes,
+    tries to send ETH, fails, reverts. The delete is reverted, _withdrawable is restored.
+    Second postOp (postOpReverted): MagicSpend reverts with UnexpectedPostOpRevertedMode.
+    EntryPoint catches this revert. Final state: _withdrawable[user] still has the value.
+    Nonce is consumed (set in validation, which persists).
+
+    User can call withdrawGasExcess() later to recover funds. No permanent loss.
+  solidity: |
+    // Scenario: postOp reverts because MagicSpend has insufficient balance
+    //
+    // Validation phase (persists):
+    //   _withdrawable[user] = withdrawAmount - maxCost  (SET)
+    //   _nonceUsed[nonce][user] = true                  (SET)
+    //
+    // First postOp call (reverted, state rolled back):
+    //   delete _withdrawable[user]  (ROLLED BACK)
+    //   forceSafeTransferETH fails  (REVERT)
+    //
+    // Second postOp call (postOpReverted mode):
+    //   revert UnexpectedPostOpRevertedMode()  (REVERT)
+    //
+    // Final state:
+    //   _withdrawable[user] = withdrawAmount - maxCost  (still set!)
+    //   _nonceUsed[nonce][user] = true                  (consumed)
+    //   User can call withdrawGasExcess() to recover
+  attack_scenario: |
+    1. User submits UserOp with MagicSpend paymaster, 1 ETH withdraw
+    2. Validation passes, _withdrawable[user] = 1 ETH - maxCost
+    3. UserOp executes, then postOp runs
+    4. postOp fails (insufficient balance in MagicSpend)
+    5. EntryPoint re-calls postOp with postOpReverted → MagicSpend reverts
+    6. _withdrawable[user] still holds (1 ETH - maxCost)
+    7. User calls withdrawGasExcess() in a separate tx to recover funds
+    8. No permanent loss, but gas is wasted and UX is degraded
+  impact: |
+    No permanent fund loss. User can recover via withdrawGasExcess() in a separate
+    transaction. However, the user pays gas for the failed UserOp AND the recovery tx.
+    This is a graceful degradation, not a vulnerability. The nonce is consumed so the
+    WithdrawRequest cannot be reused, but the funds are recoverable.
+  status: known_limitation
+
+- id: MS-F-06
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "Nonce consumed in validate but signature check is deferred — invalid sig still burns nonce"
+  severity: "Low"
+  confidence: 70
+  description: |
+    In validatePaymasterUserOp, the flow is:
+    1. _validateRequest(): checks nonce not used, checks balance limit, SETS nonce as used (line 352)
+    2. isValidWithdrawSignature(): checks signature, returns bool
+    3. validationData = (sigFailed ? 1 : 0) | ...
+
+    If the signature is invalid, sigFailed=1, validationData has bit 0 set.
+    The EntryPoint sees this and rejects the UserOp. BUT _validateRequest already
+    ran and set _nonceUsed[nonce][account] = true.
+
+    The nonce is now permanently consumed even though the UserOp was rejected.
+    The _withdrawable was also incremented (line 143), but since the UserOp is
+    rejected, postOp never runs, so _withdrawable has stale funds credited.
+
+    Wait — in ERC-4337 v0.6, if validation returns sigFailed, the EntryPoint reverts
+    the validation phase for that op. So the nonce consumption and _withdrawable
+    increment are both reverted.
+
+    Actually, let me reconsider v0.6 behavior: The EntryPoint uses a try/catch or
+    inner call for validation. If validationData indicates sig failure, the EntryPoint
+    does NOT revert the validation — it just skips execution. The validation state
+    changes (nonce used, _withdrawable set) PERSIST.
+
+    If this is the case, an attacker with a known nonce could submit an op with
+    an invalid signature to burn that nonce, preventing the legitimate user from
+    using their valid WithdrawRequest with that nonce.
+
+    However, the attacker needs to know the nonce AND the WithdrawRequest details
+    to construct the paymasterAndData. The nonce is per-user, so the attacker would
+    need to be the user themselves (sender). And the EntryPoint validates the sender
+    account too, so the attacker must control the sender account.
+  solidity: |
+    function validatePaymasterUserOp(UserOperation calldata userOp, bytes32, uint256 maxCost)
+        external onlyEntryPoint returns (bytes memory context, uint256 validationData)
+    {
+        // ...
+        _validateRequest(userOp.sender, withdrawRequest);  // nonce consumed HERE (line 352)
+
+        bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest);
+        validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160);
+        // If sigFailed=true, EntryPoint rejects but nonce may already be consumed
+
+        _withdrawable[userOp.sender] += withdrawAmount - maxCost;  // state set even on sig fail
+        // ...
+    }
+  attack_scenario: |
+    1. Owner signs WithdrawRequest for user with nonce N
+    2. Attacker (controlling user's smart wallet) submits UserOp with modified/invalid signature
+       but correct nonce N in the WithdrawRequest
+    3. validatePaymasterUserOp runs: _validateRequest consumes nonce N, then sig check fails
+    4. If EntryPoint does NOT revert validation state: nonce N is permanently consumed
+    5. User cannot use the legitimate WithdrawRequest with nonce N anymore
+    6. _withdrawable[user] has stale credit that user can drain via withdrawGasExcess
+
+    HOWEVER: if the attacker controls the smart wallet, they already have the keys.
+    The scenario is self-griefing. And _withdrawable credit means funds aren't lost.
+  impact: |
+    Self-griefing only. If the user controls their own wallet, burning their own nonce
+    while getting _withdrawable credit (recoverable via withdrawGasExcess) is not an
+    attack on anyone else. Owner can issue a new WithdrawRequest with different nonce.
+    Also depends on whether EntryPoint v0.6 reverts validation state on sig failure.
+  status: pending
+
+- id: MS-F-07
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "maxWithdrawDenominator=0 causes division by zero in _validateRequest"
+  severity: "Low"
+  confidence: 80
+  description: |
+    _validateRequest computes: uint256 maxAllowed = address(this).balance / maxWithdrawDenominator
+    If maxWithdrawDenominator is 0, this is a division by zero → EVM reverts.
+    This would brick ALL withdrawals (both paymaster and direct) since _validateRequest
+    is called in both paths.
+
+    The owner can set maxWithdrawDenominator=0 via setMaxWithdrawDenominator().
+    There's no check preventing zero.
+
+    However, this is an owner-only action (centralization risk) which is explicitly
+    OUT OF SCOPE per the bounty context. The owner is trusted.
+  solidity: |
+    function _validateRequest(address account, WithdrawRequest memory withdrawRequest) internal {
+        // ...
+        uint256 maxAllowed = address(this).balance / maxWithdrawDenominator;
+        // ^ division by zero if maxWithdrawDenominator == 0
+        // ...
+    }
+
+    function _setMaxWithdrawDenominator(uint256 newDenominator) internal {
+        maxWithdrawDenominator = newDenominator;  // no zero check
+        emit MaxWithdrawDenominatorSet(newDenominator);
+    }
+  attack_scenario: |
+    1. Owner (accidentally or maliciously) calls setMaxWithdrawDenominator(0)
+    2. All subsequent withdraw and validatePaymasterUserOp calls revert with
+       division by zero in _validateRequest
+    3. Contract is bricked until owner sets a non-zero value
+    4. _withdrawable funds from already-validated ops are stuck (withdrawGasExcess
+       still works since it doesn't call _validateRequest)
+  impact: |
+    DoS on all withdrawals. Owner-only action, centralization risk is out of scope.
+    Existing _withdrawable can still be claimed via withdrawGasExcess.
+    QA/Informational at best since centralization is excluded.
+  status: known_limitation
+
+- id: MS-F-08
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "forceSafeTransferETH with GAS_STIPEND_NO_STORAGE_WRITES limits receiver behavior"
+  severity: "Low"
+  confidence: 55
+  description: |
+    In postOp, the ETH transfer uses:
+    SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES)
+
+    GAS_STIPEND_NO_STORAGE_WRITES is 2300 gas — equivalent to a basic transfer.
+    If the receiving smart wallet has a receive() function that does storage writes
+    (e.g., logging, updating state), it will run out of gas.
+
+    However, forceSafeTransferETH in Solady is designed to handle this: if the
+    initial transfer with limited gas fails, it uses CREATE to force-send ETH.
+    The CREATE approach deploys a minimal contract that selfdestructs to the target,
+    which cannot be blocked.
+
+    Wait — post-Cancun, SELFDESTRUCT no longer sends ETH to another address in the
+    same way (EIP-6780). SELFDESTRUCT only sends ETH if the contract was created in
+    the same transaction. Since forceSafeTransferETH creates and selfdestructs in
+    the same call, this still works post-Cancun.
+
+    So the force send should work regardless. But the receiver's receive() code
+    does NOT execute in the force-send path. This means any receive() hooks in the
+    smart wallet are skipped.
+  solidity: |
+    // postOp line 170:
+    SafeTransferLib.forceSafeTransferETH(account, withdrawable, SafeTransferLib.GAS_STIPEND_NO_STORAGE_WRITES);
+    // GAS_STIPEND_NO_STORAGE_WRITES = 2300
+    // If receive() needs more gas → falls back to CREATE+SELFDESTRUCT force send
+    // Receiver's receive() is NOT called in force-send path
+  attack_scenario: |
+    1. Smart wallet has a receive() that updates internal accounting
+    2. UserOp uses MagicSpend paymaster
+    3. postOp sends ETH via forceSafeTransferETH
+    4. If receive() needs > 2300 gas, force-send is used
+    5. Smart wallet receives ETH but its internal accounting is not updated
+    6. Wallet may have inconsistent internal state
+
+    This is a design tradeoff to prevent receiver griefing (blocking postOp by
+    consuming all gas in receive). The 2300 stipend + force send ensures postOp
+    always succeeds.
+  impact: |
+    Smart wallets with complex receive() hooks may have inconsistent internal state.
+    Not a MagicSpend vulnerability — it's a deliberate security tradeoff to prevent
+    griefing. Smart wallets interacting with MagicSpend should not rely on receive()
+    being called. Informational.
+  status: known_limitation
+
+- id: MS-F-09
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "Validation phase _withdrawable += allows stacking with stale _withdrawable from failed postOp"
+  severity: "Medium"
+  confidence: 50
+  description: |
+    The += operator on line 143 means _withdrawable accumulates rather than being set.
+    If a previous postOp failed (see MS-F-05) and _withdrawable[user] still has a
+    non-zero value, a subsequent validatePaymasterUserOp will ADD to it:
+
+    _withdrawable[user] += withdrawAmount - maxCost
+
+    This means the user could accumulate multiple WithdrawRequest amounts in
+    _withdrawable without any of them being sent via postOp, then drain everything
+    at once via withdrawGasExcess().
+
+    For this to happen:
+    1. First UserOp: validate sets _withdrawable, postOp fails, _withdrawable persists
+    2. Second UserOp: validate ADDS more to _withdrawable
+    3. User calls withdrawGasExcess() to drain total
+
+    The total drained = sum of all (withdrawAmount_i - maxCost_i) from each validate.
+    Each WithdrawRequest was independently signed and nonce-protected. So the user
+    was entitled to each amount. The total is correct.
+
+    BUT: the gas from each failed UserOp was charged by EntryPoint from MagicSpend's
+    deposit. So MagicSpend (the protocol/owner) pays gas for failed ops AND still
+    owes the _withdrawable. This is a griefing vector: user intentionally causes
+    postOp to fail to accumulate _withdrawable while making MagicSpend pay gas.
+
+    How to cause postOp to fail: the only way is if MagicSpend runs out of ETH
+    during postOp's forceSafeTransferETH. This requires draining MagicSpend's
+    balance between validate and postOp, which is hard without bundle manipulation.
+  solidity: |
+    // Line 143 - uses += not =
+    _withdrawable[userOp.sender] += withdrawAmount - maxCost;
+
+    // If _withdrawable already has stale value from failed postOp:
+    // _withdrawable[user] = stale_value + (new_withdrawAmount - new_maxCost)
+    // User can drain via withdrawGasExcess() in a separate tx
+  attack_scenario: |
+    1. MagicSpend has 10 ETH, user has signed request for 5 ETH (nonce 1)
+    2. UserOp 1: validate sets _withdrawable += (5 ETH - maxCost)
+    3. UserOp 1 execution: user's callData calls withdraw() with a DIFFERENT large
+       request (nonce 2) draining most of MagicSpend's balance
+    4. postOp 1: tries to send _withdrawable but MagicSpend has no ETH → reverts
+    5. _withdrawable[user] persists with (5 ETH - maxCost) value
+    6. Owner refills MagicSpend with 10 ETH
+    7. User submits UserOp 2 with nonce 3 for 5 ETH
+    8. validate: _withdrawable += (5 ETH - maxCost), total now ~10 ETH - 2*maxCost
+    9. User calls withdrawGasExcess() in UserOp 2's callData → drains ~10 ETH
+
+    Wait — step 3 would also consume MagicSpend balance, and the user already received
+    those funds via withdraw(). The _withdrawable is additional entitlement. Each
+    nonce represents a separate signed authorization. So total withdrawn =
+    nonce1 amount + nonce2 amount + nonce3 amount. All signed by owner. No theft.
+  impact: |
+    Each withdrawal is independently authorized by the owner. The += accumulation
+    doesn't enable extracting more than what was authorized across all used nonces.
+    The griefing aspect (gas cost to MagicSpend for failed postOps) is limited by
+    maxWithdrawDenominator and bundler policies. LOW/Informational.
+  status: disproved
+
+- id: MS-F-10
+  hunter: FlowHunter
+  component: MagicSpend
+  title: "withdraw() during UserOp execution can drain MagicSpend balance causing postOp revert"
+  severity: "Medium"
+  confidence: 55
+  description: |
+    During UserOp execution (callData), the smart wallet can call MagicSpend.withdraw()
+    with a separate signed WithdrawRequest. This sends ETH from MagicSpend directly
+    to the wallet. If this drains enough balance, the subsequent postOp's
+    forceSafeTransferETH will fail.
+
+    The maxWithdrawDenominator check limits each individual withdraw to
+    balance/denominator, but the balance changes after each call. If the user
+    calls withdraw() in callData after _withdrawable was set, the balance drops.
+    Then postOp tries to send _withdrawable + gas refund and may fail.
+
+    The code acknowledges this risk: "Helps prevent withdraws in the same transaction
+    leading to reverts and hurting paymaster reputation" (line 36-37).
+
+    With denominator=10 and balance=100 ETH:
+    - validatePaymasterUserOp: allows up to 10 ETH request. Say 10 ETH.
+    - During execution, withdraw(): balance now ~90 ETH, allows 9 ETH. User takes 9 ETH.
+    - postOp: needs to send _withdrawable (~10 ETH - maxCost + gas refund).
+      Balance is ~81 ETH, so this succeeds.
+
+    With denominator=2:
+    - validate: allows 50 ETH request (of 100 ETH). Say 50 ETH.
+    - During execution, withdraw(): balance ~50 ETH, allows 25 ETH. User takes 25 ETH.
+    - postOp: needs ~50 ETH. Balance is ~25 ETH. REVERTS.
+
+    So with low denominator values, combining paymaster + withdraw in same UserOp
+    CAN cause postOp failure. But this hurts the user (funds stuck in _withdrawable)
+    and the paymaster (gas costs). It's self-griefing.
+  solidity: |
+    // 1. validatePaymasterUserOp:
+    //    maxAllowed = 100 ETH / 2 = 50 ETH
+    //    _withdrawable[user] += 50 ETH - maxCost
+
+    // 2. UserOp execution calls withdraw(request for 25 ETH):
+    //    maxAllowed = (100 - 50 + maxCost) / 2  ... actually balance is still 100 at this point
+    //    Wait: validate doesn't transfer ETH. Balance is still 100 ETH.
+    //    maxAllowed = 100 / 2 = 50 ETH. withdraw(25 ETH) succeeds.
+    //    Balance now: 75 ETH.
+
+    // 3. postOp:
+    //    withdrawable = _withdrawable[user] + (maxCost - actualGasCost)
+    //                 = (50 - maxCost) + (maxCost - actualGasCost)
+    //                 = 50 - actualGasCost
+    //    forceSafeTransferETH(user, ~50 ETH)
+    //    Balance 75 ETH >= 50 ETH → succeeds
+    //    Final balance: ~25 ETH
+
+    // Total paid out: 25 (withdraw) + 50 (postOp) = 75 ETH
+    // Two signed requests: 50 ETH + 25 ETH = 75 ETH. Correct.
+  attack_scenario: |
+    The scenario where postOp fails requires total payout to exceed MagicSpend balance.
+    validate's balance check + withdraw's balance check both use maxWithdrawDenominator.
+    With denominator=2:
+    - validate allows up to balance/2
+    - withdraw in execution sees SAME balance (validate doesn't transfer), allows another balance/2
+    - Total committed: balance/2 + balance/2 = balance
+    - postOp needs ~balance/2 ETH, only ~balance/2 remains. Succeeds (barely).
+
+    With denominator=1 (dangerous):
+    - validate allows up to full balance
+    - withdraw allows up to full balance (since validate didn't transfer yet)
+    - Total committed: 2x balance. postOp WILL fail.
+
+    denominator=1 is an owner misconfiguration (centralization, out of scope).
+  impact: |
+    With reasonable maxWithdrawDenominator (>=2), the math works out and postOp
+    does not fail. With denominator=1, postOp can fail but this is owner misconfiguration.
+    No fund loss (stuck _withdrawable recoverable via withdrawGasExcess).
+    Informational — known design tradeoff documented in the code.
+  status: known_limitation

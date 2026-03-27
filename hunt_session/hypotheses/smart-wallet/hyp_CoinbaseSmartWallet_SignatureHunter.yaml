@@ -1,0 +1,561 @@
+hunter: SignatureHunter
+component: CoinbaseSmartWallet
+date: '2026-03-27'
+hypotheses:
+
+  - id: CSW-SIG-01
+    title: "validateUserOp omite replaySafeHash — contextos de firma asimetricos entre ERC-1271 y UserOp"
+    severity: informational
+    confidence: 90
+    tier: 3
+    description: |
+      `isValidSignature` (ERC-1271 publico) aplica `replaySafeHash(hash)` antes de
+      llamar a `_isValidSignature`. El `replaySafeHash` envuelve el hash original en un
+      EIP-712 struct que incluye `chainId` y `address(this)`.
+
+      `validateUserOp` en cambio llama directamente a `_isValidSignature(userOpHash, sig)`
+      sin aplicar `replaySafeHash`. El `userOpHash` ya contiene `chainId` + `sender`
+      por construccion del EntryPoint, por lo que esta proteccion existe via otro mecanismo.
+
+      Los dos caminos de validacion son ortogonales por diseno: una firma para UserOp
+      no es valida en contexto ERC-1271 y viceversa. Esto es proteccion, no vulnerabilidad.
+    attack_scenario: |
+      No explotable. Los contextos son separados intencionalmente.
+    impact: |
+      Sin impacto. Registrado para documentar que la asimetria es by design.
+    solidity: |
+      // Verificar asimetria: firma valida para validateUserOp no pasa isValidSignature
+      bytes memory sig = abi.encode(SignatureWrapper({ownerIndex: 0, signatureData: ownerEOASig}));
+      bytes4 result = wallet.isValidSignature(userOpHash, sig);
+      // Debe retornar 0xffffffff porque isValidSignature envuelve el hash con replaySafeHash
+      t(result == 0xffffffff, "CSW-SIG-01: firma UserOp no valida en contexto ERC-1271");
+    status: false_positive
+    false_positive_reason: |
+      Asimetria intencional. El replaySafeHash separa correctamente los dos contextos
+      de firma. No hay confusion explotable.
+
+  - id: CSW-SIG-02
+    title: "Owner-contrato ERC-1271 puede validar hashes arbitrarios — superficie transitiva sin restriccion"
+    severity: high
+    confidence: 78
+    tier: 1
+    description: |
+      En `_isValidSignature`, cuando `ownerBytes.length == 32` (owner es address EOA
+      o contrato), se usa `SignatureCheckerLib.isValidSignatureNow(owner, hash, sigData)`.
+
+      Solady `isValidSignatureNow` soporta tanto EOA (via ecrecover) como contratos
+      (via ERC-1271 `isValidSignature`). Si un contrato inteligente es owner del
+      SmartWallet, ese contrato puede implementar `isValidSignature` con logica arbitraria
+      y retornar `0x1626ba7e` para cualquier hash.
+
+      El SmartWallet no tiene control sobre la logica del contrato-owner. Cualquier
+      vulnerabilidad en el contrato-owner se propaga directamente al SmartWallet.
+
+      Caso concreto: otro SmartWallet de Coinbase como owner (anidamiento). Si wallet B
+      es owner de wallet A, cualquier owner de B puede autenticar como B y actuar en
+      nombre de A. La cadena de delegacion puede ser arbitrariamente profunda y cada
+      nivel agrega surface de ataque.
+
+      Caso malicioso directo: un contrato registrado como owner que implementa
+      `isValidSignature` retornando siempre `0x1626ba7e` permite a cualquiera que
+      controle ese contrato drenar el wallet.
+    attack_scenario: |
+      1. Victor tiene SmartWallet A con owners: EOA_victim (index 0) y ContractC (index 1).
+      2. ContractC tiene bug: su `isValidSignature` puede ser manipulado por un tercero
+         para retornar `0x1626ba7e` para cualquier hash (ej. control de storage por
+         upgrade malicioso, bug de acceso, etc.).
+      3. Atacante explota el bug en ContractC.
+      4. Atacante construye UserOp: sender = wallet A, sig = SignatureWrapper{ownerIndex=1, sigData=anything}.
+      5. EntryPoint llama `validateUserOp` -> `_isValidSignature` -> `isValidSignatureNow(ContractC, ...)`.
+      6. ContractC.isValidSignature retorna 0x1626ba7e.
+      7. validateUserOp retorna 0 (valido).
+      8. UserOp ejecuta, fondos drenados.
+    impact: |
+      Perdida total de fondos si cualquier contrato-owner es comprometido.
+      El SmartWallet hereda todos los bugs de seguridad de sus owners-contratos.
+      La cadena de delegacion (wallet anidado) multiplica la superficie de ataque.
+    solidity: |
+      // MockMaliciousOwner: retorna siempre 0x1626ba7e en isValidSignature
+      // wallet.addOwnerAddress(address(maliciousOwner))
+      // Construir sig apuntando al malicious owner index
+      bytes memory sig = abi.encode(SignatureWrapper({
+          ownerIndex: maliciousOwnerIndex,
+          signatureData: bytes("arbitrary")
+      }));
+      // Llamar _isValidSignature via harness de test
+      bool result = IWalletHarness(address(wallet)).exposedIsValidSig(
+          keccak256("arbitrary malicious payload"),
+          sig
+      );
+      // Si result == true con datos arbitrarios -> BUG confirmado
+      t(!result, "CSW-SIG-02: owner-contrato malicioso no debe aprobar hash arbitrario");
+    status: investigate
+
+  - id: CSW-SIG-03
+    title: "WebAuthn requireUV=false — authenticator sin User Verification acepta firma de dispositivo robado"
+    severity: low
+    confidence: 85
+    tier: 2
+    description: |
+      En `_isValidSignature`, la validacion passkey llama a:
+        `WebAuthn.verify({challenge: abi.encode(hash), requireUV: false, ...})`
+
+      `requireUV: false` significa que el authenticator NO necesita verificar presencia
+      del usuario (PIN, biometria, etc.). Cualquier authenticator que tenga la clave
+      privada puede firmar sin que el usuario este fisicamente presente o autenticado.
+
+      Implicaciones:
+      - Un dispositivo robado puede ser usado directamente para firmar sin PIN/biometria.
+      - Authenticators basicos (tokens hardware sin UV) son aceptados.
+      - La seguridad del passkey se reduce a solo-posesion vs posesion+factor adicional.
+
+      Este es el finding [L-04] de Solodit ("Missing check for passkey associated with
+      CoinbaseSmartWallet._validateSignature()") — ya fue reportado en auditorias previas.
+    attack_scenario: |
+      1. Atacante roba dispositivo fisico con passkey del usuario.
+      2. El authenticator no necesita biometria/PIN (requireUV=false).
+      3. Atacante puede firmar UserOps maliciosas directamente con el passkey.
+      4. El SmartWallet acepta las firmas y ejecuta las operaciones del atacante.
+    impact: |
+      Si el dispositivo es robado, el atacante puede drenar fondos sin conocer el PIN
+      o biometria del usuario. Modelo de seguridad reducido vs expectativa del usuario.
+    solidity: |
+      // Crear WebAuthnAuth con flags byte donde bit UV (0x04) es 0
+      // authenticatorData[32] es el flags byte (segun WebAuthn spec)
+      // flags & 0x04 == 0 => UV no realizado
+      bytes memory authData = abi.encodePacked(
+          rpIdHash,          // 32 bytes
+          bytes1(0x01),      // flags: UP=1, UV=0 (solo user presence, no verification)
+          uint32(0),         // signCount
+          bytes0()           // no extensions
+      );
+      // Si WebAuthn.verify acepta esto con requireUV=false -> LOW confirmado
+      t(true, "CSW-SIG-03: requireUV=false acepta sigs sin user verification por diseno");
+    status: confirmed_low
+    notes: |
+      Already reported as L-04 in prior audits. Marked as confirmed low/informational.
+      The design choice may be intentional for compatibility with certain authenticators.
+
+  - id: CSW-SIG-04
+    title: "validateUserOp revierte (no retorna 1) cuando ownerIndex apunta a slot vacio — violacion de ERC-4337 spec"
+    severity: medium
+    confidence: 80
+    tier: 1
+    description: |
+      Cuando un owner es removido via `_removeOwnerAtIndex`, el storage se borra con
+      `delete $.ownerAtIndex[index]`. `ownerAtIndex(index)` retorna `bytes("")` (length 0).
+
+      En `_isValidSignature`:
+      ```solidity
+      bytes memory ownerBytes = ownerAtIndex(sigWrapper.ownerIndex);
+      if (ownerBytes.length == 32) { ... }
+      if (ownerBytes.length == 64) { ... }
+      revert InvalidOwnerBytesLength(ownerBytes); // <- se ejecuta si length == 0
+      ```
+
+      El revert ocurre cuando una UserOp referencia un owner removido. Segun ERC-4337,
+      los fallos de validacion DEBEN retornar 1, no revertir, para permitir simulacion.
+      Un revert en `validateUserOp` puede causar:
+      1. El bundler pierde gas por la op revertida.
+      2. El bundler puede penalizar o blacklistear el wallet.
+      3. Griefing: un co-owner puede remover al otro y sus UserOps pendientes revertiran.
+
+      Flujo de griefing:
+      - Alice y Bob son co-owners.
+      - Bob firma una UserOp con ownerIndex=1 (su propio index).
+      - Alice (co-owner) remueve a Bob ANTES de que la UserOp sea incluida.
+      - La UserOp de Bob llega al EntryPoint: validateUserOp revierte.
+      - El bundler puede cargar gas al wallet por el revert.
+    attack_scenario: |
+      1. Alice (owner) y Bob (owner, index 1) son co-owners del wallet.
+      2. Bob construye y firma UserOp con ownerIndex=1, la envia a bundler.
+      3. Alice, antes de la inclusion en bloque, llama removeOwnerAtIndex(1, bob_bytes).
+      4. UserOp de Bob llega al EntryPoint: validateUserOp llama _isValidSignature.
+      5. ownerAtIndex(1) retorna bytes vacios -> revert InvalidOwnerBytesLength.
+      6. Bundler pierde gas. Wallet pierde reputacion con bundlers.
+      7. Alice puede repetir esto para bloquear cualquier UserOp de Bob.
+    impact: |
+      DoS de UserOps. Perdida de reputacion del wallet con bundlers. No hay perdida
+      de fondos directa, pero sí degradacion de UX y posible exclusion de bundlers.
+    solidity: |
+      // Simular: owner removido, UserOp con ownerIndex apuntando al slot vacio
+      uint256 removedIndex = 1; // bob fue removido
+      bytes memory ownerBytes = wallet.ownerAtIndex(removedIndex);
+      t(ownerBytes.length == 0, "slot vacio tras remocion");
+
+      // validateUserOp con ownerIndex=1 debe retornar 1, no revertir
+      // Actualmente revierte con InvalidOwnerBytesLength
+      // Esperado segun ERC-4337: retornar validationData con failure bit
+      UserOperation memory userOp = buildUserOp({sigOwnerIndex: removedIndex});
+      // try wallet.validateUserOp(userOp, hash, 0) returns (uint256 vd) {
+      //     t(vd == 1, "CSW-SIG-04: debe retornar 1 para owner removido");
+      // } catch {
+      //     t(false, "CSW-SIG-04: no debe revertir, debe retornar 1");
+      // }
+    status: investigate
+
+  - id: CSW-SIG-05
+    title: "executeWithoutChainIdValidation permite removeLastOwner cross-chain — wallet puede quedar sin owners en chains secundarias"
+    severity: high
+    confidence: 75
+    tier: 1
+    description: |
+      `canSkipChainIdValidation` retorna true para `removeLastOwner.selector`. Esto
+      significa que un owner puede firmar una operacion cross-chain (sin chainId en el
+      hash) que ejecuta `removeLastOwner`.
+
+      El escenario de lock permanente:
+      - Wallet existe en mainnet (owner A, owner B) y en L2 (solo owner A).
+      - Owner A quiere sincronizar la remocion de si mismo de mainnet via cross-chain tx.
+      - Firma removeLastOwner via executeWithoutChainIdValidation.
+      - En mainnet: removeLastOwner REVIERTE porque hay 2 owners (NotLastOwner error).
+      - En L2: removeLastOwner EXITOSO porque habia 1 owner.
+      - El wallet en L2 queda con 0 owners. Los fondos en L2 estan bloqueados FOREVER.
+
+      Variante con removeOwnerAtIndex (ya reportada como H-01 en Solodit):
+      - Index 1 en mainnet = Bob, index 1 en L2 = Charlie.
+      - removeOwnerAtIndex(1, bob_bytes) via cross-chain.
+      - En mainnet: remueve Bob correctamente.
+      - En L2: falla porque index 1 tiene charlie_bytes != bob_bytes.
+      - Pero si el attacker puede manipular los indices para que coincidan...
+
+      La variante con removeLastOwner es mas peligrosa: no requiere coincidencia de
+      bytes, solo que el wallet tenga exactamente 1 owner en la chain destino.
+    attack_scenario: |
+      1. Usuario tiene wallet en mainnet (A+B owners) y en Base L2 (solo A).
+      2. A quiere "salir" del wallet en mainnet sincronizando su remocion cross-chain.
+      3. A firma removeLastOwner(index_A, a_bytes) via executeWithoutChainIdValidation.
+      4. En mainnet: NotLastOwner(2) revert -- seguro, no se ejecuta.
+      5. En Base L2: ownerCount() == 1 -- removeLastOwner ejecuta exitosamente.
+      6. wallet en Base L2: ownerCount = 0, nextOwnerIndex = previo, removedOwnersCount++.
+      7. No hay funcion para re-inicializar el wallet (initialize() requiere nextOwnerIndex == 0).
+      8. Los fondos en Base L2 estan PERMANENTEMENTE bloqueados.
+    impact: |
+      Perdida permanente de acceso al wallet (y sus fondos) en chains secundarias.
+      Un usuario que intentaba sincronizar owners entre chains puede bloquear su propio wallet.
+      No requiere accion de un atacante externo — es un self-inflicted DoS.
+    solidity: |
+      // Simular estado: mainnet tiene 2 owners, L2 tiene 1
+      // En el fork de L2:
+      t(wallet.ownerCount() == 1, "L2: solo un owner antes del cross-chain tx");
+
+      // Ejecutar removeLastOwner(0, ownerA_bytes) via executeWithoutChainIdValidation
+      // (simulado como llamada directa del EntryPoint en el fork)
+      wallet.removeLastOwner(0, ownerA_bytes); // llamado via _call en executeWithoutChainIdValidation
+
+      // Post-condicion: ownerCount debe ser > 0
+      uint256 ownersLeft = wallet.ownerCount();
+      t(ownersLeft > 0, "CSW-SIG-05: wallet no debe quedar sin owners tras cross-chain removeLastOwner");
+    status: investigate
+
+  - id: CSW-SIG-06
+    title: "MagicSpend getHash no usa EIP-712 — firma EIP-191 puede colisionar con otros contextos del owner"
+    severity: informational
+    confidence: 55
+    tier: 3
+    description: |
+      `getHash` en MagicSpend usa EIP-191 (Ethereum Signed Message) sobre
+      `abi.encode(address(this), account, chainId, asset, amount, nonce, expiry)`.
+
+      No usa EIP-712 formal (con typeHash y domainSeparator estructurado). La inclusion
+      de `address(this)` previene replay cross-contrato. La inclusion de `chainId`
+      previene replay cross-chain. La inclusion de `nonce` previene replay.
+
+      El riesgo teorico: si el owner de MagicSpend firma otros mensajes EIP-191 con
+      la misma estructura de bytes (improbable dado que incluye address(this)), podria
+      haber colision. En la practica, con abi.encode (no encodePacked), los campos
+      tienen tamanios fijos y no hay colision de tipos.
+    attack_scenario: |
+      No hay ataque practico identificado. La inclusion de address(this) + chainId + nonce
+      provee proteccion suficiente contra todos los vectores de replay.
+    impact: |
+      Sin impacto. QA/informational.
+    solidity: |
+      // Verificar que hash incluye address(this) y chainId
+      bytes32 hash = magicSpend.getHash(account, withdrawRequest);
+      // Cambiar chainId en fork -> hash diferente
+      // Cambiar address(this) (diferente deployment) -> hash diferente
+      t(hash != bytes32(0), "CSW-SIG-06: hash no trivial");
+    status: false_positive
+    false_positive_reason: |
+      address(this) + chainId + nonce proveen proteccion suficiente. EIP-191 vs EIP-712
+      es un defecto de estilo, no de seguridad en este contexto.
+
+  - id: CSW-SIG-07
+    title: "MagicSpend validatePaymasterUserOp incrementa _withdrawable aunque sigFailed=true — fondos no respaldados en withdrawable"
+    severity: high
+    confidence: 85
+    tier: 1
+    description: |
+      En `validatePaymasterUserOp`:
+      ```solidity
+      _validateRequest(userOp.sender, withdrawRequest); // (1) marca nonce, verifica limites
+      bool sigFailed = !isValidWithdrawSignature(userOp.sender, withdrawRequest); // (2) verifica firma
+      validationData = (sigFailed ? 1 : 0) | (uint256(withdrawRequest.expiry) << 160); // (3)
+      _withdrawable[userOp.sender] += withdrawAmount - maxCost; // (4) SIEMPRE ejecuta
+      ```
+
+      La linea (4) se ejecuta INDEPENDIENTEMENTE del valor de `sigFailed`. Si la firma
+      es invalida (sigFailed = true), `_withdrawable[userOp.sender]` igual se incrementa.
+
+      Segun la spec de ERC-4337, cuando `validationData` retorna con sigFailed=1, el
+      EntryPoint v0.6 marca la UserOp como fallida pero NO revierte el storage del
+      paymaster (el paymaster paga el gas del validatePaymasterUserOp). El storage
+      modificado en `validatePaymasterUserOp` PERSISTE.
+
+      Resultado: `_withdrawable[userOp.sender]` fue incrementado sin que haya habido
+      una autorizacion valida del owner de MagicSpend. Un atacante puede inflar
+      `_withdrawable` de cualquier cuenta enviando UserOps con firmas invalidas.
+
+      Si MagicSpend tiene balance suficiente, la cuenta puede llamar `withdrawGasExcess()`
+      y retirar fondos no autorizados.
+
+      Nota adicional: el nonce tambien queda marcado como usado (en _validateRequest),
+      lo que agrava el problema: el nonce se consume sin retiro valido.
+    attack_scenario: |
+      Prerrequisito: MagicSpend tiene ETH depositado (ej. 100 ETH).
+      maxWithdrawDenominator = 100 -> maxAllowed = 1 ETH por operacion.
+
+      1. Atacante construye UserOp: sender = victim, paymasterAndData con
+         amount = 1 ETH, nonce = N, expiry = far_future, firma = bytes_aleatorios.
+      2. Atacante envia la UserOp al bundler (paga gas del atacante, no de la victima).
+      3. EntryPoint llama validatePaymasterUserOp:
+         - _validateRequest: verifica amount <= maxAllowed (pasa), marca nonce N como usado.
+         - isValidWithdrawSignature: retorna false (firma invalida).
+         - validationData = 1 (sigFailed).
+         - _withdrawable[victim] += 1 ETH - maxCost.
+      4. EntryPoint rechaza la UserOp (sigFailed), cobra gas al paymaster.
+      5. _withdrawable[victim] tiene ahora ~1 ETH de mas.
+      6. Victim llama withdrawGasExcess() -> recibe ~1 ETH no autorizado.
+      7. Repetir hasta drenar MagicSpend.
+
+      Limitante: _validateRequest verifica amount <= balance/maxWithdrawDenominator.
+      Limitante: El atacante necesita que el bundler procese la UserOp (puede requerir
+      fee al bundler). Pero si el atacante es tambien bundler o usa un bundler laxo...
+    impact: |
+      Potencial drenado completo del balance de MagicSpend mediante multiples
+      UserOps con firmas invalidas. La victima recibe fondos que no le corresponden,
+      pero el danio real es a los fondos del owner de MagicSpend y a otros usuarios.
+      Severidad alta si el comportamiento del EntryPoint v0.6 confirma que el storage
+      persiste cuando validationData=1. REQUIERE FORK TEST PARA CONFIRMAR.
+    solidity: |
+      // Fork test (mainnet): verificar que _withdrawable persiste con sigFailed
+      uint256 withdrawableBefore = magicSpend.withdrawable(victim);
+
+      // Construir UserOp con firma invalida en paymasterAndData
+      bytes memory badSig = hex"deadbeef";
+      WithdrawRequest memory req = WithdrawRequest({
+          signature: badSig,
+          asset: address(0),
+          amount: 0.5 ether,
+          nonce: 999,
+          expiry: type(uint48).max
+      });
+      // Enviar via EntryPoint.handleOps (fork test)
+      // entryPoint.handleOps([userOp], payable(bundler));
+
+      uint256 withdrawableAfter = magicSpend.withdrawable(victim);
+      // Si withdrawableAfter > withdrawableBefore con firma invalida -> BUG CRITICO
+      t(withdrawableAfter == withdrawableBefore,
+        "CSW-SIG-07: _withdrawable no debe incrementarse con firma invalida");
+    status: investigate
+
+  - id: CSW-SIG-08
+    title: "MagicSpend _validateRequest marca nonce como usado ANTES de verificar firma — DoS de nonces validos"
+    severity: medium
+    confidence: 92
+    tier: 1
+    description: |
+      En `validatePaymasterUserOp`, el orden de operaciones es:
+      ```solidity
+      _validateRequest(userOp.sender, withdrawRequest); // [1] marca nonce como usado
+      bool sigFailed = !isValidWithdrawSignature(...);  // [2] verifica firma
+      ```
+
+      `_validateRequest` internamente hace:
+      ```solidity
+      _nonceUsed[withdrawRequest.nonce][account] = true; // nonce consumido
+      ```
+
+      El nonce se marca como usado ANTES de verificar si la firma es valida. Si la
+      firma es invalida, el nonce queda permanentemente consumido.
+
+      Comparacion: en `withdraw()` (funcion directa), el orden es CORRECTO:
+      ```solidity
+      if (!isValidWithdrawSignature(msg.sender, withdrawRequest)) revert InvalidSignature(); // [1]
+      _validateRequest(msg.sender, withdrawRequest); // [2] marca nonce DESPUES
+      ```
+
+      El bug existe solo en el path de `validatePaymasterUserOp`.
+
+      Un atacante que conoce el nonce de un WithdrawRequest valido puede enviar una
+      UserOp con ese nonce y una firma invalida. El nonce queda marcado, invalidando
+      el WithdrawRequest legitimo del usuario.
+    attack_scenario: |
+      1. Owner de MagicSpend le da a la victima un WithdrawRequest valido:
+         {asset: 0, amount: 1 ETH, nonce: 42, expiry: T+7days, firma: FIRMA_VALIDA}.
+      2. Atacante ve el nonce 42 (ej. por monitorear las transacciones del owner
+         o por brute-force si el nonce es predecible).
+      3. Atacante construye UserOp: sender=victim, paymasterAndData con nonce=42,
+         amount=1 ETH, expiry=T+7days, firma=BYTES_INVALIDOS.
+      4. Bundler procesa la UserOp -> validatePaymasterUserOp:
+         - _validateRequest: _nonceUsed[42][victim] = true.
+         - isValidWithdrawSignature: false.
+         - validationData = 1 (falló).
+      5. Nonce 42 queda marcado como usado.
+      6. Cuando la victima intenta usar su WithdrawRequest legitimo:
+         - Via withdraw(): _validateRequest revierte con InvalidNonce(42).
+         - Via paymaster UserOp: _validateRequest revierte con InvalidNonce(42).
+      7. La victima no puede retirar sus fondos. Necesita un nuevo WithdrawRequest
+         del owner con un nonce diferente.
+      8. Si el atacante conoce los nonces futuros, puede repetir indefinidamente.
+    impact: |
+      DoS selectivo de retiros. Un atacante puede bloquear todos los WithdrawRequests
+      del usuario si puede predecir los nonces. Los nonces son enteros arbitrarios sin
+      esquema de incremento forzado, lo que hace la prediccion dificil pero no imposible
+      si el owner usa un patron predecible (ej. timestamp, secuencia lineal).
+      No hay perdida directa de fondos del MagicSpend, pero si bloqueo temporal de
+      acceso a fondos del usuario.
+    solidity: |
+      // Verificar que nonce queda usado aunque la firma sea invalida (via validatePaymasterUserOp)
+      assertFalse(magicSpend.nonceUsed(victim, 42), "nonce no usado inicialmente");
+
+      // Construir UserOp con nonce=42 y firma invalida, enviar al bundler (fork)
+      // ... handleOps ...
+
+      assertTrue(magicSpend.nonceUsed(victim, 42),
+          "CSW-SIG-08: nonce marcado como usado aunque firma sea invalida -- BUG");
+
+      // Intentar usar el WithdrawRequest legitimo con nonce 42
+      WithdrawRequest memory legitReq = createLegitRequest(42, VALID_SIGNATURE);
+      vm.expectRevert(MagicSpend.InvalidNonce.selector);
+      magicSpend.withdraw(legitReq); // debe fallar con InvalidNonce aunque la firma sea valida
+    status: investigate
+
+  - id: CSW-SIG-09
+    title: "getUserOpHashWithoutChainId sin address(this) — mismo hash en todos los deployments del mismo wallet cross-chain"
+    severity: informational
+    confidence: 95
+    tier: 3
+    description: |
+      `getUserOpHashWithoutChainId` calcula:
+        `keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))`
+
+      No incluye `address(this)` explicitamente. Sin embargo, `UserOperationLib.hash(userOp)`
+      incluye `userOp.sender` (la direccion del wallet proxy), que es identica en todas las
+      chains si se uso CREATE2 con el mismo salt.
+
+      Esto es intencional: el hash cross-chain debe ser el mismo para que la misma firma
+      funcione en todas las chains. El diseno es correcto para sincronizacion de owners.
+
+      El riesgo documentado: las operaciones permitidas via executeWithoutChainIdValidation
+      afectan el wallet en TODAS las chains simultaneamente. Un usuario que agrega un owner
+      malicioso "en todas las chains" puede no entender el alcance de la accion.
+      Este es un problema de UX/documentacion, no de codigo.
+    attack_scenario: |
+      No hay ataque tecnico directo. El comportamiento es by design. El riesgo es que
+      los usuarios no comprendan la naturaleza cross-chain de las operaciones.
+    impact: |
+      Sin impacto tecnico. Riesgo de UX documentado.
+    solidity: |
+      // El hash cross-chain debe ser identico en mainnet y L2 para el mismo userOp
+      // Esto es correcto por diseno
+      t(true, "CSW-SIG-09: replayabilidad cross-chain es intencional");
+    status: false_positive
+    false_positive_reason: |
+      Comportamiento intencional por diseno. El hash sin chainId es identico en todas las
+      chains para habilitar la sincronizacion cross-chain de operaciones de management.
+
+  - id: CSW-SIG-10
+    title: "SignatureWrapper: tipo de firma EOA vs contrato no se distingue — SignatureCheckerLib acepta ambos para owners EOA"
+    severity: medium
+    confidence: 70
+    tier: 2
+    description: |
+      Cuando el owner registrado es una direccion EOA (32 bytes), `_isValidSignature`
+      usa `SignatureCheckerLib.isValidSignatureNow(owner, hash, sigData)`.
+
+      `isValidSignatureNow` de Solady:
+      1. Primero intenta recuperar via ecrecover (EOA path).
+      2. Si el recovered address != owner, intenta `owner.isValidSignature(hash, sigData)` (ERC-1271 path).
+      3. Si `owner` tiene codigo (es un contrato), va directamente al path ERC-1271.
+
+      Si el owner registrado es una EOA (sin codigo), el path (2) fallara con un revert
+      silencioso (la EOA no tiene `isValidSignature`). Esto esta manejado correctamente.
+
+      El problema sutil: `isValidSignatureNow` acepta tanto firmas ECDSA estandar como
+      firmas ERC-1271 para el mismo owner EOA (si de alguna forma el owner se convierte
+      en un contrato -- imposible en EVM para una EOA existente, pero posible si el owner
+      era un contrato que luego se auto-destruyo y fue re-deployado).
+
+      Mas relevante: la funcion `isValidSignatureNow` acepta firmas ERC-1271 "wrapped"
+      de Solady (con magic value al final). Esto es un vector para confusion de tipo de
+      firma si el caller no sabe exactamente que formato esta usando.
+    attack_scenario: |
+      El riesgo es teorico. En la practica, una EOA no puede convertirse en contrato
+      y viceversa (sin self-destruct + redeploy). Registrado como investigacion.
+    impact: |
+      Impacto bajo en el contexto actual. Sin perdida de fondos directa identificada.
+    solidity: |
+      // Verificar que para un owner EOA, solo firmas ECDSA validas son aceptadas
+      address eoa = vm.addr(privKey);
+      // Registrar eoa como owner
+      // Intentar pasar una "firma ERC-1271 wrapped" en sigData
+      // Si el owner no tiene codigo, isValidSignatureNow deberia usar solo ecrecover
+      bool result = SignatureCheckerLib.isValidSignatureNow(eoa, hash, erc1271WrappedSig);
+      // Para una EOA sin codigo, debe retornar false si la firma ECDSA es incorrecta
+      t(!result, "CSW-SIG-10: EOA sin codigo no debe aceptar firma ERC-1271 wrapped");
+    status: investigate
+
+priority_findings:
+  - id: CSW-SIG-08
+    priority: 1
+    reason: |
+      Bug claro y directo: nonce marcado antes de verificar firma en validatePaymasterUserOp
+      pero NO en withdraw(). La asimetria entre los dos paths es evidencia del bug.
+      Confianza 92%. Requiere fork test para confirmar que bundlers procesaran la UserOp.
+    next_step: "fork test mainnet con EntryPoint v0.6, enviar UserOp con firma invalida y verificar nonce"
+
+  - id: CSW-SIG-07
+    priority: 2
+    reason: |
+      _withdrawable incrementado aunque sigFailed=true. Si el EntryPoint v0.6 no revierte
+      el storage del paymaster en ops fallidas, esto permite inflar _withdrawable con firmas
+      invalidas y potencialmente drenar MagicSpend. Confianza 85% en el bug, 65% en que
+      el EntryPoint no revierte el storage del paymaster.
+    next_step: "fork test: verificar comportamiento del EntryPoint v0.6 con validationData=1 del paymaster"
+
+  - id: CSW-SIG-05
+    priority: 3
+    reason: |
+      removeLastOwner en canSkipChainIdValidation puede dejar wallets sin owners en chains
+      secundarias. Perdida permanente de fondos. Variante no documentada del H-01 conocido.
+    next_step: "verificar que removeLastOwner.selector esta en canSkipChainIdValidation y crear fork PoC"
+
+  - id: CSW-SIG-04
+    priority: 4
+    reason: |
+      validateUserOp revierte (violacion ERC-4337) en lugar de retornar 1 para owner removido.
+      Permite griefing entre co-owners y dano de reputacion con bundlers.
+    next_step: "confirmar con la spec de ERC-4337 que el revert es violacion, luego fork test"
+
+  - id: CSW-SIG-02
+    priority: 5
+    reason: |
+      Owner-contrato puede validar hashes arbitrarios. Superficie real solo si owners son
+      contratos vulnerables. Investigar si SpendPermissionManager u otros componentes
+      Coinbase pueden ser owners y si tienen bugs que permitan manipular isValidSignature.
+    next_step: "verificar si algun componente Coinbase en scope puede ser owner de SmartWallet"
+
+false_positives:
+  - id: FP-SIG-01
+    hypothesis: CSW-SIG-01
+    reason: "Asimetria intencional entre contextos ERC-1271 y UserOp. El replaySafeHash protege correctamente."
+
+  - id: FP-SIG-02
+    hypothesis: CSW-SIG-06
+    reason: "address(this) + chainId + nonce en el hash de MagicSpend proveen proteccion suficiente."
+
+  - id: FP-SIG-03
+    hypothesis: CSW-SIG-09
+    reason: "Hash cross-chain sin chainId es intencional para habilitar sincronizacion de owners."
