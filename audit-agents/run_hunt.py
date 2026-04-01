@@ -99,6 +99,81 @@ DOMAIN_BRIEFING = {
     "inputval":   "knowledge/input-validation.md",
 }
 
+# KB briefings mapped to each hunter's specialty.
+# Each hunter gets patterns from these briefings as background knowledge (appendix).
+# WildcardHunter intentionally excluded — works best without anchoring.
+HUNTER_KB_BRIEFINGS: dict[str, list[str]] = {
+    "MathHunter":    ["knowledge/math-libraries.md", "knowledge/fee-distribution.md"],
+    "AccessHunter":  ["knowledge/access-control.md", "knowledge/proxy-upgrade.md"],
+    "FlowHunter":    ["knowledge/reentrancy-patterns.md", "knowledge/liquidation-mechanics.md", "knowledge/flash-loan.md"],
+    "OracleHunter":  ["knowledge/oracle.md", "knowledge/mev-sandwich.md"],
+    "DomainHunter":  [],  # Gets domain-specific briefing dynamically
+    "TrustBoundaryHunter": ["knowledge/trust-boundaries.md", "knowledge/weird-erc20.md", "knowledge/cross-chain-messaging.md"],
+    "SignatureHunter": ["knowledge/signature-replay.md", "knowledge/permit2-approvals.md"],
+    "DoSHunter":     ["knowledge/input-validation.md"],
+}
+
+
+def extract_kb_pattern_summaries(briefing_paths: list[str], max_patterns: int = 30) -> str:
+    """
+    Extract pattern ID + title from KB briefings as a compact appendix.
+    Returns ~30-50 lines of 'id: one-line description' for hunter background knowledge.
+    """
+    patterns = []
+    for bp in briefing_paths:
+        full_path = KNOWLEDGE_DIR.parent / bp if not Path(bp).is_absolute() else Path(bp)
+        if not full_path.exists():
+            # Try from WEB3_DIR
+            full_path = WEB3_DIR / bp
+        if not full_path.exists():
+            continue
+
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        # Extract pattern entries: look for "- id:" and "pattern:" / "titulo:" lines
+        current_id = None
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("- id:"):
+                current_id = stripped.replace("- id:", "").strip()
+            elif stripped.startswith("pattern:") and current_id:
+                pattern_name = stripped.replace("pattern:", "").strip()
+                patterns.append(f"- {current_id}: {pattern_name}")
+                current_id = None
+            elif stripped.startswith("titulo:") and current_id:
+                title = stripped.replace("titulo:", "").strip().strip('"')
+                if title and len(title) < 120:
+                    # Update last pattern entry if it matches, otherwise add new
+                    updated = False
+                    if patterns:
+                        for i in range(len(patterns) - 1, -1, -1):
+                            if patterns[i].startswith(f"- {current_id}:"):
+                                patterns[i] = f"- {current_id}: {title}"
+                                updated = True
+                                break
+                    if not updated:
+                        patterns.append(f"- {current_id}: {title}")
+                current_id = None
+
+    if not patterns:
+        return ""
+
+    # Deduplicate and limit
+    seen = set()
+    unique = []
+    for p in patterns:
+        pid = p.split(":")[0]
+        if pid not in seen:
+            seen.add(pid)
+            unique.append(p)
+
+    unique = unique[:max_patterns]
+    return "\n".join(unique)
+
+
 # Keywords para auto-detectar dominios del código fuente del contrato.
 # Orden importa: más keywords específicas = mejor señal.
 DOMAIN_KEYWORDS: dict[str, list[str]] = {
@@ -348,6 +423,43 @@ def count_locs(file_path: Path) -> int:
         return len(code_lines)
     except:
         return 0
+
+
+_asset_flow_cache: dict = {}
+
+def _generate_asset_flow_rich(contract_path: Path) -> str:
+    """
+    Calls protocol_analyzer.py --asset-flow for Slither-based rich asset flow.
+    Returns markdown string or empty string on failure.
+    Cached per contract_path to avoid running Slither 9 times.
+    """
+    if not contract_path or not contract_path.exists():
+        return ""
+
+    cache_key = str(contract_path)
+    if cache_key in _asset_flow_cache:
+        return _asset_flow_cache[cache_key]
+
+    analyzer_script = AUDIT_AGENTS_DIR / "protocol_analyzer.py"
+    if not analyzer_script.exists():
+        _asset_flow_cache[cache_key] = ""
+        return ""
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(analyzer_script), "--asset-flow", str(contract_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip()
+        if output and "Rich Asset Flow Map" in output:
+            _asset_flow_cache[cache_key] = output + "\n"
+            return _asset_flow_cache[cache_key]
+        _asset_flow_cache[cache_key] = ""
+        return ""
+    except Exception as e:
+        print(f"[!] Rich asset flow failed: {e}")
+        _asset_flow_cache[cache_key] = ""
+        return ""
 
 
 def generate_asset_flow_map(contract_path: Path) -> str:
@@ -807,7 +919,13 @@ def _hunter_specific_section(hunter_name: str) -> str:
     """Genera secciones especializadas por tipo de hunter (Items 2,3,5,6 del plan de mejoras)."""
 
     if hunter_name == "FlowHunter":
-        return """## Flash Loan Hypothesis (OBLIGATORIO — responde para CADA función que modifica estado)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Math / precision → MathHunter | Access control / roles → AccessHunter
+- Oracle price feeds → OracleHunter | Token quirks → TrustBoundaryHunter
+TÚ: reentrancy, CEI violations, callbacks, state transitions, flash loans, fund routing, state machine.
+
+## Flash Loan Hypothesis (OBLIGATORIO — responde para CADA función que modifica estado)
 Después de tu análisis libre, pasa por estas 12 preguntas para cada función relevante:
 1. ¿Lee estado manipulable? (getReserves, slot0, balanceOf, get_virtual_price)
 2. ¿Ese estado afecta movimiento de fondos?
@@ -875,12 +993,39 @@ state_machine:
 ```
 
 Bug real: Rari Fuse — posición liquidada podía re-depositarse y crear deuda fantasma.
-Bug real: Compound v2 — cToken stuck en PAUSED sin función de unpause por admin key loss."""
+Bug real: Compound v2 — cToken stuck en PAUSED sin función de unpause por admin key loss.
+
+## Multi-TX State Sequences (OBLIGATORIO — después del FSM)
+Diferente de reentrancy (misma TX). Busca bugs INTER-BLOQUE:
+1. **TX1 (bloque N) deja estado X → TX2 (bloque N+1) lee estado X**: ¿es consistente? ¿TX2 asume que nadie más tocó el estado entre bloques?
+2. **Race conditions entre usuarios**: ¿dos usuarios ejecutando la misma función en el mismo bloque producen resultado inesperado? (e.g., dos liquidadores compitiendo)
+3. **Front-run observable**: ¿un observador de mempool puede front-run TX1 para alterar el resultado de TX2? (no sandwich genérico — secuencias ESPECÍFICAS de este contrato)
+4. **State staleness**: ¿hay funciones que leen state que debería haberse actualizado pero no se llamó al actualizador? (accrue interest, update rewards)
+
+Para cada secuencia encontrada: documenta TX1, TX2, estado intermedio, y el impacto económico.
+
+## Derived State Freshness Map (OBLIGATORIO para protocolos con rates/indexes/rewards)
+Mapea la cadena de dependencias entre valores derivados:
+
+```yaml
+derived_state_map:
+  - state: currentBorrowingRate
+    written_by: [updateInterestRates]
+    read_by: [latestBorrowingIndex, _updateIndexes]
+    stale_risk: "If utilization changes without calling updateInterestRates, _updateIndexes uses stale rate"
+    verdict: STALE_RISK
+```
+
+Para CADA par donde `read_by` de stateA incluye una función que no está en
+`written_by` de stateA → hay un path donde se lee stale. Documéntalo."""
 
     elif hunter_name == "OracleHunter":
-        return """## Oracle Deep Check (OBLIGATORIO — para cada fuente de precio)
-NOTA: Flash Loan Hypothesis (12 preguntas) es responsabilidad de FlowHunter. NO la dupliques aquí.
-Enfócate en tu especialidad: ORÁCULOS y fuentes de precio.
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Flash loans / reentrancy → FlowHunter | Access control → AccessHunter | Math precision → MathHunter
+TÚ: price feeds, TWAP manipulation, oracle staleness, spot vs TWAP, oracle dependencies, L2 sequencer.
+
+## Oracle Deep Check (OBLIGATORIO — para cada fuente de precio)
 Para CADA llamada a latestRoundData() o equivalente:
 1. ¿Se verifica updatedAt contra un heartbeat? ¿El heartbeat es ESPECÍFICO por feed o genérico?
 2. ¿Se chequea answeredInRound >= roundId?
@@ -889,19 +1034,35 @@ Para CADA llamada a latestRoundData() o equivalente:
 5. ¿Existe minAnswer/maxAnswer que clampea el precio en flash crashes?
 6. ¿El oracle puede ser sandwicheado? (front-run de oracle update para explotar el vault)
 
-Oracle-Liquidity Mismatch (cmichel/Rari): ¿cuánto capital se necesita para manipular el oracle vs cuánto se puede extraer? Si manipulación < extracción → explotable."""
+Oracle-Liquidity Mismatch (cmichel/Rari): ¿cuánto capital se necesita para manipular el oracle vs cuánto se puede extraer? Si manipulación < extracción → explotable.
+
+## L2 Oracle Specifics (OBLIGATORIO si el contrato se deploya en L2 — Base/Arbitrum/Optimism)
+1. **Sequencer uptime feed**: ¿se consulta? ¿hay grace period después de que el sequencer vuelve? (usuarios no pueden reaccionar inmediatamente)
+2. **block.timestamp en L2**: en Arbitrum es el timestamp del L1 batch, no del L2 block — ¿afecta TWAP o staleness checks?
+3. **Heartbeat divergente**: Chainlink feeds en L2 a menudo tienen heartbeats DIFERENTES que en L1 (e.g., ETH/USD: 1h en L1, 20min en Optimism). ¿El contrato usa el heartbeat correcto por chain?
+4. **Multi-chain oracle consistency**: si el mismo protocolo está en L1+L2, ¿los precios pueden divergir temporalmente? ¿eso abre arbitrage explotable?
+5. **Fallback oracle en L2**: si el primary feed falla en L2, ¿hay fallback? ¿o la función revierte bloqueando liquidaciones?"""
 
     elif hunter_name == "DomainHunter":
-        return """## Symmetric Inspection (OBLIGATORIO — después de tu análisis de dominio)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Math genérico / precision → MathHunter | Access control genérico → AccessHunter
+- Reentrancy / CEI → FlowHunter | Oracle feeds → OracleHunter
+TÚ: lógica de NEGOCIO específica del protocolo, simetría funcional, invariantes económicos, constraint inference.
+
+## Symmetric Inspection (OBLIGATORIO — después de tu análisis de dominio)
 Identifica TODOS los pares simétricos del contrato. Pares comunes:
   deposit/withdraw, mint/burn, lock/unlock, stake/unstake, borrow/repay, open/close
 
-Para CADA par, verifica estas 5 dimensiones:
+Para CADA par, verifica estas 8 dimensiones:
 1. **State variables**: ¿ambas funciones actualizan las mismas variables (en dirección opuesta)?
 2. **Validaciones**: ¿mismas validaciones (o su inversa lógica)?
 3. **Events**: ¿ambas emiten el evento correspondiente?
 4. **Modifiers**: ¿mismos modifiers aplicados (nonReentrant, whenNotPaused)?
 5. **Edge cases**: ¿amount=0, amount=max, balance=0 manejados simétricamente?
+6. **Fee handling**: ¿ambas funciones cobran/acreditan fees simétricamente? (fee en deposit pero no en withdraw = leak)
+7. **Event ordering**: ¿eventos emitidos ANTES o DESPUÉS del state change en ambas? (inconsistencia = off-chain confusion)
+8. **Ghost variable tracking**: ¿totalDeposited se incrementa en deposit Y se decrementa en withdraw por la MISMA cantidad?
 
 Cualquier asimetría es un candidato a invariante. Documenta qué variable/check/event falta en qué función.
 Bug real: GMX — openShort actualizaba globalShortAveragePrices, closeShort NO → $42M.
@@ -912,23 +1073,84 @@ Para cada validación/require que encuentres:
 2. El path que NO tiene esa validación es el bug candidato.
 Ejemplo: si 5 de 6 funciones de withdraw verifican healthFactor, la 6ta que no lo hace es sospechosa.
 
+## Parameter Usage Consistency (OBLIGATORIO)
+Para CADA parámetro de configuración (threshold, limit, cap, fee, rate, max*, min*):
+Lista TODAS las funciones que lo leen y QUÉ HACEN con él.
+
+```yaml
+parameter_consistency:
+  - param: maxTimesLeverage
+    usages:
+      - {function: "_checkWithinlimits", line: 467, usage: "min(vp.maxTimesLeverage, maxLevTimes)"}
+      - {function: "isLiquidateable", line: 408, usage: "vp.maxTimesLeverage - 1e18 (ignores pool limit)"}
+    consistent: false
+    verdict: "BUG — open validates against min(A,B) but liquidation uses only A"
+```
+
+REGLA: Si function_validate usa `restriction(param)` y function_execute usa
+`param` sin la misma restricción → INCONSISTENCIA → Tier 1 si afecta apertura vs liquidación.
+
+ESPECIALMENTE buscar: ¿puede un estado ser creado válidamente por F_create
+y ser inmediatamente inválido según F_validate?
+
 ## Traza Hacia Atrás (samczsun — MENTALIDAD)
 No empieces preguntando "¿hay un bug aquí?". Empieza preguntando:
 "¿De dónde puede SALIR valor del protocolo?" (withdraw, redeem, liquidate, claim, transfer).
 Para cada punto de salida, traza HACIA ATRÁS: ¿qué condiciones se deben cumplir? ¿Se pueden manipular?"""
 
     elif hunter_name == "MathHunter":
-        return """## Decimal Universality (OBLIGATORIO — después de tu análisis matemático)
-Para CADA operación aritmética que involucre tokens o precios:
-- ¿Funciona con 6 decimales (USDC, USDT)?
-- ¿Funciona con 8 decimales (WBTC)?
-- ¿Funciona con 18 decimales (WETH, DAI)?
-- ¿Funciona con 2 decimales (tokens exóticos)?
-- ¿minOut/slippage protection funciona correctamente para TODOS los tokens?
-- ¿Hay divisiones donde numerador tiene menos decimales que denominador? (resultado trunca a 0)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Access control / roles → AccessHunter | Reentrancy / CEI → FlowHunter
+- Oracle manipulation → OracleHunter | Gas DoS → DoSHunter
+TÚ: overflow, underflow, precision loss, rounding direction, share price math, exchange rates.
 
-Bug real: slippage check hardcodeado para USDC (6 dec) aplicado a WETH (18 dec) → protección inefectiva.
-Bug real: price = tokenAmount * oraclePrice / 1e18 con tokenAmount de 6 dec → pierde 12 dec de precisión.
+## Pre-Descarte (OBLIGATORIO — ANTES de escribir cada hipótesis en el YAML)
+Para cada hipótesis matemática, verifica PRIMERO estos 4 filtros:
+1. **¿Está en `unchecked {}` block?** → Si la aritmética es checked (Solidity ≥0.8, sin unchecked), un overflow REVIERTE, no es explotable — descarta overflow genéricos fuera de unchecked
+2. **¿El input está acotado por un require/if anterior?** → Calcula el rango REAL del input, no asumas type(uint256).max
+3. **¿La precision loss es < 1 wei para inputs realistas?** → Prueba con montos reales ($100, $1M, $100M). Si la pérdida es dust → false_positive con razón
+4. **¿La función es internal y solo se llama con valores controlados?** → Traza TODOS los call sites. Si todos pre-validan, descarta
+
+Solo hipótesis que SOBREVIVEN los 4 filtros van al YAML. Las descartadas van a `false_positives:` con la razón específica.
+
+## Decimal Impact Table (OBLIGATORIO — reemplaza texto libre)
+Para CADA operación aritmética que involucra token amounts o precios,
+DEBES producir esta tabla en tu output YAML bajo el campo `decimal_analysis`:
+
+```yaml
+decimal_analysis:
+  - operation: "L149: cross * totalSupply / bal0 / bal1"
+    intermediate_max_bits: 96
+    result_6dec: "1e6 — OK"
+    result_8dec: "1e8 — OK"
+    result_18dec: "1e18 — OK"
+    overflow_risk: false
+    truncation_risk: false
+    verdict: SAFE
+```
+
+Si tu YAML no incluye `decimal_analysis` con al menos 1 entrada por operación
+aritmética crítica → el merge_invariants.py lo rechazará.
+
+NO escribas "funciona para 6/8/18" sin la tabla numérica con bits calculados.
+
+## Boundary Collapse Check (OBLIGATORIO)
+Para CADA integer division cuyo resultado se usa en comparación (<, <=, >, >=):
+1. ¿Cuál es el valor MÍNIMO válido del divisor?
+2. Si min_divisor → quotient == 0: ¿la comparación sigue siendo correcta?
+3. TABLA en tu output YAML bajo `boundary_analysis`:
+
+```yaml
+boundary_analysis:
+  - line: 236
+    expression: "modulo < (tickSpacing / 2)"
+    divisor: tickSpacing
+    divisor_min: 1
+    quotient_at_min: 0
+    comparison_becomes: "modulo < 0 → always false for uint"
+    verdict: BUG
+```
 
 ## Bidirectional Rounding Check (Sec3/Josselin Feist — OBLIGATORIO)
 Para cada función BIDIRECCIONAL (swap A→B y B→A, mint/redeem, deposit/withdraw):
@@ -940,33 +1162,86 @@ Para cada función BIDIRECCIONAL (swap A→B y B→A, mint/redeem, deposit/withd
 ## Fuzz para Maximizar (Dacian — MENTALIDAD)
 Cuando escribas invariantes de math, piensa en modo OPTIMIZACIÓN no solo VERIFICACIÓN:
 - No solo "¿hay precision loss?" sino "¿cuál es el INPUT que MAXIMIZA la precision loss?"
-- Escribe una función optimize_precisionLoss() que Echidna pueda maximizar"""
+- Para CADA hipótesis con precision loss, escribe una función `optimize_` que Echidna pueda maximizar:
+```solidity
+// Echidna intentará maximizar el return value
+function optimize_precisionLoss(uint256 amount) public returns (int256) {
+    uint256 shares = vault.deposit(amount);
+    uint256 redeemed = vault.redeem(shares);
+    return int256(amount) - int256(redeemed); // maximizar pérdida del usuario
+}
+```
+Si NO puedes escribir la función optimize_, la hipótesis de precision loss es especulativa — baja confidence a 50%."""
 
     elif hunter_name == "WildcardHunter":
-        return """## Deadlock Analysis (OBLIGATORIO — después de tu búsqueda creativa)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices en estos — referencia si detectas algo):
+- Math/precision → MathHunter | Reentrancy/callbacks → FlowHunter | Access control → AccessHunter
+- Oracles → OracleHunter | Signatures → SignatureHunter | Gas DoS/loops → DoSHunter
+TÚ: vectores que NO encajan en ningún otro hunter. Lo raro, lo inesperado, lo creativo.
+
+## Checklist de Vectores Exclusivos (OBLIGATORIO — revisa cada uno contra el código)
+Estos son PUNTOS DE PARTIDA, no tu scope completo. Si encuentras algo fuera de esta lista, perfecto.
+1. **SafeCast / type conversion**: ¿hay toUint128, toInt256, toUint96 que truncan silenciosamente en `unchecked` blocks?
+2. **abi.decode de datos externos**: ¿se valida longitud? ¿puede revert con datos malformados o vacíos?
+3. **CREATE2 / address prediction**: ¿se puede pre-computar address y enviar ETH/tokens antes de deploy?
+4. **selfdestruct / PUSH0**: ¿el contrato asume que code.length > 0 implica "es contrato"? ¿address(x).code.length post-selfdestruct?
+5. **EVM precompile edge cases**: ¿usa ecrecover, modexp, bn256? ¿inputs fuera de rango producen resultados inesperados?
+6. **Transient storage (EIP-1153)**: ¿usa tstore/tload? ¿se limpia al final de la tx? ¿cross-call leaks?
+7. **Returndata bomb**: ¿low-level call sin límite de returndata size? (2MB returndata = OOG)
+8. **Dirty upper bits**: ¿compara bytes32/address que podría tener dirty bits en posiciones altas?
+9. **Immutable vs recalculable**: ¿variable immutable que debería recalcularse? (chainId, DOMAIN_SEPARATOR cacheado)
+10. **Array deletion gaps**: ¿delete array[i] deja slot en zero sin compactar? ¿afecta iteraciones posteriores?
+11. **Phantom overflow en unchecked**: ¿arithmetic dentro de `unchecked {}` que puede overflow con inputs extremos?
+12. **Storage collision en proxy patterns**: ¿variables de herencia múltiple colisionan en storage layout?
+
+## Deadlock Analysis (OBLIGATORIO — después del checklist)
 Para cada safety check, margin, cap, o límite en el contrato:
 1. ¿Puede BLOQUEAR una operación de emergencia? (repay, withdraw, liquidate, unstake)
-2. ¿Hay un escenario donde el usuario NO PUEDE deshacer su posición?
-3. ¿El safety mechanism puede dejar fondos permanentemente bloqueados?
-4. ¿Un cap que protege al protocolo puede impedir que un usuario se salve de liquidación?
-
-Bug real: Safety margin aplicado al cálculo de repago impedía que usuarios repagaran → liquidados sin poder hacer nada.
-Busca: require/assert/if que revierten en funciones de salida (withdraw, repay, unstake, emergencyWithdraw).
+2. ¿El safety mechanism puede dejar fondos permanentemente bloqueados?
+3. ¿Un cap que protege al protocolo puede impedir que un usuario se salve de liquidación?
+Bug real: Safety margin en repay impedía repago → liquidados sin poder hacer nada.
 
 ## Composability Attack (samczsun — "Two Rights Make A Wrong")
 Para cada interacción con un contrato externo:
 1. ¿Qué ASUME este contrato sobre el comportamiento del otro?
-2. ¿Bajo qué condiciones esa asunción se viola?
-3. ¿Se puede crear un estado donde ambos contratos son internamente consistentes pero juntos son inseguros?
-Bug real: SushiSwap MISO — msg.value reutilizado en loop de batch. Auction y batch handler eran seguros individualmente.
+2. ¿Se puede crear un estado donde ambos contratos son internamente consistentes pero JUNTOS son inseguros?
+Bug real: SushiSwap MISO — msg.value reutilizado en loop de batch.
 
-## "Reimplementa de Memoria" (cmichel — MENTALIDAD)
-Después de leer el contrato, pregúntate: ¿podría reimplementar esto desde cero sin mirar el código?
-Si tu versión mental DIFIERE del código real en algún punto → ese punto es un candidato a bug.
-La gap entre "qué debería hacer" y "qué realmente hace" es donde viven los bugs novedosos."""
+## Mentalidad cmichel
+¿Podrías reimplementar esto de memoria? Donde tu versión mental DIFIERA del código real → candidato a bug."""
 
     elif hunter_name == "AccessHunter":
-        return """## Trust Boundary Mapping (0xRajeev — OBLIGATORIO)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Token quirks / external trust → TrustBoundaryHunter | Signatures / permits → SignatureHunter
+- Math / precision → MathHunter | Reentrancy / callbacks → FlowHunter
+TÚ: roles, modifiers, privilege escalation, authorization paths, initialization guards.
+
+## State Variable Lifecycle Audit (OBLIGATORIO — ANTES de trust boundary mapping)
+Para CADA state variable del contrato, produce esta tabla:
+
+```yaml
+state_var_lifecycle:
+  - name: feeRecipient
+    type: address
+    declared_line: 47
+    writes: []
+    reads_in_value_context:
+      - {line: 328, context: "safeTransfer(feeRecipient, pf0)"}
+    verdict: DEAD_STATE — address never set, transfers go to address(0)
+  - name: owner
+    type: address
+    declared_line: 12
+    writes: [{line: 65, context: "constructor: owner = msg.sender"}]
+    reads_in_value_context: [{line: 500, context: "modifier onlyOwner"}]
+    verdict: SAFE
+```
+
+Si `writes` está vacío y `reads_in_value_context` tiene entries → TIER 1.
+Si un contrato hermano en scope tiene setter para la misma variable y este contrato no → flag como OVERSIGHT.
+
+## Trust Boundary Mapping (0xRajeev — OBLIGATORIO)
 Para CADA función external/public, clasifica en estas 10 categorías de confianza:
 1. **Caller trust**: ¿quién puede llamar? ¿está restringido correctamente?
 2. **Callee trust**: ¿a quién llama? ¿confía en el retorno?
@@ -1033,28 +1308,72 @@ uint256 balAfter = token.balanceOf(attacker);
 t(balAfter <= balBefore, "AC-XX: self-authorization extracts value");
 ```
 
-**CADA invariante en tu YAML DEBE tener un campo `solidity:` con código real.** Si no puedes escribir el assertion, la hipótesis es demasiado vaga — descártala o concretiza."""
+**CADA invariante en tu YAML DEBE tener un campo `solidity:` con código real.** Si no puedes escribir el assertion, la hipótesis es demasiado vaga — descártala o concretiza.
+
+## Filtro Pre-Output (OBLIGATORIO — antes de escribir el YAML)
+Para cada hipótesis, clasifica ANTES de incluirla:
+- "Admin/owner puede hacer X malo" → tier: 3, confidence: max 50% (centralización, rara vez pagado en bounties)
+- "Requiere multisig malicioso o governance attack" → tier: 2, documenta pero no Tier 1
+- "Usuario sin privilegios extrae fondos o bloquea fondos ajenos" → tier: 1, INVESTIGA A FONDO
+- "Initialization/upgrade risk en contrato ya deployed" → tier: 1 (verificable on-chain)
+- "Initialization/upgrade risk en contrato pre-launch" → tier: 2
+
+Si no puedes describir el ataque en 5 pasos concretos → baja el confidence 10%."""
 
     elif hunter_name == "TrustBoundaryHunter":
-        return """## Compiler Version Check (OBLIGATORIO)
-1. Verifica la versión de Solidity del contrato
-2. Consulta https://docs.soliditylang.org/en/latest/bugs.html — ¿hay bugs conocidos para esa versión?
-3. Si usa Vyper: verificar que NO es 0.2.15-0.3.0 (reentrancy lock failure → $69M Curve hack 2023)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Access control / roles / modifiers → AccessHunter
+- Signatures / permits / EIP-712 → SignatureHunter
+- Protocol business logic → DomainHunter
+TÚ: trust en contratos EXTERNOS, token quirks, proxy patterns, compiler/EVM assumptions.
+
+## External Call Trust Matrix (OBLIGATORIO — tu sección MÁS IMPORTANTE)
+Para CADA external call en el contrato, llena esta fila:
+| Línea | Target | ¿Return value usado? | ¿Qué pasa si reverts? | ¿Qué pasa si retorna valor manipulado? | ¿Quién controla target? |
+
+Busca específicamente:
+1. **Unchecked return values**: ¿se ignora el bool de transfer/approve/call?
+2. **Trust en retorno**: ¿se usa balanceOf() de un token externo como fuente de verdad sin verificar delta?
+3. **Delegatecall a target variable**: ¿el target puede cambiar? ¿quién lo controla?
+4. **Callback trust**: ¿se valida que el callback viene del contrato esperado? (no solo msg.sender == pool)
+5. **External state dependency**: ¿una función depende de un estado externo que puede cambiar entre el check y el use?
 
 ## Weird ERC-20 Checklist (d-xo — OBLIGATORIO si el contrato interactúa con tokens)
 Para cada token que el contrato maneja, verificar:
-- ¿Retorna bool en transfer/approve? (USDT, BNB, OMG NO retornan)
+- ¿Retorna bool en transfer/approve? (USDT, BNB, OMG NO retornan) → ¿usa SafeERC20?
 - ¿Requiere approve(0) antes de re-approve? (USDT, KNC)
 - ¿Revierte en transfer de valor 0? (LEND)
 - ¿Es rebasing? (stETH, AMPL — balance cambia sin transfer)
 - ¿Tiene fee-on-transfer? (amount recibido < amount enviado)
 - ¿Tiene blocklist? (USDC, USDT — pueden bloquear el contrato)
-- ¿Usa SafeERC20 para todas las interacciones?
+- ¿Tiene hook/callback? (ERC-777 tokensReceived, ERC-677 onTokenTransfer)
+Si el contrato asume ERC-20 estándar y acepta tokens arbitrarios → HIGH risk.
 
-Si el contrato asume comportamiento estándar ERC-20 y acepta tokens arbitrarios → HIGH risk."""
+## Proxy/Upgrade Invariants (OBLIGATORIO si el contrato es upgradeable o usa proxy)
+1. ¿Storage layout preservado entre versiones? (herencia múltiple = riesgo de collision)
+2. ¿Initializer tiene reinit guard? (initializer vs reinitializer)
+3. ¿Constructor de implementation vacío? (si no, el state del constructor no existe en proxy)
+4. ¿Funciones nuevas colisionan con proxy admin selectors? (function clashing)
+5. ¿Hay delegatecall a contrato que puede ser destruido o reemplazado?
+
+## Compiler Version Check (OBLIGATORIO)
+1. Verifica versión Solidity — ¿bugs conocidos? (soliditylang.org/en/latest/bugs.html)
+2. Si Solidity < 0.8.20: ¿desplegado en chain sin PUSH0? (Shanghai EVM)
+3. Si Vyper: verificar que NO es 0.2.15-0.3.0 (reentrancy lock failure → $69M Curve 2023)
+
+## REGLA: Solidity Assertions Obligatorias
+CADA hipótesis DEBE tener campo `solidity:` con assertion real. Confidence mínimo: 55%.
+Si no puedes escribir el assertion, la hipótesis es demasiado vaga — descártala o concretiza."""
 
     elif hunter_name == "SignatureHunter":
-        return """## Signature & Permit Deep Check (OBLIGATORIO — para CADA uso de firma/permit en el contrato)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Access control genérico / roles → AccessHunter | Reentrancy / callbacks → FlowHunter
+- Math / precision → MathHunter
+TÚ: firmas, permits, nonces, EIP-712, ecrecover, meta-transactions, allowance/approval patterns.
+
+## Signature & Permit Deep Check (OBLIGATORIO — para CADA uso de firma/permit en el contrato)
 
 ### Checklist ecrecover / ECDSA (7 items):
 1. ¿`ecrecover` valida que el resultado NO es `address(0)`? (firma inválida retorna 0)
@@ -1102,7 +1421,12 @@ Si el contrato asume comportamiento estándar ERC-20 y acepta tokens arbitrarios
 - **Deadline bypass**: firmas sin expiración usadas meses después en condiciones diferentes"""
 
     elif hunter_name == "DoSHunter":
-        return """## DoS / Griefing Deep Check (OBLIGATORIO — la clase de vuln MÁS IGNORADA, 2,279 findings en Solodit)
+        return """## Scope Anti-Overlap
+Responsabilidad PRIMARIA de otros hunters (no profundices — referencia si detectas algo):
+- Reentrancy / CEI → FlowHunter | Access control → AccessHunter | Math → MathHunter
+TÚ: gas griefing, unbounded loops, revert-based DoS, blocked withdrawals, resource exhaustion, emergency blocking.
+
+## DoS / Griefing Deep Check (OBLIGATORIO — la clase de vuln MÁS IGNORADA, 2,279 findings en Solodit)
 
 ### Sección 1: Unbounded Loops & Gas Exhaustion (8 items)
 Para CADA loop (for, while) en el contrato:
@@ -1117,6 +1441,29 @@ Para CADA loop (for, while) en el contrato:
 
 Bug real: GovernorBravo — iteración sobre todas las proposals sin límite → gas DoS.
 Bug real: Nouns DAO — iteración sobre voters bloqueó settleAuction().
+
+### Sección 1b: Loop Termination Proof (DISTINTO de Sección 1)
+Sección 1 pregunta "¿puede el loop ser MUY LARGO?".
+Esta sección pregunta "¿TERMINA el loop? ¿Siempre?"
+
+Para CADA loop (while/for), produce:
+
+```yaml
+loop_termination:
+  - location: "L568: while (path.hasMultiplePools())"
+    control_variable: path
+    progression_in_body: "path.skipToken() called but return NOT assigned"
+    terminates: false
+    verdict: INFINITE_LOOP
+  - location: "L315: for (uint256 i = 1; i <= N; i++)"
+    control_variable: i
+    progression_in_body: "i++ in for header"
+    terminates: true
+    verdict: SAFE
+```
+
+CLAVE: funciones pure/view (como `bytes.skipToken()`) retornan un NUEVO valor,
+NO mutan el input. Si se llama `x.method()` sin `x = x.method()`, x NO CAMBIA.
 
 ### Sección 2: Revert-Based DoS — Bloqueo de Funciones Críticas (7 items)
 1. ¿Alguna función de SALIDA (withdraw, repay, unstake, emergencyWithdraw) hace external call que puede revert?
@@ -1415,6 +1762,51 @@ def generate_chimera_context(repo_path: Path, contract_path: Path = None) -> str
     return "\n".join(snippet_lines)
 
 
+def _run_symmetric_analysis(contract_path: Path) -> str:
+    """Run symmetric_analyzer.py and return output. Cached per file."""
+    if not contract_path or not contract_path.exists():
+        return ""
+    sym_script = AUDIT_AGENTS_DIR / "symmetric_analyzer.py"
+    if not sym_script.exists():
+        return ""
+    contract_name = contract_path.stem  # Foo.sol → Foo
+    try:
+        result = subprocess.run(
+            [sys.executable, str(sym_script), str(contract_path), "--contract", contract_name],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and result.stdout.strip() and "ERROR" not in result.stdout[:20]:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _run_deep_flatten(contract_path: Path) -> str:
+    """Run deep_flatten.py --critical-only and return output."""
+    if not contract_path or not contract_path.exists():
+        return ""
+    script = AUDIT_AGENTS_DIR / "deep_flatten.py"
+    if not script.exists():
+        return ""
+    contract_name = contract_path.stem
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), str(contract_path), "--critical-only", "--contract", contract_name],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+# Module-level cache to avoid re-running Slither per hunter
+_symmetric_cache: dict[str, str] = {}
+_flatten_cache: dict[str, str] = {}
+
+
 def generate_hunter_prompt(
     hunter_name: str,
     component: str,
@@ -1443,8 +1835,10 @@ def generate_hunter_prompt(
 
     hyp_output = str(get_hyp_dir(protocol) / f"hyp_{component}_{hunter_name}.yaml")
 
-    # Generate asset flow map
-    asset_flow_map = generate_asset_flow_map(contract_path)
+    # Generate asset flow map (rich Slither-based, fallback to regex)
+    asset_flow_map = _generate_asset_flow_rich(contract_path)
+    if not asset_flow_map:
+        asset_flow_map = generate_asset_flow_map(contract_path)
 
     # Generate Chimera context snippet (detect repo root from contract_path)
     chimera_ctx = ""
@@ -1456,6 +1850,34 @@ def generate_hunter_prompt(
                 chimera_ctx = generate_chimera_context(repo_candidate, contract_path)
                 break
             repo_candidate = repo_candidate.parent
+
+    # Generate symmetric analysis (cached — runs once for all hunters)
+    cache_key = str(contract_path) if contract_path else ""
+    if cache_key and cache_key not in _symmetric_cache:
+        _symmetric_cache[cache_key] = _run_symmetric_analysis(contract_path)
+    symmetric_section = _symmetric_cache.get(cache_key, "")
+    if symmetric_section and "No se encontraron pares" not in symmetric_section:
+        symmetric_section = f"""
+## Symmetric Analysis (asimetrías entre pares de funciones)
+{symmetric_section}
+"""
+    else:
+        symmetric_section = ""
+
+    # Generate KB pattern appendix (background knowledge, not directive)
+    kb_appendix = ""
+    kb_briefings = HUNTER_KB_BRIEFINGS.get(hunter_name, [])
+    if kb_briefings:
+        kb_patterns = extract_kb_pattern_summaries(kb_briefings)
+        if kb_patterns:
+            kb_appendix = f"""
+---
+## APPENDIX: Patrones conocidos en tu dominio (referencia — NO limites tu análisis a estos)
+Estos patrones se han visto en auditorías reales. Úsalos como background, no como checklist.
+Si reconoces alguno en el código, investígalo. Pero tu análisis principal debe ser independiente.
+
+{kb_patterns}
+"""
 
     return f"""# {hunter_name} — {component} Analysis
 
@@ -1472,7 +1894,7 @@ No busques bugs genéricos. Busca bugs que nazcan de la lógica ESPECÍFICA de e
 **Dominio**: {domain}
 {"⚠ CONTRATO TRUNCADO: se muestran los primeros 60,000 chars. Usa el Read tool en " + str(contract_path) + " para leer el resto." if contract_truncated else ""}
 
-{asset_flow_map if asset_flow_map else ""}```solidity
+{asset_flow_map if asset_flow_map else ""}{symmetric_section}```solidity
 {contract_preview}
 ```
 
@@ -1527,7 +1949,45 @@ Ejemplo de invariante bien formado:
 - **Con ataque concreto**: especifica exactamente cómo se perdería dinero
 - **Confidence honesto**: si no estás seguro al 60%+, marca validated: false
 - **False positives**: si investigas algo y es by design, añádelo a false_positives con la lección
-"""
+{kb_appendix}"""
+
+
+def _extract_deployments_from_scope_master(component: str, protocol: str = "") -> list[dict]:
+    """Extract deployment table for a component from SCOPE_MASTER.md."""
+    # Find SCOPE_MASTER
+    hunt_session = Path("hunt_session")
+    scope_masters = list(hunt_session.glob("context/*/SCOPE_MASTER.md"))
+    scope_master = None
+    for sm in scope_masters:
+        if protocol and protocol.lower() in sm.parent.name.lower():
+            scope_master = sm
+            break
+    if not scope_master and scope_masters:
+        scope_master = scope_masters[0]
+    if not scope_master:
+        return []
+
+    text = scope_master.read_text()
+    comp_escaped = re.escape(component)
+    # Split text into sections by ### headings, match component in heading line
+    sections = re.split(r'\n(?=###\s)', text)
+    target_section = None
+    for sec in sections:
+        heading = sec.split('\n')[0]
+        if re.search(comp_escaped, heading, re.IGNORECASE):
+            target_section = sec
+            break
+    if not target_section:
+        return []
+
+    deployments = []
+    # Match table rows with backtick-wrapped 0x addresses
+    for row in re.findall(r'\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*`(0x[a-fA-F0-9]+)`\s*\|\s*([^|]+?)\s*\|', target_section):
+        name, chain, address, estado = [x.strip() for x in row]
+        if chain.lower() in ("chain", "---", ""):
+            continue
+        deployments.append({"name": name, "chain": chain, "address": address, "estado": estado})
+    return deployments
 
 
 def generate_deepdive_prompt(
@@ -1626,6 +2086,26 @@ def generate_deepdive_prompt(
 
     hyp_output = str(get_hyp_dir(protocol) / f"hyp_{component}_DeepDiveHunter.yaml")
 
+    # Generate rich asset flow for DeepDive
+    asset_flow_dd = _generate_asset_flow_rich(contract_path)
+    if not asset_flow_dd:
+        asset_flow_dd = generate_asset_flow_map(contract_path)
+
+    # Generate deep flatten for DeepDive (critical functions: READ/WRITE/EXTERNAL order)
+    cache_key = str(contract_path) if contract_path else ""
+    if cache_key and cache_key not in _flatten_cache:
+        _flatten_cache[cache_key] = _run_deep_flatten(contract_path)
+    flatten_dd = _flatten_cache.get(cache_key, "")
+    flatten_section = ""
+    if flatten_dd:
+        flatten_section = f"""
+## Deep Flatten — Secuencia Real de Ejecución
+Funciones críticas aplanadas: modifiers inlineados, calls internos expandidos.
+Busca WRITEs después de EXTERNALs (CEI violations) y secuencias READ→EXTERNAL→WRITE.
+
+{flatten_dd}
+"""
+
     return f"""# DeepDiveHunter — {component} Deep Analysis
 
 ## Tu Identidad
@@ -1644,6 +2124,10 @@ Tu trabajo: encontrar lo que ELLOS NO VIERON. Profundidad, no amplitud.
 ```solidity
 {contract_src}
 ```
+
+{asset_flow_dd if asset_flow_dd else ""}
+
+{flatten_section}
 
 {conv_text}
 
@@ -1678,7 +2162,7 @@ Donde 2+ hunters señalaron lo mismo: ¿hay un bug más profundo detrás?
 ## Output
 Escribe en: `{hyp_output}`
 
-**MÁXIMO 5 hipótesis.** Cada una DEBE tener:
+**Sin límite artificial.** Genera todas las que tengan confidence >= 60%. Cada una DEBE tener:
 - `solidity` field estándar (Chimera assertions — OBLIGATORIO para merge_invariants.py)
 - `poc_sketch` field (outline de test Foundry)
 - `call_stack` field (traza de ejecución)
@@ -1692,6 +2176,164 @@ ID prefix: `{abbreviation}-DD` (ej: {abbreviation}-DD-01)
 - CADA hipótesis necesita un `poc_sketch` concreto — si no puedes escribirlo, es demasiado vaga
 - Prefiere 2 excelentes sobre 5 mediocres
 - `validated: true` solo si confidence >= 60%
+"""
+
+
+def generate_crosschain_prompt(
+    component: str,
+    contract_path: Path,
+    protocol: str,
+) -> str | None:
+    """Genera el prompt del CrossChainHunter. Returns None if single-chain (skip)."""
+    hyp_dir = get_hyp_dir(protocol)
+
+    deployments = _extract_deployments_from_scope_master(component, protocol)
+    chains = set(d["chain"] for d in deployments)
+    if len(chains) < 2:
+        skip_file = hyp_dir / f"hyp_{component}_CrossChainHunter.skip"
+        skip_file.parent.mkdir(parents=True, exist_ok=True)
+        skip_file.write_text(f"single-chain component ({', '.join(chains) if chains else 'no deployments found'})")
+        return None
+
+    deploy_text = "## Deployment Map\n\n"
+    deploy_text += "| Contrato | Chain | Address | Estado |\n"
+    deploy_text += "|----------|-------|---------|--------|\n"
+    for d in deployments:
+        deploy_text += f"| {d['name']} | {d['chain']} | `{d['address']}` | {d['estado']} |\n"
+    deploy_text += f"\n**Chains**: {', '.join(sorted(chains))} ({len(chains)} chains)\n"
+
+    relevant_hunters = ["SignatureHunter", "TrustBoundaryHunter", "FlowHunter", "AccessHunter"]
+    hunter_context = ""
+    existing_ids = set()
+    for hunter in relevant_hunters:
+        hyp_file = hyp_dir / f"hyp_{component}_{hunter}.yaml"
+        if not hyp_file.exists():
+            continue
+        try:
+            data = yaml.safe_load(hyp_file.read_text())
+            findings = data.get("invariants", data.get("findings", []))
+            if findings:
+                hunter_context += f"\n### {hunter} findings ({len(findings)}):\n"
+                for inv in findings:
+                    inv_id = inv.get("id", "?")
+                    existing_ids.add(inv_id)
+                    hunter_context += f"- [{inv_id}] ({inv.get('confidence', '?')}%): {inv.get('description', '')}\n"
+        except Exception:
+            continue
+
+    all_fps = []
+    for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
+        if "CrossChain" in hyp_file.name or "DeepDive" in hyp_file.name:
+            continue
+        try:
+            data = yaml.safe_load(hyp_file.read_text())
+            for inv in data.get("invariants", []):
+                existing_ids.add(inv.get("id", ""))
+            for fp in data.get("false_positives", []):
+                all_fps.append(f"- [{fp.get('id', '?')}]: {fp.get('reason', '')}")
+        except Exception:
+            continue
+
+    existing_text = "## Existing IDs (DO NOT DUPLICATE)\n" + ", ".join(sorted(existing_ids))
+    fp_text = "## Already Debunked\n" + ("\n".join(all_fps) if all_fps else "None yet.")
+
+    verify_context = ""
+    verify_file = Path(f"hunt_session/context/{protocol}/crosschain_verification_{component}.json")
+    if verify_file.exists():
+        try:
+            import json as _json
+            vdata = _json.loads(verify_file.read_text())
+            verify_context = f"\n## On-Chain Verification (from crosschain_verify.py)\n```json\n{_json.dumps(vdata, indent=2)[:3000]}\n```\n"
+        except Exception:
+            pass
+
+    contract_src = ""
+    if contract_path and contract_path.exists():
+        contract_src = contract_path.read_text()
+        if len(contract_src) > 60_000:
+            contract_src = contract_src[:60_000] + "\n// ... TRUNCATED"
+
+    abbreviation = "".join(w[0] for w in re.findall(r'[A-Z][a-z]*', component)).upper()
+    if not abbreviation:
+        abbreviation = component[:3].upper()
+
+    hyp_output = str(hyp_dir / f"hyp_{component}_CrossChainHunter.yaml")
+
+    return f"""# CrossChainHunter — {component} Cross-Chain Analysis
+
+## Tu Identidad
+Eres el **CrossChainHunter** del equipo de bug hunting de {protocol}.
+Analizas vulnerabilidades que SOLO EXISTEN porque el contrato esta desplegado en multiples chains.
+Los 9 hunters paralelos ya analizaron el codigo single-chain. Tu trabajo: encontrar lo que se pierde
+cuando el mismo contrato vive en {len(chains)} chains distintas.
+
+{deploy_text}
+
+## Contrato
+```solidity
+{contract_src}
+```
+
+## Context de Hunters Relevantes
+{hunter_context if hunter_context else "No hay outputs de hunters relevantes aun."}
+
+{verify_context}
+
+{existing_text}
+
+{fp_text}
+
+## Tu Proceso (10 pasos — sigue en orden)
+
+### Paso 1: Deployment Mapping
+Documenta el deployment_map completo. Para cada address, registra chain + verified status.
+
+### Paso 2: Signature Replay (CC-1)
+Busca EIP-712 domain separators. Para cada uno: incluye block.chainid? Es immutable o dinamico?
+
+### Paso 3: Bridge/Messaging Replay (CC-2)
+Solo si componente es bridge: Message ID incluye source chain + dest chain + nonce?
+
+### Paso 4: Config Divergence (CC-3)
+Mismo address en N chains: constructor args identicos? Rate limits, thresholds, fees difieren?
+
+### Paso 5: Bytecode Mismatch (CC-4)
+Bytecode identico en todas las chains? Si difiere: que cambio?
+
+### Paso 6: Nonce/State Collision (CC-5)
+Los nonces incluyen chainId? Una operacion en chain A puede afectar chain B?
+
+### Paso 7: Uninitialized Deployment (CC-6)
+Solo para proxies: initialized en todas las chains?
+
+### Paso 8: Proxy Upgrade Desync (CC-7)
+Solo para proxies: implementation address identica en todas las chains?
+
+### Paso 9: Cross-Chain State Dependencies (CC-8)
+El contrato depende de datos de otra chain? Cual es el max staleness posible?
+
+### Paso 10: L2-Specific Behavior
+block.number/timestamp semantica? tx.origin con AA? Gas model asimetrico?
+
+## Output
+Escribe en: `{hyp_output}`
+
+**Sin limite artificial de hipotesis.** Genera todas las que tengan confidence >= 60%.
+Las 8 categorias (CC-1 a CC-8) son GUIA, no restriccion. category: other si no encaja.
+
+Cada hipotesis DEBE tener:
+- `solidity` field (Chimera assertions) — si es fuzzeeable
+- O descripcion detallada con verificacion manual — si no es fuzzeeable
+- `chains_affected` field
+- `confidence` >= 60% para `validated: true`
+
+ID prefix: `{abbreviation}-CC` (ej: {abbreviation}-CC-01)
+
+## Reglas
+- NO dupliques IDs o descripciones existentes
+- NO repitas false positives ya debunked
+- Documenta TODO: si no puedes verificar algo, marca como pending_verification
+- Prefiere hipotesis con PoC concreto sobre especulacion teorica
 """
 
 
@@ -1953,6 +2595,526 @@ def generate_component_map(state: dict) -> list[dict]:
     return component_map
 
 
+# =============================================================================
+# CROSS-COMPONENT ANALYSIS (Rule 0.5 — Automated)
+# =============================================================================
+
+def find_cross_component_pairs(state: dict) -> list[tuple[str, str, list[str]]]:
+    """
+    Find pairs of completed components that interact with each other.
+    Returns list of (comp_a, comp_b, shared_dependencies) tuples.
+    """
+    done = state.get("components_done", [])
+    if len(done) < 2:
+        return []
+
+    cmap = {c["name"]: c for c in state.get("component_map", [])}
+    pairs = []
+    seen = set()
+
+    for comp_a in done:
+        info_a = cmap.get(comp_a, {})
+        deps_a = set(info_a.get("depends_on", []))
+
+        for comp_b in done:
+            if comp_a == comp_b:
+                continue
+            key = tuple(sorted([comp_a, comp_b]))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            info_b = cmap.get(comp_b, {})
+            deps_b = set(info_b.get("depends_on", []))
+
+            # Check if they reference each other
+            interactions = []
+            if comp_b in deps_a:
+                interactions.append(f"{comp_a} imports {comp_b}")
+            if comp_a in deps_b:
+                interactions.append(f"{comp_b} imports {comp_a}")
+
+            # Check shared dependencies (both depend on same contract)
+            shared = deps_a & deps_b
+            if shared:
+                interactions.append(f"shared deps: {', '.join(shared)}")
+
+            if interactions:
+                pairs.append((comp_a, comp_b, interactions))
+
+    return pairs
+
+
+def generate_cross_component_map(comp_a: str, comp_b: str, repo_path: str, protocol: str) -> str:
+    """
+    Generate a detailed interaction map between two components using Slither.
+    Returns markdown with: cross-calls, shared state, trust assumptions.
+    """
+    path_a = find_contract(comp_a, repo_path)
+    path_b = find_contract(comp_b, repo_path)
+
+    if not path_a or not path_b:
+        return f"Could not find contract files for {comp_a} and/or {comp_b}"
+
+    # Use protocol_analyzer to get function details for both
+    sys.path.insert(0, str(AUDIT_AGENTS_DIR))
+    try:
+        from protocol_analyzer import run_layer1_slither
+    except ImportError:
+        return "protocol_analyzer not available"
+
+    src_dir = str(Path(path_a).parent)
+    try:
+        all_contracts = run_layer1_slither(src_dir)
+    except Exception as e:
+        return f"Slither failed: {e}"
+
+    # Find our two contracts
+    info_a = next((c for c in all_contracts if comp_a.lower() in c.name.lower()), None)
+    info_b = next((c for c in all_contracts if comp_b.lower() in c.name.lower()), None)
+
+    if not info_a or not info_b:
+        return f"Could not find {comp_a} and/or {comp_b} in Slither output"
+
+    md = []
+    md.append(f"# Cross-Component Interaction Map: {comp_a} ↔ {comp_b}\n")
+
+    # 1. Cross-calls: A calling B's functions
+    a_calls_b = []
+    b_calls_a = []
+    for func in info_a.functions:
+        for call in func.external_calls:
+            if comp_b.lower() in call.lower():
+                a_calls_b.append(f"- `{comp_a}.{func.name}()` → `{call}`")
+
+    for func in info_b.functions:
+        for call in func.external_calls:
+            if comp_a.lower() in call.lower():
+                b_calls_a.append(f"- `{comp_b}.{func.name}()` → `{call}`")
+
+    md.append("## Cross-Calls\n")
+    if a_calls_b:
+        md.append(f"### {comp_a} → {comp_b}")
+        md.extend(a_calls_b)
+        md.append("")
+    if b_calls_a:
+        md.append(f"### {comp_b} → {comp_a}")
+        md.extend(b_calls_a)
+        md.append("")
+    if not a_calls_b and not b_calls_a:
+        md.append("No direct cross-calls detected (interaction may be through shared state or intermediary).\n")
+
+    # 2. Shared state: variables that both read or write
+    vars_a = {v["name"]: v for v in info_a.state_variables}
+    vars_b = {v["name"]: v for v in info_b.state_variables}
+    shared_vars = set(vars_a.keys()) & set(vars_b.keys())
+
+    # Also check if A reads state that B writes and vice versa
+    a_reads = set()
+    a_writes = set()
+    b_reads = set()
+    b_writes = set()
+    for func in info_a.functions:
+        a_reads.update(func.reads_state)
+        a_writes.update(func.writes_state)
+    for func in info_b.functions:
+        b_reads.update(func.reads_state)
+        b_writes.update(func.writes_state)
+
+    # A writes what B reads (A can influence B's behavior)
+    a_influences_b = a_writes & b_reads
+    b_influences_a = b_writes & a_reads
+
+    md.append("## Shared & Cross-Influenced State\n")
+    if shared_vars:
+        md.append(f"**Shared variable names**: {', '.join(sorted(shared_vars))}")
+        md.append("")
+    if a_influences_b:
+        md.append(f"**{comp_a} writes → {comp_b} reads**: {', '.join(sorted(a_influences_b))}")
+        md.append(f"  Risk: {comp_a} can manipulate state that {comp_b} trusts")
+        md.append("")
+    if b_influences_a:
+        md.append(f"**{comp_b} writes → {comp_a} reads**: {', '.join(sorted(b_influences_a))}")
+        md.append(f"  Risk: {comp_b} can manipulate state that {comp_a} trusts")
+        md.append("")
+    if not shared_vars and not a_influences_b and not b_influences_a:
+        md.append("No shared or cross-influenced state detected.\n")
+
+    # 3. Asymmetric guards: function in A has guard but corresponding call in B doesn't
+    md.append("## Guard Comparison\n")
+    md.append(f"| Function | Contract | Modifiers | Reentrancy Guard |")
+    md.append(f"|----------|----------|-----------|------------------|")
+    for func in info_a.functions:
+        if func.visibility in ("public", "external") and func.external_calls:
+            mods = ", ".join(func.modifiers) if func.modifiers else "NONE"
+            guard = "YES" if func.has_reentrancy_guard else "NO"
+            md.append(f"| `{func.name}()` | {comp_a} | {mods} | {guard} |")
+    for func in info_b.functions:
+        if func.visibility in ("public", "external") and func.external_calls:
+            mods = ", ".join(func.modifiers) if func.modifiers else "NONE"
+            guard = "YES" if func.has_reentrancy_guard else "NO"
+            md.append(f"| `{func.name}()` | {comp_b} | {mods} | {guard} |")
+    md.append("")
+
+    return "\n".join(md)
+
+
+def generate_edge_hunter_prompt(
+    comp_a: str, comp_b: str, interaction_map: str,
+    path_a: Path, path_b: Path, protocol: str,
+) -> str:
+    """
+    Generate a focused EdgeHunter prompt for cross-component analysis.
+    Lighter than DeepDive: only cross-call functions + interaction map.
+    Looks for bugs that ONLY exist in the interaction between two components.
+    """
+    # Read ONLY the cross-call functions, not full contracts
+    # Parse interaction map to find relevant function names
+    cross_funcs_a = set()
+    cross_funcs_b = set()
+    for line in interaction_map.split("\n"):
+        if f"`{comp_a}." in line and "→" in line:
+            # Extract function name from `CompA.funcName()` → `call`
+            try:
+                fname = line.split(f"`{comp_a}.")[1].split("(")[0]
+                cross_funcs_a.add(fname)
+            except (IndexError, ValueError):
+                pass
+        if f"`{comp_b}." in line and "→" in line:
+            try:
+                fname = line.split(f"`{comp_b}.")[1].split("(")[0]
+                cross_funcs_b.add(fname)
+            except (IndexError, ValueError):
+                pass
+
+    # Extract relevant code sections (cross-call functions only + their helpers)
+    FUNC_LIMIT = 15_000
+    def extract_relevant_functions(path: Path, func_names: set) -> str:
+        if not path or not path.exists() or not func_names:
+            return path.read_text()[:FUNC_LIMIT] if path and path.exists() else ""
+        src = path.read_text()
+        # If we can't parse well, return truncated full source
+        if len(src) <= FUNC_LIMIT:
+            return src
+        # Try to extract just the relevant functions
+        lines = src.split("\n")
+        relevant = []
+        in_func = False
+        brace_depth = 0
+        for i, line in enumerate(lines):
+            # Check if this line starts a relevant function
+            if any(f"function {fn}" in line for fn in func_names):
+                in_func = True
+                brace_depth = 0
+            if in_func:
+                relevant.append(f"{line}")
+                brace_depth += line.count("{") - line.count("}")
+                if brace_depth <= 0 and "{" in "".join(relevant[-5:]):
+                    in_func = False
+                    relevant.append("")
+        extracted = "\n".join(relevant)
+        if extracted and len(extracted) > 200:
+            return f"// Cross-call functions extracted from {path.name}\n\n{extracted}"
+        return src[:FUNC_LIMIT] + "\n// ... TRUNCATED"
+
+    src_a = extract_relevant_functions(path_a, cross_funcs_a)
+    src_b = extract_relevant_functions(path_b, cross_funcs_b)
+
+    abbreviation = f"{comp_a[:2]}{comp_b[:2]}".upper()
+    hyp_output = str(get_hyp_dir(protocol) / f"hyp_{comp_a}_{comp_b}_EdgeHunter.yaml")
+
+    # Collect HIGH-CONFIDENCE hypotheses from both components (only cross-relevant)
+    hyp_dir = get_hyp_dir(protocol)
+    relevant_hyps = []
+    for hyp_file in sorted(hyp_dir.glob("hyp_*.yaml")):
+        if "template" in hyp_file.name:
+            continue
+        if comp_a not in hyp_file.name and comp_b not in hyp_file.name:
+            continue
+        try:
+            data = yaml.safe_load(hyp_file.read_text())
+            if not data:
+                continue
+            for inv in data.get("invariants", []):
+                desc = inv.get("description", "").lower()
+                # Only include hypotheses that mention the OTHER component or cross-component patterns
+                other = comp_b if comp_a in hyp_file.name else comp_a
+                if (other.lower() in desc or "cross" in desc or "external" in desc
+                        or "callback" in desc or "reentran" in desc):
+                    relevant_hyps.append(
+                        f"[{inv.get('id', '?')}] ({inv.get('confidence', 0)}%): {inv.get('description', '')}"
+                    )
+        except Exception:
+            continue
+
+    hyps_text = ""
+    if relevant_hyps:
+        hyps_text = "## Cross-Relevant Hypotheses from Individual Hunts\n\n"
+        for h in relevant_hyps:
+            hyps_text += f"- {h}\n"
+        hyps_text += "\nThese are LEADS — investigate but don't duplicate.\n"
+
+    return f"""# EdgeHunter — {comp_a} ↔ {comp_b}
+
+## Tu Identidad
+Eres el **EdgeHunter** de {protocol}. Tu ÚNICO objetivo: encontrar bugs que existen
+SOLO en la INTERACCIÓN entre {comp_a} y {comp_b}. No buscas bugs dentro de un
+componente — eso ya lo hicieron los 9 hunters + DeepDive.
+
+## Interaction Map (Slither)
+{interaction_map}
+
+## Código Relevante — {comp_a}
+```solidity
+{src_a}
+```
+
+## Código Relevante — {comp_b}
+```solidity
+{src_b}
+```
+
+{hyps_text}
+
+## Checklist (OBLIGATORIO — en orden)
+
+### 1. Trust Boundaries
+Para cada cross-call en el interaction map:
+- ¿Qué asume el caller sobre el return value? ¿Puede ser manipulado?
+- ¿Hay validaciones que un lado asume pero el otro no enforce?
+
+### 2. State Manipulation Across Components
+Para cada cross-influenced state variable:
+- ¿Se puede manipular estado en {comp_a} para explotar {comp_b} (o viceversa)?
+- ¿Flash loan + secuencia multi-tx extrae valor cruzando ambos?
+
+### 3. Guard Gaps
+- ¿Reentrancy guard en uno pero no en el otro para la misma operación?
+- ¿Access control bypaseable via path cruzado?
+
+### 4. Atomicity
+- ¿Operación multi-step puede quedar a medias entre los dos?
+- ¿Front-running de la secuencia cross-component?
+
+## Output
+Escribe en: `{hyp_output}`
+
+El YAML DEBE tener estos campos top-level (para merge_invariants.py):
+```yaml
+hunter: EdgeHunter
+component: "{comp_a}_{comp_b}"
+invariants:
+  - id: {abbreviation}-EH-01
+    description: "..."
+    solidity: |
+      // Chimera assertions referenciando AMBOS contratos
+      // Usa crossContractA y crossContractB como addresses
+      // Ejemplo: ICompA(crossContractA).balanceOf(...)
+    poc_sketch: "..."
+    call_stack: "..."
+    confidence: 75
+    tier: 1
+    type: property
+```
+
+ID prefix: `{abbreviation}-EH` (ej: {abbreviation}-EH-01)
+
+Cada hipótesis DEBE tener:
+- `description`: qué se rompe
+- `solidity`: assertions Chimera usando `crossContractA`/`crossContractB` como interface addresses
+- `call_stack`: secuencia EXACTA de txs cruzando ambos componentes
+- `poc_sketch`: outline de test Foundry con ambos contratos
+- `confidence` >= 60%
+- `tier`: 1 (hard fail) o 2 (needs review)
+- `type`: property (default) u optimize
+
+## Reglas
+- SOLO bugs cross-component. Si el ataque funciona con UN solo contrato, no es para ti.
+- **Sin límite artificial.** Genera todas las que tengan confidence >= 60%. Calidad > cantidad, pero no cortes artificialmente.
+- El interaction map te dice DÓNDE. Tú piensas QUÉ puede salir mal.
+"""
+
+
+def run_cross_component_check(state: dict) -> int:
+    """
+    Auto-check for cross-component interactions after completing a component.
+    Called from --complete. Returns number of pairs found.
+    """
+    pairs = find_cross_component_pairs(state)
+    if not pairs:
+        print("  No cross-component interactions detected between completed components.")
+        return 0
+
+    protocol = state.get("protocol", "unknown")
+    repo_path = state.get("repo_path", "")
+    hyp_dir = get_hyp_dir(protocol)
+
+    # Check which pairs already have EdgeHunter output
+    new_pairs = []
+    for comp_a, comp_b, interactions in pairs:
+        edge_file = hyp_dir / f"hyp_{comp_a}_{comp_b}_EdgeHunter.yaml"
+        edge_file_rev = hyp_dir / f"hyp_{comp_b}_{comp_a}_EdgeHunter.yaml"
+        if not edge_file.exists() and not edge_file_rev.exists():
+            new_pairs.append((comp_a, comp_b, interactions))
+
+    if not new_pairs:
+        print("  All cross-component pairs already have EdgeHunter analysis.")
+        return 0
+
+    print(f"\n{'='*60}")
+    print(f"  RULE 0.5: Cross-Component Interactions Detected!")
+    print(f"{'='*60}")
+    print(f"  {len(new_pairs)} new pair(s) to analyze:\n")
+
+    for comp_a, comp_b, interactions in new_pairs:
+        print(f"  → {comp_a} ↔ {comp_b}")
+        for inter in interactions:
+            print(f"    - {inter}")
+
+    print(f"\n  Generating interaction maps and EdgeHunter prompts...")
+
+    prompts = {}
+    for comp_a, comp_b, interactions in new_pairs:
+        print(f"\n  Analyzing: {comp_a} ↔ {comp_b}")
+        interaction_map = generate_cross_component_map(comp_a, comp_b, repo_path, protocol)
+
+        path_a = find_contract(comp_a, repo_path)
+        path_b = find_contract(comp_b, repo_path)
+
+        prompt = generate_edge_hunter_prompt(
+            comp_a, comp_b, interaction_map,
+            path_a, path_b, protocol,
+        )
+
+        prompt_file = get_context_dir(protocol) / f"edge_{comp_a}_{comp_b}.md"
+        prompt_file.write_text(prompt)
+        prompts[f"{comp_a}↔{comp_b}"] = prompt_file
+        print(f"    ✓ EdgeHunter prompt: {prompt_file}")
+
+    # Detect transitive chains: if A↔B and B↔C, generate A→B→C chain hunter
+    chain_prompts = _detect_transitive_chains(new_pairs, pairs, protocol, repo_path, hyp_dir)
+    prompts.update(chain_prompts)
+
+    print(f"\n  ⚡ Launch EdgeHunters with Agent tool (one per pair/chain):")
+    for pair_name, prompt_file in prompts.items():
+        print(f'    Agent: Read {prompt_file} and execute the EdgeHunter analysis')
+
+    return len(prompts)
+
+
+def _detect_transitive_chains(
+    new_pairs: list[tuple[str, str, list[str]]],
+    all_pairs: list[tuple[str, str, list[str]]],
+    protocol: str, repo_path: str, hyp_dir: Path,
+) -> dict:
+    """
+    Detect transitive interaction chains (A↔B + B↔C → A→B→C).
+    Returns dict of chain_name → prompt_file for chain EdgeHunters.
+    """
+    # Build adjacency from ALL pairs (not just new)
+    adj: dict[str, set[str]] = {}
+    for a, b, _ in all_pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    # Find chains of length 3 (A-B-C where A and C don't interact directly)
+    chains = []
+    seen = set()
+    for mid in adj:
+        neighbors = adj[mid]
+        if len(neighbors) < 2:
+            continue
+        for a in neighbors:
+            for c in neighbors:
+                if a >= c:  # avoid duplicates
+                    continue
+                if c in adj.get(a, set()):
+                    continue  # A↔C exists directly, pair-level EdgeHunter covers it
+                key = tuple(sorted([a, mid, c]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                chains.append((a, mid, c))
+
+    if not chains:
+        return {}
+
+    prompts = {}
+    for comp_a, comp_mid, comp_c in chains:
+        chain_name = f"{comp_a}→{comp_mid}→{comp_c}"
+        chain_file = hyp_dir / f"hyp_{comp_a}_{comp_mid}_{comp_c}_EdgeHunter.yaml"
+        if chain_file.exists():
+            continue
+
+        print(f"\n  🔗 Transitive chain detected: {chain_name}")
+
+        # Generate maps for both edges
+        map_ab = generate_cross_component_map(comp_a, comp_mid, repo_path, protocol)
+        map_bc = generate_cross_component_map(comp_mid, comp_c, repo_path, protocol)
+
+        abbreviation = f"{comp_a[:2]}{comp_mid[:2]}{comp_c[:2]}".upper()
+        prompt = f"""# EdgeHunter — Transitive Chain: {chain_name}
+
+## Tu Identidad
+Eres el **EdgeHunter** de {protocol}. Buscas bugs que SOLO existen cuando
+{comp_a}, {comp_mid}, y {comp_c} interactúan en CADENA.
+
+{comp_a} interactúa con {comp_mid}, y {comp_mid} interactúa con {comp_c},
+pero {comp_a} y {comp_c} NO interactúan directamente.
+Esto crea un path transitivo: un atacante puede manipular {comp_a} → afectar
+{comp_mid} → explotar {comp_c} (o al revés).
+
+## Interaction Map: {comp_a} ↔ {comp_mid}
+{map_ab}
+
+## Interaction Map: {comp_mid} ↔ {comp_c}
+{map_bc}
+
+## Checklist
+
+### 1. Transitive State Manipulation
+- ¿Puede un atacante usar {comp_a} para cambiar estado en {comp_mid} que luego
+  {comp_c} lee como trusted?
+- ¿El path inverso ({comp_c} → {comp_mid} → {comp_a}) también es explotable?
+
+### 2. Trust Chain Breaks
+- {comp_c} confía en {comp_mid}. {comp_mid} confía en {comp_a}.
+  ¿{comp_a} puede abusar de esta confianza transitiva?
+
+### 3. Multi-Tx Attack Sequences
+- ¿Hay una secuencia de 3+ txs que cruza los 3 componentes y extrae valor?
+- ¿Flash loan amplifica alguno de estos paths?
+
+## Output
+Escribe en: `{chain_file}`
+
+El YAML DEBE tener estos campos top-level:
+```yaml
+hunter: EdgeHunter
+component: "{comp_a}_{comp_mid}_{comp_c}"
+invariants:
+  - id: {abbreviation}-CH-01
+    description: "..."
+    solidity: |
+      // Usa crossContractA, crossContractB, crossContractC
+    call_stack: "..."
+    confidence: 70
+    tier: 1
+    type: property
+```
+
+ID prefix: `{abbreviation}-CH` (ej: {abbreviation}-CH-01)
+
+**Sin límite artificial.** Genera todas las que tengan confidence >= 60%. Solo las que necesiten los 3 componentes para el ataque.
+"""
+        prompt_path = get_context_dir(protocol) / f"edge_chain_{comp_a}_{comp_mid}_{comp_c}.md"
+        prompt_path.write_text(prompt)
+        prompts[chain_name] = prompt_path
+        print(f"    ✓ Chain EdgeHunter prompt: {prompt_path}")
+
+    return prompts
+
+
 def print_status(state: dict):
     """Imprime el estado del hunt activo."""
     if not state:
@@ -2025,18 +3187,28 @@ def main():
     parser.add_argument("--status", "-s", action="store_true", help="Muestra estado del hunt")
     parser.add_argument("--init-ficha", type=str, metavar="COMPONENT", help="Solo crea ficha vacía")
     parser.add_argument("--complete", type=str, metavar="COMPONENT", help="Marca componente como completo")
+    parser.add_argument("--cross-component", action="store_true",
+                        help="Ejecutar análisis cross-component (Rule 0.5) manualmente")
     parser.add_argument("--no-solodit", action="store_true", help="Omitir búsqueda en Solodit")
     parser.add_argument("--print-prompts", action="store_true", help="Imprime prompts de hunters a stdout")
     parser.add_argument("--map-components", action="store_true",
                         help="Escanea el repo y genera component_map en current_hunt.json")
     parser.add_argument("--force", action="store_true",
                         help="Regenerar component_map aunque ya exista")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Solo genera prompts para hunters que NO tienen hyp_*.yaml para el componente")
     args = parser.parse_args()
 
     state = load_hunt_state()
 
     if args.status:
         print_status(state)
+        return 0
+
+    if args.cross_component:
+        n = run_cross_component_check(state)
+        if n == 0:
+            print("No new cross-component pairs to analyze.")
         return 0
 
     if args.init_ficha:
@@ -2131,6 +3303,10 @@ def main():
                 print(f"  ⚠ apply_feedback error: {result.stderr[:200]}")
         except Exception as e:
             print(f"  ⚠ apply_feedback no ejecutado: {e}")
+
+        # Auto-trigger cross-component check (Rule 0.5)
+        run_cross_component_check(state)
+
         return 0
 
     if not args.component:
@@ -2200,8 +3376,13 @@ def main():
             print(f"  ⚠ Sin contexto Solodit")
 
     # Pre-scan estático (independiente de hunters — resultados en results/)
-    print(f"\n  Ejecutando pre-scan estático...")
-    prescan_results = run_prescan(contract_path, repo_path)
+    # Skip prescan if --no-solodit (benchmark mode) to avoid network hangs
+    prescan_results = {}
+    if not args.no_solodit:
+        print(f"\n  Ejecutando pre-scan estático...")
+        prescan_results = run_prescan(contract_path, repo_path)
+    else:
+        print(f"\n  Pre-scan estático: SKIP (--no-solodit mode)")
 
     # Briefings (primario completo + secundario solo grep)
     briefing_excerpt = load_briefings(domains)
@@ -2290,6 +3471,29 @@ def main():
                 if h in name.lower():
                     selected_hunters.append(name)
 
+    # --backfill: filtrar a solo hunters sin hyp_*.yaml existente
+    if args.backfill:
+        hyp_dir = get_hyp_dir(protocol)
+        existing_hunters = set()
+        for hyp_file in hyp_dir.glob(f"hyp_{component}_*.yaml"):
+            # Extraer hunter name: hyp_Component_HunterName.yaml
+            parts = hyp_file.stem.split("_")
+            if len(parts) >= 3:
+                hunter_name = parts[-1]
+                # Match against known hunter names
+                for known in HUNTER_DOMAINS:
+                    if known.replace("Hunter", "") == hunter_name.replace("Hunter", ""):
+                        existing_hunters.add(known)
+        missing = [h for h in selected_hunters if h not in existing_hunters]
+        if missing:
+            print(f"\n  BACKFILL: {len(existing_hunters)} hunters ya ejecutados, {len(missing)} faltantes")
+            for h in existing_hunters:
+                print(f"    ✓ {h} (ya existe)")
+            selected_hunters = missing
+        else:
+            print(f"\n  BACKFILL: todos los hunters ya tienen hipótesis para {component}")
+            return 0
+
     print(f"\n  Hunters seleccionados: {', '.join(selected_hunters)}")
 
     # Generar prompts
@@ -2312,6 +3516,16 @@ def main():
     for name, prompt in prompts.items():
         prompt_file = prompts_dir / f"{component}_{name}_prompt.md"
         prompt_file.write_text(prompt)
+
+    # Generate CrossChainHunter prompt (conditional on multi-chain)
+    cc_prompt = generate_crosschain_prompt(component, contract_path, protocol)
+    if cc_prompt:
+        cc_prompt_file = prompts_dir / f"{component}_CrossChainHunter_prompt.md"
+        cc_prompt_file.write_text(cc_prompt)
+        print(f"\n  CrossChainHunter prompt saved: {cc_prompt_file}")
+        print(f"  -> Run AFTER 9 hunters, BEFORE DeepDiveHunter")
+    else:
+        print(f"\n  CrossChainHunter: SKIP (single-chain component)")
 
     print(f"\n{'='*60}")
     print(f"  LISTO PARA HUNT AUTÓNOMO")
