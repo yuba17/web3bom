@@ -1362,6 +1362,26 @@ Si el contrato asume ERC-20 estándar y acepta tokens arbitrarios → HIGH risk.
 2. Si Solidity < 0.8.20: ¿desplegado en chain sin PUSH0? (Shanghai EVM)
 3. Si Vyper: verificar que NO es 0.2.15-0.3.0 (reentrancy lock failure → $69M Curve 2023)
 
+## Integration Assumption Verification (OBLIGATORIO si interactúa con protocolo externo)
+Para CADA interacción con protocolo externo (Uniswap, Chainlink, Aave, Compound, etc.):
+
+```yaml
+integration_assumptions:
+  - external_protocol: "Uniswap V3"
+    call: "pool.observations(index)"
+    assumption: "uninitialized slots return timestamp=0"
+    actual_behavior: "uninitialized slots return timestamp=1"
+    code_check: "L322: if (timestamp == 0) revert"
+    match: false
+    verdict: "BUG — sentinel value mismatch"
+```
+
+Proceso:
+1. Listar CADA external call a protocolo conocido
+2. Para cada uno: ¿qué ASUME el código sobre el return value?
+3. Verificar contra el comportamiento REAL del protocolo externo
+4. Sentinel values son los MÁS peligrosos: 0 vs 1, empty vs default, revert vs return(0)
+
 ## REGLA: Solidity Assertions Obligatorias
 CADA hipótesis DEBE tener campo `solidity:` con assertion real. Confidence mínimo: 55%.
 Si no puedes escribir el assertion, la hipótesis es demasiado vaga — descártala o concretiza."""
@@ -1944,6 +1964,12 @@ Ejemplo de invariante bien formado:
 
 {_hunter_specific_section(hunter_name)}
 
+## Regla Anti-Tunnel-Vision (aplica a TODOS los hunters)
+Si durante tu análisis identificas un bug en función F():
+1. Revisa TODAS las líneas restantes de F() antes de pasar a otra función
+2. Busca si funciones adyacentes (mismo caller, misma familia) tienen el mismo error
+3. Documenta en tu YAML: `related_functions_audited: [list]` para cada finding
+
 ## Reglas Críticas
 - **Sin genéricos**: "el contrato podría tener reentrancy" NO es un invariante
 - **Con ataque concreto**: especifica exactamente cómo se perdería dinero
@@ -2136,6 +2162,20 @@ Tu trabajo: encontrar lo que ELLOS NO VIERON. Profundidad, no amplitud.
 {fp_text}
 
 ## Tu Proceso (OBLIGATORIO — sigue las 4 secciones en orden)
+
+### Sección 0: Full Function Audit After Finding (OBLIGATORIO)
+REGLA: cuando encuentres un bug en una función, DETENTE.
+Audita CADA LÍNEA RESTANTE de esa función antes de pasar a la siguiente hipótesis.
+
+Una función con 1 bug tiene P(otro bug) ≈ 30%.
+Evidencia: checkPoolActivity (3 bugs en 1 función), isLiquidateable (2 bugs en 1 función).
+
+Proceso:
+1. Bug encontrado en F() línea N → audita líneas N+1 hasta fin de F()
+2. ¿Las funciones hermanas (llamadas por el mismo caller) tienen el mismo patrón?
+3. ¿Contratos hermanos en scope tienen la versión correcta? (comparar setters, validators)
+4. Solo después de auditar F() completa, pasa a la siguiente hipótesis.
+5. Documenta en tu YAML: `related_functions_audited: [list]` para cada finding.
 
 ### Sección 1: Design Assumption Analysis
 Para cada función crítica: ¿qué asume el developer que nunca pasará?
