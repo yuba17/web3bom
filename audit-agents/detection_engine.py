@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+import yaml
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -161,6 +162,47 @@ class DetectionReport:
             print(f"  {layer}: {stats}")
 
         print(f"{'='*70}")
+
+
+def generate_prepass_yaml(findings: list, output_path: Path):
+    """Generate YAML consumable by run_hunt.py hunter prompts."""
+    signals = []
+    for f in findings:
+        if f.severity_score() < 2:  # Skip low/info
+            continue
+        signals.append({
+            "source": f.layer,
+            "title": f.title,
+            "severity": f.severity,
+            "location": f.location,
+            "description": f.description[:500],
+            "confidence": f.confidence,
+            "action": "VERIFY" if f.confidence < 0.6 else "INVESTIGATE",
+        })
+
+    output = {
+        "prepass_signals": signals,
+        "total": len(signals),
+        "generated_at": datetime.now().isoformat(),
+    }
+
+    try:
+        output_path.write_text(yaml.dump(output, default_flow_style=False, allow_unicode=True))
+    except ImportError:
+        # Fallback: write simple YAML manually
+        lines = [f"total: {len(signals)}", f"generated_at: '{datetime.now().isoformat()}'", "prepass_signals:"]
+        for s in signals:
+            lines.append(f"- title: \"{s['title']}\"")
+            lines.append(f"  severity: {s['severity']}")
+            lines.append(f"  location: \"{s['location']}\"")
+            lines.append(f"  confidence: {s['confidence']}")
+            lines.append(f"  action: {s['action']}")
+            lines.append(f"  source: {s['source']}")
+            desc = s['description'].replace('"', '\\"').replace('\n', ' ')[:200]
+            lines.append(f"  description: \"{desc}\"")
+        output_path.write_text('\n'.join(lines))
+
+    print(f"  Prepass YAML: {output_path} ({len(signals)} signals)")
 
 
 # =============================================================================
@@ -816,23 +858,31 @@ def main():
     parser.add_argument("--output", default="./detection-results", help="Output directory")
     parser.add_argument("--layers", help="Comma-separated layers: static,invariant,symbolic,hypothesis,exploit")
     parser.add_argument("--fast", action="store_true", help="Fast mode: static + exploit only")
+    parser.add_argument("--prepass", action="store_true",
+                        help="Prepass mode: fast (static+exploit) + YAML output for hunt pipeline")
     parser.add_argument("--payout", type=int, default=100000, help="Max bounty payout")
 
     args = parser.parse_args()
 
     layers = None
-    if args.fast:
+    if args.prepass:
+        layers = ["static", "exploit"]
+    elif args.fast:
         layers = ["static", "exploit"]
     elif args.layers:
         layers = args.layers.split(",")
 
-    run_detection(
+    report = run_detection(
         source_dir=args.source,
         name=args.name,
         output_dir=args.output,
         layers=layers,
         max_payout=args.payout,
     )
+
+    if args.prepass:
+        prepass_path = Path(args.output) / f"{args.name}_prepass.yaml"
+        generate_prepass_yaml(report.findings, prepass_path)
 
 
 if __name__ == "__main__":
