@@ -63,7 +63,8 @@ logger = logging.getLogger("orchestrator")
 def setup_logging(protocol: str):
     global LOG_DIR
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    LOG_DIR = WEB3_DIR / "logs" / f"benchmark_{protocol}_{timestamp}"
+    # Keep logs inside the session dir so benchmark logs don't pollute WEB3_DIR/logs/
+    LOG_DIR = HUNT_SESSION_DIR / "logs" / f"{protocol}_{timestamp}"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     handler = logging.FileHandler(LOG_DIR / "orchestrator.log")
@@ -2367,7 +2368,8 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     # ── F4: Report Writer (platform-aware, anti-AI writing) ───────────────
     # Full skill: platform detection, RedTeam mapping, anti-AI pass, Sherlock template
     logger.info(f"    {fid}: ReportWriter (Sherlock template)")
-    reports_dir = WEB3_DIR / "reports"
+    # Keep benchmark reports isolated — never write to WEB3_DIR/reports/
+    reports_dir = HUNT_SESSION_DIR / "reports"
     reports_dir.mkdir(exist_ok=True)
 
     slug = finding["title"][:40].lower().replace(" ", "-").replace("/", "-")
