@@ -12,6 +12,7 @@ Usage:
 
 Component gates (in order):
     hunters     — All 9 hunters generated hypothesis YAMLs with solidity fields
+    crosschain  — CrossChainHunter analyzed multi-chain deployments (or skip if single-chain)
     deepdive    — DeepDiveHunter ran after the 9 hunters
     merge       — merge_invariants.py ran, Properties.sol exists
     compile     — forge build passes
@@ -37,6 +38,15 @@ Finding gates (after a bug is found):
     reportable  — ALL finding gates passed, ready for platform submission
 
 Each gate checks ALL previous gates too (cumulative).
+
+Scope master operations:
+    python3 pipeline_gate.py --scope-status                    # Show SCOPE_MASTER summary
+    python3 pipeline_gate.py --scope-review -c <component>     # Mark component as re-reviewed
+
+Auto-updates SCOPE_MASTER.md when:
+    - Component passes 'complete' gate → state=DONE + review date added
+    - Finding is queued → finding count updated in component entry
+    - --scope-review is called → adds today's date without changing state
 """
 
 import argparse
@@ -53,6 +63,7 @@ import yaml
 WEB3_DIR = Path(__file__).resolve().parent.parent
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
 STATE_FILE = Path.home() / ".claude" / "MEMORY" / "STATE" / "current_hunt.json"
+SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
 
 
 def get_hyp_dir(protocol: str) -> Path:
@@ -81,7 +92,7 @@ HUNTER_NAMES = [
     "SignatureHunter", "DoSHunter",
 ]
 
-GATE_ORDER = ["scope", "hunters", "deepdive", "merge", "compile", "phase1", "phase2", "phase3", "phase4", "phase5", "complete"]
+GATE_ORDER = ["scope", "prepass", "hunters", "crosschain", "deepdive", "merge", "compile", "phase1", "phase2", "phase3", "phase4", "phase5", "complete"]
 
 
 # ─── State helpers ───────────────────────────────────────────────────────────
@@ -167,11 +178,16 @@ def check_scope(component: str, repo: str = "") -> tuple[bool, list[str], list[s
         failed.append("MISSING: current_hunt.json needs 'repo_path' field")
 
     # 3. Component map exists
-    cmap = state.get("component_map", [])
+    cmap = state.get("component_map", {})
     if cmap:
-        comp_names = [c["name"] for c in cmap]
+        # Support both dict-keyed and list-of-dicts formats
+        if isinstance(cmap, dict):
+            comp_names = list(cmap.keys())
+            comp_info = cmap.get(component, {})
+        else:
+            comp_names = [c["name"] for c in cmap]
+            comp_info = next((c for c in cmap if c["name"] == component), {})
         if component in comp_names:
-            comp_info = next(c for c in cmap if c["name"] == component)
             passed.append(f"OK: {component} in component_map ({comp_info.get('loc', '?')} LOC, priority={comp_info.get('priority', '?')})")
         else:
             failed.append(f"NOT_IN_MAP: {component} not found in component_map. Available: {comp_names[:5]}")
@@ -237,7 +253,7 @@ def check_hunters(component: str) -> tuple[bool, list[str], list[str]]:
         except yaml.YAMLError:
             # Malformed YAML — try counting solidity fields via grep
             text = hyp_file.read_text()
-            sol_count = text.count("solidity: |") + text.count("solidity: |-")
+            sol_count = text.count("solidity: |") + text.count("solidity: |-") + text.count("solidity_property: |") + text.count("solidity_property: |-") + text.count("solidity_invariant: |") + text.count("solidity_invariant: |-")
             if sol_count > 0:
                 passed.append(f"OK: {hunter} — {sol_count}+ with solidity (YAML malformed, grep fallback)")
                 continue
@@ -250,13 +266,18 @@ def check_hunters(component: str) -> tuple[bool, list[str], list[str]]:
         # Check for findings/invariants/hypotheses with solidity fields
         findings = content.get("findings", content.get("invariants", content.get("hypotheses", [])))
         if not findings:
+            # Accept if hunter documented false_positives (legitimate "nothing found")
+            fps = content.get("false_positives", [])
+            if fps:
+                passed.append(f"OK: {hunter} — 0 findings, {len(fps)} false_positives documented")
+                continue
             failed.append(f"NO_FINDINGS: {hyp_file.name}")
             continue
 
         has_solidity = 0
         total = len(findings)
         for f in findings:
-            if isinstance(f, dict) and f.get("solidity"):
+            if isinstance(f, dict) and (f.get("solidity") or f.get("solidity_property") or f.get("solidity_invariant")):
                 has_solidity += 1
 
         if has_solidity == 0:
@@ -287,6 +308,58 @@ def check_deepdive(component: str) -> tuple[bool, list[str], list[str]]:
 
     findings = content.get("findings", content.get("invariants", content.get("hypotheses", [])))
     return True, [f"OK: DeepDiveHunter — {len(findings)} hypotheses"], []
+
+
+def check_crosschain(component: str) -> tuple[bool, list[str], list[str]]:
+    """Check that CrossChainHunter produced output (or justified skip for single-chain)."""
+    state = load_state()
+    protocol = state.get("protocol", "")
+    hyp_dir = get_hyp_dir(protocol)
+    hyp_file = hyp_dir / f"hyp_{component}_CrossChainHunter.yaml"
+
+    # Check if component is single-chain (skip file)
+    skip_file = hyp_dir / f"hyp_{component}_CrossChainHunter.skip"
+    if skip_file.exists():
+        reason = skip_file.read_text().strip() or "single-chain component"
+        return True, [f"SKIP: CrossChainHunter — {reason}"], []
+
+    if not hyp_file.exists():
+        return False, [], [f"MISSING: {hyp_file.name} (create .skip file if single-chain)"]
+
+    try:
+        content = yaml.safe_load(hyp_file.read_text())
+    except yaml.YAMLError:
+        return True, [f"OK: CrossChainHunter — YAML malformed but file exists"], []
+    if not content:
+        return False, [], [f"EMPTY: {hyp_file.name}"]
+
+    passed = []
+    failed = []
+
+    # Check deployment_map exists
+    dmap = content.get("deployment_map", [])
+    if not dmap:
+        failed.append("MISSING: deployment_map field")
+    else:
+        chains = [d.get("chain", "?") for d in dmap]
+        passed.append(f"OK: deployment_map — {len(dmap)} deployments across {', '.join(chains)}")
+
+    # Check bytecode_match field
+    if "bytecode_match" not in content:
+        failed.append("MISSING: bytecode_match field")
+    else:
+        passed.append(f"OK: bytecode_match = {content['bytecode_match']}")
+
+    # Check at least 1 invariant or false_positive documented
+    findings = content.get("invariants", content.get("findings", content.get("hypotheses", [])))
+    fps = content.get("false_positives", [])
+    if not findings and not fps:
+        failed.append("NO_ANALYSIS: need at least 1 invariant or 1 documented false_positive")
+    else:
+        passed.append(f"OK: {len(findings)} invariants, {len(fps)} false_positives")
+
+    ok = len(failed) == 0
+    return ok, passed, failed
 
 
 def check_merge(component: str, repo_path: str = "") -> tuple[bool, list[str], list[str]]:
@@ -357,13 +430,13 @@ def check_merge(component: str, repo_path: str = "") -> tuple[bool, list[str], l
         except yaml.YAMLError:
             # Count via grep fallback
             text = hyp_file.read_text()
-            total_solidity_invariants += text.count("solidity: |") + text.count("solidity: |-")
+            total_solidity_invariants += text.count("solidity: |") + text.count("solidity: |-") + text.count("solidity_property: |") + text.count("solidity_property: |-")
             continue
         if not content:
             continue
         findings = content.get("findings", content.get("invariants", content.get("hypotheses", [])))
         for f in findings:
-            if isinstance(f, dict) and f.get("solidity") and f.get("validated", True):
+            if isinstance(f, dict) and (f.get("solidity") or f.get("solidity_property") or f.get("solidity_invariant")) and f.get("validated", True):
                 priority = str(f.get("priority", "medium")).lower()
                 if priority != "low":
                     total_solidity_invariants += 1
@@ -612,11 +685,43 @@ def check_phase5(component: str, repo_path: str = "") -> tuple[bool, list[str], 
     return True, ["SKIP: No pure math functions found — Phase 5 optional"], []
 
 
+def check_prepass(component: str, repo: str) -> tuple:
+    """Check that detection_engine prepass ran and produced output."""
+    hunt = load_state()
+    protocol = hunt.get("protocol", "")
+
+    # Check for prepass YAML in results/
+    results_dir = HUNT_SESSION_DIR / "results"
+    prepass_file = results_dir / f"{component}_prepass.yaml"
+
+    if prepass_file.exists():
+        try:
+            content = prepass_file.read_text()
+            n_signals = content.count("- title:")
+            return True, [f"Prepass YAML found: {prepass_file} ({n_signals} signals)"], []
+        except Exception as e:
+            return True, [f"Prepass YAML exists but unreadable: {e}"], []
+
+    # Also check alternate location
+    alt_file = results_dir / f"{component}_detection_report.json"
+    if alt_file.exists():
+        return True, [f"Detection report found (no YAML): {alt_file}"], []
+
+    # Not found — warn but don't block (prepass is recommended, not mandatory)
+    return True, [
+        f"⚠ No prepass YAML found for {component}.",
+        f"  Recommended: python3 audit-agents/detection_engine.py --prepass --source <src> --name {component} --output hunt_session/results/",
+        f"  Hunters will run without static pre-signals."
+    ], []
+
+
 # ─── Gate dispatcher ─────────────────────────────────────────────────────────
 
 GATE_CHECKS = {
     "scope": lambda comp, repo: check_scope(comp, repo),
+    "prepass": lambda comp, repo: check_prepass(comp, repo),
     "hunters": lambda comp, repo: check_hunters(comp),
+    "crosschain": lambda comp, repo: check_crosschain(comp),
     "deepdive": lambda comp, repo: check_deepdive(comp),
     "merge": lambda comp, repo: check_merge(comp, repo),
     "compile": lambda comp, repo: check_compile(repo),
@@ -626,6 +731,285 @@ GATE_CHECKS = {
     "phase4": lambda comp, repo: check_phase4(comp, repo),
     "phase5": lambda comp, repo: check_phase5(comp, repo),
 }
+
+# ─── SCOPE_MASTER Auto-Update ─────────────────────────────────────────────────
+
+import re as _re_module
+
+
+def _find_scope_master(protocol: str) -> Path | None:
+    """Find SCOPE_MASTER.md for the current program.
+
+    Searches by protocol name first, then by program name in current_hunt.json.
+    Returns None if no scope master exists yet.
+    """
+    state = load_state()
+
+    # Try direct protocol match
+    candidate = SCOPE_MASTER_DIR / protocol / "SCOPE_MASTER.md"
+    if candidate.exists():
+        return candidate
+
+    # Try program field from state
+    program = state.get("program", "")
+    if program:
+        candidate = SCOPE_MASTER_DIR / program.lower().replace(" ", "-") / "SCOPE_MASTER.md"
+        if candidate.exists():
+            return candidate
+
+    # Scan all context dirs for a SCOPE_MASTER that mentions this protocol
+    if SCOPE_MASTER_DIR.exists():
+        for d in SCOPE_MASTER_DIR.iterdir():
+            if d.is_dir():
+                sm = d / "SCOPE_MASTER.md"
+                if sm.exists():
+                    text = sm.read_text()
+                    if protocol in text:
+                        return sm
+
+    return None
+
+
+def _scope_master_update_component(protocol: str, component: str,
+                                    new_state: str = None,
+                                    add_review_date: str = None,
+                                    add_finding: str = None):
+    """Update a component's entry in SCOPE_MASTER.md.
+
+    - new_state: set component state (DONE, IN_PROGRESS, etc.)
+    - add_review_date: append a review date to the Revisiones array
+    - add_finding: append finding count/ID info
+    """
+    sm_path = _find_scope_master(protocol)
+    if not sm_path:
+        return
+
+    text = sm_path.read_text()
+    lines = text.split("\n")
+    modified = False
+
+    # Find the component section (look for "#### " or "### " followed by component name)
+    # Use flexible matching: component name can be a substring of the heading
+    escaped = _re_module.escape(component)
+    comp_pattern = _re_module.compile(
+        rf'^(#{2,4})\s+.*{escaped}', _re_module.IGNORECASE
+    )
+    section_start = None
+    section_end = None
+
+    for i, line in enumerate(lines):
+        if comp_pattern.search(line):
+            section_start = i
+            # Find end: next heading of same or higher level
+            heading_level = len(line) - len(line.lstrip("#"))
+            for j in range(i + 1, len(lines)):
+                if lines[j].startswith("#") and not lines[j].startswith("#" * (heading_level + 1)):
+                    section_end = j
+                    break
+            if section_end is None:
+                section_end = len(lines)
+            break
+
+    if section_start is None:
+        return  # Component not found in SCOPE_MASTER
+
+    section = lines[section_start:section_end]
+
+    # Update state
+    if new_state:
+        for k, line in enumerate(section):
+            if line.strip().startswith("- **Estado**:"):
+                section[k] = f"- **Estado**: `{new_state}`"
+                modified = True
+                break
+
+    # Add review date
+    if add_review_date:
+        for k, line in enumerate(section):
+            if line.strip().startswith("- **Revisiones**:"):
+                # Parse existing dates
+                match = _re_module.search(r'\[([^\]]*)\]', line)
+                if match:
+                    existing = match.group(1).strip()
+                    if existing:
+                        dates = [d.strip().strip("`'\"") for d in existing.split(",")]
+                        if add_review_date not in dates:
+                            dates.append(add_review_date)
+                    else:
+                        dates = [add_review_date]
+                else:
+                    dates = [add_review_date]
+                dates_str = ", ".join(f"`{d}`" for d in dates)
+                section[k] = f"- **Revisiones**: [{dates_str}]"
+                modified = True
+                break
+
+    # Add finding
+    if add_finding:
+        for k, line in enumerate(section):
+            if line.strip().startswith("- **Findings**:"):
+                current = line.strip()
+                if add_finding not in current:
+                    # Increment count and append ID
+                    count_match = _re_module.search(r'(\d+)', current)
+                    old_count = int(count_match.group(1)) if count_match else 0
+                    # Rebuild with new info
+                    section[k] = f"- **Findings**: {old_count + 1} ({add_finding})"
+                    modified = True
+                break
+
+    if modified:
+        lines[section_start:section_end] = section
+        sm_path.write_text("\n".join(lines))
+
+
+def _scope_master_update_coverage(protocol: str):
+    """Recalculate and update the COVERAGE SUMMARY table in SCOPE_MASTER.md."""
+    sm_path = _find_scope_master(protocol)
+    if not sm_path:
+        return
+
+    text = sm_path.read_text()
+
+    # Count states across all component entries
+    states = {"DONE": 0, "SKIP": 0, "NOT_STARTED": 0, "IN_PROGRESS": 0}
+    for match in _re_module.finditer(r'\*\*Estado\*\*:\s*`(\w+)', text):
+        state_val = match.group(1).upper()
+        if state_val == "DONE":
+            states["DONE"] += 1
+        elif state_val.startswith("SKIP"):
+            states["SKIP"] += 1
+        elif state_val == "NOT_STARTED":
+            states["NOT_STARTED"] += 1
+        elif state_val == "IN_PROGRESS":
+            states["IN_PROGRESS"] += 1
+
+    total = sum(states.values())
+    reviewed = states["DONE"] + states["SKIP"]
+
+    # Update the Coverage line if it exists
+    coverage_pattern = _re_module.compile(r'\*\*Coverage\*\*:.*')
+    new_coverage = f"**Coverage**: {reviewed}/{total} revisados ({int(100*reviewed/total) if total else 0}%) — {states['DONE']} DONE + {states['SKIP']} SKIP"
+
+    if coverage_pattern.search(text):
+        text = coverage_pattern.sub(new_coverage, text)
+        sm_path.write_text(text)
+
+
+def scope_master_on_complete(protocol: str, component: str):
+    """Called when a component passes the 'complete' gate.
+    Updates state to DONE and adds today's date as a review."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    _scope_master_update_component(protocol, component,
+                                    new_state="DONE",
+                                    add_review_date=today)
+    _scope_master_update_coverage(protocol)
+    print(f"  📋 SCOPE_MASTER updated: {component} → DONE (reviewed {today})")
+
+
+def scope_master_on_review(protocol: str, component: str):
+    """Called when a component is re-reviewed (not first time).
+    Adds today's date as an additional review without changing state."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    _scope_master_update_component(protocol, component,
+                                    add_review_date=today)
+    print(f"  📋 SCOPE_MASTER updated: {component} — re-review {today}")
+
+
+def scope_master_on_finding(protocol: str, component: str, finding_id: str):
+    """Called when a finding is registered for a component."""
+    _scope_master_update_component(protocol, component,
+                                    add_finding=finding_id)
+    print(f"  📋 SCOPE_MASTER updated: {component} — finding {finding_id}")
+
+
+def show_scope_status():
+    """Show SCOPE_MASTER summary for the current program."""
+    state = load_state()
+    protocol = state.get("protocol", "")
+    sm_path = _find_scope_master(protocol)
+
+    if not sm_path:
+        print(f"⛔ No SCOPE_MASTER.md found for protocol '{protocol}'")
+        print(f"  Create one at: {SCOPE_MASTER_DIR / protocol / 'SCOPE_MASTER.md'}")
+        print(f"  Template: {SCOPE_MASTER_DIR / 'SCOPE_MASTER_TEMPLATE.md'}")
+        sys.exit(1)
+
+    text = sm_path.read_text()
+
+    # Extract components and their states
+    print(f"\n{'#'*60}")
+    print(f"  SCOPE MASTER: {sm_path.parent.name}")
+    print(f"  File: {sm_path}")
+    print(f"{'#'*60}")
+
+    # Parse all component entries — Estado must be on the NEXT line after heading
+    entries = []
+    for match in _re_module.finditer(
+        r'#{2,4}\s+(?:[A-Z]\d+[\-.]\s+|T0-\d+[\-.]\s+)?(.+?)\n'
+        r'- \*\*Estado\*\*:\s*`([^`]+)`\n'
+        r'- \*\*Revisiones\*\*:\s*\[([^\]]*)\]',
+        text
+    ):
+        name = match.group(1).strip()
+        estado = match.group(2).strip()
+        revisiones = match.group(3).strip()
+        # Count reviews
+        rev_count = len([r for r in revisiones.split(",") if r.strip()]) if revisiones else 0
+        # Last review date
+        if revisiones:
+            last_rev = [r.strip().strip("`'\"") for r in revisiones.split(",")][-1]
+        else:
+            last_rev = "never"
+        entries.append((name[:35], estado, rev_count, last_rev))
+
+    if entries:
+        print(f"\n  {'Component':<37} {'Estado':<14} {'Reviews':<8} {'Last Review'}")
+        print(f"  {'-'*37} {'-'*14} {'-'*8} {'-'*12}")
+        for name, estado, rev_count, last_rev in entries:
+            estado_display = f"{'✅' if estado == 'DONE' else '⏭️' if estado.startswith('SKIP') else '🔴' if estado == 'NOT_STARTED' else '🟡'} {estado}"
+            print(f"  {name:<37} {estado_display:<14} {rev_count:<8} {last_rev}")
+
+    # Summary
+    states = {"DONE": 0, "SKIP": 0, "NOT_STARTED": 0, "IN_PROGRESS": 0}
+    for _, estado, _, _ in entries:
+        s = estado.upper()
+        if s == "DONE":
+            states["DONE"] += 1
+        elif s.startswith("SKIP"):
+            states["SKIP"] += 1
+        elif s == "NOT_STARTED":
+            states["NOT_STARTED"] += 1
+        else:
+            states["IN_PROGRESS"] += 1
+
+    total = len(entries)
+    reviewed = states["DONE"] + states["SKIP"]
+    print(f"\n  Coverage: {reviewed}/{total} ({int(100*reviewed/total) if total else 0}%)")
+    print(f"  DONE={states['DONE']} | SKIP={states['SKIP']} | IN_PROGRESS={states['IN_PROGRESS']} | NOT_STARTED={states['NOT_STARTED']}")
+
+    # Findings count
+    finding_matches = _re_module.findall(r'\|\s*\w+-\w+-\d+\s*\|', text)
+    if finding_matches:
+        print(f"  Findings tracked: {len(finding_matches)}")
+
+    # Stale components (last review > 14 days ago)
+    today = datetime.now()
+    stale = []
+    for name, estado, rev_count, last_rev in entries:
+        if estado == "DONE" and last_rev != "never":
+            try:
+                last_date = datetime.strptime(last_rev, "%Y-%m-%d")
+                days_ago = (today - last_date).days
+                if days_ago > 14:
+                    stale.append((name, days_ago))
+            except ValueError:
+                pass
+    if stale:
+        print(f"\n  ⚠️  STALE COMPONENTS (>14 days since review):")
+        for name, days in sorted(stale, key=lambda x: -x[1]):
+            print(f"    {name} — {days} days ago")
+
 
 # ─── Gate Status JSON Export ──────────────────────────────────────────────────
 
@@ -738,6 +1122,14 @@ def run_gate(component: str, gate: str, repo: str = "") -> bool:
 
     # Auto-export to gate_status.json
     export_gate_status(component, repo)
+
+    # Auto-update SCOPE_MASTER when component completes
+    if all_passed and gate in ("complete", "all"):
+        state_data = load_state()
+        protocol = state_data.get("protocol", "")
+        if protocol:
+            scope_master_on_complete(protocol, component)
+
     return all_passed
 
 
@@ -814,11 +1206,15 @@ RESULTS_DIR = HUNT_SESSION_DIR / "results"
 
 
 def _find_hyp_with_finding(finding_id: str) -> dict | None:
-    """Search all hypothesis YAMLs for a specific finding ID."""
-    state = load_state()
-    protocol = state.get("protocol", "")
-    hyp_dir = get_hyp_dir(protocol)
-    for hyp_file in hyp_dir.glob("hyp_*.yaml"):
+    """Search all hypothesis YAMLs for a specific finding ID.
+
+    Searches ALL protocol subdirectories, not just the current protocol,
+    so findings from previous components can still be resolved.
+    """
+    hyp_root = HUNT_SESSION_DIR / "hypotheses"
+    if not hyp_root.exists():
+        return None
+    for hyp_file in hyp_root.rglob("hyp_*.yaml"):
         try:
             content = yaml.safe_load(hyp_file.read_text())
         except yaml.YAMLError:
@@ -887,6 +1283,21 @@ def check_finding_poc(finding_id: str) -> tuple[bool, list[str], list[str]]:
         passed.append(f"OK: PoC files found — {[f.name for f in poc_files[:3]]}")
     elif not poc:
         failed.append(f"NO_POC_FILE: No Solidity PoC file found matching {finding_id}")
+
+    # Also check the PoC file referenced directly in the YAML poc field
+    if poc:
+        # Extract file paths from poc field — supports "path::func" and embedded paths
+        import re as _re
+        # Match paths ending in .sol or .t.sol
+        _sol_paths = _re.findall(r'([\w/._-]+\.(?:t\.)?sol)', str(poc))
+        if "::" in poc:
+            _sol_paths.insert(0, poc.split("::")[0])
+        for poc_path_str in _sol_paths:
+            for base in [WEB3_DIR, WEB3_DIR / "basenames", WEB3_DIR / "wrapped-tokens-os",
+                         WEB3_DIR / "commerce-payments", WEB3_DIR / "flywheel"]:
+                candidate = base / poc_path_str
+                if candidate.is_file() and candidate not in poc_files:
+                    poc_files.append(candidate)
 
     # Check that PoC uses fork (not just mocks)
     state = load_state()
@@ -1332,6 +1743,12 @@ def queue_finding(source: str, parent_id: str = None, title: str = "",
     state["finding_queue"].append(entry)
     _save_state(state)
     print(f"✅ Queued finding {fid}: {title}")
+
+    # Auto-update SCOPE_MASTER with new finding
+    protocol = state.get("protocol", "")
+    if protocol and component:
+        scope_master_on_finding(protocol, component, fid)
+
     return entry
 
 
@@ -1431,7 +1848,47 @@ def main():
     parser.add_argument("--qstatus", help="New status for queue-update")
     parser.add_argument("--components", help="Components for cross-component (comma-separated)")
     parser.add_argument("--hunter", help="Hunter name for spillover")
+    # Scope master operations
+    parser.add_argument("--scope-status", action="store_true", help="Show SCOPE_MASTER summary for current program")
+    parser.add_argument("--scope-review", action="store_true", help="Mark component as re-reviewed (adds today's date)")
+    parser.add_argument("--program", help="Program name for SCOPE_MASTER lookup (e.g. coinbase, hyperlane)")
+    parser.add_argument("--session-dir", help=(
+        "Override HUNT_SESSION_DIR (used by run_benchmark.py to isolate benchmark outputs)"
+    ))
     args = parser.parse_args()
+
+    # ── Session dir override (benchmark isolation) ──
+    if args.session_dir:
+        global HUNT_SESSION_DIR, SCOPE_MASTER_DIR
+        HUNT_SESSION_DIR = Path(args.session_dir).resolve()
+        SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
+
+    # ── Scope master operations ──
+    if args.scope_status:
+        if args.program:
+            # Override protocol with program name for SCOPE_MASTER lookup
+            _orig_load = load_state
+            def _patched_load():
+                s = _orig_load()
+                s["protocol"] = args.program
+                return s
+            import types
+            globals()["load_state"] = _patched_load
+        show_scope_status()
+        sys.exit(0)
+
+    if args.scope_review:
+        if not args.component:
+            parser.error("--scope-review requires --component")
+        program = args.program or ""
+        if not program:
+            state_data = load_state()
+            program = state_data.get("protocol", "")
+        if program:
+            scope_master_on_review(program, args.component)
+        else:
+            print("⛔ No program specified. Use --program <name>")
+        sys.exit(0)
 
     # ── Queue operations ──
     if args.list_queue:

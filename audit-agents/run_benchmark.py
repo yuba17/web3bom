@@ -405,7 +405,8 @@ def check_gate(component: str, gate: str, protocol: str, repo: str = "") -> bool
     """Run pipeline_gate.py and return True if gate passes."""
     cmd = [
         sys.executable, str(SCRIPT_DIR / "pipeline_gate.py"),
-        "-c", component, "--gate", gate, "--protocol", protocol
+        "-c", component, "--gate", gate, "--protocol", protocol,
+        "--session-dir", str(HUNT_SESSION_DIR),
     ]
     if repo:
         cmd += ["--repo", repo]
