@@ -1963,7 +1963,8 @@ Launch ALL 12 NOW in a single response."""
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(
-                    run_finding_pipeline, f, component, protocol, source_code, repo, clog
+                    run_finding_pipeline, f, component, protocol, source_code, repo, clog,
+                    getattr(args, 'fast', False)
                 ): f["id"]
                 for f in pipeline_findings
             }
@@ -2136,10 +2137,12 @@ def extract_findings(component: str, protocol: str,
 # ─── Finding Pipeline ────────────────────────────────────────────────────────
 
 def run_finding_pipeline(finding: dict, component: str, protocol: str,
-                         source_code: str, repo: str, clog: Path):
+                         source_code: str, repo: str, clog: Path,
+                         benchmark_mode: bool = False):
     """Run escalation → redteam → variant → report for a single finding.
 
     Each stage mirrors the full skill implementation from ~/.claude/skills/.
+    If benchmark_mode=True, stops after RedTeam (skips Variant + Report).
     """
     fid = finding["id"]
     logger.info(f"    Finding {fid}: {finding['title']} ({finding['severity']})")
@@ -2301,6 +2304,10 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     )
     run_claude(redteam_prompt, timeout=300, stall_timeout=180,
                log_file=clog / f"{fid}_redteam.log", cwd=repo)
+
+    if benchmark_mode:
+        logger.info(f"    {fid}: benchmark mode — stopping after RedTeam (skip Variant + Report)")
+        return
 
     # ── F3: Variant Hunt (4-step: root cause → L0-L3 → triage) ───────────
     # Full skill: root cause statement template, 4 search levels, triage classification
@@ -2607,28 +2614,60 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def _create_worktree(repo: str, component: str, protocol: str) -> str:
-    """Create a git worktree for a component. Returns worktree path."""
-    import tempfile
+    """Create a git worktree for a component. Returns the effective repo path inside worktree.
+
+    If --repo points to a subdirectory of the git root (e.g., .../repo/yieldoor),
+    we create the worktree from the git root and return worktree_path + subdirectory offset.
+    """
+    import tempfile, shutil
+
+    repo_path = Path(repo).resolve()
+
+    # Find the actual git root
+    code, git_root, _ = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=str(repo_path))
+    if code != 0:
+        logger.error(f"  {repo} is not inside a git repo")
+        return ""
+    git_root = Path(git_root.strip()).resolve()
+
+    # Compute subdirectory offset (e.g., "yieldoor" if repo=.../repo/yieldoor and git root=.../repo)
+    try:
+        subdir = repo_path.relative_to(git_root)
+    except ValueError:
+        subdir = Path(".")
+
     wt_path = str(Path(tempfile.gettempdir()) / f"bench-{protocol}-{component}")
     # Clean up stale worktree if exists
     if Path(wt_path).exists():
-        run_cmd(["git", "worktree", "remove", "--force", wt_path], cwd=repo)
-        import shutil
+        run_cmd(["git", "worktree", "remove", "--force", wt_path], cwd=str(git_root))
         if Path(wt_path).exists():
             shutil.rmtree(wt_path, ignore_errors=True)
-    code, _, stderr = run_cmd(["git", "worktree", "add", "--detach", wt_path, "HEAD"], cwd=repo)
+
+    code, _, stderr = run_cmd(["git", "worktree", "add", "--detach", wt_path, "HEAD"], cwd=str(git_root))
     if code != 0:
         logger.error(f"  Failed to create worktree for {component}: {stderr}")
         return ""
-    logger.info(f"  Worktree created: {wt_path}")
-    return wt_path
+
+    effective_path = str(Path(wt_path) / subdir) if str(subdir) != "." else wt_path
+    logger.info(f"  Worktree created: {wt_path} (effective repo: {effective_path})")
+    return effective_path
 
 
 def _remove_worktree(repo: str, wt_path: str):
-    """Remove a git worktree."""
-    if wt_path and Path(wt_path).exists():
-        run_cmd(["git", "worktree", "remove", "--force", wt_path], cwd=repo)
-        logger.info(f"  Worktree removed: {wt_path}")
+    """Remove a git worktree. Finds the actual worktree root (may differ from wt_path if subdir offset)."""
+    if not wt_path or not Path(wt_path).exists():
+        return
+    # Find git root of the worktree to get the actual worktree path
+    code, wt_root, _ = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=wt_path)
+    if code == 0:
+        wt_root = wt_root.strip()
+    else:
+        wt_root = wt_path
+    # Find git root of the main repo for the worktree remove command
+    code, git_root, _ = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=repo)
+    git_root = git_root.strip() if code == 0 else repo
+    run_cmd(["git", "worktree", "remove", "--force", wt_root], cwd=git_root)
+    logger.info(f"  Worktree removed: {wt_root}")
 
 
 def main():
@@ -2648,8 +2687,25 @@ def main():
                         help="Number of parallel fuzz batches per component (default 4)")
     parser.add_argument("--parallel-poc", type=int, default=4,
                         help="Number of parallel PoC generators per component (default 4)")
+    parser.add_argument("--session-dir", help=(
+        "Override hunt_session output directory. "
+        "Default in benchmark mode: benchmarks/<protocol>/bench_session/ "
+        "(isolated from the real hunt_session to avoid contamination)."
+    ))
 
     args = parser.parse_args()
+
+    # ── Isolate benchmark outputs ──────────────────────────────────────────
+    # When running a benchmark, NEVER write to the real hunt_session/.
+    # Auto-derive an isolated session dir alongside the ground-truth YAML,
+    # or use the explicit --session-dir override.
+    global HUNT_SESSION_DIR
+    if args.session_dir:
+        HUNT_SESSION_DIR = Path(args.session_dir).resolve()
+    elif args.ground_truth:
+        HUNT_SESSION_DIR = Path(args.ground_truth).resolve().parent / "bench_session"
+    # else: keep default WEB3_DIR / "hunt_session" (non-benchmark invocation)
+    HUNT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
     setup_logging(args.protocol)
     components = [c.strip() for c in args.components.split(",")]
@@ -2659,6 +2715,7 @@ def main():
     logger.info(f"  Protocol: {args.protocol}")
     logger.info(f"  Components: {components}")
     logger.info(f"  Repo: {repo}")
+    logger.info(f"  Session dir: {HUNT_SESSION_DIR}")
     logger.info(f"  Ground truth: {args.ground_truth or 'none'}")
     logger.info(f"  Parallel components: {args.parallel_components}")
 
