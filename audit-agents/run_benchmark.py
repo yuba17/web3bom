@@ -582,12 +582,12 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             old_poc.unlink()
         logger.info("    Cleaned test/poc/ from previous runs")
 
-    # ─── Step 0: Scope (init ficha) ─────────────────────────────────────
-    logger.info("  Step 0: Init ficha")
-    run_cmd([
-        sys.executable, str(SCRIPT_DIR / "run_hunt.py"),
-        "-c", component, "--init-ficha", component
-    ])
+    # Step 0: Scope (init ficha) — skipped in benchmark mode.
+    # run_hunt.py --init-ficha uses run_hunt.HUNT_SESSION_DIR (hardcoded to real hunt_session)
+    # and cannot easily accept --session-dir without a larger refactor.
+    # Benchmark pipelines never read the ficha back (scope gate is not checked here),
+    # so skipping init-ficha is safe and avoids contaminating the real hunt_session/fichas/.
+    logger.info("  Step 0: Ficha init skipped (benchmark mode — not needed)")
 
     # ─── Step 1: Prepass ─────────────────────────────────────────────────
     logger.info("  Step 1: Prepass (Slither + Aderyn + patterns)")
@@ -942,37 +942,24 @@ Launch ALL 12 NOW in a single response."""
         if len(hunters) >= 2:
             convergence_text += f"- **{area}**: flagged by {', '.join(set(hunters))} — INVESTIGATE DEEPER\n"
 
-    from run_hunt import generate_deepdive_prompt
-    try:
-        deepdive_prompt = generate_deepdive_prompt(
-            component=component,
-            contract_path=src_file,
-            protocol=protocol,
-        )
-        # Append our pre-digested context to whatever the generator produced
-        deepdive_prompt += (
-            f"\n\n## Pre-Digested Hunter Convergences\n{convergence_text or 'No convergences detected.'}\n\n"
-            f"## Hunter Hypothesis Summary (tier 1-2 only)\n{hunter_digest[:8000]}\n\n"
-            f"## Protocol Model\n{protocol_model[:3000]}\n\n"
-            f"## Chimera Setup\n```solidity\n{setup_sol_text}\n```\n\n"
-            f"Each solidity_property MUST use variable names from Setup.sol above.\n"
-            f"Use Chimera helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\")."
-        )
-    except Exception as e:
-        logger.warning(f"  Failed to generate deepdive prompt: {e}, using fallback")
-        deepdive_prompt = (
-            f"You are DeepDiveHunter analyzing {component} of {protocol}.\n\n"
-            f"## Source Code\n```solidity\n{source_code}\n```\n\n"
-            f"## Libraries\n```solidity\n{library_code[:20000]}\n```\n\n"
-            f"## Chimera Setup (use these variable names in solidity_property)\n```solidity\n{setup_sol_text}\n```\n\n"
-            f"## Protocol Model\n{protocol_model[:3000]}\n\n"
-            f"## Pre-Digested Hunter Convergences\n{convergence_text or 'No convergences detected.'}\n\n"
-            f"## Hunter Hypothesis Summary (tier 1-2 only)\n{hunter_digest[:8000]}\n\n"
-            f"Write hypotheses to: {hyp_dir}/hyp_{component}_DeepDiveHunter.yaml\n"
-            f"No artificial limit. Confidence >= 60% for validated: true.\n"
-            f"Each solidity_property MUST be a complete function using variable names from Setup.sol.\n"
-            f"Use Chimera helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\")."
-        )
+    # Build deepdive prompt directly from bench_session hyp_dir.
+    # Do NOT import generate_deepdive_prompt from run_hunt — that function uses
+    # run_hunt.HUNT_SESSION_DIR (real hunt_session, not bench_session) to read
+    # hypotheses, which is wrong in benchmark mode and would be a thread-safety
+    # issue in parallel component execution (two threads patching the same module global).
+    deepdive_prompt = (
+        f"You are DeepDiveHunter analyzing {component} of {protocol}.\n\n"
+        f"## Source Code\n```solidity\n{source_code}\n```\n\n"
+        f"## Libraries\n```solidity\n{library_code[:20000]}\n```\n\n"
+        f"## Chimera Setup (use these variable names in solidity_property)\n```solidity\n{setup_sol_text}\n```\n\n"
+        f"## Protocol Model\n{protocol_model[:3000]}\n\n"
+        f"## Pre-Digested Hunter Convergences\n{convergence_text or 'No convergences detected.'}\n\n"
+        f"## Hunter Hypothesis Summary (tier 1-2 only)\n{hunter_digest[:8000]}\n\n"
+        f"Write hypotheses to: {hyp_dir}/hyp_{component}_DeepDiveHunter.yaml\n"
+        f"No artificial limit. Confidence >= 60% for validated: true.\n"
+        f"Each solidity_property MUST be a complete function using variable names from Setup.sol.\n"
+        f"Use Chimera helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\")."
+    )
 
     run_claude(
         deepdive_prompt,
