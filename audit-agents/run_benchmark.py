@@ -2851,6 +2851,40 @@ def main():
     logger.info(f"{'═'*60}")
     logger.info(f"  Logs: {LOG_DIR}")
 
+    # ─── Persist consolidated findings to JSON ────────────────────────────
+    # Allows querying all findings from all components after the run completes.
+    findings_json = HUNT_SESSION_DIR / "findings_all.json"
+    all_findings_flat = []
+    for r in results:
+        for f in r.get("findings", []):
+            all_findings_flat.append({
+                "component": r["component"],
+                "id": f.get("id", ""),
+                "title": f.get("title", ""),
+                "severity": f.get("severity", ""),
+                "confidence": f.get("confidence", 0),
+                "fuzz_confirmed": f.get("fuzz_confirmed", False),
+                "poc_path": f.get("poc_path", ""),
+                "hunter": f.get("hunter", ""),
+            })
+    findings_json_data = {
+        "protocol": args.protocol,
+        "components": components_done,
+        "total_findings": len(all_findings_flat),
+        "generated_at": datetime.now().isoformat(),
+        "findings": all_findings_flat,
+    }
+    findings_json.write_text(json.dumps(findings_json_data, indent=2, ensure_ascii=False))
+    logger.info(f"  Findings JSON: {findings_json}")
+    logger.info(f"  Reports:       {HUNT_SESSION_DIR / 'reports'}/")
+    logger.info(f"  Hypotheses:    {HUNT_SESSION_DIR / 'hypotheses' / args.protocol}/")
+    logger.info(f"")
+    logger.info(f"  To re-score hypotheses vs ground truth:")
+    if args.ground_truth:
+        logger.info(f"    python3 audit-agents/benchmark_score.py \\")
+        logger.info(f"      --ground-truth {args.ground_truth} \\")
+        logger.info(f"      --hypotheses-dir {HUNT_SESSION_DIR / 'hypotheses' / args.protocol}")
+
 
 if __name__ == "__main__":
     main()
