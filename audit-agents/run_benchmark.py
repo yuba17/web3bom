@@ -3698,6 +3698,8 @@ def main():
         "Default in benchmark mode: benchmarks/<protocol>/bench_session/ "
         "(isolated from the real hunt_session to avoid contamination)."
     ))
+    parser.add_argument("--mode", choices=["api", "agent"], default="api",
+                        help="Execution mode: 'api' (subprocess, needs API key) or 'agent' (generates plan for Claude Code skill, uses subscription)")
 
     args = parser.parse_args()
 
@@ -3733,6 +3735,33 @@ def main():
         logger.info("  ⚠️  PRE-PRODUCTION mode: PoC will deploy contracts, not use fork state")
 
     setup_logging(args.protocol)
+
+    if args.mode == "agent":
+        from plan_generator import generate_plan
+        from plan_schema import validate_plan
+        components_list = [c.strip() for c in args.components.split(",")]
+        repo_path = str(Path(args.repo).resolve())
+        plan = generate_plan(
+            repo=repo_path, components=components_list, protocol=args.protocol,
+            session_dir=str(HUNT_SESSION_DIR), ground_truth=args.ground_truth or "",
+            is_pre_production=IS_PRE_PRODUCTION, fast=args.fast,
+        )
+        errors = validate_plan(plan)
+        if errors:
+            logger.error("Plan validation failed:")
+            for e in errors:
+                logger.error(f"  - {e}")
+            sys.exit(1)
+        plan_path = HUNT_SESSION_DIR / "execution_plan.json"
+        plan.to_json(plan_path)
+        logger.info(f"Execution plan written: {plan_path} ({len(plan.steps)} steps)")
+        print(f"\n{'='*60}")
+        print(f"  AGENT MODE — Plan generated ({len(plan.steps)} steps)")
+        print(f"  Run this in Claude Code:")
+        print(f"  /run-benchmark-agent {plan_path}")
+        print(f"{'='*60}\n")
+        return
+
     components = [c.strip() for c in args.components.split(",")]
     repo = str(Path(args.repo).resolve())
 
