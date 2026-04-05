@@ -27,11 +27,23 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+# ─── Global Claude concurrency limiter ───────────────────────────────────────
+# Safety net against runaway concurrency bugs — NOT a rate-limit guard.
+# Tier 4 API: 4K RPM / 2M input tok/min. Our peak: 2 components × 9 hunters =
+# 18 calls × 8k tokens ≈ 144k tok/min = 7% of limit. API is NOT the bottleneck.
+# Default 24: enough for 2×9 hunters (18) + 2×10 verification (20) fully parallel,
+# while capping any accidental explosion. PoC concurrency is separately controlled
+# by --parallel-poc (forge/RAM bound, not API bound).
+_CLAUDE_SEMAPHORE = threading.Semaphore(
+    int(os.environ.get("MAX_CLAUDE_CONCURRENT", "24"))
+)
 
 # Add audit-agents to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,6 +54,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WEB3_DIR = SCRIPT_DIR.parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
+POC_CONFIDENCE_THRESHOLD = 65  # min confidence to attempt PoC (shared by component + cross-component)
+IS_PRE_PRODUCTION = False      # set in main() — changes PoC strategy to deploy-on-fork
 
 # ─── Load .env if present ────────────────────────────────────────────────────
 _env_file = WEB3_DIR / ".env"
@@ -118,8 +132,6 @@ def run_claude(prompt: str, allowed_tools: list = None, timeout: int = 1800,
     If stream-json emits 0 events but the process exits cleanly, retries once
     with --output-format text as fallback.
     """
-    import json as _json
-
     base_cmd = ["claude", "-p", prompt]
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
@@ -129,6 +141,15 @@ def run_claude(prompt: str, allowed_tools: list = None, timeout: int = 1800,
     work_cwd = cwd or str(WEB3_DIR)
 
     logger.info(f"  Running claude -p ({len(prompt)} chars prompt)...")
+
+    with _CLAUDE_SEMAPHORE:
+        return _run_claude_inner(prompt, base_cmd, env, work_cwd, timeout, stall_timeout, log_file)
+
+
+def _run_claude_inner(prompt: str, base_cmd: list, env: dict, work_cwd: str,
+                      timeout: int, stall_timeout: int, log_file) -> tuple[int, str]:
+    """Inner Claude execution — called while semaphore is held."""
+    import json as _json
 
     # ── stream-json attempt ──────────────────────────────────────────
     cmd = base_cmd + ["--output-format", "stream-json", "--verbose"]
@@ -432,6 +453,584 @@ def read_source(src_path: str) -> str:
     return content
 
 
+# ─── Prompt Builders (extracted for reuse by agent mode) ────────────────────
+
+def build_hunter_brief(component: str, protocol: str, src_file, src_dir,
+                       protocol_model: str, prepass_signals_text: str,
+                       setup_sol_text: str, setup_var_names: str,
+                       existing_tests_summary: str, knowledge_context: str,
+                       interfaces_code: str, accumulated_context: str,
+                       hyp_dir) -> str:
+    """Build the hunter brief content written to hunter_brief_{component}.md."""
+    return (
+        f"# Hunter Brief — {component} ({protocol})\n\n"
+        f"## Source Files to Read\n"
+        f"- Main contract: {src_file}\n"
+        f"- Libraries: {src_dir / 'libraries'}/ (read ALL .sol files)\n\n"
+        f"## Protocol Model\n{protocol_model[:3000] if protocol_model else 'Read the source to understand the protocol.'}\n\n"
+        f"## Prepass Signals (static analysis findings)\n```yaml\n{prepass_signals_text[:4000] if prepass_signals_text else 'None'}\n```\n\n"
+        f"## Chimera Setup (use these EXACT variable names in solidity_property)\n```solidity\n{setup_sol_text}\n```\n\n"
+        f"## Dev Test Gaps (what the project's own tests MISSED)\n{existing_tests_summary[:2000] if existing_tests_summary else 'No analysis available.'}\n\n"
+        f"## Known Vulnerability Patterns (from knowledge base)\n{knowledge_context[:2000] if knowledge_context else 'None loaded.'}\n\n"
+        f"## Interfaces (function signatures the contract calls externally)\n```solidity\n{interfaces_code[:5000] if interfaces_code else 'None loaded.'}\n```\n\n"
+        f"## Context from Previous Components\n{accumulated_context[:1500] if accumulated_context else 'This is the first component.'}\n\n"
+        f"## OUTPUT RULES\n"
+        f"1. Write YAML to ABSOLUTE PATH: {hyp_dir}/hyp_{component}_<YourHunterName>.yaml\n"
+        f"   DO NOT use relative paths. DO NOT create hunt_session/ inside the repo.\n"
+        f"2. Each hypothesis MUST have `solidity_property`: a COMPLETE Solidity function body\n"
+        f"3. Use EXACT variable names from Setup.sol above: {setup_var_names}\n"
+        f"4. Use Chimera assertion helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\"), lte(a, b, \"msg\")\n"
+        f"5. Confidence >= 60% for validated: true\n"
+        f"6. Minimum 5 hypotheses, no maximum\n"
+        f"7. YAML schema: id, tier, type, description, attack_scenario, solidity_property, validated, priority, confidence, vulnerable_location\n"
+        f"   `vulnerable_location` is REQUIRED for every finding. Format:\n"
+        f"   ```yaml\n"
+        f"   vulnerable_location:\n"
+        f"     contract: \"Strategy.sol\"\n"
+        f"     function: \"_setSecondaryPositionsTicks\"  # the primary function where bug lives\n"
+        f"     lines: [142, 143]                          # exact line numbers from the source\n"
+        f"     vulnerable_code: \"tick = price() >> 1\"   # the exact wrong expression/statement\n"
+        f"     fix: \"should use sqrtPriceX96 not spot price\"\n"
+        f"   ```\n"
+        f"   This is how manual auditors think — they know the EXACT LINE and EXACT CODE that's wrong.\n"
+        f"   Do NOT write a vulnerable_location that just says 'the whole function' — be specific.\n"
+        f"8. **TYPE RULE (CRITICAL)**: Setup.sol declares CONCRETE types, not interfaces.\n"
+        f"   Look at Setup.sol variable declarations to know the exact type of each variable.\n"
+        f"   In solidity_property, use the SAME type as declared in Setup.sol for struct access.\n"
+        f"   WRONG: `IFoo.SomeStruct memory x = foo.getX()` (if Setup.sol says `Foo internal foo`)\n"
+        f"   RIGHT: `Foo.SomeStruct memory x = foo.getX()` (matches the concrete type in Setup.sol)\n"
+        f"   SAFEST: avoid struct type annotations — use tuple destructuring: `(uint a, uint b) = foo.getX()`\n"
+        f"9. **STRUCT GETTER RULE (CRITICAL)**: Solidity auto-generates getters for public struct state variables that return TUPLES, not structs.\n"
+        f"   WRONG: `contract.myStruct().field` — tuple has no named fields, this WILL NOT compile\n"
+        f"   WRONG: `(a,b) = (contract.myStruct().x, contract.myStruct().y)` — same error\n"
+        f"   RIGHT: `(uint a, uint b) = contract.myStruct();` — destructure the tuple\n"
+        f"   RIGHT: `MyStruct memory s = contract.getMyStruct();` — if an explicit getter exists that returns the struct type\n"
+        f"   Before using `.field` access, verify the contract has an explicit getter returning the struct type.\n"
+        f"10. Example solidity_property:\n"
+        f"   ```\n"
+        f"   function property_vault_no_drain() public {{\n"
+        f"       uint256 bal0 = token0.balanceOf(address(vault));\n"
+        f"       t(bal0 > 0, \"Vault drained\");\n"
+        f"   }}\n"
+        f"   ```\n"
+        f"11. Example vulnerable_location:\n"
+        f"   ```yaml\n"
+        f"   vulnerable_location:\n"
+        f"     contract: \"Leverager.sol\"\n"
+        f"     function: \"withdraw\"\n"
+        f"     lines: [232]\n"
+        f"     vulnerable_code: \"token1Amount = amountOut;\"  # amountOut is for token0, wrong for token1\n"
+        f"     fix: \"compute token1Amount independently from token0 amountOut\"\n"
+        f"   ```\n"
+    )
+
+
+def build_hunter_dispatch_prompt(component: str, protocol: str, src_file,
+                                 src_dir, hunter_brief_path, hyp_dir) -> str:
+    """Build the coordinator prompt that launches 12 hunters."""
+    methodology_dir = Path(__file__).resolve().parent / "prompts" / "hunters"
+    return f"""You are the Hunt Coordinator for {component} in {protocol}.
+
+Your ONLY job: launch 12 hunter subagents in parallel using the Agent tool, then wait for all to complete.
+
+## CRITICAL INSTRUCTION FOR EACH AGENT
+Every agent prompt MUST follow this EXACT template (fill in [HunterName]):
+
+"You are [HunterName] analyzing {component} in {protocol}.
+
+Read these files FIRST before any analysis:
+1. {hunter_brief_path} — protocol context, Setup.sol, prepass signals, output rules
+2. {methodology_dir}/[HunterName].md — your hunting methodology, examples of real bugs to find, and key questions
+
+Then read the source code: {src_file} and all .sol files in {src_dir / 'libraries'}/.
+
+Follow your methodology file. Write YAML to {hyp_dir}/hyp_{component}_[HunterName].yaml"
+
+Do NOT summarize or paraphrase the methodology — the agent MUST read the file itself.
+
+## HYPOTHESIS QUALITY REQUIREMENTS
+- Find ≥2 distinct bugs per public/external function analyzed, or explicitly state "no additional vulnerabilities found at confidence ≥60%".
+- Do NOT include hypotheses with confidence < 55%. Quality over quantity.
+- Do NOT generate low-confidence padding hypotheses.
+- Each hypothesis MUST have a concrete poc_sketch with specific function calls and values.
+- If a function has BOTH a prepass signal AND a hunter hypothesis → investigate deeply for HIDDEN secondary bugs in the same function.
+- When 2+ hunters flag the same area (convergence), the DeepDive will investigate — but YOU should still try to find the deeper bug.
+
+## The 12 Hunters (ALL in parallel, single message)
+Launch using Agent tool with run_in_background=true for all except the last:
+
+1. **MathHunter** — arithmetic, precision, share/exchange rate manipulation
+2. **AccessHunter** — roles, modifiers, privilege escalation, initialization
+3. **FlowHunter** — reentrancy, CEI, callbacks, state transitions, flash loans
+4. **OracleHunter** — price feeds, TWAP manipulation, oracle staleness
+5. **DomainHunter** — protocol invariants, symmetric inspection, value tracing
+6. **TrustBoundaryHunter** — external call trust, weird ERC-20, proxy/upgrade
+7. **WildcardHunter** — low-level EVM, composability, gas griefing
+8. **SignatureHunter** — ecrecover, EIP-712, nonces, permit, replay
+9. **DoSHunter** — unbounded loops, gas exhaustion, blocked withdrawals
+10. **LogicHunter** — copy-paste bugs, wrong variables, sibling function diffs, symmetry
+11. **AdversarialHunter** — attacker mindset, backward reasoning from value exits, assumption breaking
+12. **LibraryHunter** — library function analysis: stale state, ignored returns, broken loops
+
+Launch ALL 12 NOW in a single response."""
+
+
+def build_deepdive_prompt(component: str, protocol: str, source_code: str,
+                          library_code: str, setup_sol_text: str,
+                          protocol_model: str, hyp_dir,
+                          convergence_text: str, hunter_digest: str) -> str:
+    """Build the DeepDiveHunter prompt."""
+    return (
+        f"You are DeepDiveHunter analyzing {component} of {protocol}.\n\n"
+        f"## Source Code\n```solidity\n{source_code}\n```\n\n"
+        f"## Libraries\n```solidity\n{library_code[:20000]}\n```\n\n"
+        f"## Chimera Setup (use these variable names in solidity_property)\n```solidity\n{setup_sol_text}\n```\n\n"
+        f"## Protocol Model\n{protocol_model[:3000]}\n\n"
+        f"## Pre-Digested Hunter Convergences\n{convergence_text or 'No convergences detected.'}\n\n"
+        f"## Hunter Hypothesis Summary (tier 1-2 only)\n{hunter_digest[:8000]}\n\n"
+        f"Write hypotheses to: {hyp_dir}/hyp_{component}_DeepDiveHunter.yaml\n"
+        f"No artificial limit. Confidence >= 60% for validated: true.\n"
+        f"Each solidity_property MUST be a complete function using variable names from Setup.sol.\n"
+        f"Use Chimera helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\")."
+    )
+
+
+def build_verify_prompt(finding: dict, relevant_code: str) -> str:
+    """Build the quick verification prompt for a finding."""
+    vuln_loc = finding.get("vulnerable_location") or {}
+    vuln_section = ""
+    if vuln_loc:
+        vuln_section = (
+            f"Hunter's claimed location:\n"
+            f"  Function: {vuln_loc.get('function', 'N/A')}\n"
+            f"  Lines: {vuln_loc.get('lines', 'N/A')}\n"
+            f"  Wrong code: `{vuln_loc.get('vulnerable_code', 'N/A')}`\n"
+            f"  Fix: {vuln_loc.get('fix', 'N/A')}\n"
+        )
+    return (
+        f"You are a senior smart contract auditor doing a QUICK VERIFICATION of a bug report.\n"
+        f"Read the code and determine — with adversarial skepticism — if this is a REAL bug.\n\n"
+        f"## Hypothesis\n"
+        f"Title: {finding.get('title', finding.get('id', '?'))}\n"
+        f"Root Cause: {finding.get('root_cause', '')}\n"
+        f"Confidence reported by hunter: {finding.get('confidence', 0)}%\n"
+        f"{vuln_section}\n"
+        f"## Source Code (focused on the vulnerable area)\n"
+        f"```solidity\n{relevant_code}\n```\n\n"
+        f"## Verification Checklist (check ALL before deciding)\n"
+        f"1. Can you find the EXACT code expression that's wrong in the source above?\n"
+        f"2. Is there a require/modifier/check that already prevents exploitation?\n"
+        f"3. Does exploitation require a privileged caller (owner/admin/governance)? → FALSE_POSITIVE\n"
+        f"4. Is the 'wrong' behavior actually documented / intentional by design?\n"
+        f"5. Is there real economic impact (fund loss / DoS / access bypass)?\n\n"
+        f"## Output (EXACTLY this format, nothing else)\n"
+        f"VERDICT: REAL\n"
+        f"REASON: <one sentence — the exact wrong expression and why it causes harm>\n"
+        f"POC_HINT: <one sentence — simplest way to trigger it in a fork test>\n\n"
+        f"OR:\n\n"
+        f"VERDICT: FALSE_POSITIVE\n"
+        f"REASON: <one sentence — what check/design prevents exploitation>\n"
+        f"POC_HINT: N/A"
+    )
+
+
+def build_poc_prompt(finding: dict, fid: str, component: str,
+                     relevant_code: str, interfaces_code: str,
+                     setup_content: str, poc_path, test_name: str,
+                     is_pre_production: bool) -> str:
+    """Build the PoC generation prompt."""
+    vuln_loc = finding.get("vulnerable_location") or {}
+    vuln_loc_section = ""
+    if vuln_loc:
+        vuln_loc_section = (
+            f"## EXACT VULNERABLE LOCATION (from hunter analysis)\n"
+            f"Contract: {vuln_loc.get('contract', 'N/A')}\n"
+            f"Function: `{vuln_loc.get('function', 'N/A')}`\n"
+            f"Lines: {vuln_loc.get('lines', 'N/A')}\n"
+            f"Vulnerable code: `{vuln_loc.get('vulnerable_code', 'N/A')}`\n"
+            f"Fix: {vuln_loc.get('fix', 'N/A')}\n\n"
+        )
+
+    poc_hint_section = ""
+    if finding.get("_poc_hint"):
+        poc_hint_section = f"## Verification Hint (from code-read step)\n{finding['_poc_hint']}\n\n"
+
+    return (
+        f"Write a Foundry fork test that proves this vulnerability.\n\n"
+        f"## Finding\n"
+        f"ID: {fid}\n"
+        f"Title: {finding.get('title', fid)}\n"
+        f"Root Cause: {finding.get('root_cause', finding.get('description', ''))}\n"
+        f"Component: {component}\n"
+        f"Fuzz confirmed: {finding.get('fuzz_confirmed', False)}\n"
+        f"Property that broke: {finding.get('property_name', 'N/A')}\n\n"
+        f"{poc_hint_section}"
+        f"## Counterexample Trace from Fuzzer\n"
+        f"```\n{finding.get('counterexample_trace', 'No trace available')}\n```\n\n"
+        f"{vuln_loc_section}"
+        f"## Source Code (focused on vulnerable area)\n```solidity\n{relevant_code}\n```\n\n"
+        f"## Interfaces (CRITICAL — use ONLY these function signatures)\n"
+        f"```solidity\n{interfaces_code[:5000]}\n```\n\n"
+        f"## Deployment Template (from test/chimera/Setup.sol)\n"
+        f"```solidity\n{setup_content}\n```\n"
+        f"COPY the deployment pattern above for your setUp(). It shows correct constructor args,\n"
+        f"fork setup, and dependency initialization.\n\n"
+        f"## STEP 0: Constraint Analysis (DO THIS BEFORE WRITING CODE)\n"
+        f"Before writing any Solidity, read the source code and:\n"
+        f"1. List EVERY require/revert/assert that could block your exploit path\n"
+        f"2. For each constraint, determine the exact values that satisfy it\n"
+        f"3. If a swap is needed: calculate the MAXIMUM amount that stays within protocol limits\n"
+        f"4. If a call needs specific msg.sender: check if it's immutable/hardcoded (if yes, the bug may be unexploitable)\n"
+        f"5. Design your PoC to satisfy ALL constraints while exploiting the bug\n\n"
+        f"## Requirements\n"
+        f"1. Write to: {poc_path}\n"
+        f"2. Test function MUST be named `{test_name}`\n"
+        f"3. Use ONLY ASCII characters in strings — NO em-dashes or curly quotes\n"
+        f"4. Keep <16 local variables per function (avoid stack-too-deep)\n"
+        + (
+        f"5. DEPLOYMENT STRATEGY — PRE-PRODUCTION PROTOCOL (contracts NOT deployed on-chain):\n"
+        f"   a) Use vm.createFork(vm.envString(\"BASE_RPC_URL\")) to get real token state (USDC, WETH, etc.)\n"
+        f"   b) Deploy ALL protocol contracts yourself in setUp() using `new Contract(args)`\n"
+        f"   c) Read constructor args from src/ — look for immutables and initializers\n"
+        f"   d) Use vm.deal() to fund attacker with tokens, then interact with YOUR deployed contracts\n"
+        f"   e) Do NOT try to call contracts at hardcoded addresses — they don't exist on-chain\n"
+        if is_pre_production else
+        f"5. Use vm.createFork with the deployed contract address — REAL fork state, not local deployment\n"
+        ) +
+        f"6. The test MUST prove CONCRETE DAMAGE — one of:\n"
+        f"   a) Token balance loss: `assertGt(balanceBefore - balanceAfter, threshold)`\n"
+        f"   b) State corruption: a storage value is wrong after the attack\n"
+        f"   c) DoS: a critical function reverts when it shouldn't\n"
+        f"   d) Privilege escalation: unauthorized caller can execute privileged action AND it persists\n"
+        f"7. If the attack requires msg.sender == immutable_address, the bug is likely unexploitable — SKIP it.\n\n"
+        f"## Workflow\n"
+        f"1. Complete Step 0 constraint analysis (write it as a comment in the test)\n"
+        f"2. Write the .sol file\n"
+        f"3. Run: forge test --match-test {test_name} --match-path test/poc/{poc_path.name} -vvv --fuzz-runs 1\n"
+        f"4. If it fails, read the error and fix the .sol file\n"
+        f"5. Repeat until it passes or you've tried 3 times\n\n"
+        f"Keep it minimal — just enough to prove the bug exists."
+    )
+
+
+def build_escalation_prompt(finding: dict, finding_context: str) -> str:
+    """Build the EscalationHunter prompt."""
+    return (
+        f"You are EscalationHunter. Establish the severity CEILING for this finding.\n\n"
+        f"{finding_context}\n\n"
+        f"Execute ALL 5 checks in order. Even if the first is ESCALABLE, continue all 5.\n\n"
+        f"### CHECK 1 — ESCAPE MECHANISMS (highest ROI)\n"
+        f"Can the admin/protocol undo the damage once it occurs?\n"
+        f"Look for: pause(), emergencyShutdown(), upgradeable proxies, rescue functions.\n"
+        f"If NO escape mechanism AND impact is permanent → severity goes up one level.\n"
+        f"Output: [ESCALABLE] / [NO_ESCALABLE] + 2-line justification.\n\n"
+        f"### CHECK 2 — SCOPE MULTIPLIER\n"
+        f"Does a single attack execution affect 1 victim or N victims?\n"
+        f"Does it affect all positions in a pool simultaneously? All lenders? Repeatable at ~0 marginal cost?\n"
+        f"If 1 attack → N victims (all users of pool/vault) → severity goes up one level.\n"
+        f"Output: [ESCALABLE] / [NO_ESCALABLE] + victim count and why.\n\n"
+        f"### CHECK 3 — PERMANENCE OF DAMAGE\n"
+        f"Is damage temporary (reversible) or permanent?\n"
+        f"Can a user recover funds? Can admin restore correct state? Does damage accumulate over time?\n"
+        f"Permanent + no escape = +1 level. Temporary with mitigation window = no escalation.\n"
+        f"Output: [ESCALABLE] / [NO_ESCALABLE] + permanence description.\n\n"
+        f"### CHECK 4 — COMBINATION WITH PRIOR FINDINGS\n"
+        f"Combined with another confirmed finding in same protocol, does it produce greater impact?\n"
+        f"Only escalate if combination produces qualitatively different impact (e.g., liquidation bypass + oracle manipulation = fund theft).\n"
+        f"Output: [ESCALABLE] / [NO_ESCALABLE] / [CONDICIONAL] + which finding and how.\n\n"
+        f"### CHECK 5 — ATTACKER DIRECT (no permissions)\n"
+        f"Can an unprivileged actor trigger the impact directly without admin or external event?\n"
+        f"If any user can trigger with only capital → +1 level. If requires trusted role → no escalation.\n"
+        f"Output: [ESCALABLE] / [NO_ESCALABLE] + who can trigger and how.\n\n"
+        f"## REQUIRED OUTPUT FORMAT:\n"
+        f"```\n"
+        f"ESCALATION HUNTER REPORT\n"
+        f"═════════════════════════\n"
+        f"Finding: {finding.get('title', finding.get('id', '?'))}\n"
+        f"Severidad propuesta: {finding['severity']}\n\n"
+        f"CHECK 1 — Escape Mechanisms:    [ESCALABLE/NO_ESCALABLE]\n"
+        f"  → [justification]\n"
+        f"CHECK 2 — Scope Multiplier:     [ESCALABLE/NO_ESCALABLE]\n"
+        f"  → [justification]\n"
+        f"CHECK 3 — Permanencia del daño: [ESCALABLE/NO_ESCALABLE]\n"
+        f"  → [justification]\n"
+        f"CHECK 4 — Combinación:          [ESCALABLE/NO_ESCALABLE/CONDICIONAL]\n"
+        f"  → [justification]\n"
+        f"CHECK 5 — Attacker directo:     [ESCALABLE/NO_ESCALABLE]\n"
+        f"  → [justification]\n\n"
+        f"TECHO DE SEVERIDAD: [Critical/High/Medium]\n"
+        f"ARGUMENTO PARA REDTEAM (3-5 lines): [concrete, technical, falsifiable]\n"
+        f"CHECKS QUE ESCALARON: [...]\n"
+        f"CHECKS QUE NO ESCALARON: [...]\n"
+        f"```\n\n"
+        f"Rules:\n"
+        f"- Max 1 level escalation per check. Multiple checks REINFORCE the level, not raise further.\n"
+        f"- If no check escalates → ceiling = original severity.\n"
+        f"- The RedTeam argument MUST be falsifiable — if you can't describe how JUDGE could attack it, it's too vague.\n"
+        f"- Don't access code not provided in the snippets. Mark as [CONDICIONAL: requires verifying X]."
+    )
+
+
+def build_redteam_prompt(finding_context: str, fid: str, finding: dict,
+                         component: str) -> str:
+    """Build the RedTeam prompt with 4 attackers."""
+    return (
+        f"You are the RedTeam moderator. Attack this finding aggressively to destroy it before reporting.\n\n"
+        f"{finding_context}\n\n"
+        f"## 4 ADVERSARIAL ATTACKERS\n\n"
+        f"**[JUDGE]** — Platform judge (Sherlock/C4/Cantina/Immunefi)\n"
+        f"Seeks formal rejection: out of scope, known issue, requires admin, by design.\n"
+        f"In Ronda 0: would a platform judge assign this severity? Too high (inflated) or too low?\n\n"
+        f"**[DEVIL]** — Technical devil's advocate\n"
+        f"Attacks exploit logic: PoC doesn't prove real loss, oracle can't be manipulated this way, slippage protection blocks it.\n"
+        f"In Ronda 0: technically verify the 5 severity checks. Can severity go UP or DOWN?\n\n"
+        f"**[GUARD]** — Protocol defender\n"
+        f"Finds existing mitigations: checks in callers, governance limits, rate limits, circuit breakers.\n"
+        f"In Ronda 0: is there a rescue mechanism (multisig, timelock, proxy upgrade) that reduces permanent impact?\n\n"
+        f"**[ECONOMIST]** — Economic analyst\n"
+        f"Calculates attack profitability: gas, capital needed, MEV competition, timing windows.\n"
+        f"In Ronda 0: how much real money at risk? $1K or $1M? Magnitude matters.\n\n"
+        f"## SEVERITY CALIBRATION TABLE\n"
+        f"| Scope (% affected ops) | Permanence | Path type | Severity |\n"
+        f"|---|---|---|---|\n"
+        f"| 100% (all users) | permanent (no admin fix) | normal operation | Critical or High |\n"
+        f"| 100% | temporal (admin can fix) | normal operation | High |\n"
+        f"| 50% (one token/path) | permanent | normal operation | High |\n"
+        f"| 50% | temporal | requires specific config | Medium |\n"
+        f"| 10% (edge case) | permanent | requires attack | Medium |\n"
+        f"| 10% | temporal | requires attack | Low |\n\n"
+        f"PRIOR CALIBRATION ERRORS:\n"
+        f"- Fee loss in ALL liquidations → we said Medium, GT said High. Rule: 100% scope + permanent + normal path = High minimum.\n"
+        f"- DoS only in denomination==token1 path → we said High, GT said Medium. Rule: 50% scope + permanent + normal = Medium/High boundary → Medium.\n\n"
+        f"## PROTOCOL: RONDA 0 + 3 ROUNDS\n\n"
+        f"### RONDA 0: Severity Calibration\n"
+        f"All 4 attackers answer these 5 questions BRIEFLY. Severity can go UP or DOWN:\n"
+        f"1. Escape mechanisms: can admin/protocol undo damage? No rescue + permanent → consider raising.\n"
+        f"2. Scope: 1 victim or all pool/vault users? Systemic → raise. Single user → lower.\n"
+        f"3. Permanence: reversible or permanent? Permanent → raise. Temporal with reaction window → lower.\n"
+        f"4. Trigger: unprivileged attacker can execute directly? Yes → raise. Requires trusted role → lower.\n"
+        f"5. Combination: adds to another confirmed finding for qualitatively greater impact?\n"
+        f"Each attacker gives severity verdict in ONE line at end of Ronda 0.\n"
+        f"If consensus that proposed severity is wrong → ADJUST BEFORE rounds 1-3.\n\n"
+        f"### ROUND 1: First Attack (each attacker, max 150 words)\n"
+        f"Each attacker identifies the STRONGEST argument against the finding. Only the best argument.\n\n"
+        f"### ROUND 2: Cross-response\n"
+        f"Are the other attackers correct? Or wrong? Can ally with or contradict each other.\n"
+        f"If two attackers contradict → ambiguity signal, must resolve.\n\n"
+        f"### ROUND 3: Individual Verdict (1 paragraph each)\n"
+        f"Each attacker: KILL (finding doesn't survive) / WEAKEN (valid but lower severity) / SURVIVE (solid)\n\n"
+        f"## REQUIRED FINAL OUTPUT:\n"
+        f"```\n"
+        f"VEREDITO REDTEAM\n"
+        f"════════════════\n"
+        f"Finding: {finding.get('title', finding.get('id', '?'))}\n"
+        f"Componente: {component}\n\n"
+        f"RESULTADO: [REPORT / REPORT_DOWNGRADED / DO_NOT_REPORT]\n\n"
+        f"Argumentos que sobrevivieron:\n  [list]\n"
+        f"Argumentos que lo debilitan:\n  [list]\n"
+        f"Argumentos que fallaron (attackers equivocados):\n  [list]\n\n"
+        f"Severidad propuesta:   {finding['severity']}\n"
+        f"Severidad final:       [Critical/High/Medium/Low]\n"
+        f"Razón del cambio:      [why up/down/same]\n"
+        f"Confianza: [0-100%]\n\n"
+        f"Qué añadir al reporte para sobrevivir review:\n  [specific points]\n"
+        f"Qué NO incluir (weakens argument):\n  [list]\n"
+        f"```\n\n"
+        f"Rules:\n"
+        f"- Attackers do NOT help the hunter — they try to KILL the finding.\n"
+        f"- Specific arguments ONLY — 'could be by design' without citing code is INVALID.\n"
+        f"- No authority arguments — 'OpenZeppelin audited this' is invalid unless you cite what they found.\n"
+        f"- Hunter CANNOT respond during rounds.\n"
+        f"- If all 4 say KILL → DO_NOT_REPORT, no exceptions.\n"
+        f"- If 3 SURVIVE + 1 KILL → investigate the KILL argument deeply before reporting.\n\n"
+        f"## REPORT vs REPORT_DOWNGRADED — use these exact criteria:\n"
+        f"REPORT: the finding is valid at the proposed severity. Attackers found no fatal flaw and no severe overestimate.\n"
+        f"REPORT_DOWNGRADED: the finding is valid but the severity is WRONG (too high) AND you can state the correct severity.\n"
+        f"  → Only use DOWNGRADED if the severity deserves 1+ levels down (e.g., proposed High → correct Medium).\n"
+        f"  → Do NOT use DOWNGRADED just because the finding is 'borderline' or 'context-dependent'.\n"
+        f"  → If attackers couldn't kill it AND severity seems right → REPORT, not DOWNGRADED.\n"
+        f"DO_NOT_REPORT: at least one attacker found a FATAL flaw (out of scope, requires trusted role, mitigated, impossible to trigger)."
+    )
+
+
+def build_variant_prompt(fid: str, finding_context: str, repo: str) -> str:
+    """Build the VariantHunter prompt."""
+    return (
+        f"You are VariantHunter. A confirmed bug rarely appears only once. Search for variants systematically.\n\n"
+        f"{finding_context}\n\n"
+        f"## STEP 1: ROOT CAUSE STATEMENT\n"
+        f"Write the root cause in this EXACT format:\n"
+        f'> "This vulnerability exists because **[UNTRUSTED DATA]** reaches **[DANGEROUS OPERATION]** without **[REQUIRED PROTECTION]**."\n\n'
+        f"Examples:\n"
+        f'- "...because **slot0.sqrtPriceX96** reaches **amountOut calculation** without **using TWAP instead of spot price**"\n'
+        f'- "...because **balanceOf(address(this))** reaches **share calculation** without **pre-operation snapshot**"\n\n'
+        f"If you can't write it in this format, you don't understand the bug well enough.\n\n"
+        f"## STEP 2: EXACT MATCH (Level 0)\n"
+        f"Use Grep to search the EXACT code pattern of the bug.\n"
+        f"MUST match ONLY the known instance (1 result). If 0: pattern is wrong. If >1: already have variant candidates.\n"
+        f"Document: Level 0: <pattern>, Matches: N, Locations: [list]\n\n"
+        f"## STEP 3: PROGRESSIVE ABSTRACTION (Levels 1-3)\n"
+        f"Abstract ONE element at a time. After each, search and document.\n\n"
+        f"**Level 1** — Variable names → wildcards:\n"
+        f"Replace specific names with generic patterns.\n\n"
+        f"**Level 2** — Function names → family:\n"
+        f"Replace specific function with the family (e.g., withdraw → any function that sends tokens).\n\n"
+        f"**Level 3** — Full structural pattern:\n"
+        f"Combine multiple grep searches to find the structural pattern.\n\n"
+        f"For EACH level document: Level N: <pattern>, Matches: N, New locations: [list]\n\n"
+        f"## STEP 4: TRIAGE\n"
+        f"For EACH location found in Levels 1-3 that is NOT the original:\n"
+        f"- **TRUE VARIANT**: same root cause, same impact, different fix → NEW FINDING\n"
+        f"- **SIMILAR PATTERN**: same structure but different context → INVESTIGATE\n"
+        f"- **FALSE POSITIVE**: pattern matches but protection/context prevents it → DISCARD\n\n"
+        f"## REQUIRED OUTPUT FORMAT:\n"
+        f"```\n"
+        f"# Variant Hunt — {fid}\n\n"
+        f"## Root Cause Statement\n"
+        f'"This vulnerability exists because..."\n\n'
+        f"## Search Results\n"
+        f"### Level 0 (exact match)\n"
+        f"### Level 1 (variable abstraction)\n"
+        f"### Level 2 (function family)\n"
+        f"### Level 3 (structural)\n\n"
+        f"## Triage\n"
+        f"| Location | Level | Classification | Notes |\n\n"
+        f"## Variants Found: X\n"
+        f"```\n\n"
+        f"Search ALL .sol files in {repo}/src/. Max 15 minutes."
+    )
+
+
+def build_report_prompt(finding_context: str, report_path) -> str:
+    """Build the ReportWriter prompt."""
+    return (
+        f"You are ReportWriter. Convert a RedTeam-validated finding into a platform-ready report.\n\n"
+        f"{finding_context}\n\n"
+        f"## STEP 1 — PLATFORM: SHERLOCK\n"
+        f"This is a Sherlock contest benchmark. Use the Sherlock template.\n\n"
+        f"## STEP 2 — REDTEAM MAPPING\n"
+        f"Extract from the finding context:\n"
+        f"- Severidad final → Severity field\n"
+        f"- Surviving arguments → Impact section (strongest ones)\n"
+        f"- Weakening arguments → mention + counter in Impact\n"
+        f"- What NOT to include → exclusion list (don't put in report)\n"
+        f"- What to ADD → reinforce in Description or Impact\n"
+        f"Only arguments that survived RedTeam go in the report.\n\n"
+        f"## STEP 3 — ANTI-AI WRITING RULES (CRITICAL)\n"
+        f"DO NOT use:\n"
+        f"- Filler phrases: 'It is important to note', 'This could potentially lead to', 'It is worth mentioning'\n"
+        f"- Hedging: 'may', 'could', 'might', 'potentially', 'in some cases' — the PoC proved it, no 'might'\n"
+        f"- Passive voice: write 'the function lacks', 'an attacker calls', not 'it was found that'\n"
+        f"- Symmetric structure: not all sections same length, not all paragraphs with 3 sentences\n"
+        f"- Explaining the obvious: don't explain what liquidation is, what a gauge is — the judge knows\n"
+        f"- Generic openings: start with the punch, not context\n\n"
+        f"DO write like a senior auditor:\n"
+        f"- First sentence already says what's broken and what happens\n"
+        f"- Active voice, specific: 'withdraw() at line 224 has no try/catch'\n"
+        f"- Asymmetric: section lengths follow complexity, not aesthetics\n"
+        f"- Confident: no hedging, the PoC demonstrated it\n"
+        f"- Technically specific: cite contract, line, exact variable\n\n"
+        f"## SHERLOCK TEMPLATE:\n"
+        f"```markdown\n"
+        f"## Summary\n"
+        f"[One sentence: who can do what, with what result]\n\n"
+        f"## Vulnerability Detail\n"
+        f"[Deep technical explanation. Sherlock values depth.\n"
+        f"Include code with comments. Cite Sherlock severity criteria.]\n\n"
+        f"## Impact\n"
+        f"[Cite which Sherlock severity rule applies:\n"
+        f"- High: direct loss without time limit or user interaction\n"
+        f"- Medium: with specific conditions / temporary DoS]\n\n"
+        f"## Code Snippet\n"
+        f"```solidity\n"
+        f"// [file]:[line]\n"
+        f"[vulnerable snippet]\n"
+        f"```\n\n"
+        f"## Tool used\n"
+        f"Manual Review\n\n"
+        f"## Recommendation\n"
+        f"[Fix with code]\n"
+        f"```\n\n"
+        f"## AFTER WRITING — MANDATORY REVIEW PASS:\n"
+        f"Re-read line by line and eliminate:\n"
+        f"- Any sentence starting with 'It is', 'This could', 'It is worth', 'As a result'\n"
+        f"- Any 'may', 'could', 'might', 'potentially', 'in some cases'\n"
+        f"- Any section where all sentences are approximately equal length\n"
+        f"- Any paragraph with 3 bullets when one sentence would suffice\n"
+        f"- Any sentence explaining something the judge already knows\n"
+        f"- Any passive voice usable as active\n"
+        f"If a section sounds like corporate documentation → rewrite it.\n\n"
+        f"Write the report to: {report_path}\n"
+        f"Use English for all content (Sherlock platform). Be specific with line numbers."
+    )
+
+
+def build_cross_pair_prompt(comp_a: str, comp_b: str, iface_a: str,
+                            iface_b: str, cross_calls: str, src_dir,
+                            pair_file) -> str:
+    """Build the cross-component pair analysis prompt."""
+    return (
+        f"You are CrossComponentHunter. Analyze the interaction between {comp_a} and {comp_b}.\n\n"
+        f"## {comp_a} Interface\n```solidity\n{iface_a}\n```\n\n"
+        f"## {comp_b} Interface\n```solidity\n{iface_b}\n```\n\n"
+        f"## Known cross-component call sites\n{cross_calls}\n\n"
+        f"## Your task\n"
+        f"For the {comp_a} × {comp_b} interaction surface:\n"
+        f"1. What breaks if {comp_b} behaves unexpectedly at each call site in {comp_a}?\n"
+        f"2. What breaks if {comp_a} behaves unexpectedly at each call site in {comp_b}?\n"
+        f"3. Custody invariants: assets in {comp_a} XOR {comp_b} — can both hold the same asset?\n"
+        f"4. Accounting desync: does {comp_a} track a value that {comp_b} can change without notifying {comp_a}?\n"
+        f"5. Sequence-dependent state: does calling {comp_a} then {comp_b} differ from {comp_b} then {comp_a}?\n"
+        f"6. If you need to read full source, use the Read tool on the .sol files in {src_dir}/\n\n"
+        f"Write findings (YAML list) to: {pair_file}\n\n"
+        f"YAML format — top-level key must be 'findings', each entry:\n"
+        f"  - id: CROSS-{comp_a[:3].upper()}-{comp_b[:3].upper()}-001\n"
+        f"    title: <one line>\n"
+        f"    severity: High/Medium/Low\n"
+        f"    confidence: 70\n"
+        f"    description: <root cause>\n"
+        f"    attack_scenario: <step by step>\n"
+        f"    components: [{comp_a}, {comp_b}]\n"
+    )
+
+
+def build_is_same_bug_prompt(leader: dict, sibling: dict) -> str:
+    """Build the dedup check prompt for two findings."""
+    return (
+        f"You are deduplicating smart contract audit findings.\n"
+        f"Determine if Finding B is the SAME bug as Finding A, or a genuinely DIFFERENT bug.\n\n"
+        f"## Finding A (PoC-confirmed)\n"
+        f"Title: {leader['title']}\n"
+        f"Root Cause: {leader.get('root_cause', 'N/A')}\n\n"
+        f"## Finding B (needs evaluation)\n"
+        f"Title: {sibling['title']}\n"
+        f"Root Cause: {sibling.get('root_cause', 'N/A')}\n\n"
+        f"## The ONE test that matters\n"
+        f"Would a single code patch that fixes Finding A ALSO fix Finding B?\n"
+        f"If yes → SAME. If no (requires a separate code change) → DIFFERENT.\n\n"
+        f"## SAME examples (different wording, same fix)\n"
+        f"- A: 'pullFunds does not decrement underlyingBalance'\n"
+        f"  B: 'pushFunds does not increment underlyingBalance'\n"
+        f"  → SAME if both fix the same missing balance update in the same function family\n"
+        f"- A: 'collectFees uses wrong tickUpper for vesting position (line 167)'\n"
+        f"  B: 'collectPositionFees called with mainPosition.tickUpper instead of vestPosition.tickUpper'\n"
+        f"  → SAME — identical line, identical fix\n"
+        f"- A: 'DoS via uninitialized observation in checkPoolActivity'\n"
+        f"  B: 'checkPoolActivity reverts when observation[0] is uninitialized'\n"
+        f"  → SAME — same function, same trigger, same fix\n\n"
+        f"## DIFFERENT examples (genuinely separate bugs)\n"
+        f"- A: 'pullFunds does not check frozen reserve'\n"
+        f"  B: 'borrow() allows borrowing above utilization cap'\n"
+        f"  → DIFFERENT — different checks, different fixes\n"
+        f"- A: 'collectFees tick mismatch (line 167)'\n"
+        f"  B: 'balances() excludes vesting position liquidity'\n"
+        f"  → DIFFERENT — different functions, different fixes\n\n"
+        f"## Output — EXACTLY one of these two lines, nothing else:\n"
+        f"SAME\n"
+        f"DIFFERENT: <one sentence — what separate code change Finding B requires>"
+    )
+
+
 # ─── FoundryTester Wrapper Generator ────────────────────────────────────────
 
 def _generate_foundry_tester_wrappers(chimera_dir: Path):
@@ -496,6 +1095,165 @@ def _generate_foundry_tester_wrappers(chimera_dir: Path):
 
     foundry_tester.write_text(new_content, encoding="utf-8")
     logger.info(f"  FoundryTester.sol: generated {len(wrappers)} invariant_ wrappers from {len(prop_fns)} property_ functions")
+
+
+# ─── Pipeline Funnel Dashboard ──────────────────────────────────────────────
+
+def _log_funnel(component: str,
+                all_findings: list,
+                verified: list,
+                poc_candidates: list,
+                poc_confirmed: list,
+                redteam_report: list):
+    """Log the pipeline funnel — hypothesis → verification → PoC → RedTeam."""
+    n_hyp = len(all_findings)
+    n_ver = len(verified)
+    n_poc_in = len(poc_candidates)
+    n_poc_out = len(poc_confirmed)
+    n_rt = len(redteam_report)
+
+    def _pct(a, b):
+        return f"{a/b*100:.0f}%" if b else "—"
+
+    logger.info(f"\n  {'─'*52}")
+    logger.info(f"  PIPELINE FUNNEL — {component}")
+    logger.info(f"  {'─'*52}")
+    logger.info(f"  Hypotheses generated:  {n_hyp:>4}")
+    if n_ver:
+        logger.info(f"  Post-verification:     {n_ver:>4}  ({_pct(n_ver, n_hyp)} pass)")
+    if n_poc_in:
+        logger.info(f"  Post-dedup (PoC in):   {n_poc_in:>4}  ({_pct(n_poc_in, n_ver or n_hyp)} of verified)")
+    if n_poc_out:
+        logger.info(f"  PoC confirmed:         {n_poc_out:>4}  ({_pct(n_poc_out, n_poc_in)} pass)")
+    if n_rt:
+        logger.info(f"  RedTeam REPORT:        {n_rt:>4}  ({_pct(n_rt, n_poc_out)} of PoC)")
+    logger.info(f"  {'─'*52}\n")
+
+
+# ─── PoC Helpers (top-level so cross-component can reuse them) ───────────────
+
+def _sanitize_sol_unicode(path: Path):
+    """Replace Unicode chars that break solc (em-dash, curly quotes, etc.)."""
+    if not path.exists():
+        return
+    txt = path.read_text(encoding="utf-8")
+    replacements = {
+        "\u2014": "--",   # em-dash
+        "\u2013": "-",    # en-dash
+        "\u2018": "'",    # left single curly
+        "\u2019": "'",    # right single curly
+        "\u201c": '"',    # left double curly
+        "\u201d": '"',    # right double curly
+        "\u2026": "...",  # ellipsis
+    }
+    changed = False
+    for uchar, repl in replacements.items():
+        if uchar in txt:
+            txt = txt.replace(uchar, repl)
+            changed = True
+    if changed:
+        path.write_text(txt, encoding="utf-8")
+        logger.info(f"    Sanitized Unicode chars in {path.name}")
+
+
+def _filter_errors_for_file(stderr: str, filename: str) -> str:
+    """Extract only compile errors related to a specific file."""
+    lines = stderr.splitlines()
+    relevant = []
+    capture = False
+    for line in lines:
+        if filename in line:
+            capture = True
+            relevant.append(line)
+        elif capture and (line.startswith("  ") or line.startswith("    |")):
+            relevant.append(line)
+        else:
+            capture = False
+    return "\n".join(relevant) if relevant else stderr[-2000:]
+
+
+def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
+                          component: str, protocol: str, repo: str,
+                          clog: Path, forge_env: dict,
+                          poc_confidence_threshold: int = 65):
+    """Generate and test a fork PoC for a single finding.
+    Top-level so both run_component_pipeline and run_cross_component can call it."""
+    fid = finding.get("id") or finding.get("title", "UNKNOWN")[:20].replace(" ", "-")
+
+    if not finding.get("fuzz_confirmed") and not finding.get("has_poc") and finding.get("confidence", 0) < poc_confidence_threshold:
+        logger.info(f"    {fid}: skipping PoC (not confirmed, confidence < {poc_confidence_threshold})")
+        finding["has_poc"] = False
+        return
+
+    logger.info(f"    {fid}: Generating Fork PoC")
+    poc_dir = Path(repo) / "test" / "poc"
+    poc_dir.mkdir(parents=True, exist_ok=True)
+    poc_path = poc_dir / f"PoC_{fid.replace('-', '_')}.t.sol"
+    test_name = f"test_poc_{fid.replace('-', '_').lower()}"
+
+    setup_content = ""
+    setup_path = Path(repo) / "test" / "chimera" / "Setup.sol"
+    if setup_path.exists():
+        setup_content = setup_path.read_text(encoding="utf-8")[:4000]
+
+    relevant_code = _extract_relevant_code(source_code, "", finding)
+    poc_prompt = build_poc_prompt(
+        finding=finding, fid=fid, component=component,
+        relevant_code=relevant_code, interfaces_code=interfaces_code,
+        setup_content=setup_content, poc_path=poc_path, test_name=test_name,
+        is_pre_production=IS_PRE_PRODUCTION
+    )
+
+    run_claude(poc_prompt, allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
+               timeout=900, log_file=clog / f"{fid}_poc_gen.log", cwd=repo)
+
+    if not poc_path.exists():
+        finding["has_poc"] = False
+        return
+
+    _sanitize_sol_unicode(poc_path)
+
+    poc_rel = str(poc_path.relative_to(Path(repo)))
+    poc_rc, _, poc_stderr = run_cmd(
+        ["forge", "test", "--match-test", test_name, "--match-path", poc_rel,
+         "-vvv", "--fuzz-runs", "1"],
+        timeout=300, cwd=repo, log_file=clog / f"{fid}_poc_run.log", env=forge_env
+    )
+    if poc_rc == 0:
+        logger.info(f"    {fid}: PoC PASSED — vulnerability confirmed!")
+        finding["has_poc"] = True
+        finding["poc_path"] = str(poc_path)
+        return
+
+    # One fix attempt
+    logger.info(f"    {fid}: PoC failed, attempting fix...")
+    file_errors = _filter_errors_for_file(poc_stderr, poc_path.name)
+    poc_content = poc_path.read_text(encoding="utf-8")[:8000] if poc_path.exists() else ""
+    run_claude(
+        f"Fix this Foundry PoC. Only fix compile/runtime errors, keep the attack logic.\n\n"
+        f"## Error\n```\n{file_errors}\n```\n\n"
+        f"## Current Code\n```solidity\n{poc_content}\n```\n\n"
+        f"## Interfaces\n```solidity\n{interfaces_code[:5000]}\n```\n\n"
+        f"File: {poc_path}\n"
+        f"Fix it, then run: forge test --match-test {test_name} --match-path {poc_rel} -vvv --fuzz-runs 1\n"
+        f"Use ONLY ASCII in strings.",
+        allowed_tools=["Read", "Edit", "Bash"],
+        timeout=600, log_file=clog / f"{fid}_poc_fix.log", cwd=repo
+    )
+    _sanitize_sol_unicode(poc_path)
+
+    poc_rc2, _, _ = run_cmd(
+        ["forge", "test", "--match-test", test_name, "--match-path", poc_rel,
+         "-vvv", "--fuzz-runs", "1"],
+        timeout=300, cwd=repo, env=forge_env
+    )
+    if poc_rc2 == 0:
+        logger.info(f"    {fid}: PoC PASSED after fix!")
+        finding["has_poc"] = True
+        finding["poc_path"] = str(poc_path)
+    else:
+        logger.warning(f"    {fid}: PoC FAILED — finding unverified")
+        finding["has_poc"] = False
 
 
 # ─── Component Pipeline ─────────────────────────────────────────────────────
@@ -691,7 +1449,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             f"Create these files in {chimera_dir_early}/:\n"
             f"- Setup.sol: abstract contract that deploys {component} with ALL its dependencies.\n"
             f"  COPY the deployment pattern from the project's own tests above — they know their constructor args.\n"
-            f"  Use vm.createFork if the project uses external contracts (Uniswap, tokens, etc).\n"
+            f"  Use vm.createSelectFork(vm.envString(\"ETH_RPC_URL\")) in setUp() if the project uses external contracts (Uniswap, real tokens, oracles, etc). NEVER use string alias like \"mainnet\" — always use vm.envString(\"ETH_RPC_URL\").\n"
             f"  MUST define internal variables accessible by Properties: the main contract + tokens + actors.\n"
             f"  Example: `Strategy internal strategy; Vault internal vault; IERC20 internal token0;`\n"
             f"  Define actors: owner, user, depositor, attacker with distinct addresses.\n"
@@ -733,7 +1491,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         run_claude(
             setup_prompt,
             allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-            timeout=600,
+            timeout=1200,  # Increased: complex components (Leverager, LendingPool) need >600s
             log_file=clog / "chimera_setup_early.log",
             cwd=repo
         )
@@ -791,95 +1549,23 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     context_dir = HUNT_SESSION_DIR / "context" / f"{protocol}-bench"
     context_dir.mkdir(parents=True, exist_ok=True)
     hunter_brief_path = context_dir / f"{component}_hunter_brief.md"
-    hunter_brief_content = (
-        f"# Hunter Brief — {component} ({protocol})\n\n"
-        f"## Source Files to Read\n"
-        f"- Main contract: {src_file}\n"
-        f"- Libraries: {src_dir / 'libraries'}/ (read ALL .sol files)\n\n"
-        f"## Protocol Model\n{protocol_model[:3000] if protocol_model else 'Read the source to understand the protocol.'}\n\n"
-        f"## Prepass Signals (static analysis findings)\n```yaml\n{prepass_signals_text[:4000] if prepass_signals_text else 'None'}\n```\n\n"
-        f"## Chimera Setup (use these EXACT variable names in solidity_property)\n```solidity\n{setup_sol_text}\n```\n\n"
-        f"## Dev Test Gaps (what the project's own tests MISSED)\n{existing_tests_summary[:2000] if existing_tests_summary else 'No analysis available.'}\n\n"
-        f"## Known Vulnerability Patterns (from knowledge base)\n{knowledge_context[:2000] if knowledge_context else 'None loaded.'}\n\n"
-        f"## Interfaces (function signatures the contract calls externally)\n```solidity\n{interfaces_code[:5000] if interfaces_code else 'None loaded.'}\n```\n\n"
-        f"## Context from Previous Components\n{accumulated_context[:1500] if accumulated_context else 'This is the first component.'}\n\n"
-        f"## OUTPUT RULES\n"
-        f"1. Write YAML to ABSOLUTE PATH: {hyp_dir}/hyp_{component}_<YourHunterName>.yaml\n"
-        f"   DO NOT use relative paths. DO NOT create hunt_session/ inside the repo.\n"
-        f"2. Each hypothesis MUST have `solidity_property`: a COMPLETE Solidity function body\n"
-        f"3. Use EXACT variable names from Setup.sol above: {setup_var_names}\n"
-        f"4. Use Chimera assertion helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\"), lte(a, b, \"msg\")\n"
-        f"5. Confidence >= 60% for validated: true\n"
-        f"6. Minimum 5 hypotheses, no maximum\n"
-        f"7. YAML schema: id, tier, type, description, attack_scenario, solidity_property, validated, priority, confidence\n"
-        f"8. **TYPE RULE (CRITICAL)**: Setup.sol declares CONCRETE types, not interfaces.\n"
-        f"   Look at Setup.sol variable declarations to know the exact type of each variable.\n"
-        f"   In solidity_property, use the SAME type as declared in Setup.sol for struct access.\n"
-        f"   WRONG: `IFoo.SomeStruct memory x = foo.getX()` (if Setup.sol says `Foo internal foo`)\n"
-        f"   RIGHT: `Foo.SomeStruct memory x = foo.getX()` (matches the concrete type in Setup.sol)\n"
-        f"   SAFEST: avoid struct type annotations — use tuple destructuring: `(uint a, uint b) = foo.getX()`\n"
-        f"9. **STRUCT GETTER RULE (CRITICAL)**: Solidity auto-generates getters for public struct state variables that return TUPLES, not structs.\n"
-        f"   WRONG: `contract.myStruct().field` — tuple has no named fields, this WILL NOT compile\n"
-        f"   WRONG: `(a,b) = (contract.myStruct().x, contract.myStruct().y)` — same error\n"
-        f"   RIGHT: `(uint a, uint b) = contract.myStruct();` — destructure the tuple\n"
-        f"   RIGHT: `MyStruct memory s = contract.getMyStruct();` — if an explicit getter exists that returns the struct\n"
-        f"   Before using `.field` access, verify the contract has an explicit getter returning the struct type.\n"
-        f"10. Example solidity_property:\n"
-        f"   ```\n"
-        f"   function property_vault_no_drain() public {{\n"
-        f"       uint256 bal0 = token0.balanceOf(address(vault));\n"
-        f"       t(bal0 > 0, \"Vault drained\");\n"
-        f"   }}\n"
-        f"   ```\n"
+    hunter_brief_content = build_hunter_brief(
+        component=component, protocol=protocol, src_file=src_file,
+        src_dir=src_dir, protocol_model=protocol_model,
+        prepass_signals_text=prepass_signals_text,
+        setup_sol_text=setup_sol_text, setup_var_names=setup_var_names,
+        existing_tests_summary=existing_tests_summary,
+        knowledge_context=knowledge_context, interfaces_code=interfaces_code,
+        accumulated_context=accumulated_context, hyp_dir=hyp_dir
     )
     hunter_brief_path.write_text(hunter_brief_content, encoding="utf-8")
     logger.info(f"  Wrote hunter brief ({len(hunter_brief_content)} chars) to {hunter_brief_path}")
 
     # Coordinator prompt — lightweight, tells agents to read brief + methodology from disk
-    methodology_dir = SCRIPT_DIR / "prompts" / "hunters"
-    hunter_dispatch_prompt = f"""You are the Hunt Coordinator for {component} in {protocol}.
-
-Your ONLY job: launch 12 hunter subagents in parallel using the Agent tool, then wait for all to complete.
-
-## CRITICAL INSTRUCTION FOR EACH AGENT
-Every agent prompt MUST follow this EXACT template (fill in [HunterName]):
-
-"You are [HunterName] analyzing {component} in {protocol}.
-
-Read these files FIRST before any analysis:
-1. {hunter_brief_path} — protocol context, Setup.sol, prepass signals, output rules
-2. {methodology_dir}/[HunterName].md — your hunting methodology, examples of real bugs to find, and key questions
-
-Then read the source code: {src_file} and all .sol files in {src_dir / 'libraries'}/.
-
-Follow your methodology file. Write YAML to {hyp_dir}/hyp_{component}_[HunterName].yaml"
-
-Do NOT summarize or paraphrase the methodology — the agent MUST read the file itself.
-
-## HYPOTHESIS QUALITY REQUIREMENTS
-- Find ≥2 distinct bugs per public/external function analyzed, or explicitly state "no additional vulnerabilities found at confidence ≥60%".
-- Do NOT generate low-confidence padding hypotheses.
-- Each hypothesis MUST have a concrete poc_sketch with specific function calls and values.
-- If a function has BOTH a prepass signal AND a hunter hypothesis → investigate deeply for HIDDEN secondary bugs in the same function.
-- When 2+ hunters flag the same area (convergence), the DeepDive will investigate — but YOU should still try to find the deeper bug.
-
-## The 12 Hunters (ALL in parallel, single message)
-Launch using Agent tool with run_in_background=true for all except the last:
-
-1. **MathHunter** — arithmetic, precision, share/exchange rate manipulation
-2. **AccessHunter** — roles, modifiers, privilege escalation, initialization
-3. **FlowHunter** — reentrancy, CEI, callbacks, state transitions, flash loans
-4. **OracleHunter** — price feeds, TWAP manipulation, oracle staleness
-5. **DomainHunter** — protocol invariants, symmetric inspection, value tracing
-6. **TrustBoundaryHunter** — external call trust, weird ERC-20, proxy/upgrade
-7. **WildcardHunter** — low-level EVM, composability, gas griefing
-8. **SignatureHunter** — ecrecover, EIP-712, nonces, permit, replay
-9. **DoSHunter** — unbounded loops, gas exhaustion, blocked withdrawals
-10. **LogicHunter** — copy-paste bugs, wrong variables, sibling function diffs, symmetry
-11. **AdversarialHunter** — attacker mindset, backward reasoning from value exits, assumption breaking
-12. **LibraryHunter** — library function analysis: stale state, ignored returns, broken loops
-
-Launch ALL 12 NOW in a single response."""
+    hunter_dispatch_prompt = build_hunter_dispatch_prompt(
+        component=component, protocol=protocol, src_file=src_file,
+        src_dir=src_dir, hunter_brief_path=hunter_brief_path, hyp_dir=hyp_dir
+    )
 
     t0 = time.time()
     rc, out = run_claude(
@@ -897,18 +1583,23 @@ Launch ALL 12 NOW in a single response."""
     if not skip_file.exists():
         skip_file.write_text("single-chain protocol")
 
-    # Check hunters gate — BLOCKING
-    hunters_ok = check_gate(component, "hunters", protocol, repo)
-    summary["gates"]["hunters"] = hunters_ok
-    if not hunters_ok:
-        # Verify: are there ANY hypothesis files?
-        hyp_count = len(list(hyp_dir.glob(f"hyp_{component}_*.yaml")))
-        if hyp_count == 0:
-            logger.error(f"  BLOCKED: Hunters produced 0 YAML files. Cannot continue.")
-            summary["status"] = "BLOCKED_HUNTERS"
-            return summary
-        else:
-            logger.warning(f"  Gate failed but {hyp_count} YAML files exist — continuing with warning")
+    # Check hunters gate — in benchmark mode, verify YAML count directly
+    # (pipeline_gate.py checks for solidity_property fields which benchmark hunters don't require)
+    REQUIRED_HUNTERS = ["AccessHunter", "DomainHunter", "FlowHunter", "MathHunter",
+                        "OracleHunter", "TrustBoundaryHunter", "WildcardHunter",
+                        "SignatureHunter", "DoSHunter"]
+    hyp_count = len(list(hyp_dir.glob(f"hyp_{component}_*.yaml")))
+    missing_hunters = [h for h in REQUIRED_HUNTERS
+                       if not (hyp_dir / f"hyp_{component}_{h}.yaml").exists()]
+    if missing_hunters:
+        logger.error(f"  BLOCKED: Missing hunters: {missing_hunters}. Cannot continue.")
+        summary["status"] = "BLOCKED_HUNTERS"
+        summary["gates"]["hunters"] = False
+        return summary
+    else:
+        hunters_ok = True
+        summary["gates"]["hunters"] = True
+        logger.info(f"  Gate hunters: PASS ({hyp_count} YAML files, all 9 required hunters present)")
 
     # Step 3 (Library Analyzer) — now runs as LibraryHunter (#11) in parallel with other hunters above
 
@@ -947,18 +1638,11 @@ Launch ALL 12 NOW in a single response."""
     # run_hunt.HUNT_SESSION_DIR (real hunt_session, not bench_session) to read
     # hypotheses, which is wrong in benchmark mode and would be a thread-safety
     # issue in parallel component execution (two threads patching the same module global).
-    deepdive_prompt = (
-        f"You are DeepDiveHunter analyzing {component} of {protocol}.\n\n"
-        f"## Source Code\n```solidity\n{source_code}\n```\n\n"
-        f"## Libraries\n```solidity\n{library_code[:20000]}\n```\n\n"
-        f"## Chimera Setup (use these variable names in solidity_property)\n```solidity\n{setup_sol_text}\n```\n\n"
-        f"## Protocol Model\n{protocol_model[:3000]}\n\n"
-        f"## Pre-Digested Hunter Convergences\n{convergence_text or 'No convergences detected.'}\n\n"
-        f"## Hunter Hypothesis Summary (tier 1-2 only)\n{hunter_digest[:8000]}\n\n"
-        f"Write hypotheses to: {hyp_dir}/hyp_{component}_DeepDiveHunter.yaml\n"
-        f"No artificial limit. Confidence >= 60% for validated: true.\n"
-        f"Each solidity_property MUST be a complete function using variable names from Setup.sol.\n"
-        f"Use Chimera helpers: t(condition, \"msg\"), eq(a, b, \"msg\"), gte(a, b, \"msg\")."
+    deepdive_prompt = build_deepdive_prompt(
+        component=component, protocol=protocol, source_code=source_code,
+        library_code=library_code, setup_sol_text=setup_sol_text,
+        protocol_model=protocol_model, hyp_dir=hyp_dir,
+        convergence_text=convergence_text, hunter_digest=hunter_digest
     )
 
     run_claude(
@@ -968,6 +1652,22 @@ Launch ALL 12 NOW in a single response."""
         log_file=clog / "deepdive.log",
         cwd=repo
     )
+
+    # Rescue DeepDive YAML: Claude may write to cwd (worktree root) instead of hyp_dir.
+    # Use find to locate the file wherever it landed in the worktree, then copy to hyp_dir.
+    dd_yaml_target = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
+    if not dd_yaml_target.exists():
+        import shutil as _shutil_dd
+        import subprocess as _sp_dd
+        _find = _sp_dd.run(
+            ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
+            capture_output=True, text=True
+        )
+        for _found in _find.stdout.strip().splitlines():
+            if _found and Path(_found) != dd_yaml_target:
+                _shutil_dd.copy2(_found, dd_yaml_target)
+                logger.info(f"  Rescued DeepDive YAML from worktree: {Path(_found).name} → {hyp_dir.name}/")
+                break
 
     deepdive_ok = check_gate(component, "deepdive", protocol, repo)
     summary["gates"]["deepdive"] = deepdive_ok
@@ -1018,7 +1718,7 @@ Launch ALL 12 NOW in a single response."""
             run_claude(
                 chimera_prompt,
                 allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-                timeout=600,
+                timeout=1200,  # Increased: complex components need >600s for full setup
                 log_file=clog / "chimera_builder.log",
                 cwd=repo
             )
@@ -1038,6 +1738,21 @@ Launch ALL 12 NOW in a single response."""
             summary["gates"]["compile"] = False
             return summary
 
+        # ─── Step 5c: Second-chance rescue of DeepDive YAML before merge ──────
+        # (Primary rescue is right after run_claude; this catches any edge cases)
+        dd_yaml_pre = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
+        if not dd_yaml_pre.exists():
+            import shutil as _shutil_pre, subprocess as _sp_pre
+            _find2 = _sp_pre.run(
+                ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
+                capture_output=True, text=True
+            )
+            for _f2 in _find2.stdout.strip().splitlines():
+                if _f2 and Path(_f2) != dd_yaml_pre:
+                    _shutil_pre.copy2(_f2, dd_yaml_pre)
+                    logger.info(f"  Pre-merge rescue: {Path(_f2).name} → {hyp_dir.name}/")
+                    break
+
         # ─── Step 6: Merge Invariants (setup-aware) ──────────────────────────
         logger.info("  Step 6: Merge Invariants")
 
@@ -1050,7 +1765,9 @@ Launch ALL 12 NOW in a single response."""
         code, _, _ = run_cmd([
             sys.executable, str(SCRIPT_DIR / "merge_invariants.py"),
             "--component", component,
-            "--hypotheses-dir", str(hyp_dir)
+            "--hypotheses-dir", str(hyp_dir),
+            "--session-dir", str(HUNT_SESSION_DIR),
+            "--protocol", protocol,
         ], log_file=clog / "merge.log")
         merge_ok = code == 0
         summary["gates"]["merge"] = merge_ok
@@ -1185,7 +1902,7 @@ Launch ALL 12 NOW in a single response."""
                     f"After fixing, run `forge build` to verify ALL errors are resolved — fix any new ones too."
                 )
                 # Shorter timeout for simple fixes, longer for later attempts
-                fix_timeout = 120 if attempt <= 2 else 180 if attempt <= 5 else 240
+                fix_timeout = 300 if attempt <= 2 else 360 if attempt <= 5 else 480
                 tier = "fix" if attempt <= 2 else "context" if attempt <= 5 else "simplify" if attempt <= 7 else "delete"
                 run_claude(
                     fix_prompt,
@@ -1436,7 +2153,7 @@ Launch ALL 12 NOW in a single response."""
                         f"3. Also write 2-3 invariants for ADJACENT areas that might have the same root cause\n\n"
                         f"## Current Properties\n```solidity\n{existing_props[:10000]}\n```\n\n"
                         f"## Setup\n```solidity\n{setup_sol_text}\n```\n\n"
-                        f"## Source Code\n```solidity\n{source_code[:15000]}\n```\n\n"
+                        f"## Source Code (first 15K — full source at {src_file})\n```solidity\n{source_code[:15000]}\n```\n\n"
                         f"APPEND new functions to existing Properties files. Use Setup.sol variables.\n"
                         f"Use Chimera helpers: t(), eq(), gte(), lte()."
                     )
@@ -1459,7 +2176,7 @@ Launch ALL 12 NOW in a single response."""
                         f"ALL {component} invariants passed 5000 Foundry fuzz runs without breaking.\n\n"
                         f"This means either: (a) the code is safe, or (b) our invariants are too weak.\n\n"
                         f"## Current Properties (all passing)\n```solidity\n{existing_props[:15000]}\n```\n\n"
-                        f"## Source Code\n```solidity\n{source_code[:20000]}\n```\n\n"
+                        f"## Source Code (first 20K — full source at {src_file})\n```solidity\n{source_code[:20000]}\n```\n\n"
                         f"## Setup\n```solidity\n{setup_sol_text}\n```\n\n"
                         f"## Task: Write MORE AGGRESSIVE invariants\n"
                         f"Add 5-10 new property functions to the existing Properties files. Focus on:\n"
@@ -1602,6 +2319,16 @@ Launch ALL 12 NOW in a single response."""
     summary["findings"] = findings
     logger.info(f"  Found {len(findings)} findings ({sum(1 for f in findings if f.get('fuzz_confirmed'))} fuzz-confirmed)")
 
+    # ─── Early exit for hypothesis mode ──────────────────────────────────
+    # In hypothesis mode, scoring happens at the main() level against the YAML files.
+    # No PoC generation, no verification, no RedTeam. Fastest possible iteration.
+    benchmark_mode_flag = getattr(args, "benchmark_mode", "redteam")
+    if benchmark_mode_flag == "hypothesis":
+        comp_elapsed = (time.time() - comp_start) / 60
+        logger.info(f"  🏁 Component {component} COMPLETE (hypothesis mode) — "
+                    f"{len(findings)} findings ({comp_elapsed:.1f}min)")
+        return summary
+
     # ─── Step 10.1: Deduplicate findings by root cause ─────────────────
     def _dedup_findings(findings_list: list[dict]) -> list[dict]:
         """Group findings by root cause, return best candidate per group.
@@ -1647,10 +2374,12 @@ Launch ALL 12 NOW in a single response."""
                 intersection = fp & gfp
                 union = fp | gfp
                 jaccard = len(intersection) / len(union) if union else 0
-                # Also check function overlap: if ≥1 fn: token shared + any line/var overlap
+                # Function + variable overlap: 1 shared function AND ≥2 non-function tokens
+                # (line numbers or camelCase vars). Requiring 2 specific tokens prevents
+                # false merges of different bugs that happen to share a function name.
                 fn_overlap = {t for t in intersection if t.startswith("fn:")}
                 non_fn_overlap = {t for t in intersection if not t.startswith("fn:")}
-                fn_match = len(fn_overlap) >= 1 and len(non_fn_overlap) >= 1
+                fn_match = len(fn_overlap) >= 1 and len(non_fn_overlap) >= 2
                 if jaccard > 0.4 or fn_match:
                     group.append(f)
                     group_fps[i] = gfp | fp  # expand group fingerprint
@@ -1691,6 +2420,94 @@ Launch ALL 12 NOW in a single response."""
         return deduped
 
     finding_groups = _dedup_findings(findings)
+    poc_findings: list = []        # populated in Step 10.3/10.5 — initialized here for funnel
+    escaped_siblings: list = []    # Capa 3: siblings that are different bugs (Step 10.6)
+    fallback_findings: list = []   # Capa 2: fallbacks when group leader fails PoC (Step 10.5b)
+
+    # ─── Step 10.2: Verification — lightweight code-read before Foundry PoC ─────
+    # For every distinct (function, line) location, run a quick Claude call:
+    # "Read this specific code + hypothesis — is the bug real?"
+    # This replicates the manual auditor step: suspect bug → re-read focused code
+    # → confirm before investing 15 min in a Foundry PoC.
+    # POC_CONFIDENCE_THRESHOLD is a module-level constant (65) shared with cross-component.
+
+    def _collect_verify_candidates(groups: list[list[dict]]) -> list[dict]:
+        """Collect ALL findings above confidence threshold for verification.
+        No artificial location-based dedup — the verification step itself is the filter.
+        Only skip exact ID duplicates."""
+        seen_ids: set[str] = set()
+        candidates = []
+        for group in groups:
+            for f in group:
+                if not (f.get("fuzz_confirmed") or f.get("confidence", 0) >= POC_CONFIDENCE_THRESHOLD):
+                    continue
+                fid = f.get("id", "")
+                if fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
+                candidates.append(f)
+        return sorted(candidates, key=lambda x: x.get("confidence", 0), reverse=True)
+
+    def _verify_finding(finding: dict) -> tuple[bool, str, str]:
+        """Quick code-read verification: re-read the specific function and confirm
+        the bug is real before investing 15 minutes in a Foundry PoC.
+        Returns (is_real, reason, poc_hint)."""
+        fid = finding["id"]
+        relevant_code = _extract_relevant_code(source_code, library_code, finding)
+
+        verify_prompt = build_verify_prompt(finding=finding, relevant_code=relevant_code)
+
+        rc, output = run_claude(
+            verify_prompt,
+            allowed_tools=[],  # pure reasoning — no tool calls, stays fast (~30-90s)
+            timeout=120,
+            log_file=clog / f"{fid}_verify.log",
+            cwd=repo
+        )
+
+        output_lower = output.lower()
+        # On timeout or empty output: conservative fallback → treat as REAL
+        # (better to attempt a PoC on a false positive than to drop a real bug)
+        if not output_lower.strip() or rc != 0:
+            logger.info(f"    [TIMEOUT/ERROR → REAL fallback] {fid}")
+            return True, "timeout — included conservatively", ""
+        is_real = "verdict: real" in output_lower and "verdict: false_positive" not in output_lower
+
+        reason, poc_hint = "", ""
+        for line in output.splitlines():
+            if line.upper().startswith("REASON:"):
+                reason = line[7:].strip()
+            elif line.upper().startswith("POC_HINT:"):
+                poc_hint = line[9:].strip()
+
+        status = "REAL ✓" if is_real else "FALSE_POSITIVE ✗"
+        logger.info(f"    [{status}] {fid}: {reason[:80]}")
+        return is_real, reason, poc_hint
+
+    verify_candidates = _collect_verify_candidates(finding_groups)
+    logger.info(f"  Step 10.2: Verifying {len(verify_candidates)} distinct hypotheses "
+                f"({min(10, len(verify_candidates))} parallel)")
+
+    verified_findings: list[dict] = []
+    if verify_candidates:
+        with ThreadPoolExecutor(max_workers=min(10, len(verify_candidates))) as executor:
+            futures = {executor.submit(_verify_finding, f): f for f in verify_candidates}
+            for future in as_completed(futures):
+                f = futures[future]
+                try:
+                    is_real, reason, poc_hint = future.result()
+                    f["_verified"] = is_real
+                    f["_verify_reason"] = reason
+                    if poc_hint and poc_hint.lower() != "n/a":
+                        f["_poc_hint"] = poc_hint
+                    if is_real or f.get("fuzz_confirmed"):
+                        verified_findings.append(f)
+                except Exception as e:
+                    logger.error(f"    Verification error for {f['id']}: {e}")
+                    f["_verified"] = True  # conservative: include on error
+                    verified_findings.append(f)
+        verified_findings.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        logger.info(f"  Verification complete: {len(verified_findings)}/{len(verify_candidates)} confirmed real bugs")
 
     # ─── Step 10.5: Fork PoC per confirmed finding (Phase 3) ─────────
     if finding_groups:
@@ -1698,243 +2515,202 @@ Launch ALL 12 NOW in a single response."""
         poc_dir = Path(repo) / "test" / "poc"
         poc_dir.mkdir(parents=True, exist_ok=True)
 
-        def _sanitize_sol_unicode(path: Path):
-            """Replace Unicode chars that break solc (em-dash, curly quotes, etc.)."""
-            if not path.exists():
-                return
-            txt = path.read_text(encoding="utf-8")
-            replacements = {
-                "\u2014": "--",   # em-dash
-                "\u2013": "-",    # en-dash
-                "\u2018": "'",    # left single curly
-                "\u2019": "'",    # right single curly
-                "\u201c": '"',    # left double curly
-                "\u201d": '"',    # right double curly
-                "\u2026": "...",  # ellipsis
-            }
-            changed = False
-            for uchar, repl in replacements.items():
-                if uchar in txt:
-                    txt = txt.replace(uchar, repl)
-                    changed = True
-            if changed:
-                path.write_text(txt, encoding="utf-8")
-                logger.info(f"    Sanitized Unicode chars in {path.name}")
-
-        def _filter_errors_for_file(stderr: str, filename: str) -> str:
-            """Extract only compile errors related to a specific file."""
-            lines = stderr.splitlines()
-            relevant = []
-            capture = False
-            for line in lines:
-                if filename in line:
-                    capture = True
-                    relevant.append(line)
-                elif capture and (line.startswith("  ") or line.startswith("    |")):
-                    relevant.append(line)
-                else:
-                    capture = False
-            return "\n".join(relevant) if relevant else stderr[-2000:]
-
-        def generate_and_test_poc(finding):
-            """Generate and test a fork PoC for a single finding."""
-            fid = finding["id"]
-
-            if not finding.get("fuzz_confirmed") and finding.get("confidence", 0) < POC_CONFIDENCE_THRESHOLD:
-                logger.info(f"    {fid}: skipping PoC (not confirmed, confidence < {POC_CONFIDENCE_THRESHOLD})")
-                finding["has_poc"] = False
-                return
-
-            logger.info(f"    {fid}: Generating Fork PoC")
-            poc_path = poc_dir / f"PoC_{fid.replace('-', '_')}.t.sol"
-            test_name = f"test_poc_{fid.replace('-', '_').lower()}"
-
-            # Load Setup.sol as deployment template
-            setup_content = ""
-            setup_path = Path(repo) / "test" / "chimera" / "Setup.sol"
-            if setup_path.exists():
-                setup_content = setup_path.read_text(encoding="utf-8")[:4000]
-
-            poc_prompt = (
-                f"Write a Foundry fork test that proves this vulnerability.\n\n"
-                f"## Finding\n"
-                f"ID: {fid}\n"
-                f"Title: {finding['title']}\n"
-                f"Root Cause: {finding['root_cause']}\n"
-                f"Component: {component}\n"
-                f"Fuzz confirmed: {finding.get('fuzz_confirmed', False)}\n"
-                f"Property that broke: {finding.get('property_name', 'N/A')}\n\n"
-                f"## Counterexample Trace from Fuzzer\n"
-                f"```\n{finding.get('counterexample_trace', 'No trace available')}\n```\n\n"
-                f"## Source Code\n```solidity\n{source_code[:30000]}\n```\n\n"
-                f"## Interfaces (CRITICAL — use ONLY these function signatures)\n"
-                f"```solidity\n{interfaces_code[:8000]}\n```\n\n"
-                f"## Deployment Template (from test/chimera/Setup.sol)\n"
-                f"```solidity\n{setup_content}\n```\n"
-                f"COPY the deployment pattern above for your setUp(). It shows correct constructor args,\n"
-                f"fork setup, and dependency initialization.\n\n"
-                f"## STEP 0: Constraint Analysis (DO THIS BEFORE WRITING CODE)\n"
-                f"Before writing any Solidity, read the source code and:\n"
-                f"1. List EVERY require/revert/assert that could block your exploit path\n"
-                f"2. For each constraint, determine the exact values that satisfy it\n"
-                f"3. If a swap is needed: calculate the MAXIMUM amount that stays within protocol limits\n"
-                f"   (e.g., maxObservationDeviation, slippage checks, balance caps)\n"
-                f"4. If a call needs specific msg.sender: check if it's immutable/hardcoded (if yes, the bug may be unexploitable)\n"
-                f"5. Design your PoC to satisfy ALL constraints while exploiting the bug\n\n"
-                f"## Requirements\n"
-                f"1. Write to: {poc_path}\n"
-                f"2. Test function MUST be named `{test_name}`\n"
-                f"3. Use ONLY ASCII characters in strings — NO em-dashes or curly quotes\n"
-                f"4. Keep <16 local variables per function (avoid stack-too-deep)\n"
-                f"5. Use vm.createFork — REAL fork, not mocks\n"
-                f"6. The test MUST prove CONCRETE DAMAGE — one of:\n"
-                f"   a) Token balance loss: `assertGt(balanceBefore - balanceAfter, threshold)`\n"
-                f"   b) State corruption: a storage value is wrong after the attack\n"
-                f"   c) DoS: a critical function reverts when it shouldn't\n"
-                f"   d) Privilege escalation: unauthorized caller can execute privileged action AND it persists\n"
-                f"   NOT acceptable: just calling a function without proving damage. If the call succeeds\n"
-                f"   but no state changes or funds move, it's NOT a vulnerability.\n"
-                f"7. If the attack requires msg.sender == immutable_address and you can't impersonate it\n"
-                f"   without vm.prank of a real protocol address, the bug is likely unexploitable — SKIP it.\n\n"
-                f"## Workflow\n"
-                f"1. Complete Step 0 constraint analysis (write it as a comment in the test)\n"
-                f"2. Write the .sol file\n"
-                f"3. Run: forge test --match-test {test_name} --match-path test/poc/{poc_path.name} -vvv --fuzz-runs 1\n"
-                f"4. If it fails, read the error and fix the .sol file\n"
-                f"5. Repeat until it passes or you've tried 3 times\n\n"
-                f"Keep it minimal — just enough to prove the bug exists."
+        def _run_poc(finding):
+            """Delegate to top-level generate_and_test_poc with component context."""
+            generate_and_test_poc(
+                finding, source_code, interfaces_code,
+                component, protocol, repo, clog, forge_env,
+                poc_confidence_threshold=POC_CONFIDENCE_THRESHOLD
             )
 
-            run_claude(
-                poc_prompt,
-                allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-                timeout=600,
-                log_file=clog / f"{fid}_poc_gen.log",
-                cwd=repo
-            )
-
-            if not poc_path.exists():
-                finding["has_poc"] = False
-                return
-
-            # Sanitize Unicode chars that break solc
-            _sanitize_sol_unicode(poc_path)
-
-            # Verify the PoC externally (Claude may have already tested via Bash)
-            poc_rel = str(poc_path.relative_to(Path(repo)))
-            poc_rc, _, poc_stderr = run_cmd(
-                ["forge", "test", "--match-test", test_name,
-                 "--match-path", poc_rel,
-                 "-vvv", "--fuzz-runs", "1"],
-                timeout=300, cwd=repo,
-                log_file=clog / f"{fid}_poc_run.log",
-                env=forge_env
-            )
-            if poc_rc == 0:
-                logger.info(f"    {fid}: PoC PASSED — vulnerability confirmed!")
-                finding["has_poc"] = True
-                finding["poc_path"] = str(poc_path)
-                return
-
-            # One fix attempt with full context
-            logger.info(f"    {fid}: PoC failed, attempting fix...")
-            file_errors = _filter_errors_for_file(poc_stderr, poc_path.name)
-            poc_content = poc_path.read_text(encoding="utf-8")[:8000] if poc_path.exists() else ""
-            run_claude(
-                f"Fix this Foundry PoC. Only fix compile/runtime errors, keep the attack logic.\n\n"
-                f"## Error\n```\n{file_errors}\n```\n\n"
-                f"## Current Code\n```solidity\n{poc_content}\n```\n\n"
-                f"## Interfaces\n```solidity\n{interfaces_code[:5000]}\n```\n\n"
-                f"File: {poc_path}\n"
-                f"Fix it, then run: forge test --match-test {test_name} --match-path {poc_rel} -vvv --fuzz-runs 1\n"
-                f"Use ONLY ASCII in strings.",
-                allowed_tools=["Read", "Edit", "Bash"],
-                timeout=300,
-                log_file=clog / f"{fid}_poc_fix.log",
-                cwd=repo
-            )
-            _sanitize_sol_unicode(poc_path)
-
-            poc_rc2, _, _ = run_cmd(
-                ["forge", "test", "--match-test", test_name,
-                 "--match-path", poc_rel,
-                 "-vvv", "--fuzz-runs", "1"],
-                timeout=300, cwd=repo, env=forge_env
-            )
-            if poc_rc2 == 0:
-                logger.info(f"    {fid}: PoC PASSED after fix!")
-                finding["has_poc"] = True
-                finding["poc_path"] = str(poc_path)
-            else:
-                logger.warning(f"    {fid}: PoC FAILED — finding unverified")
-                finding["has_poc"] = False
-
-        # Run PoC generation per dedup group — try best candidate first,
-        # fallback to next in group if it fails (max 3 attempts per group).
-        # Global 3h timer for entire PoC phase.
+        # Run PoC for every verified finding (Step 10.2 output).
+        # Fallback to group leaders if verification produced nothing.
         POC_PHASE_TIMEOUT = 12 * 3600 if not args.fast else 3 * 3600
-        MAX_PER_GROUP = 3  # max candidates to try per dedup group
-
-        # Both modes use 65% threshold — v11 showed 80% filtered valid H/M findings
-        # (H-02 at 72%, M-03 at 65% were missed). With killpg fix, PoC phase is fast enough.
-        POC_CONFIDENCE_THRESHOLD = 65
-        poc_groups = []
-        for group in finding_groups:
-            candidates = [f for f in group if f.get("fuzz_confirmed") or f.get("confidence", 0) >= POC_CONFIDENCE_THRESHOLD]
-            if candidates:
-                poc_groups.append(candidates)
-
-        total_candidates = sum(len(g) for g in poc_groups)
         POC_PARALLEL = args.parallel_poc
-        logger.info(f"  {len(poc_groups)} unique groups, {total_candidates} total candidates "
+
+        # ── Dedup verified findings before PoC phase ──────────────────────
+        # Multiple hunters often find the same bug — verification confirms all of
+        # them because they describe the same issue. Without dedup, we'd generate
+        # N PoCs for the same bug (N = convergence count, typically 3-5×).
+        # Strategy: keep only the best representative per dedup group (lowest rank
+        # = highest confidence). If the leader's PoC fails, the group's fallbacks
+        # are still attempted in _process_finding's retry logic.
+        def _dedup_for_poc(candidates: list) -> list:
+            """Return one representative per dedup group (highest confidence)."""
+            best_per_group: dict = {}  # group_id → finding
+            ungrouped = []
+            for f in candidates:
+                gid = f.get("_dedup_group")
+                if gid is None:
+                    ungrouped.append(f)
+                    continue
+                rank = f.get("_dedup_rank", 0)
+                existing = best_per_group.get(gid)
+                if existing is None or rank < existing.get("_dedup_rank", 999):
+                    best_per_group[gid] = f
+            result = list(best_per_group.values()) + ungrouped
+            result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+            return result
+
+        if verified_findings:
+            pre_dedup = len(verified_findings)
+            poc_findings = _dedup_for_poc(verified_findings)
+            post_dedup = len(poc_findings)
+            if pre_dedup != post_dedup:
+                logger.info(f"  Step 10.3: Dedup before PoC — {pre_dedup} verified → "
+                            f"{post_dedup} unique ({pre_dedup - post_dedup} duplicates removed)")
+        else:
+            poc_findings = [
+                g[0] for g in finding_groups
+                if g and (g[0].get("fuzz_confirmed") or g[0].get("confidence", 0) >= POC_CONFIDENCE_THRESHOLD)
+            ]
+
+        logger.info(f"  Step 10.5: PoC phase — {len(poc_findings)} verified findings "
                     f"({POC_PHASE_TIMEOUT/3600:.0f}h timer, {POC_PARALLEL} parallel)")
         poc_phase_start = time.time()
-        groups_confirmed = 0
+        pocs_confirmed = 0
 
-        def _process_group(group_idx_and_group):
-            """Process one dedup group: try candidates sequentially with fallback."""
-            group_idx, group = group_idx_and_group
+        def _process_finding(idx_and_finding):
+            """Generate and test PoC for one verified finding."""
+            idx, finding, total = idx_and_finding
             elapsed = time.time() - poc_phase_start
             if elapsed > POC_PHASE_TIMEOUT:
-                return group_idx, False, None
+                return idx, False, None
             remaining = POC_PHASE_TIMEOUT - elapsed
-            logger.info(f"    [Group {group_idx+1}/{len(poc_groups)}] {remaining/60:.0f}min remaining "
-                        f"({len(group)} candidates)")
+            logger.info(f"    [Finding {idx+1}/{total}] {finding['id']} "
+                        f"— {remaining/60:.0f}min remaining")
+            _run_poc(finding)
+            return idx, finding.get("has_poc", False), finding["id"]
 
-            for attempt, f in enumerate(group[:MAX_PER_GROUP]):
-                generate_and_test_poc(f)
-                if f.get("has_poc"):
-                    for other in group:
-                        if other["id"] != f["id"]:
-                            other["_dedup_covered_by"] = f["id"]
-                    logger.info(f"    Group {group_idx+1} confirmed via {f['id']} — "
-                                f"skipping {len(group) - attempt - 1} remaining duplicates")
-                    return group_idx, True, f["id"]
-                elif attempt < min(MAX_PER_GROUP, len(group)) - 1:
-                    logger.info(f"    {f['id']} failed, trying next candidate in group...")
-            return group_idx, False, None
-
+        n_poc = len(poc_findings)
         with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
             futures = {
-                executor.submit(_process_group, (i, group)): i
-                for i, group in enumerate(poc_groups)
+                executor.submit(_process_finding, (i, f, n_poc)): i
+                for i, f in enumerate(poc_findings)
             }
             for future in as_completed(futures):
-                group_idx = futures[future]
+                idx = futures[future]
                 try:
                     _, confirmed, fid = future.result()
                     if confirmed:
-                        groups_confirmed += 1
+                        pocs_confirmed += 1
                 except Exception as e:
-                    logger.error(f"    Group {group_idx+1}: PoC error: {e}")
+                    logger.error(f"    Finding {idx+1}: PoC error: {e}")
 
-        groups_attempted = len(poc_groups)
-        logger.info(f"  PoC phase complete: {groups_confirmed}/{groups_attempted} groups confirmed")
+        logger.info(f"  PoC phase complete: {pocs_confirmed}/{len(poc_findings)} findings confirmed")
 
-        # Mark all findings without PoC
+        # ── Step 10.5b: Capa 2 — Fallback PoC for groups with failed leaders ─
+        # When a group leader fails PoC, its siblings were never tried.
+        # Promote the best verified sibling (rank 1) to a fallback PoC attempt.
+        # Without this, real bugs hidden behind a poorly-described leader are silently lost.
+        fallback_findings: list[dict] = []
+        for g in finding_groups:
+            if len(g) > 1 and not g[0].get("has_poc"):
+                # Leader failed — look for best verified sibling
+                for sib in g[1:]:
+                    if sib.get("_verified") or sib.get("fuzz_confirmed"):
+                        sib["_capa2_fallback"] = True
+                        fallback_findings.append(sib)
+                        break  # only the best sibling per group
+
+        if fallback_findings:
+            logger.info(f"  Step 10.5b: Capa 2 fallback — {len(fallback_findings)} groups "
+                        f"whose leader failed PoC; trying best sibling for each")
+            n_fb = len(fallback_findings)
+            with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
+                futures_fb = {
+                    executor.submit(_process_finding, (i, f, n_fb)): i
+                    for i, f in enumerate(fallback_findings)
+                }
+                for future in as_completed(futures_fb):
+                    try:
+                        _, confirmed, fid = future.result()
+                        if confirmed:
+                            pocs_confirmed += 1
+                            logger.info(f"    Capa 2 fallback {fid}: PoC PASSED — real bug found!")
+                    except Exception as e:
+                        logger.error(f"    Capa 2 fallback PoC error: {e}")
+            capa2_confirmed = sum(1 for f in fallback_findings if f.get("has_poc"))
+            logger.info(f"  Capa 2 fallback complete: {capa2_confirmed}/{len(fallback_findings)} confirmed")
+
+        # ── Step 10.6: is_same_bug safety check (Capa 3) ─────────────────
+        # For every group whose leader passed PoC, check each sibling:
+        # "Is B really the same bug as A, or a different vulnerability?"
+        # If DIFFERENT → the sibling escaped dedup by mistake and needs its own PoC.
+        # This prevents silent loss of real bugs due to over-aggressive deduplication.
+        def _check_is_same_bug(leader: dict, sibling: dict) -> bool:
+            """60s Claude call: does sibling describe the same bug as leader?
+            Conservative: returns False (DIFFERENT) on timeout/error — never silently drops."""
+            prompt = build_is_same_bug_prompt(leader=leader, sibling=sibling)
+            fid_s = sibling["id"]
+            _, out = run_claude(
+                prompt, allowed_tools=[], timeout=60, stall_timeout=45,
+                log_file=clog / f"{fid_s}_same_bug_check.log", cwd=repo
+            )
+            # Conservative fallback: empty/timeout → treat as DIFFERENT (never drop)
+            result = (out or "").strip().upper()
+            is_same = result.startswith("SAME") and not result.startswith("DIFFERENT")
+            verdict = "SAME" if is_same else "DIFFERENT"
+            logger.info(f"    is_same_bug({leader['id']}, {fid_s}): {verdict}")
+            return is_same
+
+        groups_with_passed_leader = [
+            g for g in finding_groups
+            if len(g) > 1 and g[0].get("has_poc")
+        ]
+        if groups_with_passed_leader:
+            # Collect all verified siblings for parallel checking
+            sibling_checks = [
+                (g[0], sib)
+                for g in groups_with_passed_leader
+                for sib in g[1:]
+                if sib.get("_verified") or sib.get("fuzz_confirmed")
+            ]
+            if sibling_checks:
+                logger.info(f"  Step 10.6: is_same_bug check — {len(sibling_checks)} siblings "
+                            f"across {len(groups_with_passed_leader)} confirmed groups")
+                with ThreadPoolExecutor(max_workers=min(8, len(sibling_checks))) as ex:
+                    future_map = {
+                        ex.submit(_check_is_same_bug, leader, sib): (leader, sib)
+                        for leader, sib in sibling_checks
+                    }
+                    for fut in as_completed(future_map):
+                        leader, sib = future_map[fut]
+                        try:
+                            same = fut.result()
+                        except Exception:
+                            same = False  # conservative: unknown → treat as different
+                        if not same:
+                            sib["_escaped_dedup"] = True
+                            escaped_siblings.append(sib)
+
+        if escaped_siblings:
+            logger.info(f"  Step 10.7: PoC for {len(escaped_siblings)} escaped siblings "
+                        f"(different bugs grouped by mistake)")
+            poc_phase_start_esc = time.time()
+            n_esc = len(escaped_siblings)
+            with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
+                futures = {
+                    executor.submit(_process_finding, (i, f, n_esc)): i
+                    for i, f in enumerate(escaped_siblings)
+                }
+                for future in as_completed(futures):
+                    try:
+                        _, confirmed, fid = future.result()
+                        if confirmed:
+                            pocs_confirmed += 1
+                            logger.info(f"    Escaped sibling {fid}: PoC PASSED — real distinct bug!")
+                    except Exception as e:
+                        logger.error(f"    Escaped sibling PoC error: {e}")
+            logger.info(f"  Escaped siblings PoC complete: "
+                        f"{sum(1 for f in escaped_siblings if f.get('has_poc'))}/{len(escaped_siblings)} confirmed")
+
+        # Mark all findings without PoC (default)
         for group in finding_groups:
             for f in group:
                 f.setdefault("has_poc", False)
+        for f in escaped_siblings:
+            f.setdefault("has_poc", False)
 
     # Flatten groups back to findings list for downstream
     findings = [f for group in finding_groups for f in group]
@@ -1947,13 +2723,25 @@ Launch ALL 12 NOW in a single response."""
     if skipped:
         logger.info(f"  Skipping {skipped} unverified findings (no PoC, no fuzz confirmation)")
 
+    # In 'poc' mode: stop here — we have PoC-confirmed findings but don't need RedTeam.
+    # In 'redteam' mode (default): run the full finding pipeline.
+    if benchmark_mode_flag == "poc":
+        _log_funnel(component, findings, verified_findings,
+                    poc_findings + escaped_siblings + fallback_findings,
+                    pipeline_findings, [])
+        comp_elapsed = (time.time() - comp_start) / 60
+        logger.info(f"  🏁 Component {component} COMPLETE (poc mode) — "
+                    f"{len(pipeline_findings)} PoC-confirmed ({comp_elapsed:.1f}min)")
+        return summary
+
+    report_findings = []
     if pipeline_findings:
         logger.info(f"  Processing {len(pipeline_findings)} verified findings (3 parallel)")
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(
                     run_finding_pipeline, f, component, protocol, source_code, repo, clog,
-                    getattr(args, 'fast', False)
+                    benchmark_mode=True  # always True in benchmark: skip Variant+Report, stop at RedTeam
                 ): f["id"]
                 for f in pipeline_findings
             }
@@ -1964,6 +2752,15 @@ Launch ALL 12 NOW in a single response."""
                     logger.info(f"    {fid}: pipeline complete")
                 except Exception as e:
                     logger.error(f"    {fid}: pipeline error: {e}")
+
+        report_findings = [f for f in pipeline_findings
+                           if f.get("redteam_verdict") in ("REPORT", "REPORT_DOWNGRADED")]
+
+    # ─── Funnel Dashboard ────────────────────────────────────────────────
+    # Total PoC attempts = initial dedup batch + escaped siblings (Capa 3) + fallback (Capa 2)
+    _log_funnel(component, findings, verified_findings,
+                poc_findings + escaped_siblings + fallback_findings,
+                pipeline_findings, report_findings)
 
     # ─── Done ────────────────────────────────────────────────────────────
     comp_elapsed = (time.time() - comp_start) / 60
@@ -2032,6 +2829,135 @@ def parse_fuzz_failures(phase1_log: Path, phase2_log: Path = None) -> dict[str, 
     return failed
 
 
+def _extract_relevant_code(source_code: str, library_code: str, finding: dict) -> str:
+    """Extract source code sections relevant to a specific finding.
+
+    Provides a focused view: the exact functions + line ranges mentioned,
+    rather than the full 30k contract. This replicates what a manual auditor
+    has in their head when writing a PoC.
+    """
+    import re as _re
+
+    all_source = source_code + "\n\n" + (library_code or "")
+
+    # Step 1: Extract function names + line numbers from finding fields
+    finding_text = " ".join([
+        finding.get("title", ""),
+        finding.get("root_cause", ""),
+        finding.get("description", ""),
+        finding.get("attack_scenario", ""),
+    ])
+    vuln_loc = finding.get("vulnerable_location") or {}
+    if vuln_loc.get("function"):
+        finding_text += " " + vuln_loc["function"] + "("
+    if vuln_loc.get("vulnerable_code"):
+        finding_text += " " + vuln_loc["vulnerable_code"]
+
+    SKIP_WORDS = {
+        "if", "for", "while", "require", "assert", "emit", "revert", "return",
+        "new", "delete", "type", "uint256", "uint128", "uint64", "int256",
+        "address", "bytes", "bytes32", "string", "bool", "mapping", "memory",
+        "storage", "calldata", "public", "private", "external", "internal",
+        "view", "pure", "override", "virtual", "immutable", "constant",
+        "function", "event", "modifier", "struct", "error", "interface",
+        "contract", "library", "abstract", "constructor", "fallback", "receive",
+    }
+
+    fn_names = []
+    seen_fns = set()
+    for m in _re.finditer(r'\b(\w+)\s*\(', finding_text):
+        fn = m.group(1)
+        if fn not in SKIP_WORDS and len(fn) > 2 and fn not in seen_fns:
+            fn_names.append(fn)
+            seen_fns.add(fn)
+
+    # Explicit line numbers
+    explicit_lines = []
+    for m in _re.finditer(r'(?:line|l\.?)\s*(\d{2,4})\b', finding_text, _re.IGNORECASE):
+        ln = int(m.group(1))
+        if 1 <= ln <= 5000:
+            explicit_lines.append(ln)
+    if vuln_loc.get("lines"):
+        raw = vuln_loc["lines"]
+        if isinstance(raw, list):
+            explicit_lines.extend([int(x) for x in raw if str(x).isdigit()])
+        elif isinstance(raw, (int, str)):
+            try:
+                explicit_lines.append(int(str(raw).split("-")[0]))
+            except ValueError:
+                pass
+
+    sections = []
+    used_ranges = []  # (start, end) line ranges already included
+
+    source_lines = all_source.splitlines()
+
+    def _add_range(start_ln: int, end_ln: int, label: str = ""):
+        """Add a line range to sections, avoiding duplicates."""
+        for used_s, used_e in used_ranges:
+            if start_ln <= used_e and end_ln >= used_s:
+                return  # overlaps existing range
+        used_ranges.append((start_ln, end_ln))
+        snippet = "\n".join(
+            f"{i+1:4d}: {l}"
+            for i, l in enumerate(source_lines[start_ln:end_ln], start_ln)
+        )
+        if label:
+            sections.append(f"// === {label} ===\n{snippet}")
+        else:
+            sections.append(snippet)
+
+    # Step 2: Extract function bodies for each mentioned function
+    for fn_name in fn_names[:6]:  # limit to 6 functions to keep output focused
+        pattern = _re.compile(
+            r'^\s*(?:function\s+' + _re.escape(fn_name) + r'\b)',
+            _re.MULTILINE
+        )
+        for match in pattern.finditer(all_source):
+            fn_start_char = match.start()
+            # Find the opening brace
+            brace_pos = all_source.find('{', fn_start_char)
+            if brace_pos == -1 or brace_pos - fn_start_char > 500:
+                continue
+            # Walk forward counting braces to find the end
+            depth = 0
+            end_char = brace_pos
+            for i, ch in enumerate(all_source[brace_pos:], brace_pos):
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_char = i + 1
+                        break
+            # Convert char positions to line numbers
+            start_ln = all_source[:fn_start_char].count('\n')
+            end_ln = all_source[:end_char].count('\n') + 1
+            # Skip enormous functions (>150 lines) — include partial view
+            if end_ln - start_ln > 150:
+                end_ln = start_ln + 150
+            _add_range(start_ln, end_ln, f"function {fn_name}")
+            break  # only first definition
+
+    # Step 3: Add ±30 lines around specific line numbers
+    for ln in explicit_lines[:5]:
+        start_ln = max(0, ln - 30)
+        end_ln = min(len(source_lines), ln + 30)
+        _add_range(start_ln, end_ln, f"context around line {ln}")
+
+    if not sections:
+        # Fallback: no functions/lines found in finding — return first 8K (cap consistent
+        # with the main path above). For cross-component callers, source_code is combined_source
+        # so this may show the wrong contract, but the model has file access to read more.
+        return source_code[:8000]
+
+    result = "\n\n".join(sections)
+    # Cap at 8000 chars to stay within budget
+    if len(result) > 8000:
+        result = result[:8000] + "\n// ... (truncated)"
+    return result
+
+
 def extract_findings(component: str, protocol: str,
                      fuzz_failures: dict[str, str] = None) -> list[dict]:
     """Extract findings from hypothesis files, prioritizing fuzz-confirmed ones.
@@ -2087,6 +3013,10 @@ def extract_findings(component: str, protocol: str,
                 fuzz_confirmed = prop_name in fuzz_failures if prop_name else False
                 counterexample_trace = fuzz_failures.get(prop_name, "") if prop_name else ""
 
+                # Derive hunter name from filename: hyp_Strategy_MathHunter.yaml → "MathHunter"
+                _stem_parts = hyp_file.stem.split("_", 2)
+                _hunter_name = _stem_parts[2] if len(_stem_parts) >= 3 else hyp_file.stem
+
                 finding = {
                     "id": fid,
                     "title": hyp.get("title", hyp.get("description", "")),
@@ -2094,9 +3024,11 @@ def extract_findings(component: str, protocol: str,
                     "confidence": confidence,
                     "root_cause": hyp.get("root_cause", hyp.get("attack_scenario", "")),
                     "source_file": hyp_file.name,
+                    "hunter": _hunter_name,
                     "fuzz_confirmed": fuzz_confirmed,
                     "property_name": prop_name,
                     "counterexample_trace": counterexample_trace,
+                    "vulnerable_location": hyp.get("vulnerable_location"),
                 }
 
                 if fuzz_confirmed:
@@ -2133,8 +3065,8 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     Each stage mirrors the full skill implementation from ~/.claude/skills/.
     If benchmark_mode=True, stops after RedTeam (skips Variant + Report).
     """
-    fid = finding["id"]
-    logger.info(f"    Finding {fid}: {finding['title']} ({finding['severity']})")
+    fid = finding.get("id", finding.get("title", "UNKNOWN")[:20])
+    logger.info(f"    Finding {fid}: {finding.get('title','?')} ({finding.get('severity','?')})")
 
     # Load PoC code if it exists
     poc_code = ""
@@ -2142,209 +3074,118 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     if poc_path and Path(poc_path).exists():
         poc_code = Path(poc_path).read_text(encoding="utf-8")[:10000]
 
+    # Use focused code extraction for the finding — keeps prompts under 12k chars
+    # instead of sending full 30k contract for every escalation/redteam call.
+    focused_code = _extract_relevant_code(source_code, "", finding)
+
+    # For cross-component findings: source_code = combined_source (all contracts).
+    # Injecting source_code[:12000] would show the WRONG contracts (sorted-first small ones)
+    # instead of the contracts where the bug actually lives. Since RedTeam/EscalationHunter
+    # have unrestricted file access, show the repo path and let them read what they need.
+    if component == "CrossComponent":
+        _src_hint = (
+            f"## Source Files (use Read tool to access)\n"
+            f"Repo: {repo}\n"
+            f"Protocol contracts: {repo}/src/\n"
+            f"(focused extract above already targets the vulnerable area)"
+        )
+    else:
+        _src_hint = f"## Full Source (for context)\n```solidity\n{source_code[:12000]}\n```"
+
     finding_context = (
         f"Finding ID: {fid}\n"
-        f"Title: {finding['title']}\n"
-        f"Severity: {finding['severity']}\n"
-        f"Confidence: {finding['confidence']}%\n"
-        f"Root Cause: {finding['root_cause']}\n"
+        f"Title: {finding.get('title', finding.get('id', '?'))}\n"
+        f"Severity: {finding.get('severity', 'Medium')}\n"
+        f"Confidence: {finding.get('confidence', 70)}%\n"
+        f"Root Cause: {finding.get('root_cause', finding.get('description', ''))}\n"
         f"Component: {component}\n"
         f"Protocol: {protocol}\n"
         f"Fuzz Confirmed: {finding.get('fuzz_confirmed', False)}\n"
         f"Has PoC: {finding.get('has_poc', False)}\n\n"
-        f"## Source Code\n```solidity\n{source_code[:30000]}\n```"
+        f"## Source Code (focused on vulnerable area)\n```solidity\n{focused_code}\n```\n\n"
+        f"{_src_hint}"
     )
     if poc_code:
         finding_context += f"\n\n## Proof of Concept\n```solidity\n{poc_code}\n```"
 
-    # ── F1: Escalation Hunter (Medium+ only) ──────────────────────────────
-    # Full skill: 5 checks ordered by ROI, structured output with TECHO DE SEVERIDAD
-    if finding["severity"] in ("High", "Medium", "Critical"):
+    # ── F1: Escalation Hunter (Medium+ only) — skip in benchmark mode ────
+    # EscalationHunter only adjusts severity ceiling, doesn't affect REPORT/NO verdict.
+    # Skip in benchmark mode to save ~150s per finding.
+    if not benchmark_mode and finding.get("severity", "Low").capitalize() in ("High", "Medium", "Critical"):
         logger.info(f"    {fid}: EscalationHunter (5 checks)")
-        esc_prompt = (
-            f"You are EscalationHunter. Establish the severity CEILING for this finding.\n\n"
-            f"{finding_context}\n\n"
-            f"Execute ALL 5 checks in order. Even if the first is ESCALABLE, continue all 5.\n\n"
-            f"### CHECK 1 — ESCAPE MECHANISMS (highest ROI)\n"
-            f"Can the admin/protocol undo the damage once it occurs?\n"
-            f"Look for: pause(), emergencyShutdown(), upgradeable proxies, rescue functions.\n"
-            f"If NO escape mechanism AND impact is permanent → severity goes up one level.\n"
-            f"Output: [ESCALABLE] / [NO_ESCALABLE] + 2-line justification.\n\n"
-            f"### CHECK 2 — SCOPE MULTIPLIER\n"
-            f"Does a single attack execution affect 1 victim or N victims?\n"
-            f"Does it affect all positions in a pool simultaneously? All lenders? Repeatable at ~0 marginal cost?\n"
-            f"If 1 attack → N victims (all users of pool/vault) → severity goes up one level.\n"
-            f"Output: [ESCALABLE] / [NO_ESCALABLE] + victim count and why.\n\n"
-            f"### CHECK 3 — PERMANENCE OF DAMAGE\n"
-            f"Is damage temporary (reversible) or permanent?\n"
-            f"Can a user recover funds? Can admin restore correct state? Does damage accumulate over time?\n"
-            f"Permanent + no escape = +1 level. Temporary with mitigation window = no escalation.\n"
-            f"Output: [ESCALABLE] / [NO_ESCALABLE] + permanence description.\n\n"
-            f"### CHECK 4 — COMBINATION WITH PRIOR FINDINGS\n"
-            f"Combined with another confirmed finding in same protocol, does it produce greater impact?\n"
-            f"Only escalate if combination produces qualitatively different impact (e.g., liquidation bypass + oracle manipulation = fund theft).\n"
-            f"Output: [ESCALABLE] / [NO_ESCALABLE] / [CONDICIONAL] + which finding and how.\n\n"
-            f"### CHECK 5 — ATTACKER DIRECT (no permissions)\n"
-            f"Can an unprivileged actor trigger the impact directly without admin or external event?\n"
-            f"If any user can trigger with only capital → +1 level. If requires trusted role → no escalation.\n"
-            f"Output: [ESCALABLE] / [NO_ESCALABLE] + who can trigger and how.\n\n"
-            f"## REQUIRED OUTPUT FORMAT:\n"
-            f"```\n"
-            f"ESCALATION HUNTER REPORT\n"
-            f"═════════════════════════\n"
-            f"Finding: {finding['title']}\n"
-            f"Severidad propuesta: {finding['severity']}\n\n"
-            f"CHECK 1 — Escape Mechanisms:    [ESCALABLE/NO_ESCALABLE]\n"
-            f"  → [justification]\n"
-            f"CHECK 2 — Scope Multiplier:     [ESCALABLE/NO_ESCALABLE]\n"
-            f"  → [justification]\n"
-            f"CHECK 3 — Permanencia del daño: [ESCALABLE/NO_ESCALABLE]\n"
-            f"  → [justification]\n"
-            f"CHECK 4 — Combinación:          [ESCALABLE/NO_ESCALABLE/CONDICIONAL]\n"
-            f"  → [justification]\n"
-            f"CHECK 5 — Attacker directo:     [ESCALABLE/NO_ESCALABLE]\n"
-            f"  → [justification]\n\n"
-            f"TECHO DE SEVERIDAD: [Critical/High/Medium]\n"
-            f"ARGUMENTO PARA REDTEAM (3-5 lines): [concrete, technical, falsifiable]\n"
-            f"CHECKS QUE ESCALARON: [...]\n"
-            f"CHECKS QUE NO ESCALARON: [...]\n"
-            f"```\n\n"
-            f"Rules:\n"
-            f"- Max 1 level escalation per check. Multiple checks REINFORCE the level, not raise further.\n"
-            f"- If no check escalates → ceiling = original severity.\n"
-            f"- The RedTeam argument MUST be falsifiable — if you can't describe how JUDGE could attack it, it's too vague.\n"
-            f"- Don't access code not provided in the snippets. Mark as [CONDICIONAL: requires verifying X]."
-        )
+        esc_prompt = build_escalation_prompt(finding=finding, finding_context=finding_context)
         run_claude(esc_prompt, timeout=180, stall_timeout=120,
                    log_file=clog / f"{fid}_escalation.log", cwd=repo)
 
     # ── F2: RedTeam (4 attackers, Ronda 0 + 3 rounds) ────────────────────
     # Full skill: severity calibration table, 4 adversarial roles, structured verdict
     logger.info(f"    {fid}: RedTeam (Ronda 0 + 3 rounds)")
-    redteam_prompt = (
-        f"You are the RedTeam moderator. Attack this finding aggressively to destroy it before reporting.\n\n"
-        f"{finding_context}\n\n"
-        f"## 4 ADVERSARIAL ATTACKERS\n\n"
-        f"**[JUDGE]** — Platform judge (Sherlock/C4/Cantina/Immunefi)\n"
-        f"Seeks formal rejection: out of scope, known issue, requires admin, by design.\n"
-        f"In Ronda 0: would a platform judge assign this severity? Too high (inflated) or too low?\n\n"
-        f"**[DEVIL]** — Technical devil's advocate\n"
-        f"Attacks exploit logic: PoC doesn't prove real loss, oracle can't be manipulated this way, slippage protection blocks it.\n"
-        f"In Ronda 0: technically verify the 5 severity checks. Can severity go UP or DOWN?\n\n"
-        f"**[GUARD]** — Protocol defender\n"
-        f"Finds existing mitigations: checks in callers, governance limits, rate limits, circuit breakers.\n"
-        f"In Ronda 0: is there a rescue mechanism (multisig, timelock, proxy upgrade) that reduces permanent impact?\n\n"
-        f"**[ECONOMIST]** — Economic analyst\n"
-        f"Calculates attack profitability: gas, capital needed, MEV competition, timing windows.\n"
-        f"In Ronda 0: how much real money at risk? $1K or $1M? Magnitude matters.\n\n"
-        f"## SEVERITY CALIBRATION TABLE\n"
-        f"| Scope (% affected ops) | Permanence | Path type | Severity |\n"
-        f"|---|---|---|---|\n"
-        f"| 100% (all users) | permanent (no admin fix) | normal operation | Critical or High |\n"
-        f"| 100% | temporal (admin can fix) | normal operation | High |\n"
-        f"| 50% (one token/path) | permanent | normal operation | High |\n"
-        f"| 50% | temporal | requires specific config | Medium |\n"
-        f"| 10% (edge case) | permanent | requires attack | Medium |\n"
-        f"| 10% | temporal | requires attack | Low |\n\n"
-        f"PRIOR CALIBRATION ERRORS:\n"
-        f"- Fee loss in ALL liquidations → we said Medium, GT said High. Rule: 100% scope + permanent + normal path = High minimum.\n"
-        f"- DoS only in denomination==token1 path → we said High, GT said Medium. Rule: 50% scope + permanent + normal = Medium/High boundary → Medium.\n\n"
-        f"## PROTOCOL: RONDA 0 + 3 ROUNDS\n\n"
-        f"### RONDA 0: Severity Calibration\n"
-        f"All 4 attackers answer these 5 questions BRIEFLY. Severity can go UP or DOWN:\n"
-        f"1. Escape mechanisms: can admin/protocol undo damage? No rescue + permanent → consider raising.\n"
-        f"2. Scope: 1 victim or all pool/vault users? Systemic → raise. Single user → lower.\n"
-        f"3. Permanence: reversible or permanent? Permanent → raise. Temporal with reaction window → lower.\n"
-        f"4. Trigger: unprivileged attacker can execute directly? Yes → raise. Requires trusted role → lower.\n"
-        f"5. Combination: adds to another confirmed finding for qualitatively greater impact?\n"
-        f"Each attacker gives severity verdict in ONE line at end of Ronda 0.\n"
-        f"If consensus that proposed severity is wrong → ADJUST BEFORE rounds 1-3.\n\n"
-        f"### ROUND 1: First Attack (each attacker, max 150 words)\n"
-        f"Each attacker identifies the STRONGEST argument against the finding. Only the best argument.\n\n"
-        f"### ROUND 2: Cross-response\n"
-        f"Are the other attackers correct? Or wrong? Can ally with or contradict each other.\n"
-        f"If two attackers contradict → ambiguity signal, must resolve.\n\n"
-        f"### ROUND 3: Individual Verdict (1 paragraph each)\n"
-        f"Each attacker: KILL (finding doesn't survive) / WEAKEN (valid but lower severity) / SURVIVE (solid)\n\n"
-        f"## REQUIRED FINAL OUTPUT:\n"
-        f"```\n"
-        f"VEREDITO REDTEAM\n"
-        f"════════════════\n"
-        f"Finding: {finding['title']}\n"
-        f"Componente: {component}\n\n"
-        f"RESULTADO: [REPORT / REPORT_DOWNGRADED / DO_NOT_REPORT]\n\n"
-        f"Argumentos que sobrevivieron:\n  [list]\n"
-        f"Argumentos que lo debilitan:\n  [list]\n"
-        f"Argumentos que fallaron (attackers equivocados):\n  [list]\n\n"
-        f"Severidad propuesta:   {finding['severity']}\n"
-        f"Severidad final:       [Critical/High/Medium/Low]\n"
-        f"Razón del cambio:      [why up/down/same]\n"
-        f"Confianza: [0-100%]\n\n"
-        f"Qué añadir al reporte para sobrevivir review:\n  [specific points]\n"
-        f"Qué NO incluir (weakens argument):\n  [list]\n"
-        f"```\n\n"
-        f"Rules:\n"
-        f"- Attackers do NOT help the hunter — they try to KILL the finding.\n"
-        f"- Specific arguments ONLY — 'could be by design' without citing code is INVALID.\n"
-        f"- No authority arguments — 'OpenZeppelin audited this' is invalid unless you cite what they found.\n"
-        f"- Hunter CANNOT respond during rounds.\n"
-        f"- If all 4 say KILL → DO_NOT_REPORT, no exceptions.\n"
-        f"- If 3 SURVIVE + 1 KILL → investigate the KILL argument deeply before reporting."
+    redteam_prompt = build_redteam_prompt(
+        finding_context=finding_context, fid=fid, finding=finding,
+        component=component
     )
-    run_claude(redteam_prompt, timeout=300, stall_timeout=180,
-               log_file=clog / f"{fid}_redteam.log", cwd=repo)
+    _, redteam_output = run_claude(redteam_prompt, timeout=300, stall_timeout=180,
+                                   log_file=clog / f"{fid}_redteam.log", cwd=repo)
+
+    # Parse RedTeam verdict and store on finding for scoring
+    def _parse_redteam_verdict(text: str) -> str:
+        """Try strict then lenient parse of RESULTADO line."""
+        m = re.search(r'RESULTADO:\s*(REPORT_DOWNGRADED|DO_NOT_REPORT|REPORT)', text or "")
+        if m:
+            return m.group(1)
+        # Lenient: case-insensitive, allow surrounding text
+        m2 = re.search(r'(?:resultado|verdict)[:\s]+(REPORT_DOWNGRADED|DO_NOT_REPORT|REPORT)',
+                       text or "", re.IGNORECASE)
+        if m2:
+            return m2.group(1).upper()
+        return "UNKNOWN"
+
+    verdict = _parse_redteam_verdict(redteam_output)
+
+    # If still UNKNOWN, retry once — output may have cut off or missed the RESULTADO line
+    if verdict == "UNKNOWN":
+        logger.warning(f"    {fid}: RedTeam returned UNKNOWN — retrying (1/1)")
+        _, redteam_output2 = run_claude(redteam_prompt, timeout=300, stall_timeout=180,
+                                        log_file=clog / f"{fid}_redteam_retry.log", cwd=repo)
+        verdict = _parse_redteam_verdict(redteam_output2)
+        if verdict != "UNKNOWN":
+            logger.info(f"    {fid}: RedTeam retry → {verdict}")
+        else:
+            logger.warning(f"    {fid}: RedTeam still UNKNOWN after retry — keeping UNKNOWN")
+
+    finding["redteam_verdict"] = verdict
+    # Save raw output for post-hoc analysis (capped at 2K chars)
+    finding["_redteam_output"] = (redteam_output or "")[:2000]
+
+    # Categorize kill reason using R1-R5 rejection rules (for analytics)
+    if verdict == "DO_NOT_REPORT":
+        _rt = (redteam_output or "").lower()
+        if any(w in _rt for w in ["trusted role", "admin", "owner", "manager", "privileged", "only owner", "onlyowner"]):
+            finding["redteam_kill_reason"] = "R1_TRUSTED_ROLE"
+        elif any(w in _rt for w in ["view only", "no-op", "read-only", "read only", "pure function"]):
+            finding["redteam_kill_reason"] = "R2_VIEW_ONLY"
+        elif any(w in _rt for w in ["by design", "intended behavior", "disabled by design", "works as intended"]):
+            finding["redteam_kill_reason"] = "R3_BY_DESIGN"
+        elif any(w in _rt for w in ["out of scope", "not in scope", "not in the scope", "oos", "outside scope"]):
+            finding["redteam_kill_reason"] = "R4_OUT_OF_SCOPE"
+        elif any(w in _rt for w in ["no funds", "cosmetic", "no security impact", "ux issue", "no impact"]):
+            finding["redteam_kill_reason"] = "R5_NO_IMPACT"
+        else:
+            finding["redteam_kill_reason"] = "R0_OTHER"
+    else:
+        finding["redteam_kill_reason"] = ""
+
+    logger.info(f"    {fid}: RedTeam verdict → {verdict}"
+                + (f" [{finding['redteam_kill_reason']}]" if finding.get("redteam_kill_reason") else ""))
 
     if benchmark_mode:
-        logger.info(f"    {fid}: benchmark mode — stopping after RedTeam (skip Variant + Report)")
+        logger.info(f"    {fid}: benchmark mode — stopping after RedTeam")
         return
 
     # ── F3: Variant Hunt (4-step: root cause → L0-L3 → triage) ───────────
     # Full skill: root cause statement template, 4 search levels, triage classification
     logger.info(f"    {fid}: VariantHunt (L0-L3)")
-    variant_prompt = (
-        f"You are VariantHunter. A confirmed bug rarely appears only once. Search for variants systematically.\n\n"
-        f"{finding_context}\n\n"
-        f"## STEP 1: ROOT CAUSE STATEMENT\n"
-        f"Write the root cause in this EXACT format:\n"
-        f'> "This vulnerability exists because **[UNTRUSTED DATA]** reaches **[DANGEROUS OPERATION]** without **[REQUIRED PROTECTION]**."\n\n'
-        f"Examples:\n"
-        f'- "...because **slot0.sqrtPriceX96** reaches **amountOut calculation** without **using TWAP instead of spot price**"\n'
-        f'- "...because **balanceOf(address(this))** reaches **share calculation** without **pre-operation snapshot**"\n\n'
-        f"If you can't write it in this format, you don't understand the bug well enough.\n\n"
-        f"## STEP 2: EXACT MATCH (Level 0)\n"
-        f"Use Grep to search the EXACT code pattern of the bug.\n"
-        f"MUST match ONLY the known instance (1 result). If 0: pattern is wrong. If >1: already have variant candidates.\n"
-        f"Document: Level 0: <pattern>, Matches: N, Locations: [list]\n\n"
-        f"## STEP 3: PROGRESSIVE ABSTRACTION (Levels 1-3)\n"
-        f"Abstract ONE element at a time. After each, search and document.\n\n"
-        f"**Level 1** — Variable names → wildcards:\n"
-        f"Replace specific names with generic patterns.\n\n"
-        f"**Level 2** — Function names → family:\n"
-        f"Replace specific function with the family (e.g., withdraw → any function that sends tokens).\n\n"
-        f"**Level 3** — Full structural pattern:\n"
-        f"Combine multiple grep searches to find the structural pattern.\n\n"
-        f"For EACH level document: Level N: <pattern>, Matches: N, New locations: [list]\n\n"
-        f"## STEP 4: TRIAGE\n"
-        f"For EACH location found in Levels 1-3 that is NOT the original:\n"
-        f"- **TRUE VARIANT**: same root cause, same impact, different fix → NEW FINDING\n"
-        f"- **SIMILAR PATTERN**: same structure but different context → INVESTIGATE\n"
-        f"- **FALSE POSITIVE**: pattern matches but protection/context prevents it → DISCARD\n\n"
-        f"## REQUIRED OUTPUT FORMAT:\n"
-        f"```\n"
-        f"# Variant Hunt — {fid}\n\n"
-        f"## Root Cause Statement\n"
-        f'"This vulnerability exists because..."\n\n'
-        f"## Search Results\n"
-        f"### Level 0 (exact match)\n"
-        f"### Level 1 (variable abstraction)\n"
-        f"### Level 2 (function family)\n"
-        f"### Level 3 (structural)\n\n"
-        f"## Triage\n"
-        f"| Location | Level | Classification | Notes |\n\n"
-        f"## Variants Found: X\n"
-        f"```\n\n"
-        f"Search ALL .sol files in {repo}/src/. Max 15 minutes."
-    )
+    variant_prompt = build_variant_prompt(fid=fid, finding_context=finding_context, repo=repo)
     run_claude(
         variant_prompt,
         allowed_tools=["Read", "Grep", "Glob"],
@@ -2360,70 +3201,10 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     reports_dir = HUNT_SESSION_DIR / "reports"
     reports_dir.mkdir(exist_ok=True)
 
-    slug = finding["title"][:40].lower().replace(" ", "-").replace("/", "-")
+    slug = finding.get("title", fid)[:40].lower().replace(" ", "-").replace("/", "-")
     slug = re.sub(r'[^a-z0-9-]', '', slug)
     report_path = reports_dir / f"DRAFT-{fid}-{slug}.md"
-
-    report_prompt = (
-        f"You are ReportWriter. Convert a RedTeam-validated finding into a platform-ready report.\n\n"
-        f"{finding_context}\n\n"
-        f"## STEP 1 — PLATFORM: SHERLOCK\n"
-        f"This is a Sherlock contest benchmark. Use the Sherlock template.\n\n"
-        f"## STEP 2 — REDTEAM MAPPING\n"
-        f"Extract from the finding context:\n"
-        f"- Severidad final → Severity field\n"
-        f"- Surviving arguments → Impact section (strongest ones)\n"
-        f"- Weakening arguments → mention + counter in Impact\n"
-        f"- What NOT to include → exclusion list (don't put in report)\n"
-        f"- What to ADD → reinforce in Description or Impact\n"
-        f"Only arguments that survived RedTeam go in the report.\n\n"
-        f"## STEP 3 — ANTI-AI WRITING RULES (CRITICAL)\n"
-        f"DO NOT use:\n"
-        f"- Filler phrases: 'It is important to note', 'This could potentially lead to', 'It is worth mentioning'\n"
-        f"- Hedging: 'may', 'could', 'might', 'potentially', 'in some cases' — the PoC proved it, no 'might'\n"
-        f"- Passive voice: write 'the function lacks', 'an attacker calls', not 'it was found that'\n"
-        f"- Symmetric structure: not all sections same length, not all paragraphs with 3 sentences\n"
-        f"- Explaining the obvious: don't explain what liquidation is, what a gauge is — the judge knows\n"
-        f"- Generic openings: start with the punch, not context\n\n"
-        f"DO write like a senior auditor:\n"
-        f"- First sentence already says what's broken and what happens\n"
-        f"- Active voice, specific: 'withdraw() at line 224 has no try/catch'\n"
-        f"- Asymmetric: section lengths follow complexity, not aesthetics\n"
-        f"- Confident: no hedging, the PoC demonstrated it\n"
-        f"- Technically specific: cite contract, line, exact variable\n\n"
-        f"## SHERLOCK TEMPLATE:\n"
-        f"```markdown\n"
-        f"## Summary\n"
-        f"[One sentence: who can do what, with what result]\n\n"
-        f"## Vulnerability Detail\n"
-        f"[Deep technical explanation. Sherlock values depth.\n"
-        f"Include code with comments. Cite Sherlock severity criteria.]\n\n"
-        f"## Impact\n"
-        f"[Cite which Sherlock severity rule applies:\n"
-        f"- High: direct loss without time limit or user interaction\n"
-        f"- Medium: with specific conditions / temporary DoS]\n\n"
-        f"## Code Snippet\n"
-        f"```solidity\n"
-        f"// [file]:[line]\n"
-        f"[vulnerable snippet]\n"
-        f"```\n\n"
-        f"## Tool used\n"
-        f"Manual Review\n\n"
-        f"## Recommendation\n"
-        f"[Fix with code]\n"
-        f"```\n\n"
-        f"## AFTER WRITING — MANDATORY REVIEW PASS:\n"
-        f"Re-read line by line and eliminate:\n"
-        f"- Any sentence starting with 'It is', 'This could', 'It is worth', 'As a result'\n"
-        f"- Any 'may', 'could', 'might', 'potentially', 'in some cases'\n"
-        f"- Any section where all sentences are approximately equal length\n"
-        f"- Any paragraph with 3 bullets when one sentence would suffice\n"
-        f"- Any sentence explaining something the judge already knows\n"
-        f"- Any passive voice usable as active\n"
-        f"If a section sounds like corporate documentation → rewrite it.\n\n"
-        f"Write the report to: {report_path}\n"
-        f"Use English for all content (Sherlock platform). Be specific with line numbers."
-    )
+    report_prompt = build_report_prompt(finding_context=finding_context, report_path=report_path)
     run_claude(
         report_prompt,
         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
@@ -2435,48 +3216,241 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
 
 # ─── Cross-Component Hunt ────────────────────────────────────────────────────
 
-def run_cross_component(components_done: list[str], protocol: str, repo: str):
-    """Run cross-component analysis + multi-contract fuzzing after 2+ components."""
+def run_cross_component(components_done: list[str], protocol: str, repo: str,
+                        parallel_poc: int = 2) -> list[dict]:
+    """Run cross-component analysis + multi-contract fuzzing after 2+ components.
+    Returns list of cross-component findings that passed PoC + RedTeam."""
     if len(components_done) < 2:
-        return
+        return []
+    poc_candidates: list[dict] = []  # populated in Phase A.5; returned at end
 
     logger.info(f"\n{'='*60}")
     logger.info(f"  CROSS-COMPONENT HUNT: {', '.join(components_done)}")
     logger.info(f"{'='*60}")
 
     import shutil
+    import itertools
     clog = component_log_dir("cross_component")
     src_dir = Path(repo) / "src"
     chimera_dir = Path(repo) / "test" / "chimera"
 
-    # ─── Phase A: Hypothesis Generation ──────────────────────────────
-    logger.info("  Cross-A: Generating interaction hypotheses")
-    code_snippets = ""
-    for comp in components_done:
-        src_files = list(src_dir.glob(f"**/{comp}.sol"))
-        if src_files:
-            content = src_files[0].read_text()[:15000]
-            code_snippets += f"\n// === {comp}.sol ===\n{content}\n"
+    # ─── Phase A: Per-pair hypothesis generation (parallel) ───────────
+    # Old approach: dump all N contracts at once → 70k+ chars → Claude times out.
+    # New approach: one focused call per pair, using interfaces (not full source).
+    logger.info("  Cross-A: Generating interaction hypotheses (per pair)")
 
-    hyp_prompt = (
-        f"You are CrossComponentHunter analyzing interactions between: {', '.join(components_done)}.\n\n"
-        f"## Source Code\n```solidity\n{code_snippets}\n```\n\n"
-        f"For EACH pair of components:\n"
-        f"1. List cross-contract calls, shared state, mutual assumptions\n"
-        f"2. What breaks if component B behaves unexpectedly at each call site?\n"
-        f"3. Custody invariants, debt conservation, health consistency\n"
-        f"4. Flash loan paths that span multiple components\n"
-        f"5. Sequence-dependent state: does calling A then B differ from B then A?\n\n"
-        f"Each hypothesis MUST have `solidity_property` with Chimera assertion code.\n"
-        f"Write findings to: {HUNT_SESSION_DIR}/hypotheses/{protocol}/hyp_CrossComponent_DeepDiveHunter.yaml"
-    )
-    run_claude(
-        hyp_prompt,
-        allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
-        timeout=600,
-        log_file=clog / "cross_hypotheses.log",
-        cwd=repo
-    )
+    def _read_interface(comp: str) -> str:
+        """Read the interface file for a component, fallback to extracting
+        function signatures from source if no interface file exists."""
+        # Try interface file first (I<Comp>.sol or <Comp>.sol under interfaces/)
+        iface_dir = src_dir / "interfaces"
+        for name in (f"I{comp}.sol", f"{comp}.sol"):
+            p = iface_dir / name
+            if p.exists():
+                return p.read_text(encoding="utf-8")[:6000]
+        # Fallback: extract function signatures from source via regex
+        src_files = list(src_dir.glob(f"**/{comp}.sol"))
+        if not src_files:
+            return ""
+        import re as _re
+        text = src_files[0].read_text(encoding="utf-8")
+        # Extract: state variables (public), function signatures, events, errors
+        lines = text.splitlines()
+        sigs = []
+        in_func = False
+        brace_depth = 0
+        for line in lines:
+            stripped = line.strip()
+            # State vars and events/errors — always include
+            if _re.match(r'(address|uint|int|bool|bytes|mapping|struct|enum|event|error|I\w+)\s', stripped):
+                sigs.append(line)
+            # Function signature lines
+            elif stripped.startswith("function "):
+                sigs.append(line)
+                if "{" in line:
+                    in_func = True
+                    brace_depth = line.count("{") - line.count("}")
+            elif in_func:
+                brace_depth += line.count("{") - line.count("}")
+                if brace_depth <= 0:
+                    in_func = False
+        return "\n".join(sigs[:200])  # cap at 200 lines
+
+    def _find_cross_calls(comp_a: str, comp_b: str) -> str:
+        """Grep for places where comp_a calls comp_b and vice versa."""
+        results = []
+        for caller, callee in ((comp_a, comp_b), (comp_b, comp_a)):
+            src_files = list(src_dir.glob(f"**/{caller}.sol"))
+            if not src_files:
+                continue
+            text = src_files[0].read_text(encoding="utf-8")
+            lines = text.splitlines()
+            hits = []
+            for i, line in enumerate(lines):
+                if callee.lower() in line.lower() or f"I{callee}" in line:
+                    ctx_start = max(0, i - 1)
+                    ctx_end = min(len(lines), i + 3)
+                    hits.append(f"  L{i+1}: " + " | ".join(lines[ctx_start:ctx_end]))
+            if hits:
+                results.append(f"{caller} → {callee} ({len(hits)} call sites):\n" + "\n".join(hits[:10]))
+        return "\n\n".join(results) if results else "No direct cross-calls detected."
+
+    # Each pair writes to its own temp file; at the end we merge into the
+    # canonical hyp_CrossComponent_DeepDiveHunter.yaml so extract_findings() finds it.
+    hyp_dir = HUNT_SESSION_DIR / "hypotheses" / protocol
+    hyp_dir.mkdir(parents=True, exist_ok=True)
+    canonical_file = hyp_dir / "hyp_CrossComponent_DeepDiveHunter.yaml"
+
+    # Clean up pair files from any previous run to avoid stale data contaminating the merge
+    for stale in hyp_dir.glob("hyp_Cross_*.yaml"):
+        stale.unlink()
+    if canonical_file.exists():
+        canonical_file.unlink()
+
+    def _run_pair_hunt(pair: tuple) -> None:
+        comp_a, comp_b = pair
+        iface_a = _read_interface(comp_a)
+        iface_b = _read_interface(comp_b)
+        cross_calls = _find_cross_calls(comp_a, comp_b)
+        # Temp file per pair — merged into canonical after all pairs complete
+        pair_file = hyp_dir / f"hyp_Cross_{comp_a}_{comp_b}.yaml"
+        pair_prompt = build_cross_pair_prompt(
+            comp_a=comp_a, comp_b=comp_b, iface_a=iface_a, iface_b=iface_b,
+            cross_calls=cross_calls, src_dir=src_dir, pair_file=pair_file
+        )
+        run_claude(
+            pair_prompt,
+            allowed_tools=["Read", "Write", "Grep", "Glob"],
+            timeout=900,
+            stall_timeout=600,
+            log_file=clog / f"cross_{comp_a}_{comp_b}.log",
+            cwd=repo
+        )
+        logger.info(f"    Cross pair {comp_a}×{comp_b}: done")
+
+    pairs = list(itertools.combinations(components_done, 2))
+    logger.info(f"  Cross-A: {len(pairs)} pairs — {', '.join(f'{a}×{b}' for a,b in pairs)}")
+    with ThreadPoolExecutor(max_workers=min(3, len(pairs))) as executor:
+        list(executor.map(_run_pair_hunt, pairs))
+
+    # Merge all per-pair YAML files into the canonical file that extract_findings() expects.
+    # Also builds the combined source needed for the PoC phase below.
+    import yaml as _yaml
+    merged_findings = []
+    for pair_file in sorted(hyp_dir.glob("hyp_Cross_*.yaml")):
+        try:
+            data = _yaml.safe_load(pair_file.read_text())
+            if not data:
+                continue
+            # Collect from all possible keys — a YAML may have findings + hypotheses
+            for key in ("findings", "hypotheses", "invariants"):
+                for entry in (data.get(key) or []):
+                    if isinstance(entry, dict):
+                        merged_findings.append(entry)
+        except Exception:
+            pass
+    if merged_findings:
+        canonical_file.write_text(
+            _yaml.dump({"hunter": "CrossComponentHunter",
+                        "component": "CrossComponent",
+                        "findings": merged_findings},
+                       allow_unicode=True, sort_keys=False)
+        )
+        logger.info(f"  Cross-A merged: {len(merged_findings)} findings → {canonical_file.name}")
+
+    # ─── Phase A.5: PoC + RedTeam for cross-component findings ────────
+    # Cross-component findings are never PoC'd in the component pipelines.
+    # We: (1) generate+test PoC, (2) only send PoC-confirmed to RedTeam.
+    if merged_findings:
+        # Build combined source from all component .sol files.
+        # IMPORTANT: combined_source is NOT injected wholesale into any prompt.
+        # It only feeds _extract_relevant_code(), which always outputs max 8K focused.
+        # RedTeam/Escalation use focused_code (8K) + file access tools, never raw combined.
+        # The cap exists only to bound memory and _extract_relevant_code search time.
+        # Strategy: sort ascending by file size — small contracts always included fully;
+        # only the largest get truncated if combined total exceeds the cap (rare).
+        _CROSS_COMBINED_CAP = 100_000
+        _comp_files = []
+        for comp in components_done:
+            src_files = list(src_dir.glob(f"**/{comp}.sol"))
+            if src_files:
+                size = src_files[0].stat().st_size
+                _comp_files.append((size, comp, src_files[0]))
+        _comp_files.sort()  # ascending by size — small contracts enter first, always complete
+
+        combined_source = ""
+        for size, comp, src_path in _comp_files:
+            budget_left = _CROSS_COMBINED_CAP - len(combined_source)
+            if budget_left <= 0:
+                logger.warning(f"  Cross: combined_source hit {_CROSS_COMBINED_CAP//1000}K cap — "
+                               f"skipping {comp} ({size//1000}K)")
+                break
+            raw = src_path.read_text(encoding="utf-8", errors="replace")
+            if len(raw) > budget_left:
+                raw = raw[:budget_left] + f"\n// ... {comp}.sol truncated (budget exhausted)\n"
+                logger.info(f"  Cross: {comp}.sol truncated to {budget_left//1000}K "
+                            f"(full size {size//1000}K)")
+            combined_source += f"\n// === {comp}.sol ===\n{raw}\n"
+        logger.info(f"  Cross: combined_source = {len(combined_source)//1000}K chars "
+                    f"({len(_comp_files)} contracts)")
+
+        # Build interfaces code (all interface files)
+        cross_interfaces = ""
+        iface_dir = src_dir / "interfaces"
+        if iface_dir.exists():
+            for ifile in sorted(iface_dir.glob("*.sol")):
+                cross_interfaces += f"\n// === {ifile.name} ===\n{ifile.read_text()[:3000]}\n"
+
+        # forge env for PoC runs
+        cross_poc_env = os.environ.copy()
+        cross_poc_env["FOUNDRY_PROFILE"] = "chimera"
+        for _v in ("ETH_RPC_URL", "FORK_URL", "BASE_RPC_URL"):
+            _val = os.environ.get(_v, "")
+            if _val:
+                cross_poc_env[_v] = _val
+
+        # Filter to high-confidence findings worth PoC'ing
+        poc_candidates = [
+            f for f in merged_findings
+            if isinstance(f, dict)
+            and f.get("confidence", 0) >= 65
+            and f.get("severity", "Low").capitalize() in ("High", "Medium", "Critical")
+        ]
+        if poc_candidates:
+            logger.info(f"  Cross-A.5: PoC → RedTeam on {len(poc_candidates)} cross-component findings")
+
+            def _run_cross_finding(finding: dict) -> None:
+                fid = finding.get("id", "?")
+                # Step 1: generate and test PoC
+                generate_and_test_poc(
+                    finding, combined_source, cross_interfaces,
+                    "CrossComponent", protocol, repo, clog, cross_poc_env,
+                    poc_confidence_threshold=POC_CONFIDENCE_THRESHOLD
+                )
+                # Step 2: RedTeam only if PoC passed (or always — RedTeam will judge)
+                run_finding_pipeline(
+                    finding, "CrossComponent", protocol, combined_source, repo, clog,
+                    benchmark_mode=True
+                )
+                logger.info(f"    Cross {fid}: PoC={'✓' if finding.get('has_poc') else '✗'} "
+                            f"RedTeam={finding.get('redteam_verdict', '?')}")
+
+            with ThreadPoolExecutor(max_workers=parallel_poc) as executor:
+                futures = {executor.submit(_run_cross_finding, f): f for f in poc_candidates}
+                for future in as_completed(futures):
+                    finding = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"    Cross {finding.get('id','?')}: error: {e}")
+
+            confirmed = [f for f in poc_candidates if f.get("has_poc")]
+            reportable = [f for f in poc_candidates
+                          if f.get("redteam_verdict") in ("REPORT", "REPORT_DOWNGRADED")]
+            logger.info(f"  Cross-A.5 complete: {len(confirmed)} PoC confirmed, "
+                        f"{len(reportable)} reportable")
+        else:
+            logger.info("  Cross-A.5: No high-confidence cross-component findings to PoC")
 
     # ─── Phase B: Multi-Contract Chimera Setup ───────────────────────
     logger.info("  Cross-B: Building multi-contract chimera setup")
@@ -2494,7 +3468,7 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str):
 
     if not all_properties:
         logger.warning("  No chimera backups found — skipping cross-component fuzzing")
-        return
+        return poc_candidates
 
     # Reset chimera to git state first
     if chimera_dir.exists():
@@ -2555,7 +3529,7 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str):
 
     if not compile_ok:
         logger.error("  Cross-component chimera failed to compile — skipping fuzzing")
-        return
+        return poc_candidates
 
     # ─── Phase D: Fuzz cross-component ───────────────────────────────
     logger.info("  Cross-D: Phase 1 — Foundry 5K runs (cross-component)")
@@ -2599,15 +3573,18 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str):
         logger.info(f"  Cross-component fuzz failures: {cross_fuzz_failures}")
     findings = extract_findings("CrossComponent", protocol, cross_fuzz_failures)
     logger.info(f"  Cross-component hunt complete: {len(findings)} findings")
+    return poc_candidates
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def _create_worktree(repo: str, component: str, protocol: str) -> str:
+def _create_worktree(repo: str, component: str, protocol: str, run_id: str = "") -> str:
     """Create a git worktree for a component. Returns the effective repo path inside worktree.
 
     If --repo points to a subdirectory of the git root (e.g., .../repo/yieldoor),
     we create the worktree from the git root and return worktree_path + subdirectory offset.
+
+    run_id: unique suffix per benchmark run (timestamp) to avoid collisions between concurrent runs.
     """
     import tempfile, shutil
 
@@ -2620,25 +3597,49 @@ def _create_worktree(repo: str, component: str, protocol: str) -> str:
         return ""
     git_root = Path(git_root.strip()).resolve()
 
+    # Prune any stale worktree registrations (missing dirs still registered in git)
+    run_cmd(["git", "worktree", "prune"], cwd=str(git_root))
+
     # Compute subdirectory offset (e.g., "yieldoor" if repo=.../repo/yieldoor and git root=.../repo)
     try:
         subdir = repo_path.relative_to(git_root)
     except ValueError:
         subdir = Path(".")
 
-    wt_path = str(Path(tempfile.gettempdir()) / f"bench-{protocol}-{component}")
-    # Clean up stale worktree if exists
+    # Include run_id in name to avoid collisions between concurrent benchmark runs
+    suffix = f"-{run_id}" if run_id else ""
+    wt_path = str(Path(tempfile.gettempdir()) / f"bench-{protocol}-{component}{suffix}")
+
+    # Clean up stale worktree if the directory still exists
     if Path(wt_path).exists():
         run_cmd(["git", "worktree", "remove", "--force", wt_path], cwd=str(git_root))
         if Path(wt_path).exists():
             shutil.rmtree(wt_path, ignore_errors=True)
 
-    code, _, stderr = run_cmd(["git", "worktree", "add", "--detach", wt_path, "HEAD"], cwd=str(git_root))
+    # Use -f (force) to override any stale git registration that survived prune
+    code, _, stderr = run_cmd(
+        ["git", "worktree", "add", "-f", "--detach", wt_path, "HEAD"], cwd=str(git_root)
+    )
     if code != 0:
         logger.error(f"  Failed to create worktree for {component}: {stderr}")
         return ""
 
     effective_path = str(Path(wt_path) / subdir) if str(subdir) != "." else wt_path
+
+    # Patch foundry.toml to add [rpc_endpoints] if missing — prevents vm.createSelectFork("mainnet") failures
+    ft = Path(effective_path) / "foundry.toml"
+    if ft.exists():
+        ft_text = ft.read_text(encoding="utf-8")
+        if "[rpc_endpoints]" not in ft_text:
+            ft.write_text(
+                ft_text.rstrip() + "\n\n[rpc_endpoints]\n"
+                'mainnet = "${ETH_RPC_URL}"\n'
+                'base = "${BASE_RPC_URL}"\n'
+                'arbitrum = "${ARB_RPC_URL}"\n',
+                encoding="utf-8"
+            )
+            logger.info(f"  Patched foundry.toml: added [rpc_endpoints] in {effective_path}")
+
     logger.info(f"  Worktree created: {wt_path} (effective repo: {effective_path})")
     return effective_path
 
@@ -2670,13 +3671,28 @@ def main():
     parser.add_argument("--skip-phase3", action="store_true", help="Skip fork PoC (explicit)")
     parser.add_argument("--fast", action="store_true",
                         help="Fast mode: hunters → top findings → PoC. Skip invariant compile/fuzz/medusa.")
-    parser.add_argument("--workers", type=int, default=4, help="Max parallel hunters")
-    parser.add_argument("--parallel-components", type=int, default=1,
-                        help="Number of components to run in parallel (requires git worktrees)")
-    parser.add_argument("--parallel-fuzz", type=int, default=4,
-                        help="Number of parallel fuzz batches per component (default 4)")
-    parser.add_argument("--parallel-poc", type=int, default=4,
-                        help="Number of parallel PoC generators per component (default 4)")
+    parser.add_argument("--benchmark-mode",
+                        choices=["hypothesis", "poc", "redteam"],
+                        default="redteam",
+                        help=(
+                            "Benchmark depth. "
+                            "'hypothesis': hunters+deepdive+scoring only (~45min/component). "
+                            "'poc': +verification+PoC phase (~3h/component). "
+                            "'redteam': +EscalationHunter+RedTeam (default, full pipeline)."
+                        ))
+    parser.add_argument("--workers", type=int, default=9, help="Max parallel hunters (default 9 = all hunters truly parallel, pure API calls)")
+    parser.add_argument("--parallel-components", type=int, default=2,
+                        help="Number of components to run in parallel (requires git worktrees, default 2 proven stable on 16GB)")
+    parser.add_argument("--parallel-fuzz", type=int, default=3,
+                        help="Number of parallel fuzz batches per component (forge-bound, default 3 for 16GB RAM)")
+    parser.add_argument("--parallel-poc", type=int, default=3,
+                        help="Number of parallel PoC generators per component (forge-bound, default 3 for 16GB RAM)")
+    parser.add_argument("--pre-production", action="store_true",
+                        help=(
+                            "Protocol is pre-production (not deployed on-chain). "
+                            "PoC generation deploys contracts in setUp() instead of using fork state. "
+                            "Auto-detected if ground-truth YAML has no on-chain addresses."
+                        ))
     parser.add_argument("--session-dir", help=(
         "Override hunt_session output directory. "
         "Default in benchmark mode: benchmarks/<protocol>/bench_session/ "
@@ -2689,13 +3705,32 @@ def main():
     # When running a benchmark, NEVER write to the real hunt_session/.
     # Auto-derive an isolated session dir alongside the ground-truth YAML,
     # or use the explicit --session-dir override.
-    global HUNT_SESSION_DIR
+    global HUNT_SESSION_DIR, IS_PRE_PRODUCTION
     if args.session_dir:
         HUNT_SESSION_DIR = Path(args.session_dir).resolve()
     elif args.ground_truth:
         HUNT_SESSION_DIR = Path(args.ground_truth).resolve().parent / "bench_session"
     # else: keep default WEB3_DIR / "hunt_session" (non-benchmark invocation)
     HUNT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Auto-detect pre-production: flag set OR ground-truth has no on-chain addresses
+    IS_PRE_PRODUCTION = getattr(args, "pre_production", False)
+    if not IS_PRE_PRODUCTION and args.ground_truth:
+        try:
+            import yaml as _yaml
+            gt = _yaml.safe_load(Path(args.ground_truth).read_text())
+            scope = gt.get("scope", [])
+            # Pre-production if scope has only .sol paths (no 0x addresses)
+            has_address = any(
+                str(s).strip().startswith("0x") or str(s).strip().startswith("0X")
+                for s in scope if isinstance(s, str)
+            )
+            if not has_address:
+                IS_PRE_PRODUCTION = True
+        except Exception:
+            pass
+    if IS_PRE_PRODUCTION:
+        logger.info("  ⚠️  PRE-PRODUCTION mode: PoC will deploy contracts, not use fork state")
 
     setup_logging(args.protocol)
     components = [c.strip() for c in args.components.split(",")]
@@ -2710,13 +3745,59 @@ def main():
     logger.info(f"  Parallel components: {args.parallel_components}")
 
     start_time = time.time()
+    # Unique run ID (short timestamp) so concurrent benchmark runs never share worktree names
+    run_id = datetime.now().strftime("%H%M%S")
     results = []
     components_done = []
     accumulated_context = ""
 
+    def _write_incremental_findings(extra_findings: list = None) -> None:
+        """Write findings_all.json checkpoint after each component completes (P0.3)."""
+        flat = []
+        for r in results:
+            for f in r.get("findings", []):
+                flat.append({
+                    "component": r["component"],
+                    "id": f.get("id", ""),
+                    "title": f.get("title", ""),
+                    "severity": f.get("severity", ""),
+                    "confidence": f.get("confidence", 0),
+                    "fuzz_confirmed": f.get("fuzz_confirmed", False),
+                    "poc_passed": f.get("has_poc", False),
+                    "poc_path": f.get("poc_path", ""),
+                    "hunter": f.get("hunter", ""),
+                    "redteam_verdict": f.get("redteam_verdict", ""),
+                    "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+                })
+        for f in (extra_findings or []):
+            flat.append({
+                "component": "CrossComponent",
+                "id": f.get("id", ""),
+                "title": f.get("title", ""),
+                "severity": f.get("severity", ""),
+                "confidence": f.get("confidence", 0),
+                "fuzz_confirmed": f.get("fuzz_confirmed", False),
+                "poc_passed": f.get("has_poc", False),
+                "poc_path": f.get("poc_path", ""),
+                "hunter": "CrossComponentHunter",
+                "redteam_verdict": f.get("redteam_verdict", ""),
+                "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+            })
+        findings_json = HUNT_SESSION_DIR / "findings_all.json"
+        findings_json.write_text(json.dumps({
+            "protocol": args.protocol,
+            "components_done": components_done[:],
+            "total_findings": len(flat),
+            "generated_at": datetime.now().isoformat(),
+            "complete": False,
+            "findings": flat,
+        }, indent=2, ensure_ascii=False))
+        logger.info(f"  [checkpoint] findings_all.json updated: {len(flat)} findings")
+
     if args.parallel_components > 1:
         # ─── Parallel mode: worktrees ────────────────────────────────────
         logger.info(f"  🔀 PARALLEL MODE: {args.parallel_components} components at a time via worktrees")
+        logger.info(f"  Run ID: {run_id} (worktree suffix to avoid cross-run conflicts)")
 
         # Process in batches of parallel_components
         for batch_start in range(0, len(components), args.parallel_components):
@@ -2727,7 +3808,7 @@ def main():
             # Create worktrees
             worktrees = {}
             for comp in batch:
-                wt = _create_worktree(repo, comp, args.protocol)
+                wt = _create_worktree(repo, comp, args.protocol, run_id=run_id)
                 if wt:
                     worktrees[comp] = wt
                 else:
@@ -2780,9 +3861,10 @@ def main():
                         f"- Key patterns found: check trust boundaries with this component\n"
                     )
 
-            # Cross-component after each batch if 2+ done
-            if len(components_done) >= 2:
-                run_cross_component(components_done, args.protocol, repo)
+            # Write incremental checkpoint after each batch
+            _write_incremental_findings()
+
+            # Cross-component runs once after ALL batches — see below
 
     else:
         # ─── Sequential mode (original) ─────────────────────────────────
@@ -2805,14 +3887,16 @@ def main():
                 )
             else:
                 logger.warning(f"  {component} not added to cross-component (status: {result.get('status')})")
+            # Write checkpoint after every component regardless of status
+            # (so findings from a failed component are not lost if run is interrupted)
+            _write_incremental_findings()
 
-            # Cross-component hunt after every 2-3 components
-            if len(components_done) >= 2 and len(components_done) % 2 == 0:
-                run_cross_component(components_done, args.protocol, repo)
-
-        # Final cross-component if not already done
-        if len(components_done) >= 2 and len(components_done) % 2 != 0:
-            run_cross_component(components_done, args.protocol, repo)
+    # ─── Cross-component: single run after ALL components complete ────────
+    # Runs once with the full components_done list to avoid redundant pair analysis.
+    cross_findings: list[dict] = []
+    if len(components_done) >= 2:
+        cross_findings = run_cross_component(components_done, args.protocol, repo,
+                                             parallel_poc=args.parallel_poc) or []
 
     # ─── Scoring ─────────────────────────────────────────────────────────
     if args.ground_truth:
@@ -2864,18 +3948,107 @@ def main():
                 "severity": f.get("severity", ""),
                 "confidence": f.get("confidence", 0),
                 "fuzz_confirmed": f.get("fuzz_confirmed", False),
+                "poc_passed": f.get("has_poc", False),
                 "poc_path": f.get("poc_path", ""),
                 "hunter": f.get("hunter", ""),
+                "redteam_verdict": f.get("redteam_verdict", ""),
+                "redteam_kill_reason": f.get("redteam_kill_reason", ""),
             })
+    # Include cross-component findings that were PoC'd and RedTeam'd
+    for f in cross_findings:
+        all_findings_flat.append({
+            "component": "CrossComponent",
+            "id": f.get("id", ""),
+            "title": f.get("title", ""),
+            "severity": f.get("severity", ""),
+            "confidence": f.get("confidence", 0),
+            "fuzz_confirmed": f.get("fuzz_confirmed", False),
+            "poc_passed": f.get("has_poc", False),
+            "poc_path": f.get("poc_path", ""),
+            "hunter": "CrossComponentHunter",
+            "redteam_verdict": f.get("redteam_verdict", ""),
+            "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+        })
     findings_json_data = {
         "protocol": args.protocol,
         "components": components_done,
         "total_findings": len(all_findings_flat),
         "generated_at": datetime.now().isoformat(),
+        "complete": True,
         "findings": all_findings_flat,
     }
     findings_json.write_text(json.dumps(findings_json_data, indent=2, ensure_ascii=False))
     logger.info(f"  Findings JSON: {findings_json}")
+
+    # ─── P1.3: Hunter performance tracking ───────────────────────────────
+    # Scan all hyp_*.yaml files and compute per-hunter stats:
+    # total hypotheses, validated count, avg confidence, finding conversion rate
+    import yaml as _perf_yaml  # ensure yaml is available in main() scope
+    hunter_stats: dict = {}
+    hyp_dir_final = HUNT_SESSION_DIR / "hypotheses" / args.protocol
+    if hyp_dir_final.exists():
+        for hyp_file in sorted(hyp_dir_final.glob("hyp_*.yaml")):
+            # Extract hunter name from filename: hyp_<Component>_<HunterName>.yaml
+            parts = hyp_file.stem.split("_", 2)  # ['hyp', 'Component', 'HunterName']
+            hunter_name = parts[2] if len(parts) >= 3 else hyp_file.stem
+            try:
+                data = _perf_yaml.safe_load(hyp_file.read_text())
+                if not data:
+                    continue
+                hyps = []
+                for key in ("hypotheses", "findings", "invariants"):
+                    hyps.extend(h for h in (data.get(key) or []) if isinstance(h, dict))
+                if not hyps:
+                    continue
+                confidences = [h.get("confidence", 0) for h in hyps]
+                validated = sum(1 for h in hyps if h.get("validated"))
+                hs = hunter_stats.setdefault(hunter_name, {
+                    "total_hypotheses": 0, "validated": 0, "confidence_sum": 0,
+                    "files": 0, "high_confidence": 0,
+                })
+                hs["total_hypotheses"] += len(hyps)
+                hs["validated"] += validated
+                hs["confidence_sum"] += sum(confidences)
+                hs["files"] += 1
+                hs["high_confidence"] += sum(1 for c in confidences if c >= 70)
+            except Exception:
+                pass
+
+    # Compute derived metrics and write JSON
+    hunter_perf = []
+    for hunter_name, hs in sorted(hunter_stats.items()):
+        total = hs["total_hypotheses"]
+        # Count how many findings in all_findings_flat came from this hunter
+        # Exact match: "MathHunter" == f["hunter"] — avoid substring false positives
+        # e.g. "Hunter" substring would match every hunter name
+        findings_generated = sum(
+            1 for f in all_findings_flat if f.get("hunter", "") == hunter_name
+        )
+        hunter_perf.append({
+            "hunter": hunter_name,
+            "total_hypotheses": total,
+            "validated_hypotheses": hs["validated"],
+            "high_confidence_hypotheses": hs["high_confidence"],
+            "avg_confidence": round(hs["confidence_sum"] / total, 1) if total else 0,
+            "findings_generated": findings_generated,
+            "components_covered": hs["files"],
+        })
+    # Sort by findings_generated desc, then avg_confidence desc
+    hunter_perf.sort(key=lambda x: (-x["findings_generated"], -x["avg_confidence"]))
+
+    perf_json = HUNT_SESSION_DIR / "hunter_performance.json"
+    perf_json.write_text(json.dumps({
+        "protocol": args.protocol,
+        "generated_at": datetime.now().isoformat(),
+        "hunters": hunter_perf,
+    }, indent=2, ensure_ascii=False))
+    logger.info(f"  Hunter perf:   {perf_json}")
+    if hunter_perf:
+        logger.info(f"  Top hunters by findings:")
+        for hp in hunter_perf[:5]:
+            logger.info(f"    {hp['hunter']:25s} {hp['findings_generated']} findings, "
+                        f"{hp['total_hypotheses']} hyps, avg_conf={hp['avg_confidence']}")
+
     logger.info(f"  Reports:       {HUNT_SESSION_DIR / 'reports'}/")
     logger.info(f"  Hypotheses:    {HUNT_SESSION_DIR / 'hypotheses' / args.protocol}/")
     logger.info(f"")
