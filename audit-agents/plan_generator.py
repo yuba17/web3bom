@@ -104,8 +104,10 @@ def generate_plan(
     )
 
     # Per-component steps
+    # Use worktrees when multiple components so merge/compile/fuzz can run in parallel
+    use_wt = len(components) > 1
     for comp in components:
-        _add_component_steps(plan, comp, repo, protocol, session_dir, fast)
+        _add_component_steps(plan, comp, repo, protocol, session_dir, fast, use_worktrees=use_wt)
 
     # Cross-component steps (only if >1 component)
     if len(components) > 1:
@@ -135,6 +137,12 @@ def generate_plan(
 # 2. Component steps
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _worktree_path(protocol: str, comp: str) -> str:
+    """Deterministic worktree path for a component (matches API mode convention)."""
+    import tempfile
+    return str(Path(tempfile.gettempdir()) / f"bench-{protocol}-{comp}")
+
+
 def _add_component_steps(
     plan: ExecutionPlan,
     comp: str,
@@ -142,15 +150,25 @@ def _add_component_steps(
     protocol: str,
     session_dir: str,
     fast: bool,
+    use_worktrees: bool = True,
 ) -> None:
-    """Add the 10 sequential steps for a single component."""
+    """Add the sequential steps for a single component.
+
+    When use_worktrees=True (default for multi-component), merge/compile/fuzz
+    run in an isolated git worktree so components can execute in parallel safely.
+    """
 
     src_dir = _src_dir(repo)
     results_dir = _results_dir(session_dir)
     hyp_dir = _hyp_dir(session_dir, protocol)
     gen_cmd = f"{sys.executable} {SCRIPT_DIR / 'plan_generator.py'}"
 
-    # 1. prepass
+    # Worktree: isolated repo copy for merge/compile/fuzz
+    wt_path = _worktree_path(protocol, comp)
+    # Steps that modify repo (merge, compile, fuzz) use worktree cwd
+    repo_for_build = wt_path if use_worktrees else repo
+
+    # 1. prepass (reads source only — safe in parallel on shared repo)
     plan.add_step(Step(
         id=_step_id(comp, "prepass"),
         type="bash",
@@ -164,7 +182,7 @@ def _add_component_steps(
         retry=1,
     ))
 
-    # 2. build_hunter_prompt
+    # 2. build_hunter_prompt (reads source + writes to session_dir — safe in parallel)
     plan.add_step(Step(
         id=_step_id(comp, "build_hunter_prompt"),
         type="generate",
@@ -178,7 +196,7 @@ def _add_component_steps(
         timeout=60,
     ))
 
-    # 3. hunters (agent)
+    # 3. hunters (agent — reads source, writes YAML to session_dir — safe in parallel)
     plan.add_step(Step(
         id=_step_id(comp, "hunters"),
         type="agent",
@@ -190,7 +208,7 @@ def _add_component_steps(
         retry=1,
     ))
 
-    # 4. build_deepdive_prompt
+    # 4. build_deepdive_prompt (reads hyp YAMLs — safe in parallel)
     plan.add_step(Step(
         id=_step_id(comp, "build_deepdive_prompt"),
         type="generate",
@@ -204,7 +222,7 @@ def _add_component_steps(
         timeout=60,
     ))
 
-    # 5. deepdive (agent)
+    # 5. deepdive (agent — reads source, writes YAML to session_dir — safe in parallel)
     plan.add_step(Step(
         id=_step_id(comp, "deepdive"),
         type="agent",
@@ -216,32 +234,57 @@ def _add_component_steps(
         retry=1,
     ))
 
-    # 6. merge
+    # ── Worktree boundary: from here, steps MODIFY the repo ──
+
+    if use_worktrees:
+        # 5.5. Create worktree (isolated copy for merge/compile/fuzz)
+        plan.add_step(Step(
+            id=_step_id(comp, "create_worktree"),
+            type="bash",
+            description=f"Create git worktree for {comp}",
+            command=(
+                f"git -C {repo} worktree prune && "
+                f"rm -rf {wt_path} && "
+                f"git -C {repo} worktree add -f --detach {wt_path} HEAD && "
+                # Patch foundry.toml with RPC endpoints if missing
+                f"if [ -f {wt_path}/foundry.toml ] && ! grep -q rpc_endpoints {wt_path}/foundry.toml; then "
+                f"  echo -e '\\n[rpc_endpoints]\\nmainnet = \"${{ETH_RPC_URL}}\"\\nbase = \"${{BASE_RPC_URL}}\"' >> {wt_path}/foundry.toml; "
+                f"fi && "
+                f"echo 'Worktree created: {wt_path}'"
+            ),
+            depends_on=[_step_id(comp, "deepdive")],
+            timeout=60,
+        ))
+        merge_dep = _step_id(comp, "create_worktree")
+    else:
+        merge_dep = _step_id(comp, "deepdive")
+
+    # 6. merge (writes to test/chimera/ — needs isolation)
     plan.add_step(Step(
         id=_step_id(comp, "merge"),
         type="bash",
         description=f"Merge invariants for {comp}",
         command=(
             f"{sys.executable} {SCRIPT_DIR / 'merge_invariants.py'} "
-            f"--component {comp} --hyp-dir {hyp_dir} --repo {repo}"
+            f"--component {comp} --hyp-dir {hyp_dir} --repo {repo_for_build}"
         ),
-        depends_on=[_step_id(comp, "deepdive")],
+        depends_on=[merge_dep],
         timeout=120,
     ))
 
-    # 7. compile
+    # 7. compile (forge build in worktree — needs isolation)
     plan.add_step(Step(
         id=_step_id(comp, "compile"),
         type="bash",
         description=f"Compile contracts for {comp}",
-        command=f"cd {repo} && forge build",
-        cwd=repo,
+        command=f"cd {repo_for_build} && forge build",
+        cwd=repo_for_build,
         depends_on=[_step_id(comp, "merge")],
         timeout=300,
         retry=3,
     ))
 
-    # 8. fuzz
+    # 8. fuzz (forge test in worktree — needs isolation)
     fuzz_runs = 3000 if fast else 5000
     fuzz_timeout = 900 if fast else 1800
     plan.add_step(Step(
@@ -249,15 +292,34 @@ def _add_component_steps(
         type="bash",
         description=f"Foundry fuzz {fuzz_runs} runs for {comp}",
         command=(
-            f"cd {repo} && FOUNDRY_PROFILE=chimera forge test "
+            f"cd {repo_for_build} && FOUNDRY_PROFILE=chimera forge test "
             f"--match-contract FoundryTester --fuzz-runs {fuzz_runs} -vv"
         ),
-        cwd=repo,
+        cwd=repo_for_build,
         depends_on=[_step_id(comp, "compile")],
         timeout=fuzz_timeout,
     ))
 
-    # 9. collect_findings
+    # ── End worktree boundary ──
+
+    if use_worktrees:
+        # 8.5. Cleanup worktree
+        plan.add_step(Step(
+            id=_step_id(comp, "cleanup_worktree"),
+            type="bash",
+            description=f"Remove git worktree for {comp}",
+            command=(
+                f"git -C {repo} worktree remove --force {wt_path} 2>/dev/null; "
+                f"rm -rf {wt_path}; echo 'Worktree cleaned: {wt_path}'"
+            ),
+            depends_on=[_step_id(comp, "fuzz")],
+            timeout=30,
+        ))
+        findings_dep = _step_id(comp, "cleanup_worktree")
+    else:
+        findings_dep = _step_id(comp, "fuzz")
+
+    # 9. collect_findings (reads session_dir YAMLs — safe in parallel)
     plan.add_step(Step(
         id=_step_id(comp, "collect_findings"),
         type="generate",
@@ -267,7 +329,7 @@ def _add_component_steps(
             f"--component {comp} --protocol {protocol} "
             f"--repo {repo} --session-dir {session_dir}"
         ),
-        depends_on=[_step_id(comp, "fuzz")],
+        depends_on=[findings_dep],
         timeout=60,
     ))
 
