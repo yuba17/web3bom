@@ -254,10 +254,8 @@ def extract_findings_from_yaml(hyp_dir: Path, component: str,
 
     unconfirmed.sort(key=lambda f: f.get("confidence", 0), reverse=True)
 
-    if confirmed:
-        return confirmed + unconfirmed[:10]
-    else:
-        return unconfirmed
+    # No artificial cap — dedup + verify filter by quality, not count
+    return confirmed + unconfirmed
 
 
 # ─── Code Extraction ─────────────────────────────────────────────────────────
