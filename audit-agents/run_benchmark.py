@@ -34,6 +34,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+from finding_pipeline import (
+    extract_fingerprint,
+    dedup_findings as _dedup_findings_pure,
+    collect_verify_candidates as _collect_verify_candidates_pure,
+    dedup_for_poc as _dedup_for_poc_pure,
+    extract_findings_from_yaml,
+    extract_relevant_code as _extract_relevant_code_shared,
+    build_verify_prompt as _build_verify_prompt_shared,
+    build_is_same_bug_prompt as _build_is_same_bug_prompt_shared,
+    format_funnel,
+    POC_CONFIDENCE_THRESHOLD,
+)
+
 # ─── Global Claude concurrency limiter ───────────────────────────────────────
 # Safety net against runaway concurrency bugs — NOT a rate-limit guard.
 # Tier 4 API: 4K RPM / 2M input tok/min. Our peak: 2 components × 9 hunters =
@@ -54,7 +67,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WEB3_DIR = SCRIPT_DIR.parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-POC_CONFIDENCE_THRESHOLD = 65  # min confidence to attempt PoC (shared by component + cross-component)
+# POC_CONFIDENCE_THRESHOLD imported from finding_pipeline
 IS_PRE_PRODUCTION = False      # set in main() — changes PoC strategy to deploy-on-fork
 
 # ─── Load .env if present ────────────────────────────────────────────────────
@@ -595,43 +608,7 @@ def build_deepdive_prompt(component: str, protocol: str, source_code: str,
     )
 
 
-def build_verify_prompt(finding: dict, relevant_code: str) -> str:
-    """Build the quick verification prompt for a finding."""
-    vuln_loc = finding.get("vulnerable_location") or {}
-    vuln_section = ""
-    if vuln_loc:
-        vuln_section = (
-            f"Hunter's claimed location:\n"
-            f"  Function: {vuln_loc.get('function', 'N/A')}\n"
-            f"  Lines: {vuln_loc.get('lines', 'N/A')}\n"
-            f"  Wrong code: `{vuln_loc.get('vulnerable_code', 'N/A')}`\n"
-            f"  Fix: {vuln_loc.get('fix', 'N/A')}\n"
-        )
-    return (
-        f"You are a senior smart contract auditor doing a QUICK VERIFICATION of a bug report.\n"
-        f"Read the code and determine — with adversarial skepticism — if this is a REAL bug.\n\n"
-        f"## Hypothesis\n"
-        f"Title: {finding.get('title', finding.get('id', '?'))}\n"
-        f"Root Cause: {finding.get('root_cause', '')}\n"
-        f"Confidence reported by hunter: {finding.get('confidence', 0)}%\n"
-        f"{vuln_section}\n"
-        f"## Source Code (focused on the vulnerable area)\n"
-        f"```solidity\n{relevant_code}\n```\n\n"
-        f"## Verification Checklist (check ALL before deciding)\n"
-        f"1. Can you find the EXACT code expression that's wrong in the source above?\n"
-        f"2. Is there a require/modifier/check that already prevents exploitation?\n"
-        f"3. Does exploitation require a privileged caller (owner/admin/governance)? → FALSE_POSITIVE\n"
-        f"4. Is the 'wrong' behavior actually documented / intentional by design?\n"
-        f"5. Is there real economic impact (fund loss / DoS / access bypass)?\n\n"
-        f"## Output (EXACTLY this format, nothing else)\n"
-        f"VERDICT: REAL\n"
-        f"REASON: <one sentence — the exact wrong expression and why it causes harm>\n"
-        f"POC_HINT: <one sentence — simplest way to trigger it in a fork test>\n\n"
-        f"OR:\n\n"
-        f"VERDICT: FALSE_POSITIVE\n"
-        f"REASON: <one sentence — what check/design prevents exploitation>\n"
-        f"POC_HINT: N/A"
-    )
+build_verify_prompt = _build_verify_prompt_shared
 
 
 def build_poc_prompt(finding: dict, fid: str, component: str,
@@ -994,41 +971,7 @@ def build_cross_pair_prompt(comp_a: str, comp_b: str, iface_a: str,
     )
 
 
-def build_is_same_bug_prompt(leader: dict, sibling: dict) -> str:
-    """Build the dedup check prompt for two findings."""
-    return (
-        f"You are deduplicating smart contract audit findings.\n"
-        f"Determine if Finding B is the SAME bug as Finding A, or a genuinely DIFFERENT bug.\n\n"
-        f"## Finding A (PoC-confirmed)\n"
-        f"Title: {leader['title']}\n"
-        f"Root Cause: {leader.get('root_cause', 'N/A')}\n\n"
-        f"## Finding B (needs evaluation)\n"
-        f"Title: {sibling['title']}\n"
-        f"Root Cause: {sibling.get('root_cause', 'N/A')}\n\n"
-        f"## The ONE test that matters\n"
-        f"Would a single code patch that fixes Finding A ALSO fix Finding B?\n"
-        f"If yes → SAME. If no (requires a separate code change) → DIFFERENT.\n\n"
-        f"## SAME examples (different wording, same fix)\n"
-        f"- A: 'pullFunds does not decrement underlyingBalance'\n"
-        f"  B: 'pushFunds does not increment underlyingBalance'\n"
-        f"  → SAME if both fix the same missing balance update in the same function family\n"
-        f"- A: 'collectFees uses wrong tickUpper for vesting position (line 167)'\n"
-        f"  B: 'collectPositionFees called with mainPosition.tickUpper instead of vestPosition.tickUpper'\n"
-        f"  → SAME — identical line, identical fix\n"
-        f"- A: 'DoS via uninitialized observation in checkPoolActivity'\n"
-        f"  B: 'checkPoolActivity reverts when observation[0] is uninitialized'\n"
-        f"  → SAME — same function, same trigger, same fix\n\n"
-        f"## DIFFERENT examples (genuinely separate bugs)\n"
-        f"- A: 'pullFunds does not check frozen reserve'\n"
-        f"  B: 'borrow() allows borrowing above utilization cap'\n"
-        f"  → DIFFERENT — different checks, different fixes\n"
-        f"- A: 'collectFees tick mismatch (line 167)'\n"
-        f"  B: 'balances() excludes vesting position liquidity'\n"
-        f"  → DIFFERENT — different functions, different fixes\n\n"
-        f"## Output — EXACTLY one of these two lines, nothing else:\n"
-        f"SAME\n"
-        f"DIFFERENT: <one sentence — what separate code change Finding B requires>"
-    )
+build_is_same_bug_prompt = _build_is_same_bug_prompt_shared
 
 
 # ─── FoundryTester Wrapper Generator ────────────────────────────────────────
@@ -1106,28 +1049,10 @@ def _log_funnel(component: str,
                 poc_confirmed: list,
                 redteam_report: list):
     """Log the pipeline funnel — hypothesis → verification → PoC → RedTeam."""
-    n_hyp = len(all_findings)
-    n_ver = len(verified)
-    n_poc_in = len(poc_candidates)
-    n_poc_out = len(poc_confirmed)
-    n_rt = len(redteam_report)
-
-    def _pct(a, b):
-        return f"{a/b*100:.0f}%" if b else "—"
-
-    logger.info(f"\n  {'─'*52}")
-    logger.info(f"  PIPELINE FUNNEL — {component}")
-    logger.info(f"  {'─'*52}")
-    logger.info(f"  Hypotheses generated:  {n_hyp:>4}")
-    if n_ver:
-        logger.info(f"  Post-verification:     {n_ver:>4}  ({_pct(n_ver, n_hyp)} pass)")
-    if n_poc_in:
-        logger.info(f"  Post-dedup (PoC in):   {n_poc_in:>4}  ({_pct(n_poc_in, n_ver or n_hyp)} of verified)")
-    if n_poc_out:
-        logger.info(f"  PoC confirmed:         {n_poc_out:>4}  ({_pct(n_poc_out, n_poc_in)} pass)")
-    if n_rt:
-        logger.info(f"  RedTeam REPORT:        {n_rt:>4}  ({_pct(n_rt, n_poc_out)} of PoC)")
-    logger.info(f"  {'─'*52}\n")
+    text = format_funnel(component, len(all_findings), len(verified),
+                         len(poc_candidates), len(poc_confirmed), len(redteam_report))
+    for line in text.splitlines():
+        logger.info(f"  {line}")
 
 
 # ─── PoC Helpers (top-level so cross-component can reuse them) ───────────────
@@ -1449,7 +1374,11 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             f"Create these files in {chimera_dir_early}/:\n"
             f"- Setup.sol: abstract contract that deploys {component} with ALL its dependencies.\n"
             f"  COPY the deployment pattern from the project's own tests above — they know their constructor args.\n"
-            f"  Use vm.createSelectFork(vm.envString(\"ETH_RPC_URL\")) in setUp() if the project uses external contracts (Uniswap, real tokens, oracles, etc). NEVER use string alias like \"mainnet\" — always use vm.envString(\"ETH_RPC_URL\").\n"
+            f"  NEVER use vm.createSelectFork or fork in Phase 1 Setup.sol — Phase 1 uses MOCKS for fast feedback (0 RPC calls).\n"
+            f"  For external contracts (Uniswap pools, oracles, tokens): deploy mock contracts that simulate their interface.\n"
+            f"  Use forge's `deal()` for token balances. Use MockERC20 or `deal(address(token), user, amount)` for tokens.\n"
+            f"  For Uniswap V3: create a minimal MockUniswapV3Pool that returns controlled slot0/observe/mint/burn values.\n"
+            f"  Fork testing is ONLY for Phase 3 PoCs (individual tests, not invariant fuzzing).\n"
             f"  MUST define internal variables accessible by Properties: the main contract + tokens + actors.\n"
             f"  Example: `Strategy internal strategy; Vault internal vault; IERC20 internal token0;`\n"
             f"  Define actors: owner, user, depositor, attacker with distinct addresses.\n"
@@ -1706,7 +1635,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                 f"## Source Code\n```solidity\n{source_code}\n```\n\n"
                 f"## Libraries\n```solidity\n{library_code[:20000]}\n```\n\n"
                 f"Create these files in {chimera_dir}/:\n"
-                f"- Setup.sol: deploy {component} with ALL its dependencies. Use mocks for external contracts.\n"
+                f"- Setup.sol: deploy {component} with ALL its dependencies. Use MOCKS for external contracts (no fork, no RPC).\n"
+                f"  NEVER use vm.createSelectFork — Phase 1 is mock-only for fast feedback.\n"
+                f"  For Uniswap V3: create MockUniswapV3Pool. For oracles: MockOracle. For tokens: deal().\n"
                 f"  MUST define: contract instance variables accessible by Properties (e.g., `Strategy internal strategy;`)\n"
                 f"- BeforeAfter.sol: ghost variables and state snapshots\n"
                 f"- Properties.sol: base with ghost vars, inherits BeforeAfter\n"
@@ -2330,96 +2261,12 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         return summary
 
     # ─── Step 10.1: Deduplicate findings by root cause ─────────────────
-    def _dedup_findings(findings_list: list[dict]) -> list[dict]:
-        """Group findings by root cause, return best candidate per group.
-        If the best candidate fails PoC, the next in the group gets a chance.
-
-        Uses function-name + line-number extraction for fingerprinting,
-        since SequenceMatcher on natural language descriptions is too weak."""
-
-        def _extract_fingerprint(f: dict) -> set[str]:
-            """Extract mentioned function names and line numbers as a set of tokens."""
-            text = f"{f.get('root_cause', '')} {f.get('title', '')}".lower()
-            tokens = set()
-            # Extract function names: word followed by ()
-            for m in re.finditer(r'(\w+)\s*\(', text):
-                fn = m.group(1)
-                if fn not in ('line', 'function', 'returns', 'require', 'assert',
-                              'if', 'for', 'while', 'emit', 'revert', 'error'):
-                    tokens.add(f"fn:{fn}")
-            # Extract line numbers
-            for m in re.finditer(r'(?:line|l\.?|:)\s*(\d{2,4})', text):
-                tokens.add(f"line:{m.group(1)}")
-            # Extract key variable names (camelCase identifiers)
-            for m in re.finditer(r'\b([a-z]+[A-Z]\w+)\b', f"{f.get('root_cause', '')} {f.get('title', '')}"):
-                tokens.add(f"var:{m.group(1).lower()}")
-            return tokens
-
-        groups: list[list[dict]] = []
-        group_fps: list[set[str]] = []
-
-        for f in findings_list:
-            fp = _extract_fingerprint(f)
-            if not fp:
-                groups.append([f])
-                group_fps.append(fp)
-                continue
-
-            merged = False
-            for i, group in enumerate(groups):
-                gfp = group_fps[i]
-                if not gfp:
-                    continue
-                # Jaccard similarity on extracted tokens
-                intersection = fp & gfp
-                union = fp | gfp
-                jaccard = len(intersection) / len(union) if union else 0
-                # Function + variable overlap: 1 shared function AND ≥2 non-function tokens
-                # (line numbers or camelCase vars). Requiring 2 specific tokens prevents
-                # false merges of different bugs that happen to share a function name.
-                fn_overlap = {t for t in intersection if t.startswith("fn:")}
-                non_fn_overlap = {t for t in intersection if not t.startswith("fn:")}
-                fn_match = len(fn_overlap) >= 1 and len(non_fn_overlap) >= 2
-                if jaccard > 0.4 or fn_match:
-                    group.append(f)
-                    group_fps[i] = gfp | fp  # expand group fingerprint
-                    merged = True
-                    break
-            if not merged:
-                groups.append([f])
-                group_fps.append(fp)
-
-        # Sort each group by confidence desc, return ordered list of groups
-        for g in groups:
-            g.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-
-        # Tag findings with their group info
-        deduped = []
-        for i, group in enumerate(groups):
-            for rank, f in enumerate(group):
-                f["_dedup_group"] = i
-                f["_dedup_rank"] = rank
-                f["_dedup_group_size"] = len(group)
-            deduped.append(group)
-
-        # Sort groups by convergence-weighted score:
-        # convergence (group size) is primary, confidence is tiebreaker
-        def _group_score(g):
-            convergence = len(g)        # how many hunters found it
-            confidence = g[0].get("confidence", 0)
-            return (convergence, confidence)
-        deduped.sort(key=_group_score, reverse=True)
-
-        total_before = len(findings_list)
-        total_groups = len(deduped)
-        logger.info(f"  Step 10.1: Dedup — {total_before} findings → {total_groups} unique groups")
-        for i, g in enumerate(deduped):
-            leader = g[0]
-            logger.info(f"    Group {i}: {leader['id']} (conv={len(g)}, conf={leader.get('confidence',0)}%) "
-                        f"+ {len(g)-1} dupes — {leader['title'][:60]}")
-        return deduped
-
-    finding_groups = _dedup_findings(findings)
+    finding_groups = _dedup_findings_pure(findings)
+    logger.info(f"  Step 10.1: Dedup — {len(findings)} findings → {len(finding_groups)} unique groups")
+    for i, g in enumerate(finding_groups):
+        leader = g[0]
+        logger.info(f"    Group {i}: {leader['id']} (conv={len(g)}, conf={leader.get('confidence',0)}%) "
+                    f"+ {len(g)-1} dupes — {leader['title'][:60]}")
     poc_findings: list = []        # populated in Step 10.3/10.5 — initialized here for funnel
     escaped_siblings: list = []    # Capa 3: siblings that are different bugs (Step 10.6)
     fallback_findings: list = []   # Capa 2: fallbacks when group leader fails PoC (Step 10.5b)
@@ -2430,23 +2277,6 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     # This replicates the manual auditor step: suspect bug → re-read focused code
     # → confirm before investing 15 min in a Foundry PoC.
     # POC_CONFIDENCE_THRESHOLD is a module-level constant (65) shared with cross-component.
-
-    def _collect_verify_candidates(groups: list[list[dict]]) -> list[dict]:
-        """Collect ALL findings above confidence threshold for verification.
-        No artificial location-based dedup — the verification step itself is the filter.
-        Only skip exact ID duplicates."""
-        seen_ids: set[str] = set()
-        candidates = []
-        for group in groups:
-            for f in group:
-                if not (f.get("fuzz_confirmed") or f.get("confidence", 0) >= POC_CONFIDENCE_THRESHOLD):
-                    continue
-                fid = f.get("id", "")
-                if fid in seen_ids:
-                    continue
-                seen_ids.add(fid)
-                candidates.append(f)
-        return sorted(candidates, key=lambda x: x.get("confidence", 0), reverse=True)
 
     def _verify_finding(finding: dict) -> tuple[bool, str, str]:
         """Quick code-read verification: re-read the specific function and confirm
@@ -2484,7 +2314,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         logger.info(f"    [{status}] {fid}: {reason[:80]}")
         return is_real, reason, poc_hint
 
-    verify_candidates = _collect_verify_candidates(finding_groups)
+    verify_candidates = _collect_verify_candidates_pure(finding_groups, POC_CONFIDENCE_THRESHOLD)
     logger.info(f"  Step 10.2: Verifying {len(verify_candidates)} distinct hypotheses "
                 f"({min(10, len(verify_candidates))} parallel)")
 
@@ -2535,26 +2365,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         # Strategy: keep only the best representative per dedup group (lowest rank
         # = highest confidence). If the leader's PoC fails, the group's fallbacks
         # are still attempted in _process_finding's retry logic.
-        def _dedup_for_poc(candidates: list) -> list:
-            """Return one representative per dedup group (highest confidence)."""
-            best_per_group: dict = {}  # group_id → finding
-            ungrouped = []
-            for f in candidates:
-                gid = f.get("_dedup_group")
-                if gid is None:
-                    ungrouped.append(f)
-                    continue
-                rank = f.get("_dedup_rank", 0)
-                existing = best_per_group.get(gid)
-                if existing is None or rank < existing.get("_dedup_rank", 999):
-                    best_per_group[gid] = f
-            result = list(best_per_group.values()) + ungrouped
-            result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-            return result
-
         if verified_findings:
             pre_dedup = len(verified_findings)
-            poc_findings = _dedup_for_poc(verified_findings)
+            poc_findings = _dedup_for_poc_pure(verified_findings)
             post_dedup = len(poc_findings)
             if pre_dedup != post_dedup:
                 logger.info(f"  Step 10.3: Dedup before PoC — {pre_dedup} verified → "
@@ -2829,230 +2642,29 @@ def parse_fuzz_failures(phase1_log: Path, phase2_log: Path = None) -> dict[str, 
     return failed
 
 
-def _extract_relevant_code(source_code: str, library_code: str, finding: dict) -> str:
-    """Extract source code sections relevant to a specific finding.
-
-    Provides a focused view: the exact functions + line ranges mentioned,
-    rather than the full 30k contract. This replicates what a manual auditor
-    has in their head when writing a PoC.
-    """
-    import re as _re
-
-    all_source = source_code + "\n\n" + (library_code or "")
-
-    # Step 1: Extract function names + line numbers from finding fields
-    finding_text = " ".join([
-        finding.get("title", ""),
-        finding.get("root_cause", ""),
-        finding.get("description", ""),
-        finding.get("attack_scenario", ""),
-    ])
-    vuln_loc = finding.get("vulnerable_location") or {}
-    if vuln_loc.get("function"):
-        finding_text += " " + vuln_loc["function"] + "("
-    if vuln_loc.get("vulnerable_code"):
-        finding_text += " " + vuln_loc["vulnerable_code"]
-
-    SKIP_WORDS = {
-        "if", "for", "while", "require", "assert", "emit", "revert", "return",
-        "new", "delete", "type", "uint256", "uint128", "uint64", "int256",
-        "address", "bytes", "bytes32", "string", "bool", "mapping", "memory",
-        "storage", "calldata", "public", "private", "external", "internal",
-        "view", "pure", "override", "virtual", "immutable", "constant",
-        "function", "event", "modifier", "struct", "error", "interface",
-        "contract", "library", "abstract", "constructor", "fallback", "receive",
-    }
-
-    fn_names = []
-    seen_fns = set()
-    for m in _re.finditer(r'\b(\w+)\s*\(', finding_text):
-        fn = m.group(1)
-        if fn not in SKIP_WORDS and len(fn) > 2 and fn not in seen_fns:
-            fn_names.append(fn)
-            seen_fns.add(fn)
-
-    # Explicit line numbers
-    explicit_lines = []
-    for m in _re.finditer(r'(?:line|l\.?)\s*(\d{2,4})\b', finding_text, _re.IGNORECASE):
-        ln = int(m.group(1))
-        if 1 <= ln <= 5000:
-            explicit_lines.append(ln)
-    if vuln_loc.get("lines"):
-        raw = vuln_loc["lines"]
-        if isinstance(raw, list):
-            explicit_lines.extend([int(x) for x in raw if str(x).isdigit()])
-        elif isinstance(raw, (int, str)):
-            try:
-                explicit_lines.append(int(str(raw).split("-")[0]))
-            except ValueError:
-                pass
-
-    sections = []
-    used_ranges = []  # (start, end) line ranges already included
-
-    source_lines = all_source.splitlines()
-
-    def _add_range(start_ln: int, end_ln: int, label: str = ""):
-        """Add a line range to sections, avoiding duplicates."""
-        for used_s, used_e in used_ranges:
-            if start_ln <= used_e and end_ln >= used_s:
-                return  # overlaps existing range
-        used_ranges.append((start_ln, end_ln))
-        snippet = "\n".join(
-            f"{i+1:4d}: {l}"
-            for i, l in enumerate(source_lines[start_ln:end_ln], start_ln)
-        )
-        if label:
-            sections.append(f"// === {label} ===\n{snippet}")
-        else:
-            sections.append(snippet)
-
-    # Step 2: Extract function bodies for each mentioned function
-    for fn_name in fn_names[:6]:  # limit to 6 functions to keep output focused
-        pattern = _re.compile(
-            r'^\s*(?:function\s+' + _re.escape(fn_name) + r'\b)',
-            _re.MULTILINE
-        )
-        for match in pattern.finditer(all_source):
-            fn_start_char = match.start()
-            # Find the opening brace
-            brace_pos = all_source.find('{', fn_start_char)
-            if brace_pos == -1 or brace_pos - fn_start_char > 500:
-                continue
-            # Walk forward counting braces to find the end
-            depth = 0
-            end_char = brace_pos
-            for i, ch in enumerate(all_source[brace_pos:], brace_pos):
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end_char = i + 1
-                        break
-            # Convert char positions to line numbers
-            start_ln = all_source[:fn_start_char].count('\n')
-            end_ln = all_source[:end_char].count('\n') + 1
-            # Skip enormous functions (>150 lines) — include partial view
-            if end_ln - start_ln > 150:
-                end_ln = start_ln + 150
-            _add_range(start_ln, end_ln, f"function {fn_name}")
-            break  # only first definition
-
-    # Step 3: Add ±30 lines around specific line numbers
-    for ln in explicit_lines[:5]:
-        start_ln = max(0, ln - 30)
-        end_ln = min(len(source_lines), ln + 30)
-        _add_range(start_ln, end_ln, f"context around line {ln}")
-
-    if not sections:
-        # Fallback: no functions/lines found in finding — return first 8K (cap consistent
-        # with the main path above). For cross-component callers, source_code is combined_source
-        # so this may show the wrong contract, but the model has file access to read more.
-        return source_code[:8000]
-
-    result = "\n\n".join(sections)
-    # Cap at 8000 chars to stay within budget
-    if len(result) > 8000:
-        result = result[:8000] + "\n// ... (truncated)"
-    return result
+_extract_relevant_code = _extract_relevant_code_shared
 
 
 def extract_findings(component: str, protocol: str,
                      fuzz_failures: dict[str, str] = None) -> list[dict]:
     """Extract findings from hypothesis files, prioritizing fuzz-confirmed ones.
 
-    Two tiers:
-    - CONFIRMED: hypothesis whose solidity_property function name matches a fuzz failure
-    - UNCONFIRMED: high-confidence hypothesis without fuzz proof (lower priority)
-
-    fuzz_failures: dict mapping function name → counterexample trace
+    Thin wrapper around finding_pipeline.extract_findings_from_yaml that adds
+    logging and constructs hyp_dir from HUNT_SESSION_DIR.
     """
-    import yaml
-
     hyp_dir = HUNT_SESSION_DIR / "hypotheses" / protocol
-    confirmed = []
-    unconfirmed = []
-    seen_ids = set()
+    findings = extract_findings_from_yaml(hyp_dir, component, fuzz_failures)
 
-    fuzz_failures = fuzz_failures or {}
-
-    for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
-        if "CrossChain" in hyp_file.name:
-            continue
-        try:
-            data = yaml.safe_load(hyp_file.read_text())
-            if not data:
-                continue
-            hypotheses = data.get("hypotheses", data.get("invariants", data.get("findings", [])))
-            for hyp in hypotheses:
-                fid = hyp.get("id", "UNKNOWN")
-                if fid in seen_ids:
-                    continue
-
-                tier = hyp.get("tier", 3)
-                confidence = hyp.get("confidence", 0)
-
-                # Map tier → severity (hunters use tier, not severity)
-                severity = hyp.get("severity", "")
-                if not severity:
-                    severity = {1: "High", 2: "Medium"}.get(tier, "Low")
-                if severity not in ("High", "Medium", "Critical"):
-                    continue
-                validated = hyp.get("validated", False)
-
-                # Check if this hypothesis has a matching fuzz failure
-                sol_prop = hyp.get("solidity_property", hyp.get("solidity", ""))
-                prop_name = ""
-                if sol_prop:
-                    import re
-                    match = re.search(r'function\s+(invariant_\w+|check_\w+|echidna_\w+|property_\w+)', sol_prop)
-                    if match:
-                        prop_name = match.group(1)
-
-                fuzz_confirmed = prop_name in fuzz_failures if prop_name else False
-                counterexample_trace = fuzz_failures.get(prop_name, "") if prop_name else ""
-
-                # Derive hunter name from filename: hyp_Strategy_MathHunter.yaml → "MathHunter"
-                _stem_parts = hyp_file.stem.split("_", 2)
-                _hunter_name = _stem_parts[2] if len(_stem_parts) >= 3 else hyp_file.stem
-
-                finding = {
-                    "id": fid,
-                    "title": hyp.get("title", hyp.get("description", "")),
-                    "severity": severity,
-                    "confidence": confidence,
-                    "root_cause": hyp.get("root_cause", hyp.get("attack_scenario", "")),
-                    "source_file": hyp_file.name,
-                    "hunter": _hunter_name,
-                    "fuzz_confirmed": fuzz_confirmed,
-                    "property_name": prop_name,
-                    "counterexample_trace": counterexample_trace,
-                    "vulnerable_location": hyp.get("vulnerable_location"),
-                }
-
-                if fuzz_confirmed:
-                    confirmed.append(finding)
-                    logger.info(f"    CONFIRMED by fuzzer: {fid} ({prop_name})")
-                elif (validated and confidence >= 60) or tier == 1:
-                    unconfirmed.append(finding)
-
-                seen_ids.add(fid)
-        except Exception as e:
-            logger.warning(f"  Failed to parse {hyp_file}: {e}")
-
-    unconfirmed.sort(key=lambda f: f.get("confidence", 0), reverse=True)
-
+    # Log fuzz-confirmed findings
+    confirmed = [f for f in findings if f.get("fuzz_confirmed")]
+    unconfirmed = [f for f in findings if not f.get("fuzz_confirmed")]
+    for f in confirmed:
+        logger.info(f"    CONFIRMED by fuzzer: {f['id']} ({f.get('property_name', '')})")
     if confirmed:
-        # Full mode with fuzz results: confirmed go first, unconfirmed capped at 10
-        # (the fuzz IS the filter — unconfirmed are low-priority fallback)
         logger.info(f"  {len(confirmed)} fuzz-confirmed findings, {len(unconfirmed)} unconfirmed")
-        return confirmed + unconfirmed[:10]
     else:
-        # No fuzz (fast mode) or fuzz found nothing: return all sorted by confidence.
-        # PoC generation is capped separately (top N) to keep runtime reasonable.
         logger.info(f"  0 fuzz-confirmed — {len(unconfirmed)} unconfirmed findings sorted by confidence")
-        return unconfirmed
+    return findings
 
 
 # ─── Finding Pipeline ────────────────────────────────────────────────────────
@@ -3700,6 +3312,12 @@ def main():
     ))
     parser.add_argument("--mode", choices=["api", "agent"], default="api",
                         help="Execution mode: 'api' (subprocess, needs API key) or 'agent' (generates plan for Claude Code skill, uses subscription)")
+    parser.add_argument("--lang", default="",
+                        help="Contract language: solidity, rust (auto-detected from repo if empty)")
+    parser.add_argument("--chain", default="mainnet",
+                        help="Target chain for fork PoCs (mainnet, base, optimism, arbitrum, polygon)")
+    parser.add_argument("--fork-block", type=int, default=0,
+                        help="Fork block for PoCs. 0 = latest (portable), N = pinned (deterministic)")
 
     args = parser.parse_args()
 
@@ -3745,6 +3363,11 @@ def main():
             repo=repo_path, components=components_list, protocol=args.protocol,
             session_dir=str(HUNT_SESSION_DIR), ground_truth=args.ground_truth or "",
             is_pre_production=IS_PRE_PRODUCTION, fast=args.fast,
+            benchmark_mode=getattr(args, "benchmark_mode", "redteam"),
+            parallel_components=getattr(args, "parallel_components", 2),
+            chain=getattr(args, "chain", "mainnet"),
+            fork_block=getattr(args, "fork_block", 0),
+            lang=getattr(args, "lang", ""),
         )
         errors = validate_plan(plan)
         if errors:
@@ -3753,13 +3376,32 @@ def main():
                 logger.error(f"  - {e}")
             sys.exit(1)
         plan_path = HUNT_SESSION_DIR / "execution_plan.json"
-        plan.to_json(plan_path)
-        logger.info(f"Execution plan written: {plan_path} ({len(plan.steps)} steps)")
-        print(f"\n{'='*60}")
-        print(f"  AGENT MODE — Plan generated ({len(plan.steps)} steps)")
-        print(f"  Run this in Claude Code:")
-        print(f"  /run-benchmark-agent {plan_path}")
-        print(f"{'='*60}\n")
+        plan.to_json(str(plan_path))
+        n_steps = len(plan.steps)
+        if plan.teams:
+            groups = plan.teams["groups"]
+            sub_steps = sum(
+                len(__import__("json").load(open(g["plan_file"]))["steps"])
+                for g in groups
+            )
+            logger.info(f"Execution plan written: {plan_path}")
+            logger.info(f"  Master plan: {n_steps} steps (cross + scoring)")
+            logger.info(f"  Sub-plans: {len(groups)} groups, {sub_steps} steps total")
+            for g in groups:
+                logger.info(f"    group-{g['group_id']}: {g['components']} → {g['plan_file']}")
+            print(f"\n{'='*60}")
+            print(f"  AGENT MODE + TEAMS — {len(groups)} parallel groups")
+            print(f"  Master: {n_steps} steps | Sub-plans: {sub_steps} steps")
+            print(f"  Run this in Claude Code:")
+            print(f"  /run-benchmark-agent {plan_path}")
+            print(f"{'='*60}\n")
+        else:
+            logger.info(f"Execution plan written: {plan_path} ({n_steps} steps)")
+            print(f"\n{'='*60}")
+            print(f"  AGENT MODE — Plan generated ({n_steps} steps)")
+            print(f"  Run this in Claude Code:")
+            print(f"  /run-benchmark-agent {plan_path}")
+            print(f"{'='*60}\n")
         return
 
     components = [c.strip() for c in args.components.split(",")]
