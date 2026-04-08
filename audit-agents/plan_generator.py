@@ -1540,175 +1540,64 @@ def phase_findings(
     lang: str = "solidity",
     parallel_components: int = 1,
 ) -> list[dict]:
-    """Read hypothesis YAMLs and return Fork PoC + RedTeam steps.
+    """Emit triage pipeline steps via finding_pipeline.py CLI phases.
 
     benchmark_mode controls which stages are emitted:
-    - "hypothesis": skip entire finding pipeline (return early)
-    - "poc": emit Fork PoC steps only (2 parallel per batch)
-    - "redteam": emit Fork PoC + RedTeam steps (sequential per finding after PoC)
+    - "hypothesis": skip entire finding pipeline (scoring against raw YAMLs)
+    - "poc"/"redteam": emit triage chain (dedup → verify → PoC → Capa 2+3 → RedTeam)
 
-    Fork PoC uses real fork (ETH_RPC_URL) for individual test confirmation.
-    Phase 1 mocks already ran — this is Phase 3 (fork confirmation).
-    Only findings with confidence >= 70% and validated=true get PoCs.
+    Solidity: delegates to finding_pipeline.py phase chain.
+    Rust: uses existing inline logic (_phase_findings_rust).
     """
 
     # In hypothesis mode, scoring happens against YAML files directly — no finding pipeline
     if benchmark_mode == "hypothesis":
         return [{"status": "hypothesis_mode_skip", "component": component}]
 
-    hyp_dir = _hyp_dir(session_dir, protocol)
-    findings: list[dict] = []
-
-    try:
-        import yaml as _yaml
-    except ImportError:
-        _yaml = None
-        return []
-
-    # Collect validated findings with confidence >= 70%
-    for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
-        try:
-            data = _yaml.safe_load(hyp_file.read_text())
-            if not data:
-                continue
-            hunter_name = hyp_file.stem.replace(f"hyp_{component}_", "")
-            hyps = data.get("hypotheses", data.get("findings", data.get("invariants", [])))
-            for h in (hyps or []):
-                if not isinstance(h, dict):
-                    continue
-                if h.get("confidence", 0) >= 70 and h.get("validated", False):
-                    h["hunter"] = hunter_name
-                    h["component"] = component
-                    findings.append(h)
-        except Exception:
-            pass
-
-    if not findings:
-        return [{"status": "no_findings", "component": component}]
-
     is_rust = (lang == "rust")
-    gen_cmd = f"{sys.executable} {SCRIPT_DIR / 'plan_generator.py'}"
-    src_dir = _src_dir(repo, lang, component)
-
-    # ── Rust path: RedTeam only (no Fork PoC) ──
     if is_rust:
+        # Rust path: collect findings inline, delegate to _phase_findings_rust
+        hyp_dir = _hyp_dir(session_dir, protocol)
+        findings: list[dict] = []
+        try:
+            import yaml as _yaml
+        except ImportError:
+            return []
+        for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
+            try:
+                data = _yaml.safe_load(hyp_file.read_text())
+                if not data:
+                    continue
+                hunter_name = hyp_file.stem.replace(f"hyp_{component}_", "")
+                hyps = data.get("hypotheses", data.get("findings", data.get("invariants", [])))
+                for h in (hyps or []):
+                    if not isinstance(h, dict):
+                        continue
+                    if h.get("confidence", 0) >= 70 and h.get("validated", False):
+                        h["hunter"] = hunter_name
+                        h["component"] = component
+                        findings.append(h)
+            except Exception:
+                pass
+        if not findings:
+            return [{"status": "no_findings", "component": component}]
+        src_dir = _src_dir(repo, lang, component)
         return _phase_findings_rust(findings, component, protocol, repo, session_dir, benchmark_mode, src_dir)
 
-    # ── Solidity path: Fork PoC + RedTeam ──
-    steps: list[dict] = []
-    POC_PARALLEL = 2
-    batches = [findings[i:i + POC_PARALLEL] for i in range(0, len(findings), POC_PARALLEL)]
-
-    # Step 0: Create shared ForkSetup.sol (one fork, all PoCs reuse cache)
-    poc_dir = Path(repo) / "test" / "poc"
-    fork_setup_path = poc_dir / "ForkSetup.sol"
-    fork_snippet = _fork_sol_snippet(chain, fork_block)
-    # Use plan_generator.py --phase write-fork-setup to avoid shell escaping
-    fork_setup_cmd = (
-        f"mkdir -p {poc_dir} && "
-        f"{sys.executable} {SCRIPT_DIR / 'plan_generator.py'} "
-        f"--phase write-fork-setup "
-        f"--repo {repo} --protocol {protocol} --session-dir {session_dir} "
-        f"--chain {chain} --fork-block {fork_block}"
-    )
-    setup_fork_step_id = f"{component}:create_fork_setup"
-    steps.append({
-        "id": setup_fork_step_id,
-        "type": "bash",
-        "description": f"Create shared ForkSetup.sol for {component} PoCs",
-        "command": fork_setup_cmd,
-        "timeout": 30,
-    })
-
-    prev_batch_ids: list[str] = [setup_fork_step_id]
-
-    for batch_idx, batch in enumerate(batches):
-        batch_poc_ids: list[str] = []
-
-        for i_in_batch, f in enumerate(batch):
-            global_idx = batch_idx * POC_PARALLEL + i_in_batch
-            fid = f.get("id", f"F-{component}-{global_idx:03d}")
-            severity = f.get("severity", "Unknown")
-            title = f.get("title", f.get("description", "N/A"))[:80]
-
-            # ── Fork PoC generation step ──
-            poc_step_id = f"{component}:fork_poc:{fid}"
-            batch_poc_ids.append(poc_step_id)
-
-            # Build prompt for fork PoC — uses generate phase for dynamic prompt
-            poc_prompt_id = f"{component}:fork_poc_prompt:{fid}"
-            steps.append({
-                "id": poc_prompt_id,
-                "type": "generate",
-                "description": f"Build Fork PoC prompt for {fid}",
-                "command": (
-                    f"{gen_cmd} --phase fork-poc-prompt "
-                    f"--component {component} --protocol {protocol} "
-                    f"--repo {repo} --session-dir {session_dir} "
-                    f"--finding-id {fid} --chain {chain} --fork-block {fork_block}"
-                    + (f" --parallel-components {parallel_components}" if parallel_components > 1 else "")
-                ),
-                "depends_on": prev_batch_ids[:],
-                "parallel_group": f"{component}:poc_prompt_batch_{batch_idx}",
-                "timeout": 60,
-            })
-
-            steps.append({
-                "id": poc_step_id,
-                "type": "agent",
-                "description": f"Fork PoC for {fid}: {title}",
-                "prompt": "__DYNAMIC__",
-                "tools": ["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-                "depends_on": [poc_prompt_id],
-                "parallel_group": f"{component}:poc_batch_{batch_idx}",
-                "timeout": 600,
-                "retry": 1,
-            })
-
-            # ── RedTeam step (redteam mode only, sequential after PoC) ──
-            if benchmark_mode == "redteam":
-                steps.append({
-                    "id": f"{component}:redteam:{fid}",
-                    "type": "agent",
-                    "description": f"RedTeam {fid}: {title}",
-                    "prompt": (
-                        f"RedTeam this finding for {component} in {protocol}.\n"
-                        f"Act as 4 adversarial reviewers trying to KILL this finding.\n\n"
-                        f"## Finding Details\n"
-                        f"- ID: {fid}\n"
-                        f"- Title: {title}\n"
-                        f"- Severity: {severity}\n"
-                        f"- Confidence: {f.get('confidence', 0)}%\n"
-                        f"- Hunter: {f.get('hunter', 'N/A')}\n"
-                        f"- Description: {f.get('description', 'N/A')}\n"
-                        f"- Attack: {f.get('attack_scenario', 'N/A')}\n\n"
-                        f"## Invariant (from Phase 1 fuzzing)\n"
-                        f"```solidity\n{f.get('solidity', 'N/A')}\n```\n\n"
-                        f"## Your Task\n"
-                        f"1. Read the source code at {src_dir}/{component}.sol\n"
-                        f"2. Check if a Fork PoC exists in {repo}/test/ for this finding\n"
-                        f"3. Apply rejection rules:\n"
-                        f"   - R1: Attack requires admin/owner role → REJECT\n"
-                        f"   - R2: View-only/no-op function → REJECT\n"
-                        f"   - R3: Config/pause is off-chain signal → REJECT\n"
-                        f"   - R4: Contract not in scope → REJECT\n"
-                        f"   - R5: No funds at risk, no access control bypass → REJECT\n"
-                        f"4. Assess: Is the PoC convincing? Does it show real fund loss?\n"
-                        f"5. Conclude with ONE of:\n"
-                        f"   RESULTADO: REPORT | REPORT_DOWNGRADED | DO_NOT_REPORT\n"
-                        f"   Include kill_reason if not REPORT.\n\n"
-                        f"Write your verdict to: {session_dir}/redteam_{fid}.json\n"
-                        f"Format: {{\"finding_id\": \"{fid}\", \"verdict\": \"...\", "
-                        f"\"kill_reason\": \"...\", \"severity_adjustment\": \"...\"}}"
-                    ),
-                    "tools": ["Read", "Write", "Grep", "Glob", "Bash"],
-                    "depends_on": [poc_step_id],
-                    "timeout": 300,
-                })
-
-        prev_batch_ids = batch_poc_ids[:]
-
-    return steps
+    # ── Solidity path: delegate to finding_pipeline.py triage chain ──
+    pipeline_cmd = f"{sys.executable} {SCRIPT_DIR / 'finding_pipeline.py'}"
+    return [{
+        "id": _step_id(component, "triage_dedup"),
+        "type": "generate",
+        "description": f"Triage Phase 1: dedup {component} hypotheses",
+        "command": (
+            f"{pipeline_cmd} --phase dedup "
+            f"--component {component} --protocol {protocol} "
+            f"--session-dir {session_dir} --repo {repo} "
+            f"--threshold 65 --lang {lang}"
+        ),
+        "timeout": 120,
+    }]
 
 
 def _phase_findings_rust(
