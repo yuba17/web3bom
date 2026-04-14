@@ -399,5 +399,103 @@ def main():
     print(f"    cd foundry-workspace && forge test --match-path test/poc/ -vvvv")
 
 
+# ─── Iterative PoC Repair Loop (A1/SPEAR pattern) ───────────────────────────
+
+MAX_REPAIR_ATTEMPTS = 5
+
+CATEGORY_TEMPLATES = {
+    "accounting": ["base_defi_setup.sol", "token_decimals.sol"],
+    "oracle": ["base_defi_setup.sol", "oracle_manipulation.sol"],
+    "dos": ["base_defi_setup.sol"],
+    "logic": ["base_defi_setup.sol"],
+    "rounding": ["base_defi_setup.sol", "token_decimals.sol"],
+    "liquidation": ["base_defi_setup.sol", "liquidation_setup.sol"],
+    "access": ["base_defi_setup.sol"],
+    "reentrancy": ["base_defi_setup.sol"],
+    "timing": ["base_defi_setup.sol", "time_advance.sol"],
+    "dex": ["base_defi_setup.sol", "multi_hop.sol"],
+}
+
+TEMPLATES_DIR = Path(__file__).parent / "poc_templates"
+
+
+def select_template(category: str) -> str:
+    """Select relevant PoC template content for a bug category."""
+    template_names = CATEGORY_TEMPLATES.get(category, ["base_defi_setup.sol"])
+    combined = []
+    for name in template_names:
+        tpl_path = TEMPLATES_DIR / name
+        if tpl_path.exists():
+            combined.append(f"// === Template: {name} ===\n{tpl_path.read_text()}")
+    return "\n\n".join(combined) if combined else ""
+
+
+def run_forge_build(poc_path: Path, cwd: str = None) -> tuple[bool, str]:
+    """Compile PoC with forge. Returns (success, error_output)."""
+    import subprocess
+    result = subprocess.run(
+        ["forge", "build", "--force"],
+        capture_output=True, text=True, timeout=120,
+        cwd=cwd or str(poc_path.parent.parent.parent)
+    )
+    return result.returncode == 0, result.stderr[:2000]
+
+
+def run_forge_test(poc_path: Path, cwd: str = None) -> tuple[bool, str]:
+    """Run PoC test with forge. Returns (success, output)."""
+    import subprocess
+    result = subprocess.run(
+        ["forge", "test", "--match-path", str(poc_path), "-vvv", "--fuzz-runs", "1"],
+        capture_output=True, text=True, timeout=120,
+        cwd=cwd or str(poc_path.parent.parent.parent)
+    )
+    output = result.stdout + result.stderr
+    return result.returncode == 0, output[:3000]
+
+
+def build_repair_prompt(poc_code: str, error_output: str, hypothesis: dict,
+                        phase: str = "compile") -> str:
+    """Build a prompt for LLM to fix PoC errors."""
+    fix_hints = ""
+    if phase == "execution":
+        fix_hints = """Common fixes for execution failures:
+- Missing vm.deal() for ETH/token balances
+- Missing token approve() before transfers
+- Wrong function call order (need to initialize before use)
+- Need vm.warp() for time-dependent logic
+- Need vm.prank() for caller identity
+- Wrong constructor arguments or deployment params
+- Interface mismatch (wrong function signature)"""
+    else:
+        fix_hints = """Common fixes for compilation failures:
+- Missing imports (forge-std/Test.sol, interfaces)
+- Type mismatches (uint256 vs uint128, address vs contract)
+- Missing function implementations in interfaces
+- Solidity version pragma mismatch"""
+
+    return f"""Fix this Foundry PoC that fails during {phase}.
+
+## Error Output
+```
+{error_output}
+```
+
+## Current PoC Code
+```solidity
+{poc_code}
+```
+
+## Bug Being Tested
+Title: {hypothesis.get('title', hypothesis.get('description', ''))}
+Category: {hypothesis.get('category', hypothesis.get('type', 'unknown'))}
+Root cause: {hypothesis.get('root_cause', hypothesis.get('attack_scenario', ''))}
+
+## Instructions
+Fix ONLY the {phase} errors. Do not change the test logic or the vulnerability being tested.
+{fix_hints}
+
+Return ONLY the corrected Solidity code, no explanation."""
+
+
 if __name__ == "__main__":
     main()

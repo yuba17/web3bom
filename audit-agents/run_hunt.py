@@ -40,6 +40,134 @@ KNOWLEDGE_DIR = WEB3_DIR / "knowledge"
 SOLODIT_SEARCH = AUDIT_AGENTS_DIR / "solodit_search.py"
 
 
+def mark_gate(component: str, gate: str):
+    """Mark a pipeline gate as completed after a phase finishes."""
+    try:
+        subprocess.run([
+            "python3", str(AUDIT_AGENTS_DIR / "pipeline_gate.py"),
+            "-c", component, "--mark", gate
+        ], check=False, capture_output=True)
+    except Exception:
+        pass
+
+
+def query_wiki_context(domain: str, component: str) -> str:
+    """Query Obsidian vault for relevant prior knowledge.
+
+    Searches recursively through vault subdirectories (concepts/, references/,
+    synthesis/) but caps output to ~2500 chars to avoid saturating hunter prompts.
+    """
+    vault_dir = Path.home() / "obsidian-vault" / "web3-audit"
+    if not vault_dir.exists():
+        return ""
+    skip_dirs = {"_raw", "_archives", ".obsidian", "projects"}
+    skip_files = {"index.md", "log.md"}
+    results = []
+    domain_l, comp_l = domain.lower(), component.lower()
+    for md_file in vault_dir.glob("**/*.md"):
+        if md_file.name.startswith("_") or md_file.name in skip_files:
+            continue
+        if any(part in skip_dirs for part in md_file.relative_to(vault_dir).parts):
+            continue
+        try:
+            content = md_file.read_text(errors="ignore")
+        except Exception:
+            continue
+        lower = content.lower()
+        if domain_l in lower or comp_l in lower:
+            # Extract summary from frontmatter if available (cheap context)
+            summary = ""
+            if content.startswith("---"):
+                end = content.find("---", 3)
+                if end != -1:
+                    for line in content[3:end].splitlines():
+                        if line.strip().startswith("summary:"):
+                            summary = line.split("summary:", 1)[1].strip()
+                            break
+            snippet = summary if summary else content[:300]
+            results.append(f"- **{md_file.stem}**: {snippet}")
+    if not results:
+        return ""
+    # Max 8 results, prefer shorter summaries to stay under ~2500 chars
+    return "\n---\n## Prior Knowledge (Obsidian Vault)\n" + "\n".join(results[:8])
+
+
+def load_graph_report(protocol: str) -> str:
+    """Load graphify GRAPH_REPORT.md for protocol if available."""
+    graph_dir = HUNT_SESSION_DIR / "graph" / protocol
+    for report_name in ("GRAPH_REPORT.md", "graphify-out/GRAPH_REPORT.md"):
+        report = graph_dir / report_name
+        if report.exists():
+            content = report.read_text(errors="ignore")
+            if len(content) > 3000:
+                content = content[:3000] + "\n[... truncated]"
+            return f"\n## Structural Graph (Graphify)\n{content}\n"
+    return ""
+
+
+def load_rejection_context() -> str:
+    """Load rejection rules as anti-patterns for hunters."""
+    rules_path = HUNT_SESSION_DIR / "feedback" / "rejection_rules.yaml"
+    if not rules_path.exists():
+        return ""
+    try:
+        with open(rules_path) as f:
+            rules = yaml.safe_load(f)
+        if not rules:
+            return ""
+        lines = ["\n## Anti-Patterns (Rechazados en plataformas reales -- NO reportar estos)"]
+        categories = rules.get("rejection_categories", {})
+        for cat_name, cat_data in categories.items():
+            if cat_name == "duplicate":
+                continue  # duplicates are not anti-patterns, just competition
+            rule_text = cat_data.get("rule", "")
+            count = cat_data.get("count", 0)
+            if rule_text:
+                lines.append(f"- **{cat_name}** ({count}x rechazado): {rule_text}")
+        for lesson in rules.get("lessons", []):
+            lines.append(f"- {lesson}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+    except Exception:
+        return ""
+
+
+def load_few_shot_examples(hunter_domain: str) -> str:
+    """Load 2-3 relevant few-shot examples for this hunter's domain."""
+    domain_categories = {
+        "math": ["rounding", "accounting"], "access": ["access"],
+        "flow": ["accounting", "logic"], "oracle": ["oracle"],
+        "domain": ["logic", "accounting"], "dos": ["dos"],
+        "logic": ["logic"], "adversarial": ["accounting", "oracle", "logic"],
+        "trust": ["access", "logic"], "signature": ["access"],
+        "wildcard": ["logic", "dos"],
+    }
+    cats = domain_categories.get(hunter_domain, ["logic"])
+    examples_dir = AUDIT_AGENTS_DIR / "few_shot_examples"
+    if not examples_dir.exists():
+        return ""
+    results = []
+    for cat in cats:
+        cat_file = examples_dir / f"{cat}.yaml"
+        if not cat_file.exists():
+            continue
+        try:
+            data = yaml.safe_load(cat_file.read_text())
+            for ex in data.get("examples", [])[:2]:
+                results.append(
+                    f"### {ex.get('title', '?')} ({ex.get('source', '')})\n"
+                    f"```solidity\n{ex.get('vulnerable_code', '').strip()}\n```\n"
+                    f"{ex.get('explanation', '').strip()}\n"
+                )
+        except Exception:
+            continue
+    if not results:
+        return ""
+    return (
+        "\n---\n## Ejemplos Reales de Bugs (Few-Shot — bugs confirmados en auditorías reales)\n"
+        + "\n".join(results[:3])
+    )
+
+
 def get_hyp_dir(protocol: str) -> Path:
     """Return protocol-namespaced hypotheses directory."""
     d = HUNT_SESSION_DIR / "hypotheses" / protocol
@@ -260,6 +388,61 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
 }
 
 
+def select_hunters(contract_source: str, protocol_type: str = None,
+                   profiles_path: str = None) -> list[str]:
+    """Select hunters based on code features and protocol type.
+    Tier 0 always. Tier 1 if triggers match. Tier 2 if triggers match.
+    Returns ordered list of hunter names."""
+    if profiles_path is None:
+        profiles_path = str(AUDIT_AGENTS_DIR / "hunter_profiles.yaml")
+    profiles_file = Path(profiles_path)
+    if not profiles_file.exists():
+        # Fallback: return all known hunters
+        return list(HUNTER_DOMAINS.keys())
+
+    with open(profiles_file) as f:
+        profiles = yaml.safe_load(f)
+
+    source_lower = contract_source.lower()
+    selected = list(profiles.get("tier0", []))
+
+    if not protocol_type:
+        protocol_type = detect_protocol_type(source_lower, profiles)
+
+    for tier_key in ("tier1", "tier2"):
+        for hunter, config in profiles.get(tier_key, {}).items():
+            triggers = config.get("triggers", [])
+            ptypes = config.get("protocol_types", ["*"])
+            min_loc = config.get("min_loc", 0)
+
+            if "*" not in ptypes and protocol_type not in ptypes:
+                continue
+            if triggers and any(t.lower() in source_lower for t in triggers):
+                selected.append(hunter)
+                continue
+            if min_loc and source_lower.count("\n") >= min_loc:
+                selected.append(hunter)
+
+    return list(dict.fromkeys(selected))  # deduplicate preserving order
+
+
+def detect_protocol_type(source_lower: str, profiles: dict = None) -> str:
+    """Auto-detect protocol type from source code."""
+    if profiles is None:
+        profiles_path = AUDIT_AGENTS_DIR / "hunter_profiles.yaml"
+        if profiles_path.exists():
+            with open(profiles_path) as f:
+                profiles = yaml.safe_load(f)
+        else:
+            return "unknown"
+    scores = {}
+    for ptype, keywords in profiles.get("protocol_type_signals", {}).items():
+        score = sum(1 for kw in keywords if kw.lower() in source_lower)
+        if score > 0:
+            scores[ptype] = score
+    return max(scores, key=scores.get) if scores else "unknown"
+
+
 def run_prescan(contract_path: Path, repo_path: str) -> dict:
     """
     Ejecuta pre-scan estático independiente: Semgrep + Slitherin + Aderyn.
@@ -300,38 +483,64 @@ def run_prescan(contract_path: Path, repo_path: str) -> dict:
     except Exception as e:
         print(f"  [pre-scan] ⚠ Semgrep error: {e}")
 
-    # Slitherin (DeFi-specific detectors)
-    print("  [pre-scan] Slitherin...")
-    slitherin_out = results_dir / "slitherin.json"
+    # Slither (fallback from slitherin if not available)
+    print("  [pre-scan] Slither...")
+    slither_out = results_dir / "slither.json"
     try:
+        # Try slitherin first, fallback to slither
+        import shutil as _sh
+        slither_cmd = "slitherin" if _sh.which("slitherin") else "slither"
         result = subprocess.run(
-            ["slitherin", str(src_dir), "--separated", "--json", str(slitherin_out)],
+            [slither_cmd, str(src_dir), "--json", str(slither_out)],
             capture_output=True, text=True, timeout=180
         )
-        if result.returncode == 0:
-            print(f"  [pre-scan] ✓ Slitherin → {slitherin_out}")
-            scan_results["slitherin"] = {"path": str(slitherin_out)}
+        if slither_out.exists() and slither_out.stat().st_size > 10:
+            try:
+                data = json.loads(slither_out.read_text())
+                detectors = data.get("results", {}).get("detectors", [])
+                high_med = [d for d in detectors if d.get("impact", "").lower() in ("high", "medium")]
+                print(f"  [pre-scan] ✓ {slither_cmd}: {len(detectors)} total, {len(high_med)} high/medium → {slither_out}")
+                scan_results["slither"] = {"path": str(slither_out), "count": len(detectors)}
+            except json.JSONDecodeError:
+                print(f"  [pre-scan] ✓ {slither_cmd} → {slither_out} (could not parse count)")
+                scan_results["slither"] = {"path": str(slither_out)}
         else:
-            print(f"  [pre-scan] ⚠ Slitherin: {result.stderr[:200] if result.stderr else 'error'}")
+            print(f"  [pre-scan] ⚠ {slither_cmd}: no output or empty file")
+            if result.stderr:
+                print(f"  [pre-scan]   stderr: {result.stderr[:300]}")
     except FileNotFoundError:
-        print(f"  [pre-scan] ⚠ Slitherin no instalado. Instalar: pip install slitherin")
+        print(f"  [pre-scan] ⚠ Slither no instalado. Instalar: pipx install slither-analyzer")
     except subprocess.TimeoutExpired:
-        print(f"  [pre-scan] ⚠ Slitherin timeout (>180s)")
+        print(f"  [pre-scan] ⚠ Slither timeout (>180s)")
     except Exception as e:
-        print(f"  [pre-scan] ⚠ Slitherin error: {e}")
+        print(f"  [pre-scan] ⚠ Slither error: {e}")
 
-    # Aderyn (Cyfrin, Rust-based)
+    # Aderyn (Cyfrin, Rust-based) — must run from project root to read foundry.toml remappings
     print("  [pre-scan] Aderyn...")
     aderyn_out = results_dir / "aderyn.json"
+    # Detect project root: walk up from src_dir to find foundry.toml
+    project_root = src_dir
+    for parent in [src_dir] + list(Path(src_dir).parents):
+        if (Path(parent) / "foundry.toml").exists():
+            project_root = str(parent)
+            break
     try:
         result = subprocess.run(
-            ["aderyn", "--output", str(aderyn_out), str(src_dir)],
+            ["aderyn", "--output", str(aderyn_out), "--src", str(src_dir), str(project_root)],
             capture_output=True, text=True, timeout=120
         )
-        if result.returncode == 0:
-            print(f"  [pre-scan] ✓ Aderyn → {aderyn_out}")
-            scan_results["aderyn"] = {"path": str(aderyn_out)}
-        else:
+        # Aderyn may panic after writing output (cosmetic bug in 0.1.x) — check file exists
+        if aderyn_out.exists() and aderyn_out.stat().st_size > 10:
+            try:
+                data = json.loads(aderyn_out.read_text())
+                n_high = len(data.get("high_issues", {}).get("issues", []))
+                n_med = len(data.get("medium_issues", {}).get("issues", []))
+                print(f"  [pre-scan] ✓ Aderyn: {n_high} high, {n_med} medium → {aderyn_out}")
+                scan_results["aderyn"] = {"path": str(aderyn_out), "count": n_high + n_med}
+            except json.JSONDecodeError:
+                print(f"  [pre-scan] ✓ Aderyn → {aderyn_out} (could not parse)")
+                scan_results["aderyn"] = {"path": str(aderyn_out)}
+        elif result.returncode != 0:
             print(f"  [pre-scan] ⚠ Aderyn: {result.stderr[:200] if result.stderr else 'error'}")
     except FileNotFoundError:
         print(f"  [pre-scan] ⚠ Aderyn no instalado. Instalar: cyfrinup && aderyn")
@@ -346,6 +555,165 @@ def run_prescan(contract_path: Path, repo_path: str) -> dict:
     print(f"  [pre-scan] Resumen guardado en: {summary_path}")
 
     return scan_results
+
+
+# [BENCHMARK-IMPROVE-1] Parse prescan results into hunter-consumable signals
+# Benchmark gap: M-10 (infinite loop from path.skipToken() not reassigned) is a trivial
+# "unused return value" pattern that Slither/Aderyn detect automatically, but results
+# were NOT injected into hunter prompts. This function bridges that gap.
+HIGH_VALUE_DETECTORS = {
+    # Slither detectors that correlate with real bugs
+    "unused-return", "unchecked-lowlevel", "uninitialized-state",
+    "divide-before-multiply", "reentrancy-eth", "reentrancy-no-eth",
+    "incorrect-equality", "shadowing-state", "locked-ether",
+    "controlled-delegatecall", "arbitrary-send-erc20", "suicidal",
+    "unprotected-upgrade", "msg-value-loop",
+    # Aderyn detectors
+    "unused-return-value", "unchecked-return", "state-variable-shadowing",
+    "divide-before-multiply", "reentrancy",
+    # Semgrep
+    "solidity.security",
+}
+
+
+def parse_prescan_for_hunters(prescan_results: dict, contract_name: str = "") -> str:
+    """
+    Parse Slither/Aderyn/Semgrep JSON results and format high-value signals
+    for injection into hunter prompts. Only includes findings that correlate
+    with real bugs (HIGH_VALUE_DETECTORS).
+
+    Returns YAML-formatted string ready for prompt injection.
+    """
+    signals = []
+
+    # Parse Slither/Slitherin JSON
+    for tool_key in ("slitherin", "slither"):
+        tool_data = prescan_results.get(tool_key, {})
+        tool_path = tool_data.get("path")
+        if not tool_path or not Path(tool_path).exists():
+            continue
+        try:
+            raw = json.loads(Path(tool_path).read_text())
+            # Slither format: {"results": {"detectors": [...]}} or {"results": [...]}
+            detectors = []
+            if isinstance(raw, dict):
+                res = raw.get("results", raw)
+                if isinstance(res, dict):
+                    detectors = res.get("detectors", [])
+                elif isinstance(res, list):
+                    detectors = res
+            for det in detectors:
+                check = det.get("check", det.get("detector", ""))
+                impact = det.get("impact", "").lower()
+                confidence = det.get("confidence", "").lower()
+                # Only high-value: high/medium impact OR known-good detector
+                if check not in HIGH_VALUE_DETECTORS and impact not in ("high", "medium"):
+                    continue
+                # Filter to relevant contract if specified
+                desc = det.get("description", "")[:300]
+                elements = det.get("elements", [])
+                locations = []
+                relevant = not contract_name  # if no filter, include all
+                for elem in elements[:5]:
+                    src = elem.get("source_mapping", {})
+                    fn = src.get("filename_short", src.get("filename_relative", ""))
+                    lines = src.get("lines", [])
+                    line_str = f"L{lines[0]}-{lines[-1]}" if lines else ""
+                    if fn:
+                        locations.append(f"{fn}:{line_str}")
+                        if contract_name and contract_name.lower() in fn.lower():
+                            relevant = True
+                if not relevant:
+                    continue
+                signals.append({
+                    "tool": tool_key,
+                    "detector": check,
+                    "impact": impact,
+                    "confidence": confidence,
+                    "description": desc.strip(),
+                    "locations": locations[:3],
+                })
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+    # Parse Aderyn JSON
+    aderyn_data = prescan_results.get("aderyn", {})
+    aderyn_path = aderyn_data.get("path")
+    if aderyn_path and Path(aderyn_path).exists():
+        try:
+            raw = json.loads(Path(aderyn_path).read_text())
+            # Aderyn format: {"high_issues": {"issues": [...]}, "medium_issues": {...}, ...}
+            for severity in ("critical_issues", "high_issues", "medium_issues"):
+                section = raw.get(severity, {})
+                issues = section.get("issues", [])
+                for issue in issues:
+                    title = issue.get("title", "")
+                    detector = issue.get("detector_name", "")
+                    instances = issue.get("instances", [])
+                    locs = []
+                    relevant = not contract_name
+                    for inst in instances[:5]:
+                        fn = inst.get("contract_path", inst.get("src", ""))
+                        line = inst.get("line_no", inst.get("src_char", ""))
+                        if fn:
+                            locs.append(f"{fn}:L{line}" if line else fn)
+                            if contract_name and contract_name.lower() in fn.lower():
+                                relevant = True
+                    if not relevant:
+                        continue
+                    signals.append({
+                        "tool": "aderyn",
+                        "detector": detector,
+                        "impact": severity.replace("_issues", ""),
+                        "description": title[:300],
+                        "locations": locs[:3],
+                    })
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    # Parse Semgrep JSON
+    semgrep_data = prescan_results.get("semgrep", {})
+    semgrep_path = semgrep_data.get("path")
+    if semgrep_path and Path(semgrep_path).exists():
+        try:
+            raw = json.loads(Path(semgrep_path).read_text())
+            for result in raw.get("results", []):
+                check_id = result.get("check_id", "")
+                severity = result.get("extra", {}).get("severity", "").lower()
+                if severity not in ("error", "warning") and not any(d in check_id for d in HIGH_VALUE_DETECTORS):
+                    continue
+                fn = result.get("path", "")
+                relevant = not contract_name or (contract_name.lower() in fn.lower())
+                if not relevant:
+                    continue
+                line_start = result.get("start", {}).get("line", "")
+                line_end = result.get("end", {}).get("line", "")
+                msg = result.get("extra", {}).get("message", "")[:200]
+                signals.append({
+                    "tool": "semgrep",
+                    "detector": check_id.split(".")[-1] if "." in check_id else check_id,
+                    "impact": severity,
+                    "description": msg.strip(),
+                    "locations": [f"{fn}:L{line_start}-{line_end}"] if fn else [],
+                })
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    if not signals:
+        return ""
+
+    # Format as YAML-like text for prompt injection
+    lines = [f"# Static Analysis Signals ({len(signals)} high-value findings from prescan)"]
+    for i, sig in enumerate(signals[:25], 1):  # cap at 25 signals
+        lines.append(f"- title: \"{sig['detector']}\"")
+        lines.append(f"  tool: {sig['tool']}")
+        lines.append(f"  impact: {sig.get('impact', 'unknown')}")
+        lines.append(f"  description: \"{sig['description']}\"")
+        if sig.get("locations"):
+            lines.append(f"  locations: {sig['locations']}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def load_hunt_state() -> dict:
@@ -448,7 +816,7 @@ def _generate_asset_flow_rich(contract_path: Path) -> str:
     try:
         result = subprocess.run(
             [sys.executable, str(analyzer_script), "--asset-flow", str(contract_path)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=90,
         )
         output = result.stdout.strip()
         if output and "Rich Asset Flow Map" in output:
@@ -1835,6 +2203,7 @@ def generate_hunter_prompt(
     solodit_ctx: str,
     briefing_excerpt: str,
     protocol: str,
+    prepass_signals: str = "",
 ) -> str:
     """Genera el prompt completo para un hunter específico."""
     _, focus = HUNTER_DOMAINS.get(hunter_name, ("general", "General analysis"))
@@ -1845,6 +2214,7 @@ def generate_hunter_prompt(
     contract_preview = ""
     contract_truncated = False
     CONTRACT_CHAR_LIMIT = 60_000
+    library_preview = ""
     if contract_path and contract_path.exists():
         full_src = contract_path.read_text()
         if len(full_src) > CONTRACT_CHAR_LIMIT:
@@ -1852,6 +2222,33 @@ def generate_hunter_prompt(
             contract_truncated = True
         else:
             contract_preview = full_src
+
+        # [BENCHMARK-IMPROVE-3] Include project-local libraries in hunter context
+        # Libraries (ReserveLogic, InterestRateUtils, etc.) often contain critical bugs
+        # that hunters miss when they only see the main contract.
+        lib_texts = []
+        lib_char_budget = 20_000  # budget for all libraries combined
+        lib_dir = contract_path.parent / "libraries"
+        if not lib_dir.exists():
+            lib_dir = contract_path.parent  # same dir
+        for sol_file in sorted(contract_path.parent.rglob("*.sol")):
+            # Skip the main contract itself, test files, interfaces, and node_modules
+            if sol_file == contract_path:
+                continue
+            rel = str(sol_file.relative_to(contract_path.parent))
+            if any(skip in rel for skip in ["test/", "node_modules/", "lib/", "interfaces/"]):
+                continue
+            # Only include project-local libraries (not OZ, not Uniswap)
+            if "libraries/" in rel or "types/" in rel or "utils/" in rel:
+                lib_src = sol_file.read_text()
+                if len(lib_src) > 8000:
+                    lib_src = lib_src[:8000] + "\n// ... truncated ..."
+                lib_texts.append(f"// === {rel} ===\n{lib_src}")
+        if lib_texts:
+            combined = "\n\n".join(lib_texts)
+            if len(combined) > lib_char_budget:
+                combined = combined[:lib_char_budget] + "\n// ... libraries truncated ..."
+            library_preview = combined
 
     hyp_output = str(get_hyp_dir(protocol) / f"hyp_{component}_{hunter_name}.yaml")
 
@@ -1899,6 +2296,26 @@ Si reconoces alguno en el código, investígalo. Pero tu análisis principal deb
 {kb_patterns}
 """
 
+    # Inject wiki and graph context
+    wiki_ctx = query_wiki_context(domain, component)
+    graph_ctx = load_graph_report(protocol)
+    rejection_ctx = load_rejection_context()
+    hunter_domain_key, _ = HUNTER_DOMAINS.get(hunter_name, ("general", "General"))
+    few_shot_ctx = load_few_shot_examples(hunter_domain_key)
+
+    # Prepass signals section
+    prepass_section = ""
+    if prepass_signals:
+        prepass_section = f"""
+## ⚠ SEÑALES DEL PRE-ANÁLISIS ESTÁTICO (Detection Engine)
+Las siguientes señales fueron detectadas automáticamente. DEBES verificar cada una que corresponda a tu especialidad.
+Si confirmas el bug, inclúyelo como invariante Tier 1. Si descartas, documenta por qué en false_positives.
+
+```yaml
+{prepass_signals}
+```
+"""
+
     return f"""# {hunter_name} — {component} Analysis
 
 ## Tu Identidad
@@ -1917,6 +2334,20 @@ No busques bugs genéricos. Busca bugs que nazcan de la lógica ESPECÍFICA de e
 {asset_flow_map if asset_flow_map else ""}{symmetric_section}```solidity
 {contract_preview}
 ```
+{"" if not library_preview else '''
+## Project Libraries (ANALIZAR CON LA MISMA PROFUNDIDAD que el contrato principal)
+⚠ CRÍTICO: Las libraries contienen lógica de negocio (interest rates, reserves, math).
+Bugs en libraries afectan TODOS los contratos que las usan. NO las trates como "código confiable".
+Para cada función de library llamada desde el contrato principal:
+1. Lee la implementación completa
+2. Verifica ordering de operaciones (¿se actualiza el rate ANTES o DESPUÉS de usarlo?)
+3. Verifica precision con decimals extremos (6, 8, 18)
+4. Verifica que los return values se usen correctamente
+
+```solidity
+''' + library_preview + '''
+```
+'''}
 
 ## Contexto de Solodit (bugs similares en protocolos similares)
 {solodit_ctx or "Sin contexto disponible — busca patrones propios"}
@@ -1924,7 +2355,18 @@ No busques bugs genéricos. Busca bugs que nazcan de la lógica ESPECÍFICA de e
 ## Briefing del Dominio ({domain})
 {briefing_excerpt or "Sin briefing disponible"}
 
-{chimera_ctx}
+{wiki_ctx}{graph_ctx}{rejection_ctx}{few_shot_ctx}{prepass_section}{chimera_ctx}
+
+## Razonamiento Paso a Paso (OBLIGATORIO antes de cada hipótesis)
+
+Para CADA posible vulnerabilidad, razona explícitamente:
+1. **Qué hace esta función**: describe en 1 frase
+2. **Qué asume sobre el estado**: precondiciones implícitas
+3. **Qué pasa si esa asunción es falsa**: escenario concreto
+4. **Cómo se explota**: paso a paso del atacante
+5. **Cuánto pierde la víctima**: en USD o % del pool
+
+Si no puedes completar los 5 pasos con datos concretos, la hipótesis tiene confidence < 60%.
 
 ## Tu Proceso
 1. **Lee CADA línea** del contrato — no te saltes nada
@@ -1957,18 +2399,40 @@ Ejemplo de invariante bien formado:
   solidity: |
     uint256 current = contract.value();
     gte(current, previous, "{abbreviation}-01: value decreased");
+  poc_sketch: |
+    function test_{abbreviation}_01() public {{
+        // 1. Setup: deploy protocol, seed liquidity
+        // 2. Estado previo: record contract.value()
+        // 3. Acción del atacante: call function with malicious params
+        // 4. Verificación: assert contract.value() decreased
+    }}
   validated: true
   priority: high
   confidence: 80
 ```
 
+**IMPORTANTE**: Para CADA invariante con confidence >= 60%, incluir `poc_sketch` con los 4 pasos (Setup, Estado previo, Acción, Verificación). Sin poc_sketch = hipótesis incompleta.
+
 {_hunter_specific_section(hunter_name)}
 
-## Regla Anti-Tunnel-Vision (aplica a TODOS los hunters)
+## Regla Anti-Tunnel-Vision (aplica a TODOS los hunters) — CRÍTICA
+**BENCHMARK DATA**: En tests reales, perdemos ~25% de findings porque el hunter encuentra UN bug
+en una función y deja de buscar OTROS bugs en la MISMA función. Esto NO es aceptable.
+
 Si durante tu análisis identificas un bug en función F():
-1. Revisa TODAS las líneas restantes de F() antes de pasar a otra función
-2. Busca si funciones adyacentes (mismo caller, misma familia) tienen el mismo error
-3. Documenta en tu YAML: `related_functions_audited: [list]` para cada finding
+1. **PARA.** Marca el bug encontrado. Luego VUELVE al inicio de F() y lee CADA LÍNEA de nuevo
+   buscando bugs ADICIONALES de tipos DIFERENTES al que ya encontraste.
+2. **Busca TODAS estas categorías** en F() antes de pasar a otra función:
+   - ¿Hay un off-by-one en algún boundary check? (`<` vs `<=`, `>=` vs `>`)
+   - ¿Hay un return value ignorado o no reasignado?
+   - ¿Hay integer division que redondea a zero con parámetros extremos?
+   - ¿Se usa `slot0()` cuando debería ser `sqrtPriceX96` derivado, o viceversa?
+   - ¿Hay un ordering bug (state read before update vs after)?
+3. **Busca si funciones adyacentes** (mismo caller, misma familia) tienen el mismo error pattern
+4. **Documenta**: `related_functions_audited: [list]` + `additional_bugs_in_same_function: [list]`
+
+Un hunter que reporta 1 bug en una función cuando hay 3 es PEOR que uno que reporta 0 —
+porque crea falsa sensación de cobertura.
 
 ## Reglas Críticas
 - **Sin genéricos**: "el contrato podría tener reentrancy" NO es un invariante
@@ -2014,6 +2478,119 @@ def _extract_deployments_from_scope_master(component: str, protocol: str = "") -
             continue
         deployments.append({"name": name, "chain": chain, "address": address, "estado": estado})
     return deployments
+
+
+# [BENCHMARK-IMPROVE-5] Cross-Function Invariant Consistency Checker
+# Benchmark gap: H-04 and H-05 — _checkWithinlimits and isLiquidateable enforce
+# contradictory rules using the same parameter (maxTimesLeverage).
+# This function detects pairs of functions sharing state variables and flags
+# potential inconsistencies for DeepDiveHunter to investigate.
+def _extract_consistency_pairs(contract_path: Path) -> str:
+    """
+    Analyze a contract for function pairs that share state variables
+    and may enforce contradictory invariants.
+    Returns formatted text for DeepDive prompt injection.
+    """
+    if not contract_path or not contract_path.exists():
+        return ""
+
+    source = contract_path.read_text()
+    filename = contract_path.name
+
+    # Step 1: Extract all state variables
+    state_vars = set()
+    for match in re.finditer(
+        r'^\s+(?:uint\d*|int\d*|address|bool|bytes\d*|mapping)\s+(?:public\s+|private\s+|internal\s+)?(\w+)\s*[;=]',
+        source, re.MULTILINE
+    ):
+        state_vars.add(match.group(1))
+    # Also match storage structs accessed as members
+    for match in re.finditer(r'(\w+)\.(\w+)', source):
+        if match.group(1) in state_vars:
+            state_vars.add(f"{match.group(1)}.{match.group(2)}")
+
+    if not state_vars:
+        return ""
+
+    # Step 2: Map functions → state variables they READ
+    func_pattern = re.compile(r'function\s+(\w+)\s*\(([^)]*)\)[^{]*\{', re.DOTALL)
+    func_reads: dict[str, set] = {}
+    func_lines: dict[str, int] = {}
+
+    for func_match in func_pattern.finditer(source):
+        func_name = func_match.group(1)
+        line_num = source[:func_match.start()].count('\n') + 1
+        func_lines[func_name] = line_num
+
+        body_start = source.find('{', func_match.end() - 1)
+        body_end = -1
+        depth = 0
+        for i in range(body_start, min(body_start + 30000, len(source))):
+            if source[i] == '{':
+                depth += 1
+            elif source[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    body_end = i
+                    break
+        if body_end < 0:
+            continue
+
+        body = source[body_start:body_end]
+        reads = set()
+        for var in state_vars:
+            if var in body:
+                reads.add(var)
+        if reads:
+            func_reads[func_name] = reads
+
+    # Step 3: Find pairs with shared state variables (potential consistency issues)
+    pairs = []
+    func_names = list(func_reads.keys())
+    for i in range(len(func_names)):
+        for j in range(i + 1, len(func_names)):
+            f1, f2 = func_names[i], func_names[j]
+            shared = func_reads[f1] & func_reads[f2]
+            # Only interesting if they share non-trivial state
+            # Filter out common variables like 'owner', 'paused', 'msg.sender'
+            shared_interesting = {v for v in shared
+                                  if v not in ('owner', 'paused', '_owner', 'msg')}
+            if len(shared_interesting) >= 2:  # At least 2 shared state vars = high signal
+                pairs.append((f1, f2, shared_interesting))
+
+    if not pairs:
+        return ""
+
+    # Step 4: Format for DeepDive prompt
+    # Sort by number of shared variables (most shared first)
+    pairs.sort(key=lambda x: len(x[2]), reverse=True)
+
+    lines = [
+        "## ⚠ Cross-Function Invariant Consistency Check [BENCHMARK-IMPROVE-5]",
+        "**CRITICAL**: In benchmark testing, we MISSED 2 HIGH findings (H-04, H-05) because",
+        "two functions enforced contradictory rules using the same state variables.",
+        "Example: _checkWithinlimits allowed leverage up to maxTimesLeverage,",
+        "but isLiquidateable used (maxTimesLeverage - 1e18) as divisor → contradiction.",
+        "",
+        "For EACH pair below, answer: **Do both functions enforce the SAME invariant on the shared variables?**",
+        "If they use the same variable in DIFFERENT ways (different thresholds, different formulas,",
+        "different inequality directions), that is a **potential HIGH severity finding.**",
+        "",
+    ]
+
+    for f1, f2, shared in pairs[:10]:  # Cap at 10 pairs
+        l1 = func_lines.get(f1, "?")
+        l2 = func_lines.get(f2, "?")
+        shared_str = ", ".join(sorted(shared)[:5])
+        lines.append(f"### {f1}() (L{l1}) ↔ {f2}() (L{l2})")
+        lines.append(f"   Shared state: `{shared_str}`")
+        lines.append(f"   Questions:")
+        lines.append(f"   - Do both use `{list(shared)[0]}` with the SAME threshold/formula?")
+        lines.append(f"   - If {f1} allows a state, does {f2} correctly handle that state?")
+        lines.append(f"   - Can a user satisfy {f1}'s check but fail {f2}'s check (or vice versa)?")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def generate_deepdive_prompt(
@@ -2117,6 +2694,9 @@ def generate_deepdive_prompt(
     if not asset_flow_dd:
         asset_flow_dd = generate_asset_flow_map(contract_path)
 
+    # [BENCHMARK-IMPROVE-5] Generate consistency pairs for cross-function invariant check
+    consistency_section = _extract_consistency_pairs(contract_path)
+
     # Generate deep flatten for DeepDive (critical functions: READ/WRITE/EXTERNAL order)
     cache_key = str(contract_path) if contract_path else ""
     if cache_key and cache_key not in _flatten_cache:
@@ -2184,6 +2764,19 @@ Lista cada asunción. Para cada una: construye un escenario concreto que la viol
 ### Sección 2: Cross-Function State Analysis
 Para cada PAR de funciones críticas: ¿qué pasa si se llaman en orden inesperado?
 ¿Qué estado deja A que hace que B se comporte diferente?
+
+### Sección 2.5: Cross-Function Invariant Consistency (OBLIGATORIO)
+**BENCHMARK DATA**: Perdimos 2 HIGH findings (28% de HIGHs) porque dos funciones
+enforceaban reglas CONTRADICTORIAS sobre la misma variable de estado.
+
+Para cada par de funciones que comparten variables de estado:
+1. Extrae la FÓRMULA o CONDICIÓN exacta que cada función aplica a la variable compartida
+2. Compara: ¿son consistentes? ¿Usan el mismo threshold, la misma dirección de inequality?
+3. Si f1 permite un valor X, ¿f2 lo maneja correctamente cuando recibe X?
+4. EJEMPLO: _checkWithinlimits permitía leverage = maxTimesLeverage, pero isLiquidateable
+   usaba (maxTimesLeverage - 1e18) como divisor → posición inmediatamente liquidable tras apertura.
+
+{consistency_section}
 
 ### Sección 3: Value Exit Trace (metodología samczsun)
 Identifica TODOS los puntos donde sale valor del protocolo.
@@ -3424,6 +4017,70 @@ def main():
     else:
         print(f"\n  Pre-scan estático: SKIP (--no-solodit mode)")
 
+    # Detection Engine prepass (static + exploit patterns → YAML signals for hunters)
+    prepass_signals = ""
+    detection_engine = AUDIT_AGENTS_DIR / "detection_engine.py"
+    if detection_engine.exists() and contract_path and contract_path.exists():
+        print(f"\n  Ejecutando detection_engine --prepass...")
+        prepass_out = HUNT_SESSION_DIR / "results" / f"{component}_prepass.yaml"
+        prepass_out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            src_dir = str(contract_path.parent)
+            result = subprocess.run(
+                [sys.executable, str(detection_engine), "--prepass",
+                 "--source", src_dir, "--name", component,
+                 "--output", str(prepass_out.parent)],
+                capture_output=True, text=True, timeout=120
+            )
+            prepass_yaml = prepass_out.parent / f"{component}_prepass.yaml"
+            if prepass_yaml.exists():
+                prepass_signals = prepass_yaml.read_text()
+                n_signals = prepass_signals.count("- title:")
+                print(f"  ✓ Detection engine prepass: {n_signals} signals → {prepass_yaml}")
+            else:
+                print(f"  ⚠ Detection engine: no prepass YAML generated")
+        except subprocess.TimeoutExpired:
+            print(f"  ⚠ Detection engine timeout (>120s)")
+        except Exception as e:
+            print(f"  ⚠ Detection engine error: {e}")
+    else:
+        print(f"\n  Detection engine prepass: SKIP (engine o contrato no encontrado)")
+
+    # [BENCHMARK-IMPROVE-1] Parse prescan results (Slither/Aderyn/Semgrep) into signals
+    # and merge with detection_engine prepass signals
+    if prescan_results:
+        contract_name = contract_path.stem if contract_path else ""
+        prescan_signals = parse_prescan_for_hunters(prescan_results, contract_name)
+        if prescan_signals:
+            n_prescan = prescan_signals.count("- title:")
+            print(f"  ✓ Prescan signals parsed: {n_prescan} high-value findings for hunters")
+            if prepass_signals:
+                prepass_signals = prepass_signals.rstrip() + "\n\n" + prescan_signals
+            else:
+                prepass_signals = prescan_signals
+
+    # [BENCHMARK-IMPROVE-4] Parameter Boundary Scanner
+    # Addresses M-03 (tickSpacing=1 asymmetry) and M-08 (WBTC precision loss)
+    boundary_context = ""
+    if contract_path and contract_path.exists():
+        try:
+            from parameter_boundary_scanner import scan_contract, format_for_hunter_prompt
+            boundary_result = scan_contract(contract_path)
+            boundary_context = format_for_hunter_prompt(boundary_result)
+            if boundary_context:
+                n_hyps = len(boundary_result.get("hypotheses", []))
+                print(f"  ✓ Boundary scanner: {n_hyps} edge-case hypotheses for {boundary_result.get('parameters_found', 0)} params")
+                if prepass_signals:
+                    prepass_signals = prepass_signals.rstrip() + "\n\n" + boundary_context
+                else:
+                    prepass_signals = boundary_context
+            else:
+                print(f"  ✓ Boundary scanner: no edge-case parameters found")
+        except ImportError:
+            print(f"  ⚠ Boundary scanner: parameter_boundary_scanner.py not found")
+        except Exception as e:
+            print(f"  ⚠ Boundary scanner error: {e}")
+
     # Briefings (primario completo + secundario solo grep)
     briefing_excerpt = load_briefings(domains)
     if briefing_excerpt:
@@ -3541,7 +4198,8 @@ def main():
     for hunter_name in selected_hunters:
         prompts[hunter_name] = generate_hunter_prompt(
             hunter_name, component, contract_path, domain,
-            solodit_ctx, briefing_excerpt, protocol
+            solodit_ctx, briefing_excerpt, protocol,
+            prepass_signals=prepass_signals
         )
 
     if args.print_prompts:

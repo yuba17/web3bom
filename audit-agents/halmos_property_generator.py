@@ -458,5 +458,84 @@ def main():
     print(f"  ~/.local/bin/halmos --function check_ --loop 10 --solver-timeout-assertion 10000")
 
 
+def parse_halmos_counterexample(output: str) -> dict | None:
+    """Extract counterexample from Halmos output.
+
+    Halmos outputs lines like:
+        Counterexample: p_x_uint256 = 0x00...01, p_y_uint256 = 0xff...ff
+    Returns dict mapping parameter names to values, or None if not found.
+    """
+    for line in output.splitlines():
+        if "Counterexample" in line:
+            params = {}
+            # Extract key=value pairs
+            parts = line.split(":", 1)
+            if len(parts) < 2:
+                continue
+            for pair in parts[1].split(","):
+                pair = pair.strip()
+                if "=" in pair:
+                    key, _, val = pair.partition("=")
+                    # Clean parameter name: p_x_uint256 -> x
+                    key = key.strip().removeprefix("p_").rsplit("_", 1)[0]
+                    params[key] = val.strip()
+            if params:
+                return params
+    return None
+
+
+def build_repair_prompt(invariant_sol: str, counterexample: dict,
+                        check_function: str) -> str:
+    """Build a prompt for LLM to analyze a Halmos counterexample.
+
+    The LLM should determine if:
+    1. The invariant is too strict (needs tighter bounds) -> provide corrected invariant
+    2. The counterexample reveals a real bug -> provide poc_sketch
+    """
+    ce_str = ", ".join(f"{k} = {v}" for k, v in counterexample.items())
+    return f"""Halmos found a counterexample for this invariant:
+
+## Check Function
+```solidity
+{check_function}
+```
+
+## Counterexample
+{ce_str}
+
+## Invariant Being Tested
+```solidity
+{invariant_sol}
+```
+
+Determine which case this is:
+
+**Case 1 — Invariant too strict**: The property doesn't hold for edge cases but there's
+no real vulnerability. Example: a monotonicity check fails at uint256.max due to overflow
+that's actually handled by a SafeMath revert.
+-> Provide the corrected invariant with tighter bounds.
+
+**Case 2 — Real bug found**: The counterexample demonstrates an exploitable condition.
+-> Provide a poc_sketch showing how an attacker could exploit this.
+
+Respond with EXACTLY one of:
+```yaml
+case: 1
+corrected_invariant: |
+  <new solidity code>
+reason: "<why the original was too strict>"
+```
+OR
+```yaml
+case: 2
+poc_sketch: |
+  function test_exploit() public {{
+    // steps using counterexample values
+  }}
+severity: "<HIGH/MEDIUM/LOW>"
+reason: "<what the bug is>"
+```"""
+
+
 if __name__ == "__main__":
     main()

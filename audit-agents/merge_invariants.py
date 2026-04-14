@@ -40,6 +40,7 @@ Schema de hipótesis YAML esperado:
 
 import sys
 import re
+import subprocess
 import yaml
 import argparse
 import json
@@ -67,8 +68,97 @@ HUNTER_FILE_MAP = {
     "WildcardHunter":       "Wildcard",
     "TrustBoundaryHunter":  "Trust",
     "SignatureHunter":       "Signature",
+    "LogicHunter":          "Logic",
+    "AdversarialHunter":    "Adversarial",
+    "LibraryHunter":        "Library",
     "DeepDiveHunter":       "DeepDive",
+    "CrossChainHunter":     "CrossChain",
+    "EdgeHunter":           "Cross",
 }
+
+# EdgeHunter hypotheses need special handling: they reference TWO contracts
+CROSS_COMPONENT_HUNTERS = {"EdgeHunter"}
+
+# Default pragma — overridden by detect_pragma()
+_PRAGMA = "pragma solidity ^0.8.0;"
+
+# ── Hypothesis YAML validation (Task 12) ──────────────────────────────
+REQUIRED_HYP_FIELDS = {"id", "description", "solidity"}
+
+def validate_hypothesis(hyp: dict, source_file: str) -> list[str]:
+    """Validate a single hypothesis. Returns list of warnings."""
+    warnings = []
+    for field in REQUIRED_HYP_FIELDS:
+        if field not in hyp or not hyp[field]:
+            warnings.append(f"  {source_file}: {hyp.get('id', '?')} missing '{field}'")
+    sol = hyp.get("solidity", "")
+    if sol and not any(kw in sol for kw in ["t(", "eq(", "gte(", "lte(", "assert", "require"]):
+        warnings.append(f"  {source_file}: {hyp.get('id', '?')} solidity has no assertion")
+    return warnings
+
+
+def dedup_hypotheses(hypotheses: list[dict]) -> list[dict]:
+    """Remove near-duplicate hypotheses across hunters before merge.
+
+    Two hypotheses are duplicates if:
+    - Same primary function referenced AND >50% keyword overlap in description
+    Keep the one with highest confidence. Tag with _merged_count.
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for hyp in hypotheses:
+        # Extract function names from solidity/description
+        text = f"{hyp.get('description', '')} {hyp.get('solidity', '')}".lower()
+        functions = set()
+        for token in re.findall(r'\b(\w+)\s*\(', text):
+            if token not in ('require', 'assert', 'revert', 'emit', 'if', 'for', 'while',
+                             'gte', 'lte', 'eq', 't', 'gt', 'lt', 'true', 'false'):
+                functions.add(token)
+        key = frozenset(functions) if functions else frozenset([hyp.get('id', str(id(hyp)))])
+        groups[key].append(hyp)
+
+    deduped = []
+    total_merged = 0
+    for key, group in groups.items():
+        if len(group) == 1:
+            deduped.append(group[0])
+        else:
+            best = max(group, key=lambda h: h.get("confidence", 0))
+            best["_merged_count"] = len(group)
+            best["_merged_from"] = [h.get("_hunter", h.get("id", "?")) for h in group if h != best]
+            deduped.append(best)
+            total_merged += len(group) - 1
+
+    if total_merged > 0:
+        print(f"[dedup] Merged {total_merged} duplicate hypotheses ({len(hypotheses)} → {len(deduped)})")
+
+    return deduped
+
+
+def detect_pragma(chimera_dir: Path) -> str:
+    """Detect pragma from project source files. Checks Setup.sol first, then src/."""
+    candidates = []
+    setup = chimera_dir / "Setup.sol"
+    if setup.exists():
+        candidates.append(setup)
+    # Walk up to find src/
+    repo = chimera_dir
+    for _ in range(5):
+        src = repo / "src"
+        if src.is_dir():
+            candidates.extend(sorted(src.glob("**/*.sol"))[:5])
+            break
+        repo = repo.parent
+    for f in candidates:
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                m = re.match(r'\s*(pragma\s+solidity\s+[^;]+;)', line)
+                if m:
+                    return m.group(1)
+        except Exception:
+            continue
+    return _PRAGMA
 
 
 def load_current_hunt() -> dict:
@@ -125,6 +215,50 @@ def load_hypothesis_file(path: Path) -> dict | None:
         return None
 
 
+# Required structured evidence tables per hunter (added 2026-04)
+HUNTER_REQUIRED_TABLES = {
+    "MathHunter": ["decimal_analysis", "boundary_analysis"],
+    "FlowHunter": ["derived_state_map"],
+    "AccessHunter": ["state_var_lifecycle"],
+    "DoSHunter": ["loop_termination"],
+    "DomainHunter": ["parameter_consistency"],
+    "TrustBoundaryHunter": ["integration_assumptions"],
+}
+
+
+def validate_evidence_tables(hyp_data: dict) -> list[str]:
+    """Check if hypothesis YAML includes required structured evidence tables.
+
+    Returns list of warning strings for missing tables.
+    Does NOT block merge — warns only, so hunters can still produce results
+    even if they skip a table (but the warning makes it visible).
+    """
+    warnings = []
+    hunter = hyp_data.get("hunter", "")
+    required = HUNTER_REQUIRED_TABLES.get(hunter, [])
+
+    if not required:
+        return warnings
+
+    for table_name in required:
+        # Check top-level and inside each invariant
+        has_table = table_name in hyp_data
+        if not has_table:
+            # Also check inside invariants
+            for inv in hyp_data.get("invariants", hyp_data.get("findings", hyp_data.get("hypotheses", []))):
+                if isinstance(inv, dict) and table_name in inv:
+                    has_table = True
+                    break
+
+        if not has_table:
+            warnings.append(
+                f"⚠ {hunter}: missing required '{table_name}' table. "
+                f"Re-run hunter with structured evidence requirement."
+            )
+
+    return warnings
+
+
 def extract_existing_ids_from_dir(chimera_dir: Path) -> set:
     """Extrae IDs de invariantes de TODOS los archivos Properties*.sol del directorio."""
     ids = set()
@@ -158,8 +292,11 @@ def id_to_function_name(inv_id: str, inv_type: str) -> str:
     return f"property_{clean}"
 
 
-def _wrap_comment(prefix: str, text: str) -> list[str]:
+def _wrap_comment(prefix: str, text) -> list[str]:
     """Wrap multiline text into /// comment lines."""
+    if isinstance(text, list):
+        text = " ".join(str(t) for t in text)
+    text = str(text)
     result = []
     for i, line in enumerate(text.replace("\n", " ").split(". ")):
         line = line.strip()
@@ -173,10 +310,22 @@ def _wrap_comment(prefix: str, text: str) -> list[str]:
 
 
 def _clean_solidity_body(body: str) -> str:
-    """Strip wrapper function declarations from hunter-generated Solidity."""
+    """Strip wrapper function declarations from hunter-generated Solidity.
+
+    Hunters sometimes emit a full function declaration in the `solidity` field:
+        function property_foo() public view {
+            ...body...
+        }
+    We need to extract just the body, since generate_property_function() wraps
+    it in its own function declaration.
+    """
     stripped = body.strip()
+    # Match any Solidity function signature (including view/pure and returns)
     stripped = re.sub(
-        r'function\s+\w+\([^)]*\)\s*(public|internal|external)?\s*(returns\s*\([^)]*\))?\s*\{',
+        r'function\s+\w+\([^)]*\)\s*'           # function name(args)
+        r'(?:(?:public|internal|external|private|view|pure|payable|override)\s*)*'  # modifiers
+        r'(?:returns\s*\([^)]*\)\s*)?'           # optional returns(...)
+        r'\{',                                    # opening brace
         '// (inner logic)',
         stripped
     )
@@ -199,7 +348,7 @@ def generate_property_function(inv: dict, source: str) -> str:
     inv_id = inv.get("id", "XX-00")
     desc = inv.get("description", "")
     attack = inv.get("attack_scenario", "")
-    body = inv.get("solidity", "    // TODO: implement").rstrip()
+    body = inv.get("solidity_property", inv.get("solidity", "    // TODO: implement")).rstrip()
     body = _clean_solidity_body(body)
     body = _sanitize_solidity(body)
     tier = inv.get("tier", 2)
@@ -230,7 +379,7 @@ def generate_optimize_function(inv: dict, source: str) -> str:
     """Genera código Solidity de una función optimize_*."""
     inv_id = inv.get("id", "XX-00")
     desc = inv.get("description", "")
-    body = inv.get("solidity", "    return 0;").rstrip()
+    body = inv.get("solidity_property", inv.get("solidity", "    return 0;")).rstrip()
     fn_name = id_to_function_name(inv_id, "optimize")
 
     lines = [
@@ -250,11 +399,17 @@ def generate_optimize_function(inv: dict, source: str) -> str:
     return "\n".join(lines)
 
 
-def generate_ghost_var(var_decl: str) -> str:
+def generate_ghost_var(var_decl) -> str:
     """Formatea una declaración de ghost variable."""
-    decl = var_decl.strip()
-    if not decl.endswith(";"):
-        decl += ";"
+    if isinstance(var_decl, dict):
+        # Handle dict format: {name: "x", type: "uint256", ...}
+        name = var_decl.get("name", var_decl.get("variable", ""))
+        typ = var_decl.get("type", "uint256")
+        decl = f"{typ} {name};"
+    else:
+        decl = str(var_decl).strip()
+        if not decl.endswith(";"):
+            decl += ";"
     return f"    {decl}"
 
 
@@ -285,6 +440,16 @@ def process_hypothesis(hyp_data: dict, existing_ids: set, include_low: bool = Fa
     for inv in hyp_data.get("invariants", hyp_data.get("findings", hyp_data.get("hypotheses", []))):
         if not isinstance(inv, dict):
             continue
+
+        # ── Schema validation (Task 12) ──
+        _val_warnings = validate_hypothesis(inv, source)
+        if _val_warnings:
+            for w in _val_warnings:
+                print(f"[validate] WARNING: {w}")
+            # Skip if missing critical 'solidity' field
+            if not inv.get("solidity"):
+                print(f"[validate] SKIPPING {inv.get('id', '?')} — no solidity code")
+                continue
 
         priority = str(inv.get("priority", "medium")).lower()
         if priority == "low" and not include_low:
@@ -344,6 +509,7 @@ def generate_hunter_sol_file(
     properties: list[str],
     optimizes: list[str],
     component: str,
+    pragma: str = _PRAGMA,
 ) -> str:
     """Genera el contenido completo de un archivo PropertiesX.sol."""
     contract_name = f"Properties{hunter_suffix}"
@@ -351,7 +517,7 @@ def generate_hunter_sol_file(
 
     lines = [
         "// SPDX-License-Identifier: UNLICENSED",
-        "pragma solidity ^0.8.0;",
+        pragma,
         "",
         f'import "./{base_contract}.sol";',
         "",
@@ -387,7 +553,71 @@ def generate_hunter_sol_file(
     return "\n".join(lines)
 
 
-def update_target_functions_import(chimera_dir: Path, hunter_suffixes: list[str], dry_run: bool) -> bool:
+def generate_cross_component_sol_file(
+    ghosts: list[str],
+    properties: list[str],
+    optimizes: list[str],
+    components: list[str],
+    pragma: str = _PRAGMA,
+) -> str:
+    """
+    Genera PropertiesCross.sol para invariantes cross-component.
+    A diferencia de los PropertiesX.sol normales, este NO hereda de Properties
+    (que tiene setup de un solo contrato). En su lugar, declara variables de estado
+    para los contratos involucrados que se setean en el setup del test.
+    """
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    comp_label = " + ".join(components)
+
+    lines = [
+        "// SPDX-License-Identifier: UNLICENSED",
+        pragma,
+        "",
+        f"/// @title Cross-Component Invariants: {comp_label}",
+        f"/// @notice Auto-generated by merge_invariants.py ({date_str})",
+        f"/// @dev EdgeHunter output. Setup must deploy all referenced contracts.",
+        f"/// @dev Inherits nothing — setup function must initialize contract refs.",
+        "abstract contract PropertiesCross {",
+        "",
+        f"    // ======= CROSS-COMPONENT CONTRACT REFERENCES =======",
+        f"    // These must be set in the test setup (e.g., CryticTester.setUp())",
+        f"    // Example: crossContractA = address(deployedA);",
+        "",
+    ]
+
+    # Declare address vars for each component
+    for i, comp in enumerate(components):
+        var_name = f"crossContract{chr(65 + i)}"  # crossContractA, crossContractB, ...
+        lines.append(f"    address internal {var_name}; // {comp}")
+    lines.append("")
+
+    # Ghost variables
+    if ghosts:
+        lines.append(f"    // ======= GHOST VARIABLES (EdgeHunter) =======")
+        lines.append("")
+        lines.extend(ghosts)
+        lines.append("")
+
+    # Property invariants
+    if properties:
+        lines.append(f"    // ======= CROSS-COMPONENT INVARIANTS (EdgeHunter) =======")
+        lines.append("")
+        lines.extend(f"{p}\n" for p in properties)
+
+    # Optimization functions
+    if optimizes:
+        lines.append(f"    // ======= OPTIMIZATION FUNCTIONS (EdgeHunter) =======")
+        lines.append("")
+        lines.extend(f"{o}\n" for o in optimizes)
+
+    lines.append("}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def update_target_functions_import(chimera_dir: Path, hunter_suffixes: list,
+                                   dry_run: bool = False, pragma: str = _PRAGMA):
     """
     Actualiza TargetFunctions.sol para heredar del contrato agregador
     que incluye todos los PropertiesX.sol.
@@ -408,7 +638,7 @@ def update_target_functions_import(chimera_dir: Path, hunter_suffixes: list[str]
 
     content = [
         "// SPDX-License-Identifier: UNLICENSED",
-        "pragma solidity ^0.8.0;",
+        pragma,
         "",
         *imports,
         "",
@@ -530,6 +760,10 @@ def run_split_mode(
 ) -> int:
     """Modo split: genera un PropertiesX.sol por hunter."""
 
+    # Detectar pragma del proyecto
+    pragma = detect_pragma(chimera_dir)
+    print(f"Pragma detectado: {pragma}")
+
     # Paso 0: limpiar Properties.sol de invariantes de merges anteriores
     print("--- Limpiando Properties.sol (base only) ---")
     clean_properties_base(chimera_dir, dry_run)
@@ -552,6 +786,11 @@ def run_split_mode(
         if not hyp_data:
             continue
 
+        # Validate evidence tables
+        table_warnings = validate_evidence_tables(hyp_data)
+        for w in table_warnings:
+            print(f"  {w}")
+
         # Filtrar por componente si se especificó
         if component_filter and hyp_data.get("component", "").lower() != component_filter.lower():
             print(f"    → skip (componente {hyp_data.get('component')} != {component_filter})")
@@ -572,6 +811,74 @@ def run_split_mode(
         hd["optimizes"].extend(result["new_optimizes"])
         hd["skipped"].extend(result["skipped"])
         hd["component"] = result["component"]
+
+    # ─── Dedup invariantes por body similarity (cross-hunter) ──────────
+    def _extract_body(prop_code: str) -> str:
+        """Extract the function body (between { and }) normalized for comparison."""
+        lines = prop_code.split("\n")
+        body_lines = []
+        in_body = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("function ") and stripped.endswith("{"):
+                in_body = True
+                continue
+            if stripped == "}" and in_body:
+                break
+            if in_body and stripped and not stripped.startswith("//"):
+                # Normalize: remove whitespace, lowercase identifiers won't help
+                # but removing comments and whitespace catches copy-paste dupes
+                body_lines.append(stripped)
+        return "\n".join(body_lines)
+
+    def _dedup_properties_cross_hunter(hunter_data_dict: dict) -> int:
+        """Dedup properties across all hunters by body similarity.
+        Keeps the first occurrence (highest-priority hunter) and removes dupes."""
+        import difflib
+        seen_bodies: list[tuple[str, str, str]] = []  # (body, hunter, fn_name)
+        total_removed = 0
+
+        # Collect all properties with their bodies
+        all_props = []
+        for hunter_name, data in sorted(hunter_data_dict.items()):
+            for prop in data["properties"]:
+                body = _extract_body(prop)
+                fn_match = re.search(r'function\s+(property_\w+)', prop)
+                fn_name = fn_match.group(1) if fn_match else "unknown"
+                all_props.append((hunter_name, prop, body, fn_name))
+
+        # Mark duplicates
+        dupes_to_remove: dict[str, list[str]] = defaultdict(list)  # hunter → list of props to remove
+        for i, (hunter, prop, body, fn_name) in enumerate(all_props):
+            if not body or len(body) < 20:
+                continue
+            is_dupe = False
+            for seen_body, seen_hunter, seen_fn in seen_bodies:
+                similarity = difflib.SequenceMatcher(None, body, seen_body).ratio()
+                if similarity > 0.65:
+                    dupes_to_remove[hunter].append(prop)
+                    is_dupe = True
+                    print(f"    DEDUP: {fn_name} ({hunter}) ≈ {seen_fn} ({seen_hunter}) "
+                          f"[{similarity:.0%}] — removing")
+                    total_removed += 1
+                    break
+            if not is_dupe:
+                seen_bodies.append((body, hunter, fn_name))
+
+        # Remove dupes from hunter_data
+        for hunter_name, props_to_remove in dupes_to_remove.items():
+            remove_set = set(id(p) for p in props_to_remove)
+            hunter_data_dict[hunter_name]["properties"] = [
+                p for p in hunter_data_dict[hunter_name]["properties"]
+                if id(p) not in remove_set
+            ]
+
+        return total_removed
+
+    print("\n--- Deduplicating invariants across hunters ---")
+    removed = _dedup_properties_cross_hunter(hunter_data)
+    total_before_dedup = sum(len(d["properties"]) + len(d["optimizes"]) for d in hunter_data.values())
+    print(f"  Removed {removed} duplicate invariants, {total_before_dedup} remaining")
 
     # Generar archivos por hunter
     generated_suffixes = []
@@ -599,14 +906,33 @@ def run_split_mode(
         combined_existing = base_text + existing_file_text
         unique_ghosts = _dedup_ghosts(data["ghosts"], combined_existing)
 
-        content = generate_hunter_sol_file(
-            hunter_suffix=suffix,
-            base_contract="Properties",
-            ghosts=unique_ghosts,
-            properties=data["properties"],
-            optimizes=data["optimizes"],
-            component=data["component"],
-        )
+        # Cross-component hunters get a special file that doesn't inherit Properties
+        if hunter_name in CROSS_COMPONENT_HUNTERS:
+            # Extract component names from the hypothesis data
+            # EdgeHunter files are named hyp_CompA_CompB_EdgeHunter.yaml
+            # The component field contains "CompA_CompB" or similar
+            comp_str = data["component"]
+            components = [c.strip() for c in comp_str.replace("_", " ").split() if c.strip()]
+            if len(components) < 2:
+                components = [comp_str, "unknown"]
+
+            content = generate_cross_component_sol_file(
+                ghosts=unique_ghosts,
+                properties=data["properties"],
+                optimizes=data["optimizes"],
+                components=components,
+                pragma=pragma,
+            )
+        else:
+            content = generate_hunter_sol_file(
+                hunter_suffix=suffix,
+                base_contract="Properties",
+                ghosts=unique_ghosts,
+                properties=data["properties"],
+                optimizes=data["optimizes"],
+                component=data["component"],
+                pragma=pragma,
+            )
 
         if dry_run:
             print(f"\n  [DRY-RUN] Properties{suffix}.sol:")
@@ -634,7 +960,7 @@ def run_split_mode(
             existing_suffix = name[len("Properties"):]
             all_suffixes.add(existing_suffix)
 
-    update_target_functions_import(chimera_dir, sorted(all_suffixes), dry_run)
+    update_target_functions_import(chimera_dir, sorted(all_suffixes), dry_run, pragma=pragma)
 
     print(f"\n{'[DRY-RUN] ' if dry_run else ''}Resumen:")
     print(f"  {len(generated_suffixes)} archivo(s) generados")
@@ -743,6 +1069,11 @@ def run_monolithic_mode(
         if not hyp_data:
             continue
 
+        # Validate evidence tables
+        table_warnings = validate_evidence_tables(hyp_data)
+        for w in table_warnings:
+            print(f"  {w}")
+
         if component_filter and hyp_data.get("component", "").lower() != component_filter.lower():
             print(f"    → skip (componente {hyp_data.get('component')} != {component_filter})")
             continue
@@ -838,9 +1169,36 @@ def main():
     parser.add_argument("--list", action="store_true", help="Lista invariantes existentes")
     parser.add_argument("--include-low", action="store_true", help="Incluye invariantes de prioridad low")
     parser.add_argument("--component", "-c", type=str, help="Filtra por componente")
+    parser.add_argument("--session-dir", type=str, default="", help="Override HUNT_SESSION_DIR (benchmark mode)")
+    parser.add_argument("--protocol", type=str, default="", help="Protocol name (benchmark mode, overrides current_hunt.json)")
     args = parser.parse_args()
 
     hunt = load_current_hunt()
+
+    # Gate enforcement: verify deepdive is complete before merge
+    if args.component and not args.list and not args.generate_only:
+        # If --hypotheses-dir is passed, do a direct file existence check
+        # (avoids pipeline_gate.py namespace mismatch in benchmark mode)
+        if args.hypotheses_dir:
+            dd_file = Path(args.hypotheses_dir) / f"hyp_{args.component}_DeepDiveHunter.yaml"
+            gate_ok = dd_file.exists()
+        else:
+            gate_cmd = [
+                sys.executable,
+                str(Path(__file__).parent / "pipeline_gate.py"),
+                "-c", args.component, "--gate", "deepdive"
+            ]
+            if args.session_dir:
+                gate_cmd += ["--session-dir", args.session_dir]
+            if args.protocol:
+                gate_cmd += ["--protocol", args.protocol]
+            gate_result = subprocess.run(gate_cmd, capture_output=True)
+            gate_ok = gate_result.returncode == 0
+        if not gate_ok:
+            print(f"\u2717 Gate FAIL: deepdive gate not passed for {args.component}")
+            print(f"  Run hunters + deepdive before merge_invariants.py")
+            print(f"  Use: pipeline_gate.py -c {args.component} --status")
+            return 1
 
     # Si --output se especifica, forzar modo monolítico
     if args.output:
@@ -894,7 +1252,7 @@ def main():
 
     # Ejecutar modo
     if args.monolithic:
-        return run_monolithic_mode(
+        rc = run_monolithic_mode(
             properties_path, hyp_files, existing_ids,
             args.include_low, args.dry_run, args.generate_only, args.component,
         )
@@ -902,10 +1260,22 @@ def main():
         if args.generate_only:
             print("⚠ --generate-only solo funciona con --monolithic")
             return 1
-        return run_split_mode(
+        rc = run_split_mode(
             chimera_dir, hyp_files, existing_ids,
             args.include_low, args.dry_run, args.component,
         )
+
+    # Auto-mark merge gate on success
+    if rc == 0 and not args.dry_run and args.component:
+        try:
+            subprocess.run([
+                "python3", str(Path(__file__).parent / "pipeline_gate.py"),
+                "-c", args.component, "--mark", "merge"
+            ], check=False, capture_output=True)
+        except Exception:
+            pass
+
+    return rc
 
 
 if __name__ == "__main__":

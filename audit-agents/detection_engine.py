@@ -170,6 +170,15 @@ def generate_prepass_yaml(findings: list, output_path: Path):
     for f in findings:
         if f.severity_score() < 2:  # Skip low/info
             continue
+        # Mark unused-return and ignored-return signals as CRITICAL priority
+        is_critical_signal = any(kw in f.title.lower() for kw in [
+            "unused return", "ignored return", "return value not used",
+            "unused-return", "ignored-return", "unchecked return",
+        ])
+        action = "VERIFY" if f.confidence < 0.6 else "INVESTIGATE"
+        if is_critical_signal and f.confidence >= 0.5:
+            action = "CRITICAL — unused return values often hide real bugs (loops, state, overflow)"
+
         signals.append({
             "source": f.layer,
             "title": f.title,
@@ -177,7 +186,8 @@ def generate_prepass_yaml(findings: list, output_path: Path):
             "location": f.location,
             "description": f.description[:500],
             "confidence": f.confidence,
-            "action": "VERIFY" if f.confidence < 0.6 else "INVESTIGATE",
+            "action": action,
+            "priority": "CRITICAL" if is_critical_signal else "normal",
         })
 
     output = {
@@ -632,6 +642,145 @@ Only report findings that an UNPRIVILEGED attacker can exploit. No admin-only bu
     return prompts
 
 
+def _check_uninitialized_state_vars(sol_files: list) -> list:
+    """Detect state variables that are read (especially in transfers) but never written.
+
+    Cross-reference analysis: for each state var, count write locations vs read locations.
+    If writes == 0 and the var is used in a value-transfer context → high-confidence bug.
+    """
+    import re
+    findings = []
+
+    for sol_file in sol_files:
+        try:
+            content = sol_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        lines = content.split("\n")
+
+        # Extract state variable declarations (outside functions)
+        # Simplified heuristic: lines at top-level indentation with type + name + ;
+        in_function = False
+        brace_depth = 0
+        state_vars = []  # (type, name, line_num)
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Track brace depth to know if we're inside a function
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if stripped.startswith("function ") or stripped.startswith("constructor"):
+                in_function = True
+            if brace_depth <= 1 and in_function and "}" in stripped:
+                in_function = False
+
+            # State var: declared at contract level (brace_depth == 1, not in function)
+            if brace_depth == 1 and not in_function:
+                m = re.match(
+                    r'\s*(address|uint\d*|int\d*|bool|bytes\d*|string|mapping\s*\(.*?\))\s+'
+                    r'(?:public\s+|private\s+|internal\s+|immutable\s+|constant\s+)*'
+                    r'(\w+)\s*[;=]',
+                    line
+                )
+                if m:
+                    var_type = m.group(1)
+                    var_name = m.group(2)
+                    # Skip constants, immutables (they're set at declaration or constructor)
+                    if "constant " in line or "immutable " in line:
+                        continue
+                    state_vars.append((var_type, var_name, i + 1))
+
+        if not state_vars:
+            continue
+
+        content_lower = content.lower()
+
+        for var_type, var_name, decl_line in state_vars:
+            # Count write locations: varName = (but not ==)
+            write_pattern = rf'\b{re.escape(var_name)}\s*[+\-*\/]?=(?!=)'
+            writes = re.findall(write_pattern, content)
+
+            # Also check constructor assignments
+            constructor_write = False
+            in_constructor = False
+            for line in lines:
+                if "constructor" in line:
+                    in_constructor = True
+                if in_constructor and var_name in line and "=" in line and "==" not in line:
+                    constructor_write = True
+                if in_constructor and "}" in line:
+                    in_constructor = False
+
+            total_writes = len(writes)
+            # The declaration itself may count as a write if it has = value
+            decl_line_text = lines[decl_line - 1] if decl_line <= len(lines) else ""
+            if "=" in decl_line_text and "==" not in decl_line_text:
+                total_writes = max(total_writes, 1)  # initialized at declaration
+            if constructor_write:
+                total_writes = max(total_writes, 1)
+
+            if total_writes > 0:
+                continue  # Has at least one write, not uninitialized
+
+            # Check if used in value-transfer context
+            transfer_contexts = []
+            for i, line in enumerate(lines):
+                line_lower = line.lower()
+                if var_name.lower() in line_lower:
+                    if any(kw in line_lower for kw in [
+                        "transfer(", "transferfrom(", "safetransfer(",
+                        "safetransferfrom(", ".call{value:", ".send(",
+                    ]):
+                        transfer_contexts.append((i + 1, line.strip()))
+                    elif any(kw in line_lower for kw in [
+                        "safeapprove(", "approve(",
+                    ]):
+                        transfer_contexts.append((i + 1, line.strip()))
+
+            # Also check if used in conditional that gates important logic
+            condition_contexts = []
+            for i, line in enumerate(lines):
+                if var_name in line and any(kw in line for kw in [
+                    "require(", "if (", "if(", "assert(", "?", "=="
+                ]):
+                    condition_contexts.append((i + 1, line.strip()))
+
+            if transfer_contexts:
+                loc = f"{sol_file.name}:{transfer_contexts[0][0]}"
+                findings.append(Finding(
+                    title=f"[CrossRef] Uninitialized '{var_name}' used in token transfer",
+                    severity="high",
+                    layer="static/crossref",
+                    description=(
+                        f"State variable '{var_name}' ({var_type}) declared at line {decl_line} "
+                        f"has 0 write locations (no setter, no constructor init, no assignment). "
+                        f"Used in transfer context at: {'; '.join(f'L{l}: {c[:80]}' for l, c in transfer_contexts[:3])}. "
+                        f"Default value ({'address(0)' if 'address' in var_type else '0'}) "
+                        f"means funds sent to zero address or zero amount."
+                    ),
+                    location=loc,
+                    confidence=0.85,
+                    poc_hint=f"Check: is '{var_name}' ever set? grep -rn '{var_name}.*=' in the contract. If no setter exists, this is a confirmed bug.",
+                ))
+            elif condition_contexts and "address" in var_type:
+                loc = f"{sol_file.name}:{condition_contexts[0][0]}"
+                findings.append(Finding(
+                    title=f"[CrossRef] Uninitialized '{var_name}' used in condition",
+                    severity="medium",
+                    layer="static/crossref",
+                    description=(
+                        f"State variable '{var_name}' ({var_type}) declared at line {decl_line} "
+                        f"has 0 write locations. Used in condition at: "
+                        f"{'; '.join(f'L{l}: {c[:80]}' for l, c in condition_contexts[:3])}. "
+                        f"address(0) default may cause logic to always take one branch."
+                    ),
+                    location=loc,
+                    confidence=0.65,
+                ))
+
+    return findings
+
+
 # =============================================================================
 # LAYER 5: EXPLOIT-DERIVED PATTERN MATCHING
 # =============================================================================
@@ -741,6 +890,30 @@ def run_exploit_pattern_matching(source_dir: str, report: DetectionReport) -> li
             "description": "Flash loan callback without sender validation. Attacker can call directly.",
             "real_hacks": "Multiple DeFi exploits",
         },
+        {
+            "name": "Uninitialized or dead state variable used in logic",
+            "indicators": ["= 0;", "address(0)", "initialized", "setstrategy", "setoracle", "setpricefeed"],
+            "anti_indicators": ["require(strategy != address(0)", "require(oracle != address(0)", "if (oracle == address(0)) revert"],
+            "severity": "high",
+            "description": "State variable set once or never updated is used in critical path. If never initialized or set to zero/dead address, logic silently produces wrong results or reverts.",
+            "real_hacks": "Multiple proxy initialization bugs, uninitialized fee recipient patterns",
+        },
+        {
+            "name": "Loop exits early without processing all elements",
+            "indicators": ["for (", "while (", "return true", "return false", "break;"],
+            "anti_indicators": [],
+            "severity": "medium",
+            "description": "Loop with early return/break may skip remaining elements. If the loop should process ALL items (observations, positions, orders), early exit means incomplete validation.",
+            "real_hacks": "Euler observation loop, multiple DeFi protocols with premature loop exit",
+        },
+        {
+            "name": "Boundary collapse — range becomes zero-width or inverted",
+            "indicators": ["ticklower", "tickupper", "tickspacing", "modulo", "rangeupper", "rangelower"],
+            "anti_indicators": ["require(ticklower < tickupper", "assert(lower < upper"],
+            "severity": "medium",
+            "description": "Tick/range calculation can produce tickLower >= tickUpper when value is exact multiple of spacing. Zero-width range causes Uniswap revert or empty position.",
+            "real_hacks": "Bunni V2 range edge cases, concentrated liquidity position boundary bugs",
+        },
     ]
 
     matched_patterns = 0
@@ -778,6 +951,12 @@ def run_exploit_pattern_matching(source_dir: str, report: DetectionReport) -> li
                 confidence=0.4,  # Pattern match = hypothesis, needs manual verification
                 poc_hint=f"Verify: does this code path actually lack the protection? Check anti-patterns: {check['anti_indicators']}",
             ))
+
+    # Cross-reference: uninitialized state variables
+    crossref_findings = _check_uninitialized_state_vars(sol_files)
+    findings.extend(crossref_findings)
+    if crossref_findings:
+        print(f"  Cross-ref: {len(crossref_findings)} uninitialized state vars in transfer/condition context")
 
     report.add_layer_stats("exploit_pattern", {
         "patterns_checked": len(exploit_checks),
@@ -883,6 +1062,61 @@ def main():
     if args.prepass:
         prepass_path = Path(args.output) / f"{args.name}_prepass.yaml"
         generate_prepass_yaml(report.findings, prepass_path)
+
+
+# ─── Post-Hunter Slither Confirmation (Task 28: GPTScan FP reduction pattern) ──
+
+def slither_confirm_hypothesis(hypothesis: dict, contract_path: str) -> dict:
+    """Use Slither to check if the hypothesis references real code elements.
+
+    Checks:
+    - Does the function mentioned in the hypothesis exist in the contract?
+    - Are there existing Slither detectors that flag the same area?
+
+    Returns hypothesis with added 'static_confirmation' field.
+    """
+    hyp = dict(hypothesis)  # don't mutate original
+    desc = f"{hyp.get('description', '')} {hyp.get('solidity', '')}".lower()
+
+    # Extract function names from hypothesis
+    import re
+    hyp_functions = set()
+    for m in re.finditer(r'\b(\w+)\s*\(', desc):
+        fn = m.group(1)
+        if fn not in ('require', 'assert', 'revert', 'emit', 'if', 'for', 'while',
+                       'gte', 'lte', 'eq', 't', 'uint256', 'address', 'bool'):
+            hyp_functions.add(fn)
+
+    if not hyp_functions:
+        hyp['static_confirmation'] = 'no_functions_referenced'
+        return hyp
+
+    # Read contract source to verify functions exist
+    try:
+        source = Path(contract_path).read_text()
+        source_lower = source.lower()
+    except Exception:
+        hyp['static_confirmation'] = 'source_unreadable'
+        return hyp
+
+    # Check which referenced functions actually exist in source
+    found = {fn for fn in hyp_functions if fn.lower() in source_lower}
+    missing = hyp_functions - found
+
+    if missing and len(missing) == len(hyp_functions):
+        # ALL referenced functions are missing — likely hallucinated
+        hyp['static_confirmation'] = 'all_functions_missing'
+        hyp['_missing_functions'] = list(missing)
+        conf = hyp.get('confidence', 50)
+        hyp['confidence'] = max(0, conf - 30)
+        hyp['_confidence_adjusted'] = f"Reduced from {conf} (all functions missing in source)"
+    elif missing:
+        hyp['static_confirmation'] = 'partial_match'
+        hyp['_missing_functions'] = list(missing)
+    else:
+        hyp['static_confirmation'] = 'confirmed'
+
+    return hyp
 
 
 if __name__ == "__main__":

@@ -1530,6 +1530,16 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         summary["gates"]["hunters"] = True
         logger.info(f"  Gate hunters: PASS ({hyp_count} YAML files, all 9 required hunters present)")
 
+    # Mandatory team output verification
+    verify_result = subprocess.run([
+        "python3", str(SCRIPT_DIR / "verify_team_outputs.py"),
+        "--session-dir", str(Path(hyp_dir).parent.parent),
+        "--protocol", protocol,
+        "--groups", json.dumps([{"group_id": 0, "components": [component]}])
+    ], capture_output=True, text=True)
+    if verify_result.returncode != 0:
+        logger.warning(f"  Team verification warnings:\n{verify_result.stdout[:500]}")
+
     # Step 3 (Library Analyzer) — now runs as LibraryHunter (#11) in parallel with other hunters above
 
     # ─── Step 4: DeepDive Hunter ────────────────────────────────────────
@@ -1927,7 +1937,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         if not _skip_to_extract:
             FUZZ_RUNS = 3000 if args.fast else 5000
             FUZZ_PARALLEL = args.parallel_fuzz
-            FUZZ_BATCH_TIMEOUT = 900 if args.fast else 1800  # per batch
+            FUZZ_BATCH_TIMEOUT = 1800  # per batch
 
             # Discover all invariant_ functions from FoundryTester
             foundry_tester = chimera_dir / "FoundryTester.sol"
@@ -3238,6 +3248,15 @@ def _create_worktree(repo: str, component: str, protocol: str, run_id: str = "")
 
     effective_path = str(Path(wt_path) / subdir) if str(subdir) != "." else wt_path
 
+    # Copy .env to worktree root so forge/foundry can read env vars (especially in agent mode
+    # where subprocesses don't inherit shell exports)
+    for _env_search in [repo_path, repo_path.parent, repo_path.parent.parent, git_root, git_root.parent]:
+        _env_candidate = _env_search / ".env"
+        if _env_candidate.exists():
+            shutil.copy2(str(_env_candidate), str(Path(wt_path) / ".env"))
+            logger.info(f"  Copied .env to worktree: {_env_candidate} → {wt_path}/.env")
+            break
+
     # Patch foundry.toml to add [rpc_endpoints] if missing — prevents vm.createSelectFork("mainnet") failures
     ft = Path(effective_path) / "foundry.toml"
     if ft.exists():
@@ -3282,7 +3301,8 @@ def main():
     parser.add_argument("--max-retries", type=int, default=5, help="Max fix-and-retry attempts")
     parser.add_argument("--skip-phase3", action="store_true", help="Skip fork PoC (explicit)")
     parser.add_argument("--fast", action="store_true",
-                        help="Fast mode: hunters → top findings → PoC. Skip invariant compile/fuzz/medusa.")
+                        help="Fast mode: reduced fuzz runs (3K vs 5K), skip Medusa, compile retry=1. "
+                             "Does NOT skip finding pipeline (verify/PoC/RedTeam) — that's controlled by --benchmark-mode.")
     parser.add_argument("--benchmark-mode",
                         choices=["hypothesis", "poc", "redteam"],
                         default="redteam",
