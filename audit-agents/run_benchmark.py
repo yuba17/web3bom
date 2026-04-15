@@ -2595,39 +2595,16 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
 
         logger.info(f"  PoC phase complete: {pocs_confirmed}/{len(poc_findings)} findings confirmed")
 
-        # ── Step 10.5b: Capa 2 — Fallback PoC for groups with failed leaders ─
-        # When a group leader fails PoC, its siblings were never tried.
-        # Promote the best verified sibling (rank 1) to a fallback PoC attempt.
-        # Without this, real bugs hidden behind a poorly-described leader are silently lost.
+        # ── Step 10.5b+10.6+10.7: Unified Capa 2 (fallback) + Capa 3 (escaped) ──
+        # Phase A: Identify fallback candidates (groups where leader failed PoC)
         fallback_findings: list[dict] = []
         for g in finding_groups:
             if len(g) > 1 and not g[0].get("has_poc"):
-                # Leader failed — look for best verified sibling
                 for sib in g[1:]:
                     if sib.get("_verified") or sib.get("fuzz_confirmed"):
                         sib["_capa2_fallback"] = True
                         fallback_findings.append(sib)
-                        break  # only the best sibling per group
-
-        if fallback_findings:
-            logger.info(f"  Step 10.5b: Capa 2 fallback — {len(fallback_findings)} groups "
-                        f"whose leader failed PoC; trying best sibling for each")
-            n_fb = len(fallback_findings)
-            with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
-                futures_fb = {
-                    executor.submit(_process_finding, (i, f, n_fb)): i
-                    for i, f in enumerate(fallback_findings)
-                }
-                for future in as_completed(futures_fb):
-                    try:
-                        _, confirmed, fid = future.result()
-                        if confirmed:
-                            pocs_confirmed += 1
-                            logger.info(f"    Capa 2 fallback {fid}: PoC PASSED — real bug found!")
-                    except Exception as e:
-                        logger.error(f"    Capa 2 fallback PoC error: {e}")
-            capa2_confirmed = sum(1 for f in fallback_findings if f.get("has_poc"))
-            logger.info(f"  Capa 2 fallback complete: {capa2_confirmed}/{len(fallback_findings)} confirmed")
+                        break
 
         # ── Step 10.6: is_same_bug safety check (Capa 3) ─────────────────
         # For every group whose leader passed PoC, check each sibling:
@@ -2650,12 +2627,12 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             logger.info(f"    is_same_bug({leader['id']}, {fid_s}): {verdict}")
             return is_same
 
+        # Phase B: is_same_bug check for groups where leader PASSED
         groups_with_passed_leader = [
             g for g in finding_groups
             if len(g) > 1 and g[0].get("has_poc")
         ]
         if groups_with_passed_leader:
-            # Collect all verified siblings for parallel checking
             sibling_checks = [
                 (g[0], sib)
                 for g in groups_with_passed_leader
@@ -2675,31 +2652,36 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         try:
                             same = fut.result()
                         except Exception:
-                            same = False  # conservative: unknown → treat as different
+                            same = False
                         if not same:
                             sib["_escaped_dedup"] = True
                             escaped_siblings.append(sib)
 
-        if escaped_siblings:
-            logger.info(f"  Step 10.7: PoC for {len(escaped_siblings)} escaped siblings "
-                        f"(different bugs grouped by mistake)")
-            poc_phase_start_esc = time.time()
-            n_esc = len(escaped_siblings)
+        # Phase C: Single unified PoC batch for all fallbacks + escaped siblings
+        unified_extra = fallback_findings + escaped_siblings
+        if unified_extra:
+            logger.info(f"  Step 10.7: Unified PoC batch — {len(fallback_findings)} fallbacks + "
+                        f"{len(escaped_siblings)} escaped siblings = {len(unified_extra)} total")
+            n_extra = len(unified_extra)
             with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
                 futures = {
-                    executor.submit(_process_finding, (i, f, n_esc)): i
-                    for i, f in enumerate(escaped_siblings)
+                    executor.submit(_process_finding, (i, f, n_extra)): (i, f)
+                    for i, f in enumerate(unified_extra)
                 }
                 for future in as_completed(futures):
+                    i, f = futures[future]
                     try:
                         _, confirmed, fid = future.result()
                         if confirmed:
                             pocs_confirmed += 1
-                            logger.info(f"    Escaped sibling {fid}: PoC PASSED — real distinct bug!")
+                            source = "Capa 2 fallback" if f.get("_capa2_fallback") else "Escaped sibling"
+                            logger.info(f"    {source} {fid}: PoC PASSED — real distinct bug!")
                     except Exception as e:
-                        logger.error(f"    Escaped sibling PoC error: {e}")
-            logger.info(f"  Escaped siblings PoC complete: "
-                        f"{sum(1 for f in escaped_siblings if f.get('has_poc'))}/{len(escaped_siblings)} confirmed")
+                        logger.error(f"    Unified batch PoC error: {e}")
+            fb_confirmed = sum(1 for f in fallback_findings if f.get("has_poc"))
+            esc_confirmed = sum(1 for f in escaped_siblings if f.get("has_poc"))
+            logger.info(f"  Unified batch complete: {fb_confirmed} fallbacks + {esc_confirmed} escaped = "
+                        f"{fb_confirmed + esc_confirmed} new confirmed")
 
         # Mark all findings without PoC (default)
         for group in finding_groups:
