@@ -1229,8 +1229,24 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
                timeout=POC_GEN_TIMEOUT, log_file=clog / f"{fid}_poc_gen.log", cwd=repo)
 
     if not poc_path.exists():
-        finding["has_poc"] = False
-        return
+        # Regeneration: if initial generation produced no file (timeout/error),
+        # retry once with a shorter, more focused prompt
+        logger.warning(f"    {fid}: PoC file not created — retrying generation with focused prompt")
+        regen_prompt = (
+            f"Write a Foundry fork PoC for this vulnerability. Be CONCISE — write minimal code.\n\n"
+            f"## Bug\n{finding.get('title', '')}\n{finding.get('root_cause', '')}\n\n"
+            f"## Code\n```solidity\n{relevant_code[:6000]}\n```\n\n"
+            f"Write the test to: {poc_path}\n"
+            f"Test function name: {test_name}\n"
+            f"Use forge-std Test base. Use ONLY ASCII in strings.\n"
+            f"After writing, run: forge test --match-test {test_name} --match-path "
+            f"{poc_path.relative_to(Path(repo))} -vvv --fuzz-runs 1"
+        )
+        _llm(regen_prompt, allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
+                   timeout=POC_GEN_TIMEOUT, log_file=clog / f"{fid}_poc_regen.log", cwd=repo)
+        if not poc_path.exists():
+            finding["has_poc"] = False
+            return
 
     _sanitize_sol_unicode(poc_path)
 
@@ -1268,10 +1284,11 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
         )
         _sanitize_sol_unicode(poc_path)
 
+        forge_timeout = 300 if attempt <= 2 else 450  # more time for complex state on last attempt
         poc_rc_fix, _, poc_stderr = run_cmd(
             ["forge", "test", "--match-test", test_name, "--match-path", poc_rel,
              "-vvv", "--fuzz-runs", "1"],
-            timeout=300, cwd=repo, env=forge_env
+            timeout=forge_timeout, cwd=repo, env=forge_env
         )
         if poc_rc_fix == 0:
             logger.info(f"    {fid}: PoC PASSED after fix {attempt}!")
@@ -3190,7 +3207,7 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str,
         poc_candidates = [
             f for f in merged_findings
             if isinstance(f, dict)
-            and f.get("confidence", 0) >= 65
+            and f.get("confidence", 0) >= POC_CONFIDENCE_THRESHOLD
             and f.get("severity", "Low").capitalize() in ("High", "Medium", "Critical")
         ]
         if poc_candidates:
