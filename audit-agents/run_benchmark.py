@@ -364,6 +364,7 @@ def run_claude_sub(prompt: str, agentic: bool = False, timeout: int = 1800,
 USE_SUB_MODE = False  # Set in main() based on --mode sub
 SUB_MODEL = "sonnet"  # Set in main()
 PARALLEL_HUNTERS = 6  # Set in main() from --parallel-hunters
+POC_GEN_TIMEOUT = 900  # Set in main() based on --mode and --poc-timeout
 
 # Steps that get tool access in sub mode (agentic exploration).
 _AGENTIC_TOOLS = {"Read", "Write", "Edit", "Grep", "Glob", "Bash", "Agent"}
@@ -1225,7 +1226,7 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
     )
 
     _llm(poc_prompt, allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-               timeout=900, log_file=clog / f"{fid}_poc_gen.log", cwd=repo)
+               timeout=POC_GEN_TIMEOUT, log_file=clog / f"{fid}_poc_gen.log", cwd=repo)
 
     if not poc_path.exists():
         finding["has_poc"] = False
@@ -3512,6 +3513,10 @@ def main():
                         help="Target chain for fork PoCs (mainnet, base, optimism, arbitrum, polygon)")
     parser.add_argument("--fork-block", type=int, default=0,
                         help="Fork block for PoCs. 0 = latest (portable), N = pinned (deterministic)")
+    parser.add_argument("--poc-timeout", type=int, default=0,
+                        help="PoC generation timeout in seconds. Default: 900 (api) / 1500 (sub)")
+    parser.add_argument("--poc-confidence", type=int, default=65,
+                        help="Minimum confidence %% to attempt PoC generation (default 65)")
 
     args = parser.parse_args()
 
@@ -3556,6 +3561,19 @@ def main():
         PARALLEL_HUNTERS = args.parallel_hunters
         logger.info(f"  SUB MODE: subscription, model={SUB_MODEL}, "
                     f"parallel-hunters={PARALLEL_HUNTERS}")
+
+    global POC_GEN_TIMEOUT
+    if args.poc_timeout > 0:
+        POC_GEN_TIMEOUT = args.poc_timeout
+    elif args.mode == "sub":
+        POC_GEN_TIMEOUT = 1500  # agents need more time for tool calls
+    else:
+        POC_GEN_TIMEOUT = 900
+    logger.info(f"  PoC generation timeout: {POC_GEN_TIMEOUT}s")
+
+    global POC_CONFIDENCE_THRESHOLD
+    POC_CONFIDENCE_THRESHOLD = args.poc_confidence
+    logger.info(f"  PoC confidence threshold: {POC_CONFIDENCE_THRESHOLD}%")
 
     components = [c.strip() for c in args.components.split(",")]
     repo = str(Path(args.repo).resolve())
