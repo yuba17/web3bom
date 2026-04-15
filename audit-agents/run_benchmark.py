@@ -1245,35 +1245,41 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
         finding["poc_path"] = str(poc_path)
         return
 
-    # One fix attempt
-    logger.info(f"    {fid}: PoC failed, attempting fix...")
-    file_errors = _filter_errors_for_file(poc_stderr, poc_path.name)
-    poc_content = poc_path.read_text(encoding="utf-8")[:8000] if poc_path.exists() else ""
-    _llm(
-        f"Fix this Foundry PoC. Only fix compile/runtime errors, keep the attack logic.\n\n"
-        f"## Error\n```\n{file_errors}\n```\n\n"
-        f"## Current Code\n```solidity\n{poc_content}\n```\n\n"
-        f"## Interfaces\n```solidity\n{interfaces_code[:5000]}\n```\n\n"
-        f"File: {poc_path}\n"
-        f"Fix it, then run: forge test --match-test {test_name} --match-path {poc_rel} -vvv --fuzz-runs 1\n"
-        f"Use ONLY ASCII in strings.",
-        allowed_tools=["Read", "Edit", "Bash"],
-        timeout=600, log_file=clog / f"{fid}_poc_fix.log", cwd=repo
-    )
-    _sanitize_sol_unicode(poc_path)
+    # Retry loop — up to MAX_POC_FIX_ATTEMPTS fix attempts
+    MAX_POC_FIX_ATTEMPTS = 3
+    for attempt in range(1, MAX_POC_FIX_ATTEMPTS + 1):
+        logger.info(f"    {fid}: PoC failed, fix attempt {attempt}/{MAX_POC_FIX_ATTEMPTS}...")
+        file_errors = _filter_errors_for_file(poc_stderr, poc_path.name)
+        poc_content = poc_path.read_text(encoding="utf-8")[:8000] if poc_path.exists() else ""
+        fix_timeout = 600 if attempt <= 2 else 900  # more time on last attempt
+        _llm(
+            f"Fix this Foundry PoC. Only fix compile/runtime errors, keep the attack logic.\n\n"
+            f"## Error\n```\n{file_errors}\n```\n\n"
+            f"## Current Code\n```solidity\n{poc_content}\n```\n\n"
+            f"## Interfaces\n```solidity\n{interfaces_code[:5000]}\n```\n\n"
+            f"File: {poc_path}\n"
+            f"Fix it, then run: forge test --match-test {test_name} --match-path {poc_rel} -vvv --fuzz-runs 1\n"
+            f"Use ONLY ASCII in strings."
+            + (f"\nThis is attempt {attempt}/{MAX_POC_FIX_ATTEMPTS}. Previous attempts failed. "
+               f"Try a different approach if the same fix doesn't work." if attempt > 1 else ""),
+            allowed_tools=["Read", "Edit", "Bash"],
+            timeout=fix_timeout, log_file=clog / f"{fid}_poc_fix{attempt}.log", cwd=repo
+        )
+        _sanitize_sol_unicode(poc_path)
 
-    poc_rc2, _, _ = run_cmd(
-        ["forge", "test", "--match-test", test_name, "--match-path", poc_rel,
-         "-vvv", "--fuzz-runs", "1"],
-        timeout=300, cwd=repo, env=forge_env
-    )
-    if poc_rc2 == 0:
-        logger.info(f"    {fid}: PoC PASSED after fix!")
-        finding["has_poc"] = True
-        finding["poc_path"] = str(poc_path)
-    else:
-        logger.warning(f"    {fid}: PoC FAILED — finding unverified")
-        finding["has_poc"] = False
+        poc_rc_fix, _, poc_stderr = run_cmd(
+            ["forge", "test", "--match-test", test_name, "--match-path", poc_rel,
+             "-vvv", "--fuzz-runs", "1"],
+            timeout=300, cwd=repo, env=forge_env
+        )
+        if poc_rc_fix == 0:
+            logger.info(f"    {fid}: PoC PASSED after fix {attempt}!")
+            finding["has_poc"] = True
+            finding["poc_path"] = str(poc_path)
+            return
+
+    logger.warning(f"    {fid}: PoC FAILED after {MAX_POC_FIX_ATTEMPTS} fix attempts — finding unverified")
+    finding["has_poc"] = False
 
 
 # ─── Component Pipeline ─────────────────────────────────────────────────────
