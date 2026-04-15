@@ -299,6 +299,90 @@ def _run_claude_inner(prompt: str, base_cmd: list, env: dict, work_cwd: str,
     return proc.returncode or 0, stdout_text
 
 
+# ─── Claude CLI (subscription mode) ─────────────────────────────────────────
+
+def run_claude_sub(prompt: str, agentic: bool = False, timeout: int = 1800,
+                   log_file: Path = None, cwd: str = None,
+                   model: str = "sonnet") -> tuple[int, str]:
+    """Run claude -p using subscription (no API key), text output mode.
+
+    Strips ANTHROPIC_API_KEY from env to force subscription auth.
+    When agentic=True, passes --allowedTools so Claude can use
+    Read/Write/Grep/Glob/Bash to explore code autonomously.
+    No stall detection — hard timeout only (text mode, not stream-json).
+    """
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    env.pop("ANTHROPIC_API_KEY", None)
+
+    cmd = ["claude", "-p", prompt,
+           "--model", model,
+           "--permission-mode", "bypassPermissions"]
+    if agentic:
+        cmd += ["--allowedTools", "Read,Write,Grep,Glob,Bash"]
+
+    work_cwd = cwd or str(WEB3_DIR)
+    logger.info(f"  Running claude -p sub ({len(prompt)} chars, agentic={agentic})...")
+
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, start_new_session=True, cwd=work_cwd
+    )
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        text = stdout.decode("utf-8", errors="replace")
+        if log_file:
+            log_file.write_text(
+                f"=== PROMPT ===\n{prompt[:2000]}...\n\n"
+                f"=== RUNTIME: sub mode, agentic={agentic} ===\n"
+                f"=== STDOUT ({len(text)} chars) ===\n{text}\n\n"
+                f"=== STDERR ===\n{stderr.decode('utf-8', errors='replace')}\n",
+                encoding="utf-8"
+            )
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace")
+            logger.warning(f"  claude -p sub exited {proc.returncode}: {err[:200]}")
+        return proc.returncode, text
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        logger.warning(f"  claude -p sub TIMEOUT after {timeout}s")
+        if log_file:
+            log_file.write_text("TIMEOUT", encoding="utf-8")
+        return 1, "TIMEOUT"
+
+
+# ─── LLM dispatcher ─────────────────────────────────────────────────────────
+
+USE_SUB_MODE = False  # Set in main() based on --mode sub
+SUB_MODEL = "sonnet"  # Set in main()
+PARALLEL_HUNTERS = 6  # Set in main() from --parallel-hunters
+
+# Steps that get tool access in sub mode (agentic exploration).
+_AGENTIC_TOOLS = {"Read", "Write", "Edit", "Grep", "Glob", "Bash", "Agent"}
+
+
+def _llm(prompt: str, allowed_tools: list = None, timeout: int = 1800,
+         log_file: Path = None, cwd: str = None,
+         stall_timeout: int = 600) -> tuple[int, str]:
+    """Dispatch to run_claude (API) or run_claude_sub (subscription)."""
+    if not USE_SUB_MODE:
+        return run_claude(prompt, allowed_tools=allowed_tools,
+                          timeout=timeout, log_file=log_file, cwd=cwd,
+                          stall_timeout=stall_timeout)
+
+    agentic = bool(allowed_tools and set(allowed_tools) & _AGENTIC_TOOLS)
+    return run_claude_sub(prompt, agentic=agentic, timeout=timeout,
+                          log_file=log_file, cwd=cwd, model=SUB_MODEL)
+
+
 # ─── Shell Commands ──────────────────────────────────────────────────────────
 
 def run_cmd(cmd: list[str], timeout: int = 600, cwd: str = None,
@@ -421,7 +505,7 @@ def fix_and_retry(step_name: str, cmd: list[str], context_files: list[str],
                 f"Fix ONLY what's needed to resolve this error. Do not refactor.{escalation}"
             )
 
-            run_claude(
+            _llm(
                 fix_prompt,
                 allowed_tools=["Read", "Edit", "Write", "Grep", "Glob"],
                 timeout=120,
@@ -473,7 +557,9 @@ def build_hunter_brief(component: str, protocol: str, src_file, src_dir,
                        setup_sol_text: str, setup_var_names: str,
                        existing_tests_summary: str, knowledge_context: str,
                        interfaces_code: str, accumulated_context: str,
-                       hyp_dir) -> str:
+                       hyp_dir,
+                       rejection_context: str = "",
+                       few_shot_context: str = "") -> str:
     """Build the hunter brief content written to hunter_brief_{component}.md."""
     return (
         f"# Hunter Brief — {component} ({protocol})\n\n"
@@ -487,6 +573,15 @@ def build_hunter_brief(component: str, protocol: str, src_file, src_dir,
         f"## Known Vulnerability Patterns (from knowledge base)\n{knowledge_context[:2000] if knowledge_context else 'None loaded.'}\n\n"
         f"## Interfaces (function signatures the contract calls externally)\n```solidity\n{interfaces_code[:5000] if interfaces_code else 'None loaded.'}\n```\n\n"
         f"## Context from Previous Components\n{accumulated_context[:1500] if accumulated_context else 'This is the first component.'}\n\n"
+        + (f"{rejection_context}\n\n" if rejection_context else "")
+        + (f"{few_shot_context}\n\n" if few_shot_context else "")
+        + f"## Chain-of-Thought (OBLIGATORIO antes de cada hipotesis)\n"
+        f"Para cada hipotesis, razona estos 5 pasos ANTES de escribir el YAML:\n"
+        f"1. Que HACE esta funcion? (inputs, outputs, estado modificado)\n"
+        f"2. Que ASUME? (precondiciones implicitas, trust en callers)\n"
+        f"3. Que pasa si la asuncion es FALSA? (estado corrupto, leak de fondos)\n"
+        f"4. COMO puede un atacante forzar esa condicion? (flash loan, reentrancy, params extremos)\n"
+        f"5. CUAL es el impacto concreto? (perdida en $, DoS permanente, escalacion de privilegios)\n\n"
         f"## OUTPUT RULES\n"
         f"1. Write YAML to ABSOLUTE PATH: {hyp_dir}/hyp_{component}_<YourHunterName>.yaml\n"
         f"   DO NOT use relative paths. DO NOT create hunt_session/ inside the repo.\n"
@@ -1129,7 +1224,7 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
         is_pre_production=IS_PRE_PRODUCTION
     )
 
-    run_claude(poc_prompt, allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
+    _llm(poc_prompt, allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
                timeout=900, log_file=clog / f"{fid}_poc_gen.log", cwd=repo)
 
     if not poc_path.exists():
@@ -1154,7 +1249,7 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
     logger.info(f"    {fid}: PoC failed, attempting fix...")
     file_errors = _filter_errors_for_file(poc_stderr, poc_path.name)
     poc_content = poc_path.read_text(encoding="utf-8")[:8000] if poc_path.exists() else ""
-    run_claude(
+    _llm(
         f"Fix this Foundry PoC. Only fix compile/runtime errors, keep the attack logic.\n\n"
         f"## Error\n```\n{file_errors}\n```\n\n"
         f"## Current Code\n```solidity\n{poc_content}\n```\n\n"
@@ -1417,7 +1512,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             f"If it fails, fix the errors and re-run until it compiles.\n"
             f"Use the EXACT same import paths and remappings from foundry.toml."
         )
-        run_claude(
+        _llm(
             setup_prompt,
             allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
             timeout=1200,  # Increased: complex components (Leverager, LendingPool) need >600s
@@ -1478,6 +1573,13 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     context_dir = HUNT_SESSION_DIR / "context" / f"{protocol}-bench"
     context_dir.mkdir(parents=True, exist_ok=True)
     hunter_brief_path = context_dir / f"{component}_hunter_brief.md"
+    # Load v10 context for hunter brief (benefits both api and sub modes)
+    try:
+        from run_hunt import load_rejection_context as _load_rej
+        _rejection_ctx = _load_rej()
+    except Exception:
+        _rejection_ctx = ""
+
     hunter_brief_content = build_hunter_brief(
         component=component, protocol=protocol, src_file=src_file,
         src_dir=src_dir, protocol_model=protocol_model,
@@ -1485,7 +1587,8 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         setup_sol_text=setup_sol_text, setup_var_names=setup_var_names,
         existing_tests_summary=existing_tests_summary,
         knowledge_context=knowledge_context, interfaces_code=interfaces_code,
-        accumulated_context=accumulated_context, hyp_dir=hyp_dir
+        accumulated_context=accumulated_context, hyp_dir=hyp_dir,
+        rejection_context=_rejection_ctx,
     )
     hunter_brief_path.write_text(hunter_brief_content, encoding="utf-8")
     logger.info(f"  Wrote hunter brief ({len(hunter_brief_content)} chars) to {hunter_brief_path}")
@@ -1497,15 +1600,57 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     )
 
     t0 = time.time()
-    rc, out = run_claude(
-        hunter_dispatch_prompt,
-        allowed_tools=["Agent", "Read", "Write", "Edit", "Grep", "Glob"],
-        timeout=1800,
-        log_file=clog / "hunters_dispatch.log",
-        cwd=repo
-    )
+
+    if USE_SUB_MODE:
+        # Sub mode: dispatch individual hunters in parallel from Python
+        # Each hunter gets agentic tools to explore code autonomously
+        from run_hunt import HUNTER_DOMAINS, load_rejection_context, load_few_shot_examples
+        methodology_dir = SCRIPT_DIR / "prompts" / "hunters"
+
+        def _run_single_hunter(hunter_name: str) -> None:
+            domain_key = HUNTER_DOMAINS.get(hunter_name, ("general", ""))[0]
+            rejection_ctx = load_rejection_context()
+            few_shot_ctx = load_few_shot_examples(domain_key)
+
+            prompt = (
+                f"You are {hunter_name} analyzing {component} in {protocol}.\n\n"
+                f"Read these files FIRST before any analysis:\n"
+                f"1. {hunter_brief_path} -- protocol context, Setup.sol, prepass signals, output rules\n"
+                f"2. {methodology_dir}/{hunter_name}.md -- your hunting methodology\n\n"
+                f"Then read the source code: {src_file} and all .sol files in {src_dir / 'libraries'}/.\n\n"
+                f"Follow your methodology file. Write YAML to {hyp_dir}/hyp_{component}_{hunter_name}.yaml\n\n"
+                f"## Chain-of-Thought (OBLIGATORIO antes de cada hipotesis)\n"
+                f"1. Que HACE esta funcion? (inputs, outputs, estado)\n"
+                f"2. Que ASUME? (precondiciones implicitas)\n"
+                f"3. Que pasa si la asuncion es FALSA?\n"
+                f"4. COMO puede un atacante forzar esa condicion?\n"
+                f"5. CUAL es el impacto concreto en fondos/acceso?\n\n"
+                f"{rejection_ctx}\n{few_shot_ctx}"
+            )
+            _llm(prompt, allowed_tools=["Read", "Write", "Grep", "Glob", "Bash"],
+                 timeout=1800,
+                 log_file=clog / f"hunter_{hunter_name}.log",
+                 cwd=repo)
+
+        hunters = ["MathHunter", "AccessHunter", "FlowHunter", "OracleHunter",
+                    "DomainHunter", "TrustBoundaryHunter", "WildcardHunter",
+                    "SignatureHunter", "DoSHunter", "LogicHunter",
+                    "AdversarialHunter", "LibraryHunter"]
+        logger.info(f"  Sub mode: {len(hunters)} hunters, {PARALLEL_HUNTERS} parallel")
+        with ThreadPoolExecutor(max_workers=PARALLEL_HUNTERS) as executor:
+            list(executor.map(_run_single_hunter, hunters))
+    else:
+        # API mode: single coordinator dispatches 12 agents
+        rc, out = _llm(
+            hunter_dispatch_prompt,
+            allowed_tools=["Agent", "Read", "Write", "Edit", "Grep", "Glob"],
+            timeout=1800,
+            log_file=clog / "hunters_dispatch.log",
+            cwd=repo
+        )
+
     elapsed = time.time() - t0
-    logger.info(f"  12 Hunters completed ({elapsed/60:.1f}min) — exit code {rc}")
+    logger.info(f"  12 Hunters completed ({elapsed/60:.1f}min)")
 
     # Create crosschain skip file
     skip_file = hyp_dir / f"hyp_{component}_CrossChainHunter.skip"
@@ -1584,7 +1729,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         convergence_text=convergence_text, hunter_digest=hunter_digest
     )
 
-    run_claude(
+    _llm(
         deepdive_prompt,
         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
         timeout=1800,
@@ -1656,7 +1801,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                 f"- CryticTester.sol: inherits TargetFunctions + Properties for Medusa\n\n"
                 f"The setup MUST compile with `forge build`. Test it after creating."
             )
-            run_claude(
+            _llm(
                 chimera_prompt,
                 allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
                 timeout=1200,  # Increased: complex components need >600s for full setup
@@ -1845,7 +1990,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                 # Shorter timeout for simple fixes, longer for later attempts
                 fix_timeout = 300 if attempt <= 2 else 360 if attempt <= 5 else 480
                 tier = "fix" if attempt <= 2 else "context" if attempt <= 5 else "simplify" if attempt <= 7 else "delete"
-                run_claude(
+                _llm(
                     fix_prompt,
                     allowed_tools=["Read", "Edit", "Write", "Grep", "Glob", "Bash"],
                     timeout=fix_timeout,
@@ -1908,7 +2053,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         f"ONLY ADD new functions. Do NOT modify or remove existing handlers.\n"
                         f"Write changes to: {target_funcs_path}"
                     )
-                    run_claude(
+                    _llm(
                         enhance_prompt,
                         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
                         timeout=600,
@@ -2098,7 +2243,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         f"APPEND new functions to existing Properties files. Use Setup.sol variables.\n"
                         f"Use Chimera helpers: t(), eq(), gte(), lte()."
                     )
-                    run_claude(
+                    _llm(
                         deepen_prompt,
                         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
                         timeout=600,
@@ -2129,7 +2274,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         f"Use variable names from Setup.sol. Use Chimera helpers: t(), eq(), gte(), lte().\n"
                         f"APPEND to existing Properties files — do NOT overwrite them."
                     )
-                    run_claude(
+                    _llm(
                         refocus_prompt,
                         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
                         timeout=600,
@@ -2219,7 +2364,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         f"INFRA_ERROR = fork/RPC/compilation issue, not a bug\n"
                         f"TEST_ARTIFACT = test setup issue, not a protocol bug"
                     )
-                    rc, triage_results = run_claude(
+                    rc, triage_results = _llm(
                         triage_prompt, timeout=180,
                         log_file=clog / "tolerance_tuning.log", cwd=repo
                     )
@@ -2297,7 +2442,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
 
         verify_prompt = build_verify_prompt(finding=finding, relevant_code=relevant_code)
 
-        rc, output = run_claude(
+        rc, output = _llm(
             verify_prompt,
             allowed_tools=[],  # pure reasoning — no tool calls, stays fast (~30-90s)
             timeout=120,
@@ -2466,7 +2611,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             Conservative: returns False (DIFFERENT) on timeout/error — never silently drops."""
             prompt = build_is_same_bug_prompt(leader=leader, sibling=sibling)
             fid_s = sibling["id"]
-            _, out = run_claude(
+            _, out = _llm(
                 prompt, allowed_tools=[], timeout=60, stall_timeout=45,
                 log_file=clog / f"{fid_s}_same_bug_check.log", cwd=repo
             )
@@ -2736,7 +2881,7 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     if not benchmark_mode and finding.get("severity", "Low").capitalize() in ("High", "Medium", "Critical"):
         logger.info(f"    {fid}: EscalationHunter (5 checks)")
         esc_prompt = build_escalation_prompt(finding=finding, finding_context=finding_context)
-        run_claude(esc_prompt, timeout=180, stall_timeout=120,
+        _llm(esc_prompt, timeout=180, stall_timeout=120,
                    log_file=clog / f"{fid}_escalation.log", cwd=repo)
 
     # ── F2: RedTeam (4 attackers, Ronda 0 + 3 rounds) ────────────────────
@@ -2746,7 +2891,7 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
         finding_context=finding_context, fid=fid, finding=finding,
         component=component
     )
-    _, redteam_output = run_claude(redteam_prompt, timeout=300, stall_timeout=180,
+    _, redteam_output = _llm(redteam_prompt, timeout=300, stall_timeout=180,
                                    log_file=clog / f"{fid}_redteam.log", cwd=repo)
 
     # Parse RedTeam verdict and store on finding for scoring
@@ -2767,7 +2912,7 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     # If still UNKNOWN, retry once — output may have cut off or missed the RESULTADO line
     if verdict == "UNKNOWN":
         logger.warning(f"    {fid}: RedTeam returned UNKNOWN — retrying (1/1)")
-        _, redteam_output2 = run_claude(redteam_prompt, timeout=300, stall_timeout=180,
+        _, redteam_output2 = _llm(redteam_prompt, timeout=300, stall_timeout=180,
                                         log_file=clog / f"{fid}_redteam_retry.log", cwd=repo)
         verdict = _parse_redteam_verdict(redteam_output2)
         if verdict != "UNKNOWN":
@@ -2808,7 +2953,7 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     # Full skill: root cause statement template, 4 search levels, triage classification
     logger.info(f"    {fid}: VariantHunt (L0-L3)")
     variant_prompt = build_variant_prompt(fid=fid, finding_context=finding_context, repo=repo)
-    run_claude(
+    _llm(
         variant_prompt,
         allowed_tools=["Read", "Grep", "Glob"],
         timeout=240, stall_timeout=120,
@@ -2827,7 +2972,7 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
     slug = re.sub(r'[^a-z0-9-]', '', slug)
     report_path = reports_dir / f"DRAFT-{fid}-{slug}.md"
     report_prompt = build_report_prompt(finding_context=finding_context, report_path=report_path)
-    run_claude(
+    _llm(
         report_prompt,
         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
         timeout=240, stall_timeout=120,
@@ -2940,7 +3085,7 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str,
             comp_a=comp_a, comp_b=comp_b, iface_a=iface_a, iface_b=iface_b,
             cross_calls=cross_calls, src_dir=src_dir, pair_file=pair_file
         )
-        run_claude(
+        _llm(
             pair_prompt,
             allowed_tools=["Read", "Write", "Grep", "Glob"],
             timeout=900,
@@ -3131,7 +3276,7 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str,
         f"CRITICAL: the setup must deploy the REAL contracts interacting with each other, "
         f"not isolated instances. That's the whole point of cross-component testing."
     )
-    run_claude(
+    _llm(
         setup_prompt,
         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
         timeout=1800,
@@ -3330,8 +3475,10 @@ def main():
         "Default in benchmark mode: benchmarks/<protocol>/bench_session/ "
         "(isolated from the real hunt_session to avoid contamination)."
     ))
-    parser.add_argument("--mode", choices=["api", "agent"], default="api",
-                        help="Execution mode: 'api' (subprocess, needs API key) or 'agent' (generates plan for Claude Code skill, uses subscription)")
+    parser.add_argument("--mode", choices=["api", "sub"], default="api",
+                        help="Execution mode: 'api' (API key, stream-json, stall detection) or 'sub' (subscription, agentic tools, sonnet)")
+    parser.add_argument("--parallel-hunters", type=int, default=6,
+                        help="Max parallel hunter calls in sub mode (default 6, subscription rate limits)")
     parser.add_argument("--lang", default="",
                         help="Contract language: solidity, rust (auto-detected from repo if empty)")
     parser.add_argument("--chain", default="mainnet",
@@ -3374,55 +3521,14 @@ def main():
 
     setup_logging(args.protocol)
 
-    if args.mode == "agent":
-        from plan_generator import generate_plan
-        from plan_schema import validate_plan
-        components_list = [c.strip() for c in args.components.split(",")]
-        repo_path = str(Path(args.repo).resolve())
-        plan = generate_plan(
-            repo=repo_path, components=components_list, protocol=args.protocol,
-            session_dir=str(HUNT_SESSION_DIR), ground_truth=args.ground_truth or "",
-            is_pre_production=IS_PRE_PRODUCTION, fast=args.fast,
-            benchmark_mode=getattr(args, "benchmark_mode", "redteam"),
-            parallel_components=getattr(args, "parallel_components", 2),
-            chain=getattr(args, "chain", "mainnet"),
-            fork_block=getattr(args, "fork_block", 0),
-            lang=getattr(args, "lang", ""),
-        )
-        errors = validate_plan(plan)
-        if errors:
-            logger.error("Plan validation failed:")
-            for e in errors:
-                logger.error(f"  - {e}")
-            sys.exit(1)
-        plan_path = HUNT_SESSION_DIR / "execution_plan.json"
-        plan.to_json(str(plan_path))
-        n_steps = len(plan.steps)
-        if plan.teams:
-            groups = plan.teams["groups"]
-            sub_steps = sum(
-                len(__import__("json").load(open(g["plan_file"]))["steps"])
-                for g in groups
-            )
-            logger.info(f"Execution plan written: {plan_path}")
-            logger.info(f"  Master plan: {n_steps} steps (cross + scoring)")
-            logger.info(f"  Sub-plans: {len(groups)} groups, {sub_steps} steps total")
-            for g in groups:
-                logger.info(f"    group-{g['group_id']}: {g['components']} → {g['plan_file']}")
-            print(f"\n{'='*60}")
-            print(f"  AGENT MODE + TEAMS — {len(groups)} parallel groups")
-            print(f"  Master: {n_steps} steps | Sub-plans: {sub_steps} steps")
-            print(f"  Run this in Claude Code:")
-            print(f"  /run-benchmark-agent {plan_path}")
-            print(f"{'='*60}\n")
-        else:
-            logger.info(f"Execution plan written: {plan_path} ({n_steps} steps)")
-            print(f"\n{'='*60}")
-            print(f"  AGENT MODE — Plan generated ({n_steps} steps)")
-            print(f"  Run this in Claude Code:")
-            print(f"  /run-benchmark-agent {plan_path}")
-            print(f"{'='*60}\n")
-        return
+    # ── Sub mode globals ──────────────────────────────────────────────────
+    global USE_SUB_MODE, SUB_MODEL, PARALLEL_HUNTERS
+    if args.mode == "sub":
+        USE_SUB_MODE = True
+        SUB_MODEL = "sonnet"
+        PARALLEL_HUNTERS = args.parallel_hunters
+        logger.info(f"  SUB MODE: subscription, model={SUB_MODEL}, "
+                    f"parallel-hunters={PARALLEL_HUNTERS}")
 
     components = [c.strip() for c in args.components.split(",")]
     repo = str(Path(args.repo).resolve())
