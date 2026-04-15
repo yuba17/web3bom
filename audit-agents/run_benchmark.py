@@ -1607,7 +1607,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         from run_hunt import HUNTER_DOMAINS, load_rejection_context, load_few_shot_examples
         methodology_dir = SCRIPT_DIR / "prompts" / "hunters"
 
-        def _run_single_hunter(hunter_name: str) -> None:
+        def _run_single_hunter(hunter_name: str) -> str:
             domain_key = HUNTER_DOMAINS.get(hunter_name, ("general", ""))[0]
             rejection_ctx = load_rejection_context()
             few_shot_ctx = load_few_shot_examples(domain_key)
@@ -1631,14 +1631,27 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                  timeout=1800,
                  log_file=clog / f"hunter_{hunter_name}.log",
                  cwd=repo)
+            return hunter_name
 
         hunters = ["MathHunter", "AccessHunter", "FlowHunter", "OracleHunter",
                     "DomainHunter", "TrustBoundaryHunter", "WildcardHunter",
                     "SignatureHunter", "DoSHunter", "LogicHunter",
                     "AdversarialHunter", "LibraryHunter"]
         logger.info(f"  Sub mode: {len(hunters)} hunters, {PARALLEL_HUNTERS} parallel")
+        failed_hunters = []
         with ThreadPoolExecutor(max_workers=PARALLEL_HUNTERS) as executor:
-            list(executor.map(_run_single_hunter, hunters))
+            future_to_hunter = {
+                executor.submit(_run_single_hunter, h): h for h in hunters
+            }
+            for future in as_completed(future_to_hunter):
+                hunter_name = future_to_hunter[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    failed_hunters.append(hunter_name)
+                    logger.warning(f"  Hunter {hunter_name} FAILED: {e} — continuing with remaining hunters")
+        if failed_hunters:
+            logger.warning(f"  {len(failed_hunters)} hunters failed: {failed_hunters}")
     else:
         # API mode: single coordinator dispatches 12 agents
         rc, out = _llm(
@@ -1663,17 +1676,25 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         "OracleHunter", "TrustBoundaryHunter", "WildcardHunter",
                         "SignatureHunter", "DoSHunter"]
     hyp_count = len(list(hyp_dir.glob(f"hyp_{component}_*.yaml")))
+    MIN_REQUIRED_HUNTERS = 7  # allow up to 2 failures
     missing_hunters = [h for h in REQUIRED_HUNTERS
                        if not (hyp_dir / f"hyp_{component}_{h}.yaml").exists()]
-    if missing_hunters:
-        logger.error(f"  BLOCKED: Missing hunters: {missing_hunters}. Cannot continue.")
+    present_count = len(REQUIRED_HUNTERS) - len(missing_hunters)
+    if present_count < MIN_REQUIRED_HUNTERS:
+        logger.error(f"  BLOCKED: Only {present_count}/{len(REQUIRED_HUNTERS)} required hunters present "
+                     f"(minimum {MIN_REQUIRED_HUNTERS}). Missing: {missing_hunters}")
         summary["status"] = "BLOCKED_HUNTERS"
         summary["gates"]["hunters"] = False
         return summary
     else:
         hunters_ok = True
         summary["gates"]["hunters"] = True
-        logger.info(f"  Gate hunters: PASS ({hyp_count} YAML files, all 9 required hunters present)")
+        if missing_hunters:
+            logger.warning(f"  Gate hunters: PASS with degradation — {present_count}/{len(REQUIRED_HUNTERS)} "
+                          f"required hunters present ({hyp_count} total YAML files). "
+                          f"Missing: {missing_hunters}")
+        else:
+            logger.info(f"  Gate hunters: PASS ({hyp_count} YAML files, all {len(REQUIRED_HUNTERS)} required hunters present)")
 
     # Mandatory team output verification
     verify_result = subprocess.run([
