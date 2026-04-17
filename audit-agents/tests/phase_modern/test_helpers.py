@@ -42,3 +42,20 @@ def test_ignore_keys_excluded_from_diff(tmp_path: Path):
         mode="json",
         ignore_keys=["created_at"],
     )
+
+
+def test_update_mode_strips_ignore_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """UPDATE_SNAPSHOTS=1 should write a cleaned golden, not the raw actual."""
+    golden = tmp_path / "clean.json"
+    monkeypatch.setenv("UPDATE_SNAPSHOTS", "1")
+    with pytest.raises(pytest.skip.Exception):
+        assert_matches_golden(
+            {"foo": 1, "created_at": "2026-04-17", "nested": {"created_at": "x"}},
+            golden,
+            mode="json",
+            ignore_keys=["created_at"],
+        )
+    data = json.loads(golden.read_text())
+    assert "created_at" not in data
+    assert "created_at" not in data["nested"]
+    assert data == {"foo": 1, "nested": {}}

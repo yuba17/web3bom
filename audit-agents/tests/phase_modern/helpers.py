@@ -67,7 +67,13 @@ def assert_matches_golden(
 
     if update:
         golden_path.parent.mkdir(parents=True, exist_ok=True)
-        golden_path.write_text(_serialize_actual(actual, mode))
+        # Strip ignore_keys before writing so the committed golden is clean and
+        # human-reviewable — not polluted with /tmp paths or other volatile data.
+        if isinstance(actual, (dict, list)):
+            cleaned = _drop_keys(actual, ignore)
+            golden_path.write_text(_dump(cleaned, mode))
+        else:
+            golden_path.write_text(_serialize_actual(actual, mode))
         pytest.skip(f"golden updated: {golden_path}")
 
     if not golden_path.exists():
