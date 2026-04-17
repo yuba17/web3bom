@@ -1878,23 +1878,8 @@ def _run_symmetric_analysis(contract_path: Path) -> str:
 
 
 def _run_deep_flatten(contract_path: Path) -> str:
-    """Run deep_flatten.py --critical-only and return output."""
-    if not contract_path or not contract_path.exists():
-        return ""
-    script = AUDIT_AGENTS_DIR / "deep_flatten.py"
-    if not script.exists():
-        return ""
-    contract_name = contract_path.stem
-    try:
-        result = subprocess.run(
-            [sys.executable, str(script), str(contract_path), "--critical-only", "--contract", contract_name],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return ""
+    from context_enrichment import run_deep_flatten as _impl
+    return _impl(contract_path)
 
 
 # Module-level cache to avoid re-running Slither per hunter

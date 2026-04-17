@@ -382,3 +382,46 @@ def generate_asset_flow_map(contract_path: Path) -> str:
     if not sections:
         return ""
     return "## Asset Flow Map\n" + "\n\n".join(sections) + "\n"
+
+
+def _count_lines(path: Path) -> int:
+    try:
+        return sum(1 for _ in path.open("r"))
+    except Exception:
+        return 0
+
+
+def run_deep_flatten(
+    contract_path: Path,
+    *,
+    cache_dir: Path | None = None,
+) -> str:
+    """Wrap `deep_flatten.py --critical-only`. Skips files below threshold.
+
+    Returns trimmed stdout or "". Caches by sha256 of file bytes.
+    """
+    if not contract_path or not contract_path.exists():
+        return ""
+    if _count_lines(contract_path) < DEEP_FLATTEN_MIN_LINES:
+        return ""
+    script = AUDIT_AGENTS_DIR / "deep_flatten.py"
+    if not script.exists():
+        return ""
+    key = f"flat-{contract_path.stem}-{_file_sha256(contract_path)}"
+
+    def _run() -> str:
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, str(script), str(contract_path),
+                    "--critical-only", "--contract", contract_path.stem,
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
+    return _cached_subprocess(key, cache_dir, _flatten_mem_cache, _run)
