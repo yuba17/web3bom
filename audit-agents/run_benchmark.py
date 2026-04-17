@@ -1738,6 +1738,11 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         "DomainHunter", "TrustBoundaryHunter", "WildcardHunter",
                         "SignatureHunter", "DoSHunter", "LogicHunter",
                         "AdversarialHunter", "LibraryHunter"]
+            # Filter to subset if --hunters was provided (non-empty = user-specified subset).
+            # When args.hunters is "" (default), skip filtering — run all hunters.
+            if getattr(args, "hunters", ""):
+                hunters_subset = _validate_hunters_subset(args.hunters)
+                hunters = [h for h in hunters if h in hunters_subset]
             logger.info(f"  Sub mode: {len(hunters)} hunters, {PARALLEL_HUNTERS} parallel")
             failed_hunters = []
             with ThreadPoolExecutor(max_workers=PARALLEL_HUNTERS) as executor:
@@ -3600,6 +3605,29 @@ def _remove_worktree(repo: str, wt_path: str):
     logger.info(f"  Worktree removed: {wt_root}")
 
 
+def _validate_hunters_subset(raw: str) -> set[str]:
+    """Parse --hunters value. Exits with list of valid names if any unknown.
+
+    Examples:
+        "MathHunter" → {"MathHunter"}
+        "Math,Access" → exits with error (use full names like "MathHunter")
+    """
+    from run_hunt import HUNTER_DOMAINS
+    valid = set(HUNTER_DOMAINS.keys())
+    raw = (raw or "").strip()
+    if not raw:
+        return valid
+    requested = {tok.strip() for tok in raw.split(",") if tok.strip()}
+    unknown = requested - valid
+    if unknown:
+        sys.stderr.write(
+            f"--hunters: unknown hunter(s): {sorted(unknown)}\n"
+            f"Valid hunters: {sorted(valid)}\n"
+        )
+        sys.exit(2)
+    return requested
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pipeline orchestrator for hunt benchmarks")
     parser.add_argument("--repo", required=True, help="Path to the repo root")
@@ -3656,8 +3684,13 @@ def main():
                         help="Disable few-shot example injection into hunter prompts (prevents benchmark contamination)")
     parser.add_argument("--skip-hunters", action="store_true",
                         help="Skip prepass+hunters+deepdive if hypothesis files already exist. Resume from merge step.")
+    parser.add_argument("--hunters", default="",
+                        help="Comma-separated subset of hunter names to run "
+                             "(e.g., 'MathHunter,AccessHunter'). Default: all. "
+                             "Unknown names exit non-zero with the valid list.")
 
     args = parser.parse_args()
+    hunters_subset = _validate_hunters_subset(args.hunters)
 
     # ── Isolate benchmark outputs ──────────────────────────────────────────
     # When running a benchmark, NEVER write to the real hunt_session/.
