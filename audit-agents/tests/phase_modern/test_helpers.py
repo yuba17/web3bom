@@ -1,6 +1,5 @@
 """Self-tests for the snapshot helper."""
 import json
-import os
 import sys
 from pathlib import Path
 
