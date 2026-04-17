@@ -24,6 +24,13 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 # - command: embeds session_dir and sys.executable paths, volatile
 PLAN_IGNORE_KEYS = ["created_at", "session_dir", "hypotheses_dir", "repo", "command"]
 
+# Extension point: adding a new language = adding a row here + dropping goldens
+# and fixtures under `fixtures/<language>/<benchmark>/`. No test rewrites needed.
+#   ("rust", "<benchmark>"),        # TODO(phase-2+): enable when Rust path migrated
+#   ("move", "<benchmark>"),        # TODO(phase-2+): Aptos/Sui targets
+#   ("cairo", "<benchmark>"),       # TODO(phase-2+): Starknet targets
+LANGUAGE_BENCHMARK_MATRIX = [("solidity", "yieldoor")]
+
 
 def _run_plan_generator(
     repo: Path,
@@ -56,7 +63,7 @@ def _run_plan_generator(
     return json.loads(plan_path.read_text())
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_plan_full_yieldoor(
     language: str,
     benchmark: str,
@@ -77,7 +84,7 @@ def test_plan_full_yieldoor(
     assert_matches_golden(plan, golden, mode="json", ignore_keys=PLAN_IGNORE_KEYS)
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_plan_single_component(
     language: str,
     benchmark: str,
@@ -98,7 +105,7 @@ def test_plan_single_component(
     assert_matches_golden(plan, golden, mode="json", ignore_keys=PLAN_IGNORE_KEYS)
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_plan_ignores_created_at(
     language: str,
     benchmark: str,
@@ -128,7 +135,7 @@ def test_plan_ignores_created_at(
     assert_matches_golden(plan_b, golden, mode="json", ignore_keys=PLAN_IGNORE_KEYS)
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_plan_includes_cross_when_multi_component(
     language: str,
     benchmark: str,

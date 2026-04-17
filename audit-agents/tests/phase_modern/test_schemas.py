@@ -8,6 +8,14 @@ import pytest
 import yaml
 
 
+# Extension point: adding a new language = adding a row here + dropping goldens
+# and fixtures under `fixtures/<language>/<benchmark>/`. No test rewrites needed.
+#   ("rust", "<benchmark>"),        # TODO(phase-2+): enable when Rust path migrated
+#   ("move", "<benchmark>"),        # TODO(phase-2+): Aptos/Sui targets
+#   ("cairo", "<benchmark>"),       # TODO(phase-2+): Starknet targets
+LANGUAGE_BENCHMARK_MATRIX = [("solidity", "yieldoor")]
+
+
 # Required top-level keys for every hypothesis file.
 # PLAN vs REALITY delta:
 #   Plan assumed {"title", "component", "confidence", "severity", "invariant"} at top-level.
@@ -19,7 +27,7 @@ import yaml
 HYP_REQUIRED = {"hypotheses"}
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_hyp_yaml_has_required_fields(language: str, benchmark: str, frozen_session_fixture):
     session = frozen_session_fixture("v12")
     hyp_dir = session / "hypotheses" / benchmark
@@ -41,7 +49,7 @@ def test_hyp_yaml_has_required_fields(language: str, benchmark: str, frozen_sess
     assert not errors, "Schema failures:\n  " + "\n  ".join(errors)
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_hyp_yaml_solidity_section_present(language: str, benchmark: str, frozen_session_fixture):
     """Every yieldoor hypothesis should expose solidity_property on each hypothesis item.
 
@@ -82,7 +90,7 @@ def test_hyp_yaml_solidity_section_present(language: str, benchmark: str, frozen
 FINDING_REQUIRED = {"id", "component", "severity", "confidence"}
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_findings_all_json_schema(language: str, benchmark: str, frozen_session_fixture):
     session = frozen_session_fixture("v12")
     path = session / "findings_all.json"
@@ -107,7 +115,7 @@ def test_findings_all_json_schema(language: str, benchmark: str, frozen_session_
 CHECKPOINT_REQUIRED = {"completed_steps", "failed_steps"}
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_checkpoint_json_schema(language: str, benchmark: str, frozen_session_fixture):
     session = frozen_session_fixture("v12")
     checkpoints = sorted(session.glob("checkpoint*.json"))
@@ -129,7 +137,7 @@ def test_checkpoint_json_schema(language: str, benchmark: str, frozen_session_fi
     assert not errors, "Schema failures:\n  " + "\n  ".join(errors)
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_hunter_performance_schema(language: str, benchmark: str, frozen_session_fixture):
     session = frozen_session_fixture("v12")
     path = session / "hunter_performance.json"

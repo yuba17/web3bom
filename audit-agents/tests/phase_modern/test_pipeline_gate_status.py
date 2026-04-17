@@ -11,8 +11,15 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 AUDIT_AGENTS = REPO_ROOT / "audit-agents"
 
+# Extension point: adding a new language = adding a row here + dropping goldens
+# and fixtures under `fixtures/<language>/<benchmark>/`. No test rewrites needed.
+#   ("rust", "<benchmark>"),        # TODO(phase-2+): enable when Rust path migrated
+#   ("move", "<benchmark>"),        # TODO(phase-2+): Aptos/Sui targets
+#   ("cairo", "<benchmark>"),       # TODO(phase-2+): Starknet targets
+LANGUAGE_BENCHMARK_MATRIX = [("solidity", "yieldoor")]
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_gate_status_export_structure(language: str, benchmark: str, tmp_session_dir: Path):
     """pipeline_gate.py --export-json produces a gate_status/<protocol>.json with the expected schema."""
     result = subprocess.run(
@@ -51,7 +58,7 @@ def test_gate_status_export_structure(language: str, benchmark: str, tmp_session
     assert isinstance(gates, dict)
 
 
-@pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
+@pytest.mark.parametrize("language,benchmark", LANGUAGE_BENCHMARK_MATRIX)
 def test_gate_status_missing_component_no_crash(language: str, benchmark: str, tmp_session_dir: Path):
     """Exporting status for a nonexistent component should not crash."""
     result = subprocess.run(
