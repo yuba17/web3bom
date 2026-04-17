@@ -12,7 +12,6 @@ must never fail because of a context-enrichment helper.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 # Skip deep_flatten when the contract is small — the signal isn't worth

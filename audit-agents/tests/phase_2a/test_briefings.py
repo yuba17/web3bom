@@ -75,7 +75,8 @@ def test_tiered_primary_plus_secondary_grep(tmp_briefings):
 
 def test_tiered_drops_tertiary(tmp_briefings):
     out = load_briefings_tiered(["lending", "vault", "staking"])
-    assert "staking" not in out.lower() or "Grep targets adicionales (staking)" not in out
+    assert "staking" not in out.lower()
+    assert "Grep targets adicionales (staking)" not in out
 
 
 def test_tiered_empty_list_returns_empty(tmp_briefings):
