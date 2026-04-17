@@ -12,6 +12,7 @@ must never fail because of a context-enrichment helper.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # Skip deep_flatten when the contract is small — the signal isn't worth
@@ -220,3 +221,92 @@ def load_briefings_tiered(domains: list[str]) -> str:
         if grep_text:
             parts.append(f"\n### Grep targets adicionales ({secondary})\n{grep_text}")
     return "\n\n".join(parts)
+
+
+def generate_asset_flow_map(contract_path: Path) -> str:
+    """Regex-based asset-flow scanner for a Solidity contract.
+
+    Detects transfers, approvals, mints/burns, and balance reads with
+    line-number + function-name context. Output is a markdown section
+    ready to be injected into a hunter brief.
+    """
+    if not contract_path or not contract_path.exists():
+        return ""
+    try:
+        src = contract_path.read_text()
+    except Exception:
+        return ""
+
+    lines = src.split("\n")
+    patterns = {
+        "money_in": [
+            (r'\.transferFrom\(', "transferFrom"),
+            (r'\.safeTransferFrom\(', "safeTransferFrom"),
+            (r'msg\.value', "msg.value"),
+        ],
+        "money_out": [
+            (r'\.transfer\(', "transfer"),
+            (r'\.safeTransfer\(', "safeTransfer"),
+            (r'\.call\{value:', "call{value:}"),
+        ],
+        "approvals": [
+            (r'\.approve\(', "approve"),
+            (r'\.safeApprove\(', "safeApprove"),
+            (r'\.forceApprove\(', "forceApprove"),
+        ],
+        "balance_reads": [
+            (r'balanceOf\(', "balanceOf"),
+            (r'address\(this\)\.balance', "address(this).balance"),
+        ],
+        "mint_burn": [
+            (r'\.mint\(', "mint"),
+            (r'\.burn\(', "burn"),
+            (r'_mint\(', "_mint"),
+            (r'_burn\(', "_burn"),
+        ],
+    }
+
+    current_function = "<top-level>"
+    results: dict[str, list[str]] = {k: [] for k in patterns}
+
+    for line_num, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        fn_match = re.match(r'\s*function\s+(\w+)\s*\(', line)
+        if fn_match:
+            current_function = fn_match.group(1) + "()"
+        if re.match(r'\s*(receive|fallback)\s*\(', line):
+            current_function = stripped.split("(")[0].strip() + "()"
+            if "receive" in stripped:
+                results["money_in"].append(
+                    f"- L{line_num} {current_function}: accepts ETH via payable receive"
+                )
+        for category, pattern_list in patterns.items():
+            for regex, _label in pattern_list:
+                if re.search(regex, line):
+                    display_line = stripped
+                    if len(display_line) > 120:
+                        display_line = display_line[:117] + "..."
+                    results[category].append(
+                        f"- L{line_num} {current_function}: {display_line}"
+                    )
+
+    # Filter transferFrom out of money_out to avoid double-counting
+    results["money_out"] = [
+        e for e in results["money_out"]
+        if "transferFrom" not in e and "safeTransferFrom" not in e
+    ]
+
+    sections: list[str] = []
+    section_map = [
+        ("money_in",      "Money IN (deposits/receives)"),
+        ("money_out",     "Money OUT (withdrawals/sends)"),
+        ("approvals",     "Approvals (attack surface)"),
+        ("mint_burn",     "Minting/Burning"),
+        ("balance_reads", "Balance Reads (manipulation vectors)"),
+    ]
+    for key, title in section_map:
+        if results[key]:
+            sections.append(f"### {title}\n" + "\n".join(results[key]))
+    if not sections:
+        return ""
+    return "## Asset Flow Map\n" + "\n\n".join(sections) + "\n"
