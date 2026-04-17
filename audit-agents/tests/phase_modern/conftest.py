@@ -8,6 +8,7 @@ from typing import Callable
 import pytest
 
 # Make audit-agents importable for test modules
+# conftest.py lives at audit-agents/tests/phase_modern/, so parents[2] = audit-agents/
 AUDIT_AGENTS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUDIT_AGENTS))
 
