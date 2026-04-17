@@ -8,13 +8,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import assert_matches_golden
-
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 AUDIT_AGENTS = REPO_ROOT / "audit-agents"
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 @pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
@@ -32,6 +27,10 @@ def test_gate_status_export_structure(language: str, benchmark: str, tmp_session
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
+    )
+    assert result.returncode in (0, 1), (
+        f"pipeline_gate.py exited {result.returncode}. "
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     # Legacy quirk: export_gate_status() reads protocol from load_state() directly
     # instead of _get_protocol(), so --protocol is NOT honored here. We glob the

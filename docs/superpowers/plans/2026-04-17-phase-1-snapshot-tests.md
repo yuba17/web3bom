@@ -452,7 +452,8 @@ rtk git commit -m "test: add shared fixtures for phase_modern"
 
 **Files:**
 - Create: `audit-agents/tests/phase_modern/test_pipeline_gate_status.py`
-- Golden generated: `fixtures/solidity/yieldoor/goldens/gate_status/status_initial.json`
+
+No goldens for this task — it's a contract test (shape validation), not a snapshot. The `--protocol` CLI arg is ignored by `export_gate_status()` (see inline comment), so the output filename is non-deterministic and a filename-specific golden would be brittle.
 
 - [ ] **Step 1: Write the schema-structure test**
 
