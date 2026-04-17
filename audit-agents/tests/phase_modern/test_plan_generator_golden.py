@@ -22,7 +22,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 # - hypotheses_dir: derived from session_dir, also volatile
 # - repo: absolute path, env-specific
 # - command: embeds session_dir and sys.executable paths, volatile
-PLAN_IGNORE_KEYS = ["created_at", "session_dir", "hypotheses_dir", "repo", "command"]
+# - cwd: per-step working directory, either /tmp/... or absolute repo path
+PLAN_IGNORE_KEYS = ["created_at", "session_dir", "hypotheses_dir", "repo", "command", "cwd"]
 
 # Extension point: adding a new language = adding a row here + dropping goldens
 # and fixtures under `fixtures/<language>/<benchmark>/`. No test rewrites needed.
@@ -126,9 +127,11 @@ def test_plan_ignores_created_at(
         repo=repo, components="Vault", protocol=benchmark,
         session_dir=session_b, ground_truth=ground_truth, fast=True,
     )
-    # created_at should differ (ISO timestamps)
-    assert plan_a.get("created_at") != plan_b.get("created_at") or \
-           plan_a.get("created_at") is None  # tolerate absent field
+    # created_at should be present and differ between runs (ISO timestamps).
+    # If this ever fails, either the field was removed (update the test AND
+    # PLAN_IGNORE_KEYS) or plan_generator became deterministic on time.
+    assert "created_at" in plan_a and "created_at" in plan_b
+    assert plan_a["created_at"] != plan_b["created_at"]
     # Both should match the same golden when created_at ignored
     golden = FIXTURES / language / benchmark / "goldens" / "plan_generator" / "execution_plan_single.json"
     assert_matches_golden(plan_a, golden, mode="json", ignore_keys=PLAN_IGNORE_KEYS)
