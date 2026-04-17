@@ -894,6 +894,15 @@ rtk git commit -m "test: freeze Vault/Strategy prepass goldens + schema contract
 **Files:**
 - Create: `audit-agents/tests/phase_modern/test_schemas.py`
 
+**Schema reality (discovered during implementation):** The plan's originally-assumed required-key sets did not match the v12 session. Correct sets (committed):
+- `HYP_REQUIRED = {"hypotheses"}` — top-level is a container; per-hypothesis fields live inside the `hypotheses` list.
+- `FINDING_REQUIRED = {"id", "component", "severity", "confidence"}` — unchanged from plan.
+- `CHECKPOINT_REQUIRED = {"completed_steps", "failed_steps"}` — but `failed_steps` is a **dict** (step→error) not a list.
+- `hunter_performance.json` top level is `{"protocol", "generated_at", "hunters"}` where `hunters` is a list of records.
+- `test_hyp_yaml_solidity_section_present` checks `solidity_property` on each hypothesis item (not a `solidity.invariant_solidity` sub-dict).
+
+See inline `# PLAN vs REALITY delta:` comments in `test_schemas.py` for each deviation.
+
 - [ ] **Step 1: Inspect the v12 session to confirm expected files**
 
 ```bash
