@@ -365,6 +365,7 @@ USE_SUB_MODE = False  # Set in main() based on --mode sub
 SUB_MODEL = "sonnet"  # Set in main()
 PARALLEL_HUNTERS = 6  # Set in main() from --parallel-hunters
 POC_GEN_TIMEOUT = 900  # Set in main() based on --mode and --poc-timeout
+DISABLE_FEW_SHOT = False  # Set in main() from --no-few-shot
 
 # Steps that get tool access in sub mode (agentic exploration).
 _AGENTIC_TOOLS = {"Read", "Write", "Edit", "Grep", "Glob", "Bash", "Agent"}
@@ -560,7 +561,8 @@ def build_hunter_brief(component: str, protocol: str, src_file, src_dir,
                        interfaces_code: str, accumulated_context: str,
                        hyp_dir,
                        rejection_context: str = "",
-                       few_shot_context: str = "") -> str:
+                       few_shot_context: str = "",
+                       context_enrichment_block: str = "") -> str:
     """Build the hunter brief content written to hunter_brief_{component}.md."""
     return (
         f"# Hunter Brief — {component} ({protocol})\n\n"
@@ -576,6 +578,7 @@ def build_hunter_brief(component: str, protocol: str, src_file, src_dir,
         f"## Context from Previous Components\n{accumulated_context[:1500] if accumulated_context else 'This is the first component.'}\n\n"
         + (f"{rejection_context}\n\n" if rejection_context else "")
         + (f"{few_shot_context}\n\n" if few_shot_context else "")
+        + (f"{context_enrichment_block}\n\n" if context_enrichment_block else "")
         + f"## Chain-of-Thought (OBLIGATORIO antes de cada hipotesis)\n"
         f"Para cada hipotesis, razona estos 5 pasos ANTES de escribir el YAML:\n"
         f"1. Que HACE esta funcion? (inputs, outputs, estado modificado)\n"
@@ -898,7 +901,8 @@ def build_redteam_prompt(finding_context: str, fid: str, finding: dict,
         f"════════════════\n"
         f"Finding: {finding.get('title', finding.get('id', '?'))}\n"
         f"Componente: {component}\n\n"
-        f"RESULTADO: [REPORT / REPORT_DOWNGRADED / DO_NOT_REPORT]\n\n"
+        f"RESULTADO: [REPORT / REPORT_DOWNGRADED / DO_NOT_REPORT]\n"
+        f"FIX_SCOPE: [same_fix / different_fix / n_a]\n\n"
         f"Argumentos que sobrevivieron:\n  [list]\n"
         f"Argumentos que lo debilitan:\n  [list]\n"
         f"Argumentos que fallaron (attackers equivocados):\n  [list]\n\n"
@@ -909,6 +913,12 @@ def build_redteam_prompt(finding_context: str, fid: str, finding: dict,
         f"Qué añadir al reporte para sobrevivir review:\n  [specific points]\n"
         f"Qué NO incluir (weakens argument):\n  [list]\n"
         f"```\n\n"
+        f"## FIX_SCOPE — how to choose:\n"
+        f"Use FIX_SCOPE to flag whether this finding shares a root-cause fix with another finding already REPORTED in this session.\n"
+        f"- `same_fix`: the fix is a single code change that also resolves another reported finding (e.g., identical bug in shared library). Treat as dedup candidate downstream.\n"
+        f"- `different_fix`: the finding mirrors another one (same bug class / copy-paste) BUT requires its own code change in a different file/function. Each fix is independent → keep both as separate REPORTs.\n"
+        f"- `n_a`: finding has no obvious sibling, or this is a DO_NOT_REPORT. Default.\n"
+        f"Rule: copy-paste bugs in different locations = different_fix (each site must be patched individually).\n\n"
         f"Rules:\n"
         f"- Attackers do NOT help the hunter — they try to KILL the finding.\n"
         f"- Specific arguments ONLY — 'could be by design' without citing code is INVALID.\n"
@@ -1263,7 +1273,11 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
         return
 
     # Retry loop — up to MAX_POC_FIX_ATTEMPTS fix attempts
+    # Early-abort: if the forge run times out 2x consecutively, the PoC is likely
+    # unreproducible (infinite loop / hanging state) and more fix attempts will only
+    # burn API + time. Mark unverified and return so RedTeam can still run with a caveat.
     MAX_POC_FIX_ATTEMPTS = 3
+    consecutive_timeouts = 1 if poc_stderr == "TIMEOUT" else 0
     for attempt in range(1, MAX_POC_FIX_ATTEMPTS + 1):
         logger.info(f"    {fid}: PoC failed, fix attempt {attempt}/{MAX_POC_FIX_ATTEMPTS}...")
         file_errors = _filter_errors_for_file(poc_stderr, poc_path.name)
@@ -1294,6 +1308,20 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
             logger.info(f"    {fid}: PoC PASSED after fix {attempt}!")
             finding["has_poc"] = True
             finding["poc_path"] = str(poc_path)
+            return
+
+        # Track consecutive forge timeouts — these signal an unreproducible PoC.
+        if poc_stderr == "TIMEOUT":
+            consecutive_timeouts += 1
+        else:
+            consecutive_timeouts = 0
+        if consecutive_timeouts >= 2:
+            logger.warning(
+                f"    {fid}: PoC aborted after {consecutive_timeouts} consecutive forge timeouts "
+                f"(attempt {attempt}/{MAX_POC_FIX_ATTEMPTS}) — finding likely unreproducible"
+            )
+            finding["has_poc"] = False
+            finding["poc_abort_reason"] = "consecutive_timeouts"
             return
 
     logger.warning(f"    {fid}: PoC FAILED after {MAX_POC_FIX_ATTEMPTS} fix attempts — finding unverified")
@@ -1335,6 +1363,21 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             library_code += f"\n// === {lib_file.name} ===\n{lib_content}"
 
     summary = {"component": component, "gates": {}, "findings": [], "status": "OK"}
+
+    # ─── Skip-hunters: jump to merge if hypothesis files already exist ────
+    _skip_to_merge = False
+    if getattr(args, 'skip_hunters', False):
+        hyp_dir = HUNT_SESSION_DIR / "hypotheses" / protocol
+        existing_hyps = list(hyp_dir.glob(f"hyp_{component}_*.yaml"))
+        if len(existing_hyps) >= 7:  # At least 7 hunter files = valid previous run
+            logger.info(f"  --skip-hunters: {len(existing_hyps)} hypothesis files found, skipping to merge")
+            summary["gates"]["prepass"] = True
+            summary["gates"]["hunters"] = True
+            summary["gates"]["deepdive"] = (hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml").exists()
+            protocol_model = ""
+            _skip_to_merge = True
+        else:
+            logger.warning(f"  --skip-hunters: only {len(existing_hyps)} hypothesis files, running full pipeline")
 
     # ─── Step -1: Clean slate ─────────────────────────────────────────────
     logger.info("  Step -1: Clean slate (reset chimera to git state)")
@@ -1384,21 +1427,33 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             old_poc.unlink()
         logger.info("    Cleaned test/poc/ from previous runs")
 
+    # ─── Skip Steps 0-4 if --skip-hunters and hypothesis files exist ────
+    hyp_dir = HUNT_SESSION_DIR / "hypotheses" / protocol
+    hyp_dir.mkdir(parents=True, exist_ok=True)
+    if _skip_to_merge:
+        logger.info("  Steps 0-4 SKIPPED (--skip-hunters, reusing existing hypotheses)")
+
     # Step 0: Scope (init ficha) — skipped in benchmark mode.
     # run_hunt.py --init-ficha uses run_hunt.HUNT_SESSION_DIR (hardcoded to real hunt_session)
     # and cannot easily accept --session-dir without a larger refactor.
     # Benchmark pipelines never read the ficha back (scope gate is not checked here),
     # so skipping init-ficha is safe and avoids contaminating the real hunt_session/fichas/.
-    logger.info("  Step 0: Ficha init skipped (benchmark mode — not needed)")
+    if not _skip_to_merge:
+        logger.info("  Step 0: Ficha init skipped (benchmark mode — not needed)")
 
     # ─── Step 1: Prepass ─────────────────────────────────────────────────
-    logger.info("  Step 1: Prepass (Slither + Aderyn + patterns)")
-    code, _, _ = run_cmd([
-        sys.executable, str(SCRIPT_DIR / "detection_engine.py"),
-        "--prepass", "--source", str(src_dir), "--name", component,
-        "--output", str(HUNT_SESSION_DIR / "results")
-    ], log_file=clog / "prepass.log", cwd=repo)
-    summary["gates"]["prepass"] = code == 0
+    prepass_yaml = HUNT_SESSION_DIR / "results" / f"{component}_prepass.yaml"
+    if _skip_to_merge and prepass_yaml.exists():
+        logger.info("  Step 1: Prepass SKIPPED (existing results)")
+        summary["gates"]["prepass"] = True
+    else:
+        logger.info("  Step 1: Prepass (Slither + Aderyn + patterns)")
+        code, _, _ = run_cmd([
+            sys.executable, str(SCRIPT_DIR / "detection_engine.py"),
+            "--prepass", "--source", str(src_dir), "--name", component,
+            "--output", str(HUNT_SESSION_DIR / "results")
+        ], log_file=clog / "prepass.log", cwd=repo)
+        summary["gates"]["prepass"] = code == 0
 
     # protocol_model — not generated by Claude anymore (was Step 1.5, cut for speed)
     # Hunters read the code directly, which is what I did manually
@@ -1463,7 +1518,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     # Hunters need Setup.sol to know which variables exist (strategy, vault, etc.)
     # Without it, they write invariants that reference non-existent variables
     setup_path = Path(repo) / "test" / "chimera" / "Setup.sol"
-    if not setup_path.exists():
+    if _skip_to_merge:
+        logger.info("  Step 1.9: SKIPPED (--skip-hunters)")
+    elif not setup_path.exists():
         logger.info("  Step 1.9: Generate Chimera Setup (needed for hunter context)")
         chimera_dir_early = Path(repo) / "test" / "chimera"
         chimera_dir_early.mkdir(parents=True, exist_ok=True)
@@ -1539,7 +1596,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         _llm(
             setup_prompt,
             allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-            timeout=1200,  # Increased: complex components (Leverager, LendingPool) need >600s
+            timeout=1500,  # Increased: complex components (Leverager, LendingPool) need >600s
             log_file=clog / "chimera_setup_early.log",
             cwd=repo
         )
@@ -1548,263 +1605,283 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         else:
             logger.warning("  Setup.sol generation failed — hunters will work without it")
 
-    # ─── Step 2: 9 Hunters (coordinator + context file on disk) ─────────
-    logger.info("  Step 2: 12 Hunters (coordinator dispatches, shared context on disk)")
-
+    # ─── Step 2: 12 Hunters (coordinator + context file on disk) ─────────
     hyp_dir = HUNT_SESSION_DIR / "hypotheses" / protocol
     hyp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load prepass signals
-    import yaml as _yaml
-    prepass_signals_text = ""
-    prepass_path = HUNT_SESSION_DIR / "results" / f"{component}_prepass.yaml"
-    if prepass_path.exists():
-        try:
-            prepass_data = _yaml.safe_load(prepass_path.read_text())
-            signals = prepass_data.get("prepass_signals", [])
-            top_signals = [s for s in signals if s.get("severity") in ("high", "medium", "critical")][:30]
-            if top_signals:
-                prepass_signals_text = _yaml.dump(top_signals, default_flow_style=False)
-                logger.info(f"  Loaded {len(top_signals)} prepass signals for hunters")
-        except Exception as e:
-            logger.warning(f"  Failed to load prepass signals: {e}")
-
-    # Load Setup.sol for hunter context (helps write compilable invariants)
-    setup_sol_text = ""
-    setup_var_names = ""
-    setup_path = Path(repo) / "test" / "chimera" / "Setup.sol"
-    if setup_path.exists():
-        setup_sol_text = setup_path.read_text()
-        logger.info(f"  Loaded Setup.sol ({len(setup_sol_text.splitlines())} lines) for hunter context")
-        # Extract variable names dynamically so hunters use the REAL names
-        import re as _re
-        # Match: Type internal varName  or  Type public varName
-        var_matches = _re.findall(
-            r'(?:internal|public)\s+(?:constant\s+)?(\w+)\s*[=;]',
-            setup_sol_text
-        )
-        # Also match: address internal varName
-        addr_matches = _re.findall(
-            r'address\s+(?:internal|public)\s+(?:constant\s+)?(\w+)\s*[=;]',
-            setup_sol_text
-        )
-        all_vars = list(dict.fromkeys(var_matches + addr_matches))  # dedupe, preserve order
-        setup_var_names = ", ".join(all_vars) if all_vars else "strategy, vault, token0, token1, pool"
-        logger.info(f"  Setup.sol variables: {setup_var_names}")
-
-    # Write shared context to a file on disk — each hunter agent reads it
-    # This guarantees every hunter gets full context regardless of coordinator behavior
-    context_dir = HUNT_SESSION_DIR / "context" / f"{protocol}-bench"
-    context_dir.mkdir(parents=True, exist_ok=True)
-    hunter_brief_path = context_dir / f"{component}_hunter_brief.md"
-    # Load v10 context for hunter brief (benefits both api and sub modes)
-    try:
-        from run_hunt import load_rejection_context as _load_rej
-        _rejection_ctx = _load_rej()
-    except Exception:
-        _rejection_ctx = ""
-
-    hunter_brief_content = build_hunter_brief(
-        component=component, protocol=protocol, src_file=src_file,
-        src_dir=src_dir, protocol_model=protocol_model,
-        prepass_signals_text=prepass_signals_text,
-        setup_sol_text=setup_sol_text, setup_var_names=setup_var_names,
-        existing_tests_summary=existing_tests_summary,
-        knowledge_context=knowledge_context, interfaces_code=interfaces_code,
-        accumulated_context=accumulated_context, hyp_dir=hyp_dir,
-        rejection_context=_rejection_ctx,
-    )
-    hunter_brief_path.write_text(hunter_brief_content, encoding="utf-8")
-    logger.info(f"  Wrote hunter brief ({len(hunter_brief_content)} chars) to {hunter_brief_path}")
-
-    # Coordinator prompt — lightweight, tells agents to read brief + methodology from disk
-    hunter_dispatch_prompt = build_hunter_dispatch_prompt(
-        component=component, protocol=protocol, src_file=src_file,
-        src_dir=src_dir, hunter_brief_path=hunter_brief_path, hyp_dir=hyp_dir
-    )
-
-    t0 = time.time()
-
-    if USE_SUB_MODE:
-        # Sub mode: dispatch individual hunters in parallel from Python
-        # Each hunter gets agentic tools to explore code autonomously
-        from run_hunt import HUNTER_DOMAINS, load_rejection_context, load_few_shot_examples
-        methodology_dir = SCRIPT_DIR / "prompts" / "hunters"
-
-        def _run_single_hunter(hunter_name: str) -> str:
-            domain_key = HUNTER_DOMAINS.get(hunter_name, ("general", ""))[0]
-            rejection_ctx = load_rejection_context()
-            few_shot_ctx = load_few_shot_examples(domain_key)
-
-            prompt = (
-                f"You are {hunter_name} analyzing {component} in {protocol}.\n\n"
-                f"Read these files FIRST before any analysis:\n"
-                f"1. {hunter_brief_path} -- protocol context, Setup.sol, prepass signals, output rules\n"
-                f"2. {methodology_dir}/{hunter_name}.md -- your hunting methodology\n\n"
-                f"Then read the source code: {src_file} and all .sol files in {src_dir / 'libraries'}/.\n\n"
-                f"Follow your methodology file. Write YAML to {hyp_dir}/hyp_{component}_{hunter_name}.yaml\n\n"
-                f"## Chain-of-Thought (OBLIGATORIO antes de cada hipotesis)\n"
-                f"1. Que HACE esta funcion? (inputs, outputs, estado)\n"
-                f"2. Que ASUME? (precondiciones implicitas)\n"
-                f"3. Que pasa si la asuncion es FALSA?\n"
-                f"4. COMO puede un atacante forzar esa condicion?\n"
-                f"5. CUAL es el impacto concreto en fondos/acceso?\n\n"
-                f"{rejection_ctx}\n{few_shot_ctx}"
-            )
-            _llm(prompt, allowed_tools=["Read", "Write", "Grep", "Glob", "Bash"],
-                 timeout=1800,
-                 log_file=clog / f"hunter_{hunter_name}.log",
-                 cwd=repo)
-            return hunter_name
-
-        hunters = ["MathHunter", "AccessHunter", "FlowHunter", "OracleHunter",
-                    "DomainHunter", "TrustBoundaryHunter", "WildcardHunter",
-                    "SignatureHunter", "DoSHunter", "LogicHunter",
-                    "AdversarialHunter", "LibraryHunter"]
-        logger.info(f"  Sub mode: {len(hunters)} hunters, {PARALLEL_HUNTERS} parallel")
-        failed_hunters = []
-        with ThreadPoolExecutor(max_workers=PARALLEL_HUNTERS) as executor:
-            future_to_hunter = {
-                executor.submit(_run_single_hunter, h): h for h in hunters
-            }
-            for future in as_completed(future_to_hunter):
-                hunter_name = future_to_hunter[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    failed_hunters.append(hunter_name)
-                    logger.warning(f"  Hunter {hunter_name} FAILED: {e} — continuing with remaining hunters")
-        if failed_hunters:
-            logger.warning(f"  {len(failed_hunters)} hunters failed: {failed_hunters}")
+    if _skip_to_merge:
+        hyp_count = len(list(hyp_dir.glob(f"hyp_{component}_*.yaml")))
+        logger.info(f"  Steps 2-4: SKIPPED — {hyp_count} existing hypothesis files")
+        summary["gates"]["hunters"] = True
+        summary["gates"]["deepdive"] = (hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml").exists()
+        # Create crosschain skip if needed
+        skip_file = hyp_dir / f"hyp_{component}_CrossChainHunter.skip"
+        if not skip_file.exists():
+            skip_file.write_text("single-chain protocol")
+        # Initialize variables used by Steps 5+ that are normally set in Steps 1-4
+        setup_sol_text = ""
+        setup_var_names = ""
+        setup_path = Path(repo) / "test" / "chimera" / "Setup.sol"
+        if setup_path.exists():
+            setup_sol_text = setup_path.read_text()
+            import re as _re_skip
+            setup_var_names = ", ".join(_re_skip.findall(r'\b(?:address|uint\d*|int\d*|bool)\s+(?:public\s+)?(\w+)', setup_sol_text))
+        prepass_signals_text = ""
+        interfaces_code = ""
+        existing_tests_summary = ""
+        knowledge_context = ""
     else:
-        # API mode: single coordinator dispatches 12 agents
-        rc, out = _llm(
-            hunter_dispatch_prompt,
-            allowed_tools=["Agent", "Read", "Write", "Edit", "Grep", "Glob"],
+
+        # Load prepass signals
+        import yaml as _yaml
+        prepass_signals_text = ""
+        prepass_path = HUNT_SESSION_DIR / "results" / f"{component}_prepass.yaml"
+        if prepass_path.exists():
+            try:
+                prepass_data = _yaml.safe_load(prepass_path.read_text())
+                signals = prepass_data.get("prepass_signals", [])
+                top_signals = [s for s in signals if s.get("severity") in ("high", "medium", "critical")][:30]
+                if top_signals:
+                    prepass_signals_text = _yaml.dump(top_signals, default_flow_style=False)
+                    logger.info(f"  Loaded {len(top_signals)} prepass signals for hunters")
+            except Exception as e:
+                logger.warning(f"  Failed to load prepass signals: {e}")
+
+        # Load Setup.sol for hunter context (helps write compilable invariants)
+        setup_sol_text = ""
+        setup_var_names = ""
+        setup_path = Path(repo) / "test" / "chimera" / "Setup.sol"
+        if setup_path.exists():
+            setup_sol_text = setup_path.read_text()
+            logger.info(f"  Loaded Setup.sol ({len(setup_sol_text.splitlines())} lines) for hunter context")
+            # Extract variable names dynamically so hunters use the REAL names
+            import re as _re
+            # Match: Type internal varName  or  Type public varName
+            var_matches = _re.findall(
+                r'(?:internal|public)\s+(?:constant\s+)?(\w+)\s*[=;]',
+                setup_sol_text
+            )
+            # Also match: address internal varName
+            addr_matches = _re.findall(
+                r'address\s+(?:internal|public)\s+(?:constant\s+)?(\w+)\s*[=;]',
+                setup_sol_text
+            )
+            all_vars = list(dict.fromkeys(var_matches + addr_matches))  # dedupe, preserve order
+            setup_var_names = ", ".join(all_vars) if all_vars else "strategy, vault, token0, token1, pool"
+            logger.info(f"  Setup.sol variables: {setup_var_names}")
+
+        # Write shared context to a file on disk — each hunter agent reads it
+        # This guarantees every hunter gets full context regardless of coordinator behavior
+        context_dir = HUNT_SESSION_DIR / "context" / f"{protocol}-bench"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        hunter_brief_path = context_dir / f"{component}_hunter_brief.md"
+        # Load v10 context for hunter brief (benefits both api and sub modes)
+        try:
+            from run_hunt import load_rejection_context as _load_rej
+            _rejection_ctx = _load_rej()
+        except Exception:
+            _rejection_ctx = ""
+
+        hunter_brief_content = build_hunter_brief(
+            component=component, protocol=protocol, src_file=src_file,
+            src_dir=src_dir, protocol_model=protocol_model,
+            prepass_signals_text=prepass_signals_text,
+            setup_sol_text=setup_sol_text, setup_var_names=setup_var_names,
+            existing_tests_summary=existing_tests_summary,
+            knowledge_context=knowledge_context, interfaces_code=interfaces_code,
+            accumulated_context=accumulated_context, hyp_dir=hyp_dir,
+            rejection_context=_rejection_ctx,
+        )
+        hunter_brief_path.write_text(hunter_brief_content, encoding="utf-8")
+        logger.info(f"  Wrote hunter brief ({len(hunter_brief_content)} chars) to {hunter_brief_path}")
+
+        # Coordinator prompt — lightweight, tells agents to read brief + methodology from disk
+        hunter_dispatch_prompt = build_hunter_dispatch_prompt(
+            component=component, protocol=protocol, src_file=src_file,
+            src_dir=src_dir, hunter_brief_path=hunter_brief_path, hyp_dir=hyp_dir
+        )
+
+        t0 = time.time()
+
+        if USE_SUB_MODE:
+            # Sub mode: dispatch individual hunters in parallel from Python
+            # Each hunter gets agentic tools to explore code autonomously
+            from run_hunt import HUNTER_DOMAINS, load_rejection_context, load_few_shot_examples
+            methodology_dir = SCRIPT_DIR / "prompts" / "hunters"
+
+            def _run_single_hunter(hunter_name: str) -> str:
+                domain_key = HUNTER_DOMAINS.get(hunter_name, ("general", ""))[0]
+                rejection_ctx = load_rejection_context()
+                few_shot_ctx = "" if DISABLE_FEW_SHOT else load_few_shot_examples(domain_key)
+
+                prompt = (
+                    f"You are {hunter_name} analyzing {component} in {protocol}.\n\n"
+                    f"Read these files FIRST before any analysis:\n"
+                    f"1. {hunter_brief_path} -- protocol context, Setup.sol, prepass signals, output rules\n"
+                    f"2. {methodology_dir}/{hunter_name}.md -- your hunting methodology\n\n"
+                    f"Then read the source code: {src_file} and all .sol files in {src_dir / 'libraries'}/.\n\n"
+                    f"Follow your methodology file. Write YAML to {hyp_dir}/hyp_{component}_{hunter_name}.yaml\n\n"
+                    f"## Chain-of-Thought (OBLIGATORIO antes de cada hipotesis)\n"
+                    f"1. Que HACE esta funcion? (inputs, outputs, estado)\n"
+                    f"2. Que ASUME? (precondiciones implicitas)\n"
+                    f"3. Que pasa si la asuncion es FALSA?\n"
+                    f"4. COMO puede un atacante forzar esa condicion?\n"
+                    f"5. CUAL es el impacto concreto en fondos/acceso?\n\n"
+                    f"{rejection_ctx}\n{few_shot_ctx}"
+                )
+                _llm(prompt, allowed_tools=["Read", "Write", "Grep", "Glob", "Bash"],
+                     timeout=1800,
+                     log_file=clog / f"hunter_{hunter_name}.log",
+                     cwd=repo)
+                return hunter_name
+
+            hunters = ["MathHunter", "AccessHunter", "FlowHunter", "OracleHunter",
+                        "DomainHunter", "TrustBoundaryHunter", "WildcardHunter",
+                        "SignatureHunter", "DoSHunter", "LogicHunter",
+                        "AdversarialHunter", "LibraryHunter"]
+            logger.info(f"  Sub mode: {len(hunters)} hunters, {PARALLEL_HUNTERS} parallel")
+            failed_hunters = []
+            with ThreadPoolExecutor(max_workers=PARALLEL_HUNTERS) as executor:
+                future_to_hunter = {
+                    executor.submit(_run_single_hunter, h): h for h in hunters
+                }
+                for future in as_completed(future_to_hunter):
+                    hunter_name = future_to_hunter[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        failed_hunters.append(hunter_name)
+                        logger.warning(f"  Hunter {hunter_name} FAILED: {e} — continuing with remaining hunters")
+            if failed_hunters:
+                logger.warning(f"  {len(failed_hunters)} hunters failed: {failed_hunters}")
+        else:
+            # API mode: single coordinator dispatches 12 agents
+            rc, out = _llm(
+                hunter_dispatch_prompt,
+                allowed_tools=["Agent", "Read", "Write", "Edit", "Grep", "Glob"],
+                timeout=1800,
+                log_file=clog / "hunters_dispatch.log",
+                cwd=repo
+            )
+
+        elapsed = time.time() - t0
+        logger.info(f"  12 Hunters completed ({elapsed/60:.1f}min)")
+
+        # Create crosschain skip file
+        skip_file = hyp_dir / f"hyp_{component}_CrossChainHunter.skip"
+        if not skip_file.exists():
+            skip_file.write_text("single-chain protocol")
+
+        # Check hunters gate — in benchmark mode, verify YAML count directly
+        # (pipeline_gate.py checks for solidity_property fields which benchmark hunters don't require)
+        REQUIRED_HUNTERS = ["AccessHunter", "DomainHunter", "FlowHunter", "MathHunter",
+                            "OracleHunter", "TrustBoundaryHunter", "WildcardHunter",
+                            "SignatureHunter", "DoSHunter"]
+        hyp_count = len(list(hyp_dir.glob(f"hyp_{component}_*.yaml")))
+        MIN_REQUIRED_HUNTERS = 7  # allow up to 2 failures
+        missing_hunters = [h for h in REQUIRED_HUNTERS
+                           if not (hyp_dir / f"hyp_{component}_{h}.yaml").exists()]
+        present_count = len(REQUIRED_HUNTERS) - len(missing_hunters)
+        if present_count < MIN_REQUIRED_HUNTERS:
+            logger.error(f"  BLOCKED: Only {present_count}/{len(REQUIRED_HUNTERS)} required hunters present "
+                         f"(minimum {MIN_REQUIRED_HUNTERS}). Missing: {missing_hunters}")
+            summary["status"] = "BLOCKED_HUNTERS"
+            summary["gates"]["hunters"] = False
+            return summary
+        else:
+            hunters_ok = True
+            summary["gates"]["hunters"] = True
+            if missing_hunters:
+                logger.warning(f"  Gate hunters: PASS with degradation — {present_count}/{len(REQUIRED_HUNTERS)} "
+                              f"required hunters present ({hyp_count} total YAML files). "
+                              f"Missing: {missing_hunters}")
+            else:
+                logger.info(f"  Gate hunters: PASS ({hyp_count} YAML files, all {len(REQUIRED_HUNTERS)} required hunters present)")
+
+        # Mandatory team output verification
+        verify_result = subprocess.run([
+            "python3", str(SCRIPT_DIR / "verify_team_outputs.py"),
+            "--session-dir", str(Path(hyp_dir).parent.parent),
+            "--protocol", protocol,
+            "--groups", json.dumps([{"group_id": 0, "components": [component]}])
+        ], capture_output=True, text=True)
+        if verify_result.returncode != 0:
+            logger.warning(f"  Team verification warnings:\n{verify_result.stdout[:500]}")
+
+        # Step 3 (Library Analyzer) — now runs as LibraryHunter (#11) in parallel with other hunters above
+
+        # ─── Step 4: DeepDive Hunter ────────────────────────────────────────
+        logger.info("  Step 4: DeepDive Hunter")
+
+        # Pre-digest hunter hypotheses: summarize convergences for DeepDive (Gap #5)
+        import yaml as _yaml_dd
+        hunter_digest = ""
+        convergence_map = {}  # track which areas multiple hunters flagged
+        for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
+            if "DeepDive" in hyp_file.name or "CrossChain" in hyp_file.name:
+                continue
+            try:
+                data = _yaml_dd.safe_load(hyp_file.read_text())
+                if not data:
+                    continue
+                hunter_name = hyp_file.stem.replace(f"hyp_{component}_", "")
+                hyps = data.get("hypotheses", data.get("invariants", []))
+                for h in hyps:
+                    if h.get("confidence", 0) >= 50 and h.get("tier", 3) <= 2:
+                        desc = h.get("description", h.get("title", ""))
+                        area = h.get("type", "unknown")
+                        hunter_digest += f"- [{hunter_name}] (tier={h.get('tier')}, conf={h.get('confidence')}%) {desc}\n"
+                        convergence_map.setdefault(area, []).append(hunter_name)
+            except Exception:
+                pass
+
+        convergence_text = ""
+        for area, hunters in convergence_map.items():
+            if len(hunters) >= 2:
+                convergence_text += f"- **{area}**: flagged by {', '.join(set(hunters))} — INVESTIGATE DEEPER\n"
+
+        # Build deepdive prompt directly from bench_session hyp_dir.
+        # Do NOT import generate_deepdive_prompt from run_hunt — that function uses
+        # run_hunt.HUNT_SESSION_DIR (real hunt_session, not bench_session) to read
+        # hypotheses, which is wrong in benchmark mode and would be a thread-safety
+        # issue in parallel component execution (two threads patching the same module global).
+        deepdive_prompt = build_deepdive_prompt(
+            component=component, protocol=protocol, source_code=source_code,
+            library_code=library_code, setup_sol_text=setup_sol_text,
+            protocol_model=protocol_model, hyp_dir=hyp_dir,
+            convergence_text=convergence_text, hunter_digest=hunter_digest
+        )
+
+        _llm(
+            deepdive_prompt,
+            allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
             timeout=1800,
-            log_file=clog / "hunters_dispatch.log",
+            log_file=clog / "deepdive.log",
             cwd=repo
         )
 
-    elapsed = time.time() - t0
-    logger.info(f"  12 Hunters completed ({elapsed/60:.1f}min)")
+        # Rescue DeepDive YAML: Claude may write to cwd (worktree root) instead of hyp_dir.
+        # Use find to locate the file wherever it landed in the worktree, then copy to hyp_dir.
+        dd_yaml_target = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
+        if not dd_yaml_target.exists():
+            import shutil as _shutil_dd
+            import subprocess as _sp_dd
+            _find = _sp_dd.run(
+                ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
+                capture_output=True, text=True
+            )
+            for _found in _find.stdout.strip().splitlines():
+                if _found and Path(_found) != dd_yaml_target:
+                    _shutil_dd.copy2(_found, dd_yaml_target)
+                    logger.info(f"  Rescued DeepDive YAML from worktree: {Path(_found).name} → {hyp_dir.name}/")
+                    break
 
-    # Create crosschain skip file
-    skip_file = hyp_dir / f"hyp_{component}_CrossChainHunter.skip"
-    if not skip_file.exists():
-        skip_file.write_text("single-chain protocol")
-
-    # Check hunters gate — in benchmark mode, verify YAML count directly
-    # (pipeline_gate.py checks for solidity_property fields which benchmark hunters don't require)
-    REQUIRED_HUNTERS = ["AccessHunter", "DomainHunter", "FlowHunter", "MathHunter",
-                        "OracleHunter", "TrustBoundaryHunter", "WildcardHunter",
-                        "SignatureHunter", "DoSHunter"]
-    hyp_count = len(list(hyp_dir.glob(f"hyp_{component}_*.yaml")))
-    MIN_REQUIRED_HUNTERS = 7  # allow up to 2 failures
-    missing_hunters = [h for h in REQUIRED_HUNTERS
-                       if not (hyp_dir / f"hyp_{component}_{h}.yaml").exists()]
-    present_count = len(REQUIRED_HUNTERS) - len(missing_hunters)
-    if present_count < MIN_REQUIRED_HUNTERS:
-        logger.error(f"  BLOCKED: Only {present_count}/{len(REQUIRED_HUNTERS)} required hunters present "
-                     f"(minimum {MIN_REQUIRED_HUNTERS}). Missing: {missing_hunters}")
-        summary["status"] = "BLOCKED_HUNTERS"
-        summary["gates"]["hunters"] = False
-        return summary
-    else:
-        hunters_ok = True
-        summary["gates"]["hunters"] = True
-        if missing_hunters:
-            logger.warning(f"  Gate hunters: PASS with degradation — {present_count}/{len(REQUIRED_HUNTERS)} "
-                          f"required hunters present ({hyp_count} total YAML files). "
-                          f"Missing: {missing_hunters}")
-        else:
-            logger.info(f"  Gate hunters: PASS ({hyp_count} YAML files, all {len(REQUIRED_HUNTERS)} required hunters present)")
-
-    # Mandatory team output verification
-    verify_result = subprocess.run([
-        "python3", str(SCRIPT_DIR / "verify_team_outputs.py"),
-        "--session-dir", str(Path(hyp_dir).parent.parent),
-        "--protocol", protocol,
-        "--groups", json.dumps([{"group_id": 0, "components": [component]}])
-    ], capture_output=True, text=True)
-    if verify_result.returncode != 0:
-        logger.warning(f"  Team verification warnings:\n{verify_result.stdout[:500]}")
-
-    # Step 3 (Library Analyzer) — now runs as LibraryHunter (#11) in parallel with other hunters above
-
-    # ─── Step 4: DeepDive Hunter ────────────────────────────────────────
-    logger.info("  Step 4: DeepDive Hunter")
-
-    # Pre-digest hunter hypotheses: summarize convergences for DeepDive (Gap #5)
-    import yaml as _yaml_dd
-    hunter_digest = ""
-    convergence_map = {}  # track which areas multiple hunters flagged
-    for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
-        if "DeepDive" in hyp_file.name or "CrossChain" in hyp_file.name:
-            continue
-        try:
-            data = _yaml_dd.safe_load(hyp_file.read_text())
-            if not data:
-                continue
-            hunter_name = hyp_file.stem.replace(f"hyp_{component}_", "")
-            hyps = data.get("hypotheses", data.get("invariants", []))
-            for h in hyps:
-                if h.get("confidence", 0) >= 50 and h.get("tier", 3) <= 2:
-                    desc = h.get("description", h.get("title", ""))
-                    area = h.get("type", "unknown")
-                    hunter_digest += f"- [{hunter_name}] (tier={h.get('tier')}, conf={h.get('confidence')}%) {desc}\n"
-                    convergence_map.setdefault(area, []).append(hunter_name)
-        except Exception:
-            pass
-
-    convergence_text = ""
-    for area, hunters in convergence_map.items():
-        if len(hunters) >= 2:
-            convergence_text += f"- **{area}**: flagged by {', '.join(set(hunters))} — INVESTIGATE DEEPER\n"
-
-    # Build deepdive prompt directly from bench_session hyp_dir.
-    # Do NOT import generate_deepdive_prompt from run_hunt — that function uses
-    # run_hunt.HUNT_SESSION_DIR (real hunt_session, not bench_session) to read
-    # hypotheses, which is wrong in benchmark mode and would be a thread-safety
-    # issue in parallel component execution (two threads patching the same module global).
-    deepdive_prompt = build_deepdive_prompt(
-        component=component, protocol=protocol, source_code=source_code,
-        library_code=library_code, setup_sol_text=setup_sol_text,
-        protocol_model=protocol_model, hyp_dir=hyp_dir,
-        convergence_text=convergence_text, hunter_digest=hunter_digest
-    )
-
-    _llm(
-        deepdive_prompt,
-        allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
-        timeout=1800,
-        log_file=clog / "deepdive.log",
-        cwd=repo
-    )
-
-    # Rescue DeepDive YAML: Claude may write to cwd (worktree root) instead of hyp_dir.
-    # Use find to locate the file wherever it landed in the worktree, then copy to hyp_dir.
-    dd_yaml_target = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
-    if not dd_yaml_target.exists():
-        import shutil as _shutil_dd
-        import subprocess as _sp_dd
-        _find = _sp_dd.run(
-            ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
-            capture_output=True, text=True
-        )
-        for _found in _find.stdout.strip().splitlines():
-            if _found and Path(_found) != dd_yaml_target:
-                _shutil_dd.copy2(_found, dd_yaml_target)
-                logger.info(f"  Rescued DeepDive YAML from worktree: {Path(_found).name} → {hyp_dir.name}/")
-                break
-
-    deepdive_ok = check_gate(component, "deepdive", protocol, repo)
-    summary["gates"]["deepdive"] = deepdive_ok
-    if not deepdive_ok:
-        dd_file = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
-        if not dd_file.exists():
-            logger.warning("  DeepDive gate failed and no YAML — continuing without DeepDive")
-        # Not blocking — DeepDive is additive, hunters provide the base
+        deepdive_ok = check_gate(component, "deepdive", protocol, repo)
+        summary["gates"]["deepdive"] = deepdive_ok
+        if not deepdive_ok:
+            dd_file = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
+            if not dd_file.exists():
+                logger.warning("  DeepDive gate failed and no YAML — continuing without DeepDive")
+            # Not blocking — DeepDive is additive, hunters provide the base
 
     # ─── Forge env (shared by fuzz + PoC steps) ─────────────────────────
     forge_env = os.environ.copy()
@@ -1828,6 +1905,35 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     if True:  # Steps 5-8 always run; Steps 9-9.5 gated by _SKIP_HEAVY_FUZZ
         # ─── Step 5: Ensure Chimera Setup exists & compiles BEFORE merge ────
         setup_sol = chimera_dir / "Setup.sol"
+        # ── Chimera Setup cache: reuse Setup.sol from a sibling component ──
+        # If another component already compiled a Setup.sol, use it as starting template.
+        # Siblings share 80%+ of the setup (same protocol deps/mocks), only handlers differ.
+        # Lookup order (most durable first):
+        #   1. Persistent cache at /tmp/chimera-cache-{protocol}/<sibling>/   ← survives worktree destruction
+        #   2. Live sibling worktree /tmp/bench-{protocol}-*/*/test/chimera/
+        #   3. Main repo's chimera dir (prior batch)
+        _persistent_cache_root = Path("/tmp") / f"chimera-cache-{protocol}"
+        if not setup_sol.exists():
+            _cache_search = []
+            if _persistent_cache_root.exists():
+                # Any sibling dir under the persistent cache with a compiled Setup.sol
+                _cache_search = list(_persistent_cache_root.glob("*/Setup.sol"))
+            if not _cache_search:
+                _cache_search = list(Path("/tmp").glob(f"bench-{protocol}-*/*/test/chimera/Setup.sol"))
+            if not _cache_search:
+                # Also check the main repo's chimera dir from a prior batch
+                _main_chimera = Path(repo).parent / "test" / "chimera" / "Setup.sol"
+                if _main_chimera.exists():
+                    _cache_search = [_main_chimera]
+            if _cache_search:
+                _cached_setup = _cache_search[0]
+                logger.info(f"  Step 5a: Reusing Setup.sol from {_cached_setup.parent}")
+                chimera_dir.mkdir(parents=True, exist_ok=True)
+                import shutil as _shutil_cache
+                # Copy ALL chimera files from sibling, not just Setup.sol
+                _sibling_chimera = _cached_setup.parent
+                for _cf in _sibling_chimera.glob("*.sol"):
+                    _shutil_cache.copy2(_cf, chimera_dir / _cf.name)
         if not chimera_dir.exists() or not setup_sol.exists():
             logger.info("  Step 5a: Generate Chimera Setup (no existing setup found)")
             chimera_prompt = (
@@ -1849,7 +1955,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             _llm(
                 chimera_prompt,
                 allowed_tools=["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
-                timeout=1200,  # Increased: complex components need >600s for full setup
+                timeout=1500,  # Increased: complex components need >600s for full setup
                 log_file=clog / "chimera_builder.log",
                 cwd=repo
             )
@@ -1868,6 +1974,19 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             summary["status"] = "BLOCKED_CHIMERA"
             summary["gates"]["compile"] = False
             return summary
+
+        # ── Persist compiled chimera to /tmp/chimera-cache-{protocol}/{component}/ ──
+        # Survives worktree destruction so sibling components can reuse it even if
+        # their worktrees start simultaneously or the source worktree is cleaned up.
+        try:
+            import shutil as _shutil_persist
+            _persist_dir = Path("/tmp") / f"chimera-cache-{protocol}" / component
+            _persist_dir.mkdir(parents=True, exist_ok=True)
+            for _sf in chimera_dir.glob("*.sol"):
+                _shutil_persist.copy2(_sf, _persist_dir / _sf.name)
+            logger.info(f"  Step 5b: Cached chimera setup → {_persist_dir}")
+        except Exception as _e_cache:
+            logger.warning(f"  Step 5b: Could not persist chimera cache: {_e_cache}")
 
         # ─── Step 5c: Second-chance rescue of DeepDive YAML before merge ──────
         # (Primary rescue is right after run_claude; this catches any edge cases)
@@ -2490,7 +2609,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         rc, output = _llm(
             verify_prompt,
             allowed_tools=[],  # pure reasoning — no tool calls, stays fast (~30-90s)
-            timeout=120,
+            timeout=300,
             log_file=clog / f"{fid}_verify.log",
             cwd=repo
         )
@@ -2629,16 +2748,22 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         # If DIFFERENT → the sibling escaped dedup by mistake and needs its own PoC.
         # This prevents silent loss of real bugs due to over-aggressive deduplication.
         def _check_is_same_bug(leader: dict, sibling: dict) -> bool:
-            """60s Claude call: does sibling describe the same bug as leader?
-            Conservative: returns False (DIFFERENT) on timeout/error — never silently drops."""
+            """180s Claude call: does sibling describe the same bug as leader?
+            Conservative: returns True (SAME) on timeout/error — avoid duplicate PoC work."""
             prompt = build_is_same_bug_prompt(leader=leader, sibling=sibling)
             fid_s = sibling["id"]
             _, out = _llm(
-                prompt, allowed_tools=[], timeout=60, stall_timeout=45,
+                prompt, allowed_tools=[], timeout=180, stall_timeout=120,
                 log_file=clog / f"{fid_s}_same_bug_check.log", cwd=repo
             )
-            # Conservative fallback: empty/timeout → treat as DIFFERENT (never drop)
+            # Conservative fallback: empty/timeout → treat as SAME (avoid duplicate PoC work)
             result = (out or "").strip().upper()
+            if not result:
+                # Timeout/empty → treat as SAME (conservative: avoid duplicate PoC work)
+                is_same = True
+                verdict = "SAME (timeout fallback)"
+                logger.info(f"    is_same_bug({leader['id']}, {fid_s}): {verdict}")
+                return is_same
             is_same = result.startswith("SAME") and not result.startswith("DIFFERENT")
             verdict = "SAME" if is_same else "DIFFERENT"
             logger.info(f"    is_same_bug({leader['id']}, {fid_s}): {verdict}")
@@ -2669,7 +2794,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         try:
                             same = fut.result()
                         except Exception:
-                            same = False
+                            same = True
                         if not same:
                             sib["_escaped_dedup"] = True
                             escaped_siblings.append(sib)
@@ -2934,7 +3059,15 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
             return m2.group(1).upper()
         return "UNKNOWN"
 
+    def _parse_fix_scope(text: str) -> str:
+        """Parse FIX_SCOPE line. Returns same_fix / different_fix / n_a."""
+        m = re.search(r'FIX_SCOPE:\s*(same_fix|different_fix|n_a)', text or "", re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+        return "n_a"
+
     verdict = _parse_redteam_verdict(redteam_output)
+    fix_scope = _parse_fix_scope(redteam_output)
 
     # If still UNKNOWN, retry once — output may have cut off or missed the RESULTADO line
     if verdict == "UNKNOWN":
@@ -2942,12 +3075,15 @@ def run_finding_pipeline(finding: dict, component: str, protocol: str,
         _, redteam_output2 = _llm(redteam_prompt, timeout=300, stall_timeout=180,
                                         log_file=clog / f"{fid}_redteam_retry.log", cwd=repo)
         verdict = _parse_redteam_verdict(redteam_output2)
+        if fix_scope == "n_a":
+            fix_scope = _parse_fix_scope(redteam_output2)
         if verdict != "UNKNOWN":
             logger.info(f"    {fid}: RedTeam retry → {verdict}")
         else:
             logger.warning(f"    {fid}: RedTeam still UNKNOWN after retry — keeping UNKNOWN")
 
     finding["redteam_verdict"] = verdict
+    finding["fix_scope"] = fix_scope
     # Save raw output for post-hoc analysis (capped at 2K chars)
     finding["_redteam_output"] = (redteam_output or "")[:2000]
 
@@ -3516,6 +3652,10 @@ def main():
                         help="PoC generation timeout in seconds. Default: 900 (api) / 1500 (sub)")
     parser.add_argument("--poc-confidence", type=int, default=65,
                         help="Minimum confidence %% to attempt PoC generation (default 65)")
+    parser.add_argument("--no-few-shot", action="store_true",
+                        help="Disable few-shot example injection into hunter prompts (prevents benchmark contamination)")
+    parser.add_argument("--skip-hunters", action="store_true",
+                        help="Skip prepass+hunters+deepdive if hypothesis files already exist. Resume from merge step.")
 
     args = parser.parse_args()
 
@@ -3574,6 +3714,11 @@ def main():
     POC_CONFIDENCE_THRESHOLD = args.poc_confidence
     logger.info(f"  PoC confidence threshold: {POC_CONFIDENCE_THRESHOLD}%")
 
+    global DISABLE_FEW_SHOT
+    DISABLE_FEW_SHOT = args.no_few_shot
+    if DISABLE_FEW_SHOT:
+        logger.info("  Few-shot examples DISABLED (--no-few-shot)")
+
     components = [c.strip() for c in args.components.split(",")]
     repo = str(Path(args.repo).resolve())
 
@@ -3609,6 +3754,7 @@ def main():
                     "hunter": f.get("hunter", ""),
                     "redteam_verdict": f.get("redteam_verdict", ""),
                     "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+                    "fix_scope": f.get("fix_scope", "n_a"),
                 })
         for f in (extra_findings or []):
             flat.append({
@@ -3623,6 +3769,7 @@ def main():
                 "hunter": "CrossComponentHunter",
                 "redteam_verdict": f.get("redteam_verdict", ""),
                 "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+                "fix_scope": f.get("fix_scope", "n_a"),
             })
         findings_json = HUNT_SESSION_DIR / "findings_all.json"
         findings_json.write_text(json.dumps({
@@ -3794,6 +3941,7 @@ def main():
                 "hunter": f.get("hunter", ""),
                 "redteam_verdict": f.get("redteam_verdict", ""),
                 "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+                "fix_scope": f.get("fix_scope", "n_a"),
             })
     # Include cross-component findings that were PoC'd and RedTeam'd
     for f in cross_findings:
@@ -3809,6 +3957,7 @@ def main():
             "hunter": "CrossComponentHunter",
             "redteam_verdict": f.get("redteam_verdict", ""),
             "redteam_kill_reason": f.get("redteam_kill_reason", ""),
+            "fix_scope": f.get("fix_scope", "n_a"),
         })
     findings_json_data = {
         "protocol": args.protocol,

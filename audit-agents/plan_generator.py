@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from plan_schema import Step, ExecutionPlan
+from context_enrichment import build_hunter_context
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -42,6 +43,19 @@ VERSION = "1.0.0"
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# Minimal domain detector for hunter context enrichment.
+# Keeps this file self-sufficient; a richer detector lives in
+# context_enrichment.DOMAIN_BRIEFING keys — we reuse that list.
+def _detect_primary_domain(source_code: str) -> str:
+    """Return the first DOMAIN_BRIEFING key that appears in source, or ''."""
+    from context_enrichment import DOMAIN_BRIEFING
+    src_lower = (source_code or "").lower()
+    for domain in DOMAIN_BRIEFING.keys():
+        if domain in src_lower:
+            return domain
+    return ""
+
 
 def _read_file_safe(path: Path, max_chars: int = 0) -> str:
     """Read a file, returning empty string on any error."""
@@ -295,8 +309,14 @@ def generate_plan(
                 lang=lang,
             )
             sub_wt = len(group) > 1
-            prev_checkpoint: str | None = None
+            prev_comp: str | None = None
             for comp in group:
+                # Pipeline overlap: Comp2's API phases (prepass→hunters→deepdive)
+                # start when Comp1 enters its CPU phase (after deepdive).
+                # Comp2's forge phases (create_worktree+) wait for Comp1's forge to finish.
+                # This overlaps API-only work with CPU-bound forge — no hardware contention.
+                chain_after = _step_id(prev_comp, "hunters") if prev_comp else None
+                forge_after = _step_id(prev_comp, "cleanup_worktree") if prev_comp else None
                 _add_component_steps(sub_plan, comp, repo, protocol,
                                      session_dir, fast,
                                      use_worktrees=sub_wt,
@@ -305,9 +325,10 @@ def generate_plan(
                                      fork_block=fork_block,
                                      lang=lang,
                                      parallel_components=parallel_components,
-                                     chain_after=prev_checkpoint)
-                # Chain: next component starts after this one's checkpoint
-                prev_checkpoint = _step_id(comp, "checkpoint")
+                                     chain_after=chain_after,
+                                     forge_after=forge_after,
+                                     is_pre_production=is_pre_production)
+                prev_comp = comp
 
             sub_path = str(Path(session_dir) / f"execution_plan_group_{gidx}.json")
             sub_plan.to_json(sub_path)
@@ -369,7 +390,8 @@ def generate_plan(
                                  chain=chain,
                                  fork_block=fork_block,
                                  lang=lang,
-                                 chain_after=prev_checkpoint)
+                                 chain_after=prev_checkpoint,
+                                 is_pre_production=is_pre_production)
             prev_checkpoint = _step_id(comp, "checkpoint")
 
         # Cross-component steps (only if >1 component)
@@ -423,11 +445,17 @@ def _add_component_steps(
     lang: str = "solidity",
     parallel_components: int = 1,
     chain_after: str | None = None,
+    forge_after: str | None = None,
+    is_pre_production: bool = False,
 ) -> None:
     """Add the sequential steps for a single component.
 
     When use_worktrees=True (default for multi-component), merge/compile/fuzz
     run in an isolated git worktree so components can execute in parallel safely.
+
+    Pipeline overlap: *chain_after* gates the API-only phases (prepass→hunters→deepdive).
+    *forge_after* gates the CPU-heavy phases (create_worktree→compile→fuzz).
+    This allows Comp2's hunters to overlap with Comp1's fuzz (API vs CPU, no contention).
 
     When lang="rust", Solidity-specific steps (chimera, merge, foundry fuzz)
     are replaced with Rust equivalents (cargo clippy, cargo build, cargo test).
@@ -574,22 +602,34 @@ def _add_component_steps(
                 f"echo 'Worktree created (Rust workspace OK): {wt_path}'"
             )
         else:
-            # Solidity: create worktree and patch foundry.toml
+            # Solidity: create worktree, copy .env, and patch foundry.toml
+            # Find .env by walking up from the ORIGINAL repo (not the worktree)
+            env_copy_cmd = ""
+            for parent in [Path(repo), Path(repo).parent, Path(repo).parent.parent, Path(repo).parent.parent.parent]:
+                if (parent / ".env").exists():
+                    env_copy_cmd = f"cp {parent / '.env'} {wt_path}/.env && "
+                    break
             wt_create_cmd = (
                 f"git -C {repo} worktree prune && "
                 f"rm -rf {wt_path} && "
                 f"git -C {repo} worktree add -f --detach {wt_path} HEAD && "
+                f"{env_copy_cmd}"
                 f"if [ -f {wt_path}/foundry.toml ] && ! grep -q rpc_endpoints {wt_path}/foundry.toml; then "
                 f"  echo -e '\\n[rpc_endpoints]\\nmainnet = \"${{ETH_RPC_URL}}\"\\nbase = \"${{BASE_RPC_URL}}\"' >> {wt_path}/foundry.toml; "
                 f"fi && "
                 f"echo 'Worktree created: {wt_path}'"
             )
+        # Worktree depends on deepdive (own API work done) AND forge_after
+        # (previous component's forge finished — no CPU contention).
+        wt_deps = [_step_id(comp, "deepdive")]
+        if forge_after:
+            wt_deps.append(forge_after)
         plan.add_step(Step(
             id=_step_id(comp, "create_worktree"),
             type="bash",
             description=f"Create git worktree for {comp}",
             command=wt_create_cmd,
-            depends_on=[_step_id(comp, "deepdive")],
+            depends_on=wt_deps,
             timeout=60,
         ))
         build_dep = _step_id(comp, "create_worktree")
@@ -675,7 +715,7 @@ def _add_component_steps(
         compile_dep = _step_id(comp, "merge_harness")
 
     # ── Compile ──
-    compile_retry = 1 if fast else 3
+    compile_retry = 3
     if is_rust:
         cargo_ws_build = _find_cargo_workspace(repo_for_build)
         # Limit cargo parallelism to avoid OOM when multiple crates compile
@@ -715,6 +755,7 @@ def _add_component_steps(
             f"--repo {repo_for_build} --session-dir {session_dir}"
             + (" --fast" if fast else "")
             + (f" --parallel-components {parallel_components}" if parallel_components > 1 else "")
+            + (" --pre-production" if is_pre_production else "")
             + lang_flag
         ),
         depends_on=[_step_id(comp, "compile")],
@@ -724,6 +765,8 @@ def _add_component_steps(
     # ── End worktree boundary ──
 
     if use_worktrees:
+        # Depend on post_fuzz sentinel (emitted by phase_post_compile) so that
+        # dynamically-injected fuzz steps finish BEFORE the worktree is removed.
         plan.add_step(Step(
             id=_step_id(comp, "cleanup_worktree"),
             type="bash",
@@ -732,7 +775,7 @@ def _add_component_steps(
                 f"git -C {repo} worktree remove --force {wt_path} 2>/dev/null; "
                 f"rm -rf {wt_path}; echo 'Worktree cleaned: {wt_path}'"
             ),
-            depends_on=[_step_id(comp, "post_compile")],
+            depends_on=[_step_id(comp, "post_fuzz")],
             timeout=30,
         ))
         findings_dep = _step_id(comp, "cleanup_worktree")
@@ -914,6 +957,17 @@ def phase_hunter_prompt(
     if model_path.exists():
         protocol_model = _read_file_safe(model_path, max_chars=3000)
 
+    # F019 + F022 + F024 + F015 + F016 — context enrichment pipeline.
+    # Each sub-signal degrades to empty string on failure; the brief
+    # still assembles. Domain auto-detection: cheap keyword scan on src.
+    detected_domain = _detect_primary_domain(source_code) or protocol
+    context_block = build_hunter_context(
+        contract_path=src_file,
+        domain=detected_domain,
+        component=component,
+        cache_dir=Path(session_dir) / "cache" / "context_enrichment",
+    )
+
     # Build hunter brief
     brief_content = build_hunter_brief(
         component=component,
@@ -929,6 +983,7 @@ def phase_hunter_prompt(
         interfaces_code=interfaces_code,
         accumulated_context="",
         hyp_dir=hyp_dir,
+        context_enrichment_block=context_block,
     )
 
     # Write brief to disk
@@ -1493,7 +1548,43 @@ def phase_deepdive_prompt(
                 f"— INVESTIGATE DEEPER\n"
             )
 
+    # Cross-hints: scan hypotheses from OTHER components (written by sibling group agents
+    # to the shared hyp_dir). If Strategy's hunters found something affecting Leverager,
+    # DeepDive for Leverager gets that signal. No messaging needed — filesystem is shared.
+    cross_hints = ""
+    if _yaml:
+        comp_lower = component.lower()
+        for hyp_file in sorted(hyp_dir.glob("hyp_*.yaml")):
+            # Skip own component's files
+            if f"hyp_{component}_" in hyp_file.name:
+                continue
+            try:
+                data = _yaml.safe_load(hyp_file.read_text())
+                if not data:
+                    continue
+                sibling_comp = hyp_file.stem.split("_")[1]  # hyp_Strategy_MathHunter → Strategy
+                hyps = data.get("hypotheses", data.get("invariants", []))
+                for h in hyps:
+                    desc = (h.get("description", "") + " " + h.get("title", "")).lower()
+                    # Include if it mentions our component by name
+                    if comp_lower in desc and h.get("confidence", 0) >= 60:
+                        cross_hints += (
+                            f"- [{sibling_comp}→{component}] (conf={h.get('confidence')}%) "
+                            f"{h.get('title', h.get('description', ''))}\n"
+                        )
+            except Exception:
+                pass
+
     # Build the prompt
+    cross_hints_section = ""
+    if cross_hints:
+        cross_hints_section = (
+            f"## Cross-Component Signals (from sibling component hunters)\n"
+            f"These hypotheses from OTHER components mention {component}. "
+            f"Investigate the interaction surface — the bug may live HERE.\n"
+            f"{cross_hints}\n\n"
+        )
+
     if is_rust:
         deepdive_prompt = (
             f"You are DeepDiveHunter analyzing {component} of {protocol} [RUST/SOROBAN].\n\n"
@@ -1501,6 +1592,7 @@ def phase_deepdive_prompt(
             f"## Protocol Model\n{protocol_model[:3000]}\n\n"
             f"## Pre-Digested Hunter Convergences\n{convergence_text or 'No convergences detected.'}\n\n"
             f"## Hunter Hypothesis Summary (tier 1-2 only)\n{hunter_digest[:8000]}\n\n"
+            f"{cross_hints_section}"
             f"## SOROBAN-SPECIFIC DEEP DIVE\n"
             f"- Trace ALL cross-contract calls: what assumptions does this component make about called contracts?\n"
             f"- Check EVERY storage write: is TTL extended? Can entries expire at a critical moment?\n"
@@ -1514,6 +1606,15 @@ def phase_deepdive_prompt(
         )
     else:
         from run_benchmark import build_deepdive_prompt
+        # Inject cross-hints into convergence text so DeepDive sees them
+        enriched_convergence = convergence_text
+        if cross_hints:
+            enriched_convergence += (
+                f"\n### Cross-Component Signals (from sibling hunters)\n"
+                f"These hypotheses from OTHER components mention {component}. "
+                f"The bug may live in {component}'s handling of the interaction.\n"
+                f"{cross_hints}"
+            )
         deepdive_prompt = build_deepdive_prompt(
             component=component,
             protocol=protocol,
@@ -1522,7 +1623,7 @@ def phase_deepdive_prompt(
             setup_sol_text=setup_sol_text,
             protocol_model=protocol_model,
             hyp_dir=hyp_dir,
-            convergence_text=convergence_text,
+            convergence_text=enriched_convergence,
             hunter_digest=hunter_digest,
         )
 
@@ -1585,8 +1686,9 @@ def phase_findings(
         return _phase_findings_rust(findings, component, protocol, repo, session_dir, benchmark_mode, src_dir)
 
     # ── Solidity path: delegate to finding_pipeline.py triage chain ──
+    # Phase 1: dedup emits verify agents + post-verify chain dynamically
     pipeline_cmd = f"{sys.executable} {SCRIPT_DIR / 'finding_pipeline.py'}"
-    return [{
+    steps_out: list[dict] = [{
         "id": _step_id(component, "triage_dedup"),
         "type": "generate",
         "description": f"Triage Phase 1: dedup {component} hypotheses",
@@ -1598,6 +1700,60 @@ def phase_findings(
         ),
         "timeout": 120,
     }]
+
+    # If benchmark_mode includes PoC/RedTeam, add a dedicated agent step
+    # that drives the full finding pipeline chain (verify → PoC → RedTeam).
+    # This is more reliable than depending on the executor to follow the
+    # deep generate→agent→generate chain produced by dedup.
+    if benchmark_mode in ("poc", "redteam"):
+        poc_prompt = (
+            f"You are a finding pipeline executor for {component} in the {protocol} protocol.\n\n"
+            f"## Mission\n"
+            f"Execute the FULL finding pipeline for {component}. The dedup phase has already run.\n"
+            f"Triage groups are at: {session_dir}/triage/{component}_groups.json\n\n"
+            f"## Steps to execute IN ORDER:\n\n"
+            f"### 1. Verify each finding candidate\n"
+            f"For each dedup group with confidence >= 65%, read the source code and determine:\n"
+            f"- Is this a REAL bug or a FALSE_POSITIVE?\n"
+            f"- Write verdict to: {session_dir}/triage/{component}_verify_{{id}}.json\n"
+            f"  Format: {{\"finding_id\": \"...\", \"verdict\": \"REAL\"|\"FALSE_POSITIVE\", \"reason\": \"...\"}}\n\n"
+            f"Source code is at: {repo}/src/ (or {repo}/yieldoor/src/ if present)\n\n"
+            f"### 2. Generate PoC for each REAL finding\n"
+            f"For each finding with verdict=REAL:\n"
+            f"- Write a Foundry PoC test that demonstrates the bug\n"
+            f"- Save to: {session_dir}/triage/{component}_poc_{{id}}.sol\n"
+            f"- Run: cd {repo} && forge test --match-test test_poc_{{id}} -vv 2>&1\n"
+            f"- Write result to: {session_dir}/triage/{component}_poc_{{id}}.json\n"
+            f"  Format: {{\"finding_id\": \"...\", \"poc_passed\": true/false, \"output\": \"...\"}}\n\n"
+        )
+        if benchmark_mode == "redteam":
+            poc_prompt += (
+                f"### 3. RedTeam each finding with PoC\n"
+                f"For each finding with poc_passed=true, evaluate:\n"
+                f"- Is the PoC convincing? Does it demonstrate real loss?\n"
+                f"- Severity assessment: Critical/High/Medium/Low\n"
+                f"- Write verdict to: {session_dir}/triage/{component}_redteam_{{id}}.json\n"
+                f"  Format: {{\"finding_id\": \"...\", \"verdict\": \"REPORT\"|\"REJECT\", "
+                f"\"severity\": \"...\", \"reason\": \"...\"}}\n\n"
+            )
+        poc_prompt += (
+            f"### Final: Write summary\n"
+            f"Write final summary to: {session_dir}/triage/{component}_pipeline_complete.json\n"
+            f"Format: {{\"component\": \"{component}\", \"verified\": N, \"poc_passed\": N, "
+            f"\"redteam_report\": N, \"redteam_reject\": N}}\n"
+        )
+        steps_out.append({
+            "id": _step_id(component, "finding_pipeline"),
+            "type": "agent",
+            "description": f"Full finding pipeline (verify+PoC+RedTeam) for {component}",
+            "prompt": poc_prompt,
+            "tools": ["Read", "Write", "Edit", "Grep", "Glob", "Bash"],
+            "depends_on": [_step_id(component, "triage_dedup")],
+            "timeout": 3600,
+            "retry": 1,
+        })
+
+    return steps_out
 
 
 def _phase_findings_rust(
@@ -2167,24 +2323,14 @@ def phase_chimera_early_prompt(
     if setup_path.exists():
         # Check if existing Setup.sol uses fork (incompatible with Phase 1 mocks)
         setup_content = _read_file_safe(setup_path)
-        has_fork = any(kw in setup_content for kw in [
-            "createSelectFork", "createFork", "fork-url", "--fork-url",
-            "vm.envString(\"ETH_RPC_URL\")", "vm.envString(\"FORK_URL\")",
-        ])
-        if not has_fork:
-            # Setup already exists with mocks — no action needed
-            return [{
-                "step_id": _step_id(component, "chimera_early_setup"),
-                "prompt": (
-                    f"Setup.sol already exists at {setup_path} and uses mocks (no fork). "
-                    f"No action needed — proceed to hunter phase."
-                ),
-            }]
-        # Fork-based Setup.sol found — delete it so we regenerate with mocks
-        import shutil
-        chimera_dir = setup_path.parent
-        shutil.rmtree(chimera_dir, ignore_errors=True)
-        chimera_dir.mkdir(parents=True, exist_ok=True)
+        # Setup already exists — reuse it (fork with real addresses is OK)
+        return [{
+            "step_id": _step_id(component, "chimera_early_setup"),
+            "prompt": (
+                f"Setup.sol already exists at {setup_path}. "
+                f"No action needed — proceed to hunter phase."
+            ),
+        }]
 
     src_dir = _src_dir(repo)
     src_file = src_dir / f"{component}.sol"
@@ -2232,11 +2378,15 @@ def phase_chimera_early_prompt(
         f"Create these files in {chimera_dir}/:\n"
         f"- Setup.sol: abstract contract that deploys {component} with ALL its dependencies.\n"
         f"  COPY the deployment pattern from the project's own tests above — they know their constructor args.\n"
-        f"  NEVER use vm.createSelectFork or fork in Phase 1 Setup.sol — Phase 1 uses MOCKS for fast feedback (0 RPC calls).\n"
-        f"  For external contracts (Uniswap pools, oracles, tokens): deploy mock contracts that simulate their interface.\n"
-        f"  Use forge's `deal()` for token balances. Use MockERC20 or `deal(address(token), user, amount)` for tokens.\n"
-        f"  For Uniswap V3: create a minimal MockUniswapV3Pool that returns controlled slot0/observe/mint/burn values.\n"
-        f"  Fork testing is ONLY for Phase 3 PoCs (individual tests, not invariant fuzzing).\n"
+        f"  FORK-FIRST STRATEGY (preferred): Use REAL mainnet addresses for external contracts (Uniswap pools, tokens, oracles).\n"
+        f"  The fuzz command runs with `--fork-url` via CLI (Foundry RPC cache makes reruns instant).\n"
+        f"  Do NOT use vm.createSelectFork in setUp() — the fork URL is passed via CLI flag, not in code.\n"
+        f"  Use `deal(address(token), user, amount)` for token balances on the fork.\n"
+        f"  For Uniswap V3 pools: use the REAL deployed pool address — real pool state gives higher fidelity than mocks.\n"
+        f"  Do NOT hardcode a specific block number — let Foundry use latest (portable across runs via cache).\n"
+        f"  MOCK FALLBACK: If the protocol is pre-launch (no mainnet deployment) or uses non-EVM chains,\n"
+        f"  deploy MockERC20 tokens and MockUniswapV3Pool that return controlled values.\n"
+        f"  The forge command auto-detects: if ETH_RPC_URL is set → fork mode, otherwise → mock mode.\n"
         f"  MUST define internal variables accessible by Properties: the main contract + tokens + actors.\n"
         f"  Example: `Strategy internal strategy; Vault internal vault; IERC20 internal token0;`\n"
         f"  Define actors: owner, user, depositor, attacker with distinct addresses.\n"
@@ -2294,28 +2444,15 @@ def phase_chimera_builder_prompt(
     setup_sol = chimera_dir / "Setup.sol"
 
     if chimera_dir.exists() and setup_sol.exists():
-        # Check if existing Setup.sol uses fork (incompatible with Phase 1 mocks)
-        setup_content = _read_file_safe(setup_sol)
-        has_fork = any(kw in setup_content for kw in [
-            "createSelectFork", "createFork", "fork-url", "--fork-url",
-            "vm.envString(\"ETH_RPC_URL\")", "vm.envString(\"FORK_URL\")",
-        ])
-        if has_fork:
-            # Fork-based Setup — delete and regenerate with mocks
-            import shutil
-            shutil.rmtree(chimera_dir, ignore_errors=True)
-            chimera_dir.mkdir(parents=True, exist_ok=True)
-            # Fall through to regeneration below
-        else:
-            # Setup exists with mocks — just verify it compiles
-            return [{
-                "step_id": _step_id(component, "chimera_builder"),
-                "prompt": (
-                    f"Chimera Setup already exists at {setup_sol}. "
-                    f"Verify it compiles with `cd {repo} && forge build{' --jobs 3' if parallel_components > 1 else ''}`. "
-                    f"If compilation fails, fix the errors. Do not rewrite from scratch."
-                ),
-            }]
+        # Setup exists — verify it compiles (fork with real addresses is OK)
+        return [{
+            "step_id": _step_id(component, "chimera_builder"),
+            "prompt": (
+                f"Chimera Setup already exists at {setup_sol}. "
+                f"Verify it compiles with `cd {repo} && forge build{' --jobs 3' if parallel_components > 1 else ''}`. "
+                f"If compilation fails, fix the errors. Do not rewrite from scratch."
+            ),
+        }]
 
     src_dir = _src_dir(repo)
     src_file = src_dir / f"{component}.sol"
@@ -2335,7 +2472,10 @@ def phase_chimera_builder_prompt(
         f"## Source Code\n```solidity\n{source_code}\n```\n\n"
         f"## Libraries\n```solidity\n{library_code[:20000]}\n```\n\n"
         f"Create these files in {chimera_dir}/:\n"
-        f"- Setup.sol: deploy {component} with ALL its dependencies. Use mocks for external contracts.\n"
+        f"- Setup.sol: deploy {component} with ALL its dependencies using REAL mainnet addresses.\n"
+        f"  Forge runs with --fork-url (ETH mainnet, RPC cache). Use real Uniswap pools, real tokens.\n"
+        f"  Do NOT use vm.createSelectFork — fork URL is passed via CLI. Do NOT hardcode block numbers.\n"
+        f"  Use deal() for token balances on the fork.\n"
         f"  MUST define: contract instance variables accessible by Properties (e.g., `Strategy internal strategy;`)\n"
         f"- BeforeAfter.sol: ghost variables and state snapshots\n"
         f"- Properties.sol: base with ghost vars, inherits BeforeAfter\n"
@@ -2439,6 +2579,7 @@ def phase_post_compile(
     fast: bool = False,
     lang: str = "solidity",
     parallel_components: int = 1,
+    is_pre_production: bool = False,
 ) -> list[dict]:
     """Check compile result and conditionally emit test/fuzz steps.
 
@@ -2470,10 +2611,22 @@ def phase_post_compile(
                         pass
         compile_ok = out_dir.exists() and any(out_dir.iterdir()) if out_dir.exists() else False
 
+    # Sentinel step: cleanup_worktree depends on this, not on post_compile.
+    # This ensures dynamically-injected fuzz steps run BEFORE worktree cleanup.
+    sentinel = {
+        "id": _step_id(component, "post_fuzz"),
+        "type": "bash",
+        "description": f"Sentinel: fuzz phase complete for {component}",
+        "command": "echo 'post_fuzz sentinel reached'",
+        "timeout": 10,
+    }
+
     if not compile_ok:
         if fast:
             # Fast mode: compile failed but we continue to collect_findings
-            return [{"status": "compile_failed_fast_mode", "component": component}]
+            # Still emit sentinel so cleanup_worktree dependency resolves
+            sentinel["depends_on"] = []
+            return [sentinel]
         else:
             # Non-fast mode: emit a gate step that will fail the pipeline
             return [{
@@ -2525,6 +2678,10 @@ def phase_post_compile(
                 "timeout": 600,
             })
 
+        # Sentinel: last step in the dynamic chain (Rust path)
+        last_rust_step = steps[-1]["id"]
+        sentinel["depends_on"] = [last_rust_step]
+        steps.append(sentinel)
         return steps
 
     # ── Solidity path: enhance_targets + fuzz ──
@@ -2554,18 +2711,70 @@ def phase_post_compile(
         "timeout": 600,
     })
 
-    # 8. Phase 1 — Foundry fuzz (mocks, no fork)
+    # 8. Phase 1 — Foundry fuzz (fork-first with RPC cache, fallback to no-fork)
     fuzz_runs = 3000 if fast else 5000
-    fuzz_timeout = 900 if fast else 1800
+    fuzz_timeout = 1800
     forge_jobs = " --jobs 3" if parallel_components > 1 else ""
+    # Source .env to ensure RPC URLs are available (subagents don't inherit shell exports).
+    # Try fork first (real state, high fidelity). If no RPC URL → run without fork (mocks).
+    env_file = Path(repo).resolve()
+    # Walk up to find .env (could be in repo root, parent, or grandparent).
+    # Also check the session_dir ancestors (worktrees live in /tmp/ far from the project .env).
+    env_source = ""
+    _search_roots = [env_file, env_file.parent, env_file.parent.parent, env_file.parent.parent.parent]
+    # session_dir is always inside the real project tree — use it to find .env
+    _sess = Path(session_dir).resolve()
+    for _anc in [_sess, _sess.parent, _sess.parent.parent, _sess.parent.parent.parent]:
+        if _anc not in _search_roots:
+            _search_roots.append(_anc)
+    for parent in _search_roots:
+        if (parent / ".env").exists():
+            env_source = f"set -a && source {parent / '.env'} && set +a && "
+            break
+    # Pin fork block for deterministic cache: fetch once, reuse across all components.
+    # cast block latest returns current block; all fuzz runs in this session share it.
+    mock_cmd = (
+        f"echo '[MOCK MODE] Running without fork' && "
+        f"forge test --match-contract FoundryTester --fuzz-runs {fuzz_runs} -vv{forge_jobs}"
+    )
+    if is_pre_production:
+        # Pre-production: try fork if RPC available (tests may use vm.createFork for
+        # external deps like Uniswap), fall back to mock if no RPC.
+        fuzz_cmd = (
+            f"cd {repo} && {env_source}"
+            f"if [ -n \"${{ETH_RPC_URL:-}}\" ]; then "
+            f"  echo '[PRE-PROD FORK] RPC available, running with fork for external deps' && "
+            f"  forge test --match-contract FoundryTester --fuzz-runs {fuzz_runs} -vv{forge_jobs} "
+            f"--fork-url \"$ETH_RPC_URL\" || "
+            f"  (echo '[FORK FAILED] Falling back to mock mode' && {mock_cmd}); "
+            f"else "
+            f"  {mock_cmd}; "
+            f"fi"
+        )
+    else:
+        # Deployed protocol: try fork first, fallback to mock if RPC fails
+        fuzz_cmd = (
+            f"cd {repo} && {env_source}"
+            f"if [ -n \"${{ETH_RPC_URL:-}}\" ]; then "
+            f"  FORK_BLOCK=${{FORK_BLOCK:-$(cast block latest --field number --rpc-url \"$ETH_RPC_URL\" 2>/dev/null || echo 0)}} && "
+            f"  if [ \"$FORK_BLOCK\" != \"0\" ]; then "
+            f"    echo \"[FORK MODE] block=$FORK_BLOCK (pinned, RPC cache reused across components)\" && "
+            f"    forge test --match-contract FoundryTester --fuzz-runs {fuzz_runs} -vv{forge_jobs} "
+            f"--fork-url \"$ETH_RPC_URL\" --fork-block-number $FORK_BLOCK || "
+            f"    (echo '[FORK FAILED] Falling back to mock mode' && {mock_cmd}); "
+            f"  else "
+            f"    echo '[FORK FALLBACK] Could not fetch block — running mock mode' && "
+            f"    {mock_cmd}; "
+            f"  fi; "
+            f"else "
+            f"  {mock_cmd}; "
+            f"fi"
+        )
     steps.append({
         "id": _step_id(component, "fuzz"),
         "type": "bash",
-        "description": f"Phase 1: Foundry fuzz {fuzz_runs} runs for {component}",
-        "command": (
-            f"cd {repo} && forge test "
-            f"--match-contract FoundryTester --fuzz-runs {fuzz_runs} -vv{forge_jobs}"
-        ),
+        "description": f"Phase 1: Foundry fuzz {fuzz_runs} runs for {component} (fork-first, mock fallback)",
+        "command": fuzz_cmd,
         "cwd": repo,
         "depends_on": [_step_id(component, "enhance_targets")],
         "timeout": fuzz_timeout,
@@ -2595,6 +2804,10 @@ def phase_post_compile(
             "timeout": 1200,
         })
 
+    # Sentinel: last step in the dynamic chain (Solidity path)
+    last_sol_step = steps[-1]["id"]
+    sentinel["depends_on"] = [last_sol_step]
+    steps.append(sentinel)
     return steps
 
 
@@ -2889,6 +3102,7 @@ def main() -> None:
                 fast=args.fast,
                 lang=args.lang or _detect_lang(args.repo),
                 parallel_components=args.parallel_components,
+                is_pre_production=args.pre_production,
             )
             print(json.dumps(result, indent=2))
 

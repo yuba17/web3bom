@@ -425,3 +425,26 @@ def run_deep_flatten(
         return ""
 
     return _cached_subprocess(key, cache_dir, _flatten_mem_cache, _run)
+
+
+def build_hunter_context(
+    contract_path: Path,
+    domain: str,
+    component: str,
+    *,
+    domains: list[str] | None = None,
+    cache_dir: Path | None = None,
+) -> str:
+    """Compose all 5 context signals into a single markdown block.
+
+    Returns "" if nothing produced output. Each section failure is
+    silently skipped; a hunter prompt never fails on context.
+    """
+    sections = [
+        query_wiki_context(domain, component),                          # F019
+        load_briefings_tiered(domains if domains is not None else [domain]),  # F022
+        generate_asset_flow_map(contract_path),                         # F024
+        run_symmetric_analysis(contract_path, cache_dir=cache_dir),     # F015
+        run_deep_flatten(contract_path, cache_dir=cache_dir),           # F016
+    ]
+    return "\n\n---\n\n".join(s for s in sections if s and s.strip())
