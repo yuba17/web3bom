@@ -973,159 +973,18 @@ def detect_domains(contract_src: str, max_domains: int = 3) -> list:
 
 
 def load_briefing_single(domain: str) -> str:
-    """Carga y comprime un único briefing."""
-    rel_path = DOMAIN_BRIEFING.get(domain, "")
-    if not rel_path:
-        return ""
-    full_path = WEB3_DIR / rel_path
-    if not full_path.exists():
-        return ""
-    try:
-        text = full_path.read_text()
-    except:
-        return ""
-
-    lines = text.split("\n")
-    sections = {
-        "bugs_index": [],    # Lista de bugs conocidos (solo IDs + nombres)
-        "trampas": [],       # Falsos positivos — NO perder tiempo en esto
-        "checklist": [],     # Invariant checklist
-        "grep": [],          # Grep targets
-        "incidents": [],     # Incidentes reales
-    }
-
-    current = None
-    in_trampa_block = False
-
-    for i, line in enumerate(lines):
-        # Índice de bugs conocidos (solo titulos)
-        if line.startswith("### 1.") or line.startswith("### 2."):
-            sections["bugs_index"].append(line.strip())
-            current = None
-
-        # Sección checklist
-        elif "Invariant Checklist" in line or "## 3." in line:
-            current = "checklist"
-        elif "Grep Targets" in line or "## 4." in line:
-            current = "grep"
-        elif "Real-World Incidents" in line or "## 2.3" in line:
-            current = "incidents"
-
-        # Líneas de trampas (captura las listas de trampas de cada bug)
-        elif line.strip() == "trampas:":
-            in_trampa_block = True
-        elif in_trampa_block:
-            if line.strip().startswith("- ") or line.strip().startswith("  - "):
-                sections["trampas"].append(line.strip())
-            elif line.strip() and not line.strip().startswith(" "):
-                in_trampa_block = False
-
-        # Acumular secciones estructuradas
-        elif current in sections:
-            if line.strip():
-                sections[current].append(line)
-            # Stop at next ## section
-            if line.startswith("## ") and current != "checklist":
-                current = None
-
-    # Construir el resumen comprimido
-    parts = []
-
-    if sections["bugs_index"]:
-        parts.append("## PATRONES CONOCIDOS (busca primero estos)")
-        parts.extend(sections["bugs_index"])
-
-    if sections["trampas"]:
-        parts.append("\n## TRAMPAS — NO pierdas tiempo en esto")
-        # Dedup y limitar
-        seen = set()
-        for t in sections["trampas"]:
-            clean = t.strip().lstrip("- ").strip('"')
-            if clean and clean not in seen:
-                seen.add(clean)
-                parts.append(f"  ⚠ {clean}")
-                if len(seen) >= 12:
-                    break
-
-    if sections["checklist"]:
-        parts.append("\n## CHECKLIST DE INVARIANTES")
-        parts.extend(sections["checklist"][:20])
-
-    if sections["grep"]:
-        parts.append("\n## GREP TARGETS")
-        parts.extend(sections["grep"][:15])
-
-    if sections["incidents"]:
-        parts.append("\n## INCIDENTES REALES (protocolos afectados)")
-        parts.extend(sections["incidents"][:10])
-
-    result = "\n".join(parts)
-
-    # Fallback: si la extracción no obtuvo nada útil, usar los primeros 4000 chars
-    if len(result) < 200:
-        return text[:4000]
-
-    return result
+    from context_enrichment import load_briefing_single as _impl
+    return _impl(domain)
 
 
 def load_grep_targets_only(domain: str) -> str:
-    """Carga solo la sección Quick Grep Targets de un briefing — versión compacta para dominios secundarios."""
-    rel_path = DOMAIN_BRIEFING.get(domain, "")
-    if not rel_path:
-        return ""
-    full_path = WEB3_DIR / rel_path
-    if not full_path.exists():
-        return ""
-    try:
-        text = full_path.read_text()
-    except:
-        return ""
-
-    lines = text.split("\n")
-    in_grep = False
-    grep_lines = []
-    for line in lines:
-        if "Grep Targets" in line or "Quick Grep" in line or "## 4." in line:
-            in_grep = True
-            continue
-        if in_grep:
-            if line.startswith("## ") and grep_lines:
-                break
-            if line.strip():
-                grep_lines.append(line)
-            if len(grep_lines) >= 12:
-                break
-
-    return "\n".join(grep_lines)
+    from context_enrichment import load_grep_targets_only as _impl
+    return _impl(domain)
 
 
 def load_briefings(domains: list) -> str:
-    """
-    Carga briefings para múltiples dominios con estrategia de peso diferenciado:
-    - Dominio primario (index 0): extracto completo (~1500 chars) — patrones, trampas, grep
-    - Dominio secundario (index 1): solo grep targets (~300 chars) — señal sin ruido
-    - Dominio terciario (index 2+): omitido — el Solodit context cubre cross-domain
-
-    Rationale: más de un briefing completo satura el contexto del hunter con patrones
-    irrelevantes y baja la calidad de los invariantes generados. Solo la sección
-    de grep targets es suficientemente señal/ruido para dominios secundarios.
-    """
-    if not domains:
-        return ""
-
-    parts = []
-    primary = domains[0]
-    primary_text = load_briefing_single(primary)
-    if primary_text:
-        parts.append(f"### Briefing principal: {primary}\n{primary_text}")
-
-    if len(domains) > 1:
-        secondary = domains[1]
-        grep_text = load_grep_targets_only(secondary)
-        if grep_text:
-            parts.append(f"\n### Grep targets adicionales ({secondary})\n{grep_text}")
-
-    return "\n\n".join(parts)
+    from context_enrichment import load_briefings_tiered as _impl
+    return _impl(list(domains))
 
 
 def extract_dependency_overrides(contract_path: Path, repo_path: str) -> str:

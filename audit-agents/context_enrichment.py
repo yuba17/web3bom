@@ -12,6 +12,7 @@ must never fail because of a context-enrichment helper.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # Skip deep_flatten when the contract is small — the signal isn't worth
@@ -58,3 +59,165 @@ def query_wiki_context(domain: str, component: str) -> str:
     if not results:
         return ""
     return "\n---\n## Prior Knowledge (Obsidian Vault)\n" + "\n".join(results[:8])
+
+
+WEB3_DIR = Path(__file__).resolve().parents[1]  # /home/kali/Documents/Web3
+
+DOMAIN_BRIEFING: dict[str, str] = {
+    "staking":    "knowledge/staking.md",
+    "lending":    "knowledge/lending.md",
+    "vault":      "knowledge/vault-erc4626.md",
+    "oracle":     "knowledge/oracle.md",
+    "dex":        "knowledge/dex-amm.md",
+    "flash":      "knowledge/flash-loan.md",
+    "token":      "knowledge/token-erc20.md",
+    "access":     "knowledge/access-control.md",
+    "signature":  "knowledge/signature-replay.md",
+    "proxy":      "knowledge/proxy-upgrade.md",
+    "trust":      "knowledge/trust-boundaries.md",
+    "bridge":     "knowledge/bridge.md",
+    "opstack":    "knowledge/bridge-opstack.md",
+    "erc4337":    "knowledge/erc4337-account-abstraction.md",
+    "zk":         "knowledge/zk-circuits.md",
+    "governance": "knowledge/governance.md",
+    "nft":        "knowledge/nft-erc721.md",
+    "yield":      "knowledge/yield-aggregator.md",
+    "liquid":     "knowledge/liquid-staking.md",
+    "perps":      "knowledge/perps-derivatives.md",
+    "crosschain": "knowledge/cross-chain-intents.md",
+    "vesting":    "knowledge/vesting-tokenomics.md",
+    "options":    "knowledge/options-structured-products.md",
+    "mev":        "knowledge/mev-sandwich.md",
+    "reentrancy": "knowledge/reentrancy-patterns.md",
+    "inputval":   "knowledge/input-validation.md",
+}
+
+
+def load_briefing_single(domain: str) -> str:
+    """Extract structured sections from a domain briefing markdown file.
+
+    Returns a compressed summary (patrones conocidos, trampas, checklist,
+    grep, incidents). Empty string if the briefing does not exist.
+    Falls back to the first 4000 chars if structured extraction finds
+    nothing useful (<200 chars of structured output).
+    """
+    rel_path = DOMAIN_BRIEFING.get(domain, "")
+    if not rel_path:
+        return ""
+    full_path = WEB3_DIR / rel_path
+    if not full_path.exists():
+        return ""
+    try:
+        text = full_path.read_text()
+    except Exception:
+        return ""
+
+    lines = text.split("\n")
+    sections: dict[str, list[str]] = {
+        "bugs_index": [], "trampas": [], "checklist": [], "grep": [], "incidents": [],
+    }
+    current = None
+    in_trampa_block = False
+
+    for line in lines:
+        if line.startswith("### 1.") or line.startswith("### 2."):
+            sections["bugs_index"].append(line.strip())
+            current = None
+        elif "Invariant Checklist" in line or "## 3." in line:
+            current = "checklist"
+        elif "Grep Targets" in line or "## 4." in line:
+            current = "grep"
+        elif "Real-World Incidents" in line or "## 2.3" in line:
+            current = "incidents"
+        elif line.strip() == "trampas:":
+            in_trampa_block = True
+        elif in_trampa_block:
+            if line.strip().startswith("- ") or line.strip().startswith("  - "):
+                sections["trampas"].append(line.strip())
+            elif line.strip() and not line.strip().startswith(" "):
+                in_trampa_block = False
+        elif current in sections:
+            if line.strip():
+                sections[current].append(line)
+            if line.startswith("## ") and current != "checklist":
+                current = None
+
+    parts: list[str] = []
+    if sections["bugs_index"]:
+        parts.append("## PATRONES CONOCIDOS (busca primero estos)")
+        parts.extend(sections["bugs_index"])
+    if sections["trampas"]:
+        parts.append("\n## TRAMPAS — NO pierdas tiempo en esto")
+        seen: set[str] = set()
+        for t in sections["trampas"]:
+            clean = t.strip().lstrip("- ").strip('"')
+            if clean and clean not in seen:
+                seen.add(clean)
+                parts.append(f"  ⚠ {clean}")
+                if len(seen) >= 12:
+                    break
+    if sections["checklist"]:
+        parts.append("\n## CHECKLIST DE INVARIANTES")
+        parts.extend(sections["checklist"][:20])
+    if sections["grep"]:
+        parts.append("\n## GREP TARGETS")
+        parts.extend(sections["grep"][:15])
+    if sections["incidents"]:
+        parts.append("\n## INCIDENTES REALES (protocolos afectados)")
+        parts.extend(sections["incidents"][:10])
+
+    result = "\n".join(parts)
+    if len(result) < 200:
+        return text[:4000]
+    return result
+
+
+def load_grep_targets_only(domain: str) -> str:
+    """Compact secondary-domain briefing: just the Grep Targets section."""
+    rel_path = DOMAIN_BRIEFING.get(domain, "")
+    if not rel_path:
+        return ""
+    full_path = WEB3_DIR / rel_path
+    if not full_path.exists():
+        return ""
+    try:
+        text = full_path.read_text()
+    except Exception:
+        return ""
+    lines = text.split("\n")
+    in_grep = False
+    grep_lines: list[str] = []
+    for line in lines:
+        if "Grep Targets" in line or "Quick Grep" in line or "## 4." in line:
+            in_grep = True
+            continue
+        if in_grep:
+            if line.startswith("## ") and grep_lines:
+                break
+            if line.strip():
+                grep_lines.append(line)
+            if len(grep_lines) >= 12:
+                break
+    return "\n".join(grep_lines)
+
+
+def load_briefings_tiered(domains: list[str]) -> str:
+    """Tiered briefings: primary full, secondary grep-only, tertiary dropped.
+
+    Rationale: more than one full briefing saturates the hunter prompt with
+    irrelevant patterns and lowers invariant quality. Grep-targets-only is
+    the signal/noise sweet spot for secondary domains.
+    """
+    if not domains:
+        return ""
+    parts: list[str] = []
+    primary = domains[0]
+    primary_text = load_briefing_single(primary)
+    if primary_text:
+        parts.append(f"### Briefing principal: {primary}\n{primary_text}")
+    if len(domains) > 1:
+        secondary = domains[1]
+        grep_text = load_grep_targets_only(secondary)
+        if grep_text:
+            parts.append(f"\n### Grep targets adicionales ({secondary})\n{grep_text}")
+    return "\n\n".join(parts)
