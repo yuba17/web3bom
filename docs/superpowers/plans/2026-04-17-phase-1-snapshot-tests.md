@@ -847,7 +847,10 @@ def test_prepass_matches_frozen(language: str, benchmark: str, component: str):
 @pytest.mark.parametrize("language,benchmark", [("solidity", "yieldoor")])
 def test_prepass_schema_stable(language: str, benchmark: str):
     """Every prepass YAML in the current session has the required top-level keys."""
-    required = {"source", "name", "findings", "tools_used", "layers"}
+    # Observed schema (discovered during implementation; update if the prepass
+    # output changes). The plan originally assumed {source, name, findings,
+    # tools_used, layers} but real YAMLs use this set.
+    required = {"generated_at", "prepass_signals", "total"}
     results_dir = REPO_ROOT / "benchmarks" / benchmark / "bench_session" / "results"
     yamls = sorted(results_dir.glob("*_prepass.yaml"))
     assert yamls, f"No prepass YAMLs found in {results_dir}"
