@@ -585,7 +585,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 AUDIT_AGENTS = REPO_ROOT / "audit-agents"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-PLAN_IGNORE_KEYS = ["created_at", "session_dir", "repo"]  # volatile or env-specific
+PLAN_IGNORE_KEYS = ["created_at", "session_dir", "repo", "hypotheses_dir", "command"]
+# volatile or env-specific. `command` is excluded because step command strings
+# embed --session-dir=<tmp_path> and _drop_keys is key-based, not value-based.
+# Structural coverage (id/type/description/depends_on/timeout/retry/tools/prompt)
+# is still complete without the command strings.
 
 
 def _run_plan_generator(
