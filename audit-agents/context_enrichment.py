@@ -12,12 +12,84 @@ must never fail because of a context-enrichment helper.
 """
 from __future__ import annotations
 
+import hashlib
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 # Skip deep_flatten when the contract is small — the signal isn't worth
 # the subprocess cost. Threshold chosen empirically; tune if needed.
 DEEP_FLATTEN_MIN_LINES = 200
+
+AUDIT_AGENTS_DIR = Path(__file__).resolve().parent  # /home/kali/Documents/Web3/audit-agents
+
+_symmetric_mem_cache: dict[str, str] = {}
+_flatten_mem_cache: dict[str, str] = {}
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _cached_subprocess(
+    key: str,
+    cache_dir: Path | None,
+    mem_cache: dict[str, str],
+    runner,
+) -> str:
+    """Shared cache plumbing for symmetric + deep_flatten wrappers.
+
+    Lookup order: in-memory dict → filesystem (if cache_dir) → runner().
+    `runner` must be a zero-arg callable returning the raw string output
+    (empty string on any failure is acceptable; caller still caches it).
+    """
+    if key in mem_cache:
+        return mem_cache[key]
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        disk = cache_dir / f"{key}.txt"
+        if disk.exists():
+            value = disk.read_text()
+            mem_cache[key] = value
+            return value
+    value = runner()
+    mem_cache[key] = value
+    if cache_dir is not None:
+        (cache_dir / f"{key}.txt").write_text(value)
+    return value
+
+
+def run_symmetric_analysis(
+    contract_path: Path,
+    *,
+    cache_dir: Path | None = None,
+) -> str:
+    """Wrap `symmetric_analyzer.py` CLI. Returns trimmed stdout or "".
+
+    Caches by sha256 of file bytes. Pass `cache_dir` to persist across
+    runs; otherwise caches in-process only.
+    """
+    if not contract_path or not contract_path.exists():
+        return ""
+    script = AUDIT_AGENTS_DIR / "symmetric_analyzer.py"
+    if not script.exists():
+        return ""
+    key = f"sym-{contract_path.stem}-{_file_sha256(contract_path)}"
+
+    def _run() -> str:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), str(contract_path), "--contract", contract_path.stem],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0 and result.stdout.strip() and "ERROR" not in result.stdout[:20]:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
+    return _cached_subprocess(key, cache_dir, _symmetric_mem_cache, _run)
 
 
 def query_wiki_context(domain: str, component: str) -> str:

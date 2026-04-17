@@ -1873,23 +1873,8 @@ def generate_chimera_context(repo_path: Path, contract_path: Path = None) -> str
 
 
 def _run_symmetric_analysis(contract_path: Path) -> str:
-    """Run symmetric_analyzer.py and return output. Cached per file."""
-    if not contract_path or not contract_path.exists():
-        return ""
-    sym_script = AUDIT_AGENTS_DIR / "symmetric_analyzer.py"
-    if not sym_script.exists():
-        return ""
-    contract_name = contract_path.stem  # Foo.sol → Foo
-    try:
-        result = subprocess.run(
-            [sys.executable, str(sym_script), str(contract_path), "--contract", contract_name],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0 and result.stdout.strip() and "ERROR" not in result.stdout[:20]:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return ""
+    from context_enrichment import run_symmetric_analysis as _impl
+    return _impl(contract_path)
 
 
 def _run_deep_flatten(contract_path: Path) -> str:
