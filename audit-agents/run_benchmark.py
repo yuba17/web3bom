@@ -3842,6 +3842,12 @@ def main():
         action="store_true",
         help="Bypass pipeline_gate failures when --complete is set. Ignored otherwise.",
     )
+    parser.add_argument(
+        "--state-file",
+        type=str,
+        default="",
+        help="Override state file path for --complete (default: ~/.claude/MEMORY/STATE/current_hunt.json).",
+    )
 
     args = parser.parse_args()
     if args.complete:
@@ -3858,6 +3864,25 @@ def main():
                 "(got both or neither)."
             )
     hunters_subset = _validate_hunters_subset(args.hunters)
+
+    # ── --complete routing ─────────────────────────────────────────────────
+    if args.complete:
+        from pathlib import Path as _Path
+        from component_closer import close_component
+        state_file = _Path(args.state_file) if args.state_file else None
+        report = close_component(
+            component=args.complete,
+            state_file=state_file,
+            force=args.force,
+        )
+        print(f"[complete] {report['component']}: gated={report['gated']} forced={report['forced']} "
+              f"state_updated={report['state_updated']} feedback_rc={report['feedback_rc']} "
+              f"next={report['next_component']}")
+        for err in report["errors"]:
+            print(f"  ! {err}")
+        if not report["state_updated"]:
+            return 1
+        return 0
 
     # ── Isolate benchmark outputs ──────────────────────────────────────────
     # When running a benchmark, NEVER write to the real hunt_session/.
