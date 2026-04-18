@@ -198,16 +198,16 @@ def check_scope(component: str, repo: str = "") -> tuple[bool, list[str], list[s
         else:
             failed.append(f"NOT_IN_MAP: {component} not found in component_map. Available: {comp_names[:5]}")
     else:
-        failed.append("NO_MAP: component_map empty. Run: python3 audit-agents/run_hunt.py --map-components")
+        failed.append("NO_MAP: component_map empty. Run: python3 audit-agents/run_benchmark.py --auto-components --protocol <name> --repo <path>")
 
-    # 4. Context file exists (run_hunt.py --component was executed)
+    # 4. Context file exists (run_benchmark.py --components was executed)
     protocol = _get_protocol() or state.get("protocol", "")
     ctx_file = get_context_dir(protocol) / f"{component}_context.md"
     if ctx_file.exists():
         size = ctx_file.stat().st_size
         passed.append(f"OK: context file exists ({size:,} bytes)")
     else:
-        failed.append(f"NO_CONTEXT: {ctx_file.name} missing. Run: python3 audit-agents/run_hunt.py --component {component}")
+        failed.append(f"NO_CONTEXT: {ctx_file.name} missing. Run: python3 audit-agents/run_benchmark.py --components {component} --protocol <name> --repo <path>")
 
     # 5. Hunter prompts generated
     prompts_found = 0
@@ -218,9 +218,9 @@ def check_scope(component: str, repo: str = "") -> tuple[bool, list[str], list[s
     if prompts_found >= 7:  # Allow some new hunters to not have prompts yet
         passed.append(f"OK: {prompts_found}/{len(HUNTER_NAMES)} hunter prompts generated")
     elif prompts_found > 0:
-        failed.append(f"PARTIAL: Only {prompts_found}/{len(HUNTER_NAMES)} hunter prompts. Run: python3 audit-agents/run_hunt.py --component {component}")
+        failed.append(f"PARTIAL: Only {prompts_found}/{len(HUNTER_NAMES)} hunter prompts. Run: python3 audit-agents/run_benchmark.py --components {component} --protocol <name> --repo <path>")
     else:
-        failed.append(f"NO_PROMPTS: No hunter prompts found. Run: python3 audit-agents/run_hunt.py --component {component}")
+        failed.append(f"NO_PROMPTS: No hunter prompts found. Run: python3 audit-agents/run_benchmark.py --components {component} --protocol <name> --repo <path>")
 
     # 6. Ficha exists
     ficha = load_ficha(component)
