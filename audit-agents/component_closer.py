@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +39,8 @@ def _run_gate(component: str) -> tuple[bool, str]:
             [sys.executable, str(_PIPELINE_GATE), "--component", component, "--gate", "all"],
             capture_output=True, text=True, timeout=30,
         )
-        return result.returncode == 0, result.stdout or result.stderr
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode == 0, output.strip()
     except subprocess.TimeoutExpired:
         return False, "pipeline_gate timeout"
 
@@ -52,7 +53,8 @@ def _run_feedback() -> tuple[int | None, str]:
             [sys.executable, str(_APPLY_FEEDBACK), "--hypotheses"],
             capture_output=True, text=True, timeout=60,
         )
-        return result.returncode, result.stdout or result.stderr
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode, output.strip()
     except subprocess.TimeoutExpired:
         return None, "apply_feedback timeout"
 
@@ -90,6 +92,7 @@ def close_component(
         )
 
     gated, gate_output = _run_gate(component)
+    gate_detail = gate_output.strip()
     forced = False
     if not gated:
         if not force:
@@ -101,10 +104,12 @@ def close_component(
                 "feedback_rc": None,
                 "cross_triggered": False,
                 "next_component": remaining[0] if remaining else None,
-                "errors": [gate_output.strip()] if gate_output else ["gate failed"],
+                "errors": [gate_detail] if gate_detail else ["gate failed"],
             }
         forced = True
-        errors.append(f"gate bypassed via force: {gate_output.strip()}")
+        errors.append(
+            f"gate bypassed via force: {gate_detail}" if gate_detail else "gate bypassed via force"
+        )
 
     if component in remaining:
         remaining.remove(component)
@@ -113,7 +118,7 @@ def close_component(
     state["components_remaining"] = remaining
     state["components_done"] = done
     state["current_component"] = remaining[0] if remaining else None
-    state["last_session"] = datetime.utcnow().isoformat() + "Z"
+    state["last_session"] = datetime.now(timezone.utc).isoformat()
     for c in state.get("component_map", []):
         if c.get("name") == component:
             c["status"] = "done"
