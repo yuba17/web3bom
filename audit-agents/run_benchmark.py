@@ -3867,9 +3867,9 @@ def main():
 
     # ── --complete routing ─────────────────────────────────────────────────
     if args.complete:
-        from pathlib import Path as _Path
         from component_closer import close_component
-        state_file = _Path(args.state_file) if args.state_file else None
+        stripped = args.state_file.strip()
+        state_file = Path(stripped) if stripped else None
         report = close_component(
             component=args.complete,
             state_file=state_file,
