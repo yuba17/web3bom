@@ -2313,6 +2313,91 @@ def _phase_cross_prompt_rust(
     }]
 
 
+def phase_transitive_chain_prompt(
+    components_str: str,
+    protocol: str,
+    repo: str,
+    session_dir: str,
+    lang: str = "solidity",
+) -> list[dict]:
+    """Build transitive chain prompt for (a, mid, c) triples.
+
+    Components come in as 'A,B,C' where B is the middle component. The
+    caller has already confirmed A↔C is NOT a direct edge (chain detector
+    dedups those). The prompt asks the EdgeHunter to find bugs that
+    require the full A→B→C chain.
+    """
+    parts = [p.strip() for p in components_str.split(",")]
+    if len(parts) != 3:
+        return [{"error": f"Expected 3 components, got {len(parts)}"}]
+
+    comp_a, comp_mid, comp_c = parts
+    abbreviation = f"{comp_a[:2]}{comp_mid[:2]}{comp_c[:2]}".upper()
+
+    hyp_dir = _hyp_dir(session_dir, protocol)
+    chain_file = hyp_dir / f"hyp_{comp_a}_{comp_mid}_{comp_c}_EdgeHunter.yaml"
+
+    src_dir = _src_dir(repo)
+    iface_a = _read_file_safe(src_dir / f"{comp_a}.sol", max_chars=4000)
+    iface_mid = _read_file_safe(src_dir / f"{comp_mid}.sol", max_chars=4000)
+    iface_c = _read_file_safe(src_dir / f"{comp_c}.sol", max_chars=4000)
+
+    prompt = (
+        f"# EdgeHunter — Transitive Chain: {comp_a}→{comp_mid}→{comp_c}\n\n"
+        f"## Identity\n"
+        f"You are the EdgeHunter for {protocol}. Find bugs that ONLY exist when\n"
+        f"{comp_a}, {comp_mid}, and {comp_c} interact in a chain. {comp_a}↔{comp_mid}\n"
+        f"and {comp_mid}↔{comp_c} are direct edges; {comp_a}↔{comp_c} is NOT —\n"
+        f"they communicate only through {comp_mid}.\n\n"
+        f"## Interaction Map: {comp_a} ↔ {comp_mid}\n"
+        f"```solidity\n"
+        f"// {comp_a}.sol\n"
+        f"{iface_a}\n\n"
+        f"// {comp_mid}.sol (as seen from {comp_a})\n"
+        f"{iface_mid}\n"
+        f"```\n\n"
+        f"## Interaction Map: {comp_mid} ↔ {comp_c}\n"
+        f"```solidity\n"
+        f"// {comp_mid}.sol (as seen from {comp_c})\n"
+        f"{iface_mid}\n\n"
+        f"// {comp_c}.sol\n"
+        f"{iface_c}\n"
+        f"```\n\n"
+        f"## Checklist\n\n"
+        f"### 1. Transitive state manipulation\n"
+        f"- Can an attacker use {comp_a} to change state in {comp_mid} that {comp_c}\n"
+        f"  then consumes as trusted?\n"
+        f"- Is the reverse path ({comp_c} → {comp_mid} → {comp_a}) also exploitable?\n\n"
+        f"### 2. Trust chain breaks\n"
+        f"- {comp_c} trusts {comp_mid}. {comp_mid} trusts {comp_a}. Can {comp_a}\n"
+        f"  abuse this transitive trust?\n\n"
+        f"### 3. Multi-tx attack sequences\n"
+        f"- Is there a 3+ tx sequence that crosses all three components and extracts\n"
+        f"  value? Does flash loan amplify any path?\n\n"
+        f"## Output\n"
+        f"Write to: `{chain_file}`\n\n"
+        f"```yaml\n"
+        f"hunter: EdgeHunter\n"
+        f"component: \"{comp_a}_{comp_mid}_{comp_c}\"\n"
+        f"invariants:\n"
+        f"  - id: {abbreviation}-CH-01\n"
+        f"    description: \"...\"\n"
+        f"    solidity: |\n"
+        f"      // Uses crossContractA, crossContractB, crossContractC\n"
+        f"    call_stack: \"...\"\n"
+        f"    confidence: 70\n"
+        f"    tier: 1\n"
+        f"    type: property\n"
+        f"```\n\n"
+        f"ID prefix: `{abbreviation}-CH`. No artificial limit. Only emit\n"
+        f"invariants that REQUIRE all three components to exploit.\n"
+    )
+    return [{
+        "step_id": f"chain:{comp_a}_{comp_mid}_{comp_c}:analyze",
+        "prompt": prompt,
+    }]
+
+
 def phase_chimera_early_prompt(
     component: str, protocol: str, repo: str, session_dir: str,
     parallel_components: int = 1,
