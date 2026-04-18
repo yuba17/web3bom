@@ -141,7 +141,7 @@ import benchmark.llm_runners as _llm_runners_mod  # for main() to mutate globals
 
 # ─── LLM dispatcher globals (owned by llm_runners; local copies for this module) ──
 # These are READ by functions in this file (run_hunters, etc.).
-# main() updates BOTH llm_runners and these local names via _sync_llm_globals().
+# main() updates BOTH llm_runners and these local names via inline assignment.
 USE_SUB_MODE = False  # Set in main() based on --mode sub
 SUB_MODEL = "sonnet"  # Set in main()
 PARALLEL_HUNTERS = 6  # Set in main() from --parallel-hunters
