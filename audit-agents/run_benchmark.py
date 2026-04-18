@@ -3644,6 +3644,26 @@ def _apply_force_regen_map(*, session_dir: Path, protocol: str) -> None:
             print(f"[force] removed cached component map: {candidate}", file=sys.stderr)
 
 
+def _maybe_run_apply_feedback(*, apply_feedback: bool) -> None:
+    """If flag is set, invoke apply_feedback.py once via subprocess.
+
+    Default (flag off) is the safe path for benchmarks — the corpus is
+    untouched. With the flag on, apply_feedback runs with its own defaults
+    (production knowledge/ and vault paths).
+    """
+    if not apply_feedback:
+        return
+    fb_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "apply_feedback.py"),
+    ]
+    result = subprocess.run(fb_cmd, check=False)
+    if result.returncode != 0:
+        logger.warning(
+            f"apply_feedback exited {result.returncode} — corpus may be unchanged"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pipeline orchestrator for hunt benchmarks")
     parser.add_argument("--repo", required=True, help="Path to the repo root")
@@ -4125,6 +4145,8 @@ def main():
         logger.info(f"    python3 audit-agents/benchmark_score.py \\")
         logger.info(f"      --ground-truth {args.ground_truth} \\")
         logger.info(f"      --hypotheses-dir {HUNT_SESSION_DIR / 'hypotheses' / args.protocol}")
+
+    _maybe_run_apply_feedback(apply_feedback=args.apply_feedback)
 
 
 if __name__ == "__main__":
