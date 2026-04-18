@@ -41,3 +41,21 @@ def test_generates_expected_categories(tmp_cards_dir, tmp_vault):
     assert "## Round 2 — new patterns" in page
     # Bullet content from the fixture must land in the page.
     assert "unrestricted setAdmin" in page
+
+
+def test_frontmatter_has_nonempty_summary(tmp_cards_dir, tmp_vault):
+    subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--cards-dir", str(tmp_cards_dir),
+         "--output-dir", str(tmp_vault / "solodit")],
+        check=True, cwd=REPO_ROOT,
+    )
+    page = (tmp_vault / "solodit" / "lending.md").read_text()
+    assert page.startswith("---\n"), "page must start with YAML frontmatter"
+    head, _, _ = page[4:].partition("---\n")
+    summary_lines = [line for line in head.splitlines() if line.startswith("summary:")]
+    assert len(summary_lines) == 1, summary_lines
+    value = summary_lines[0].split("summary:", 1)[1].strip()
+    assert value, "summary value must be non-empty for query_wiki_context"
+    # Heuristic: the summary should reference the category or the word 'Solodit'.
+    assert "lending" in value.lower() or "solodit" in value.lower()
