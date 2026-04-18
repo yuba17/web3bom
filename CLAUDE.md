@@ -16,6 +16,8 @@ Cada vez que se identifica un finding (cualquier severidad):
    - **Cómo funciona el ataque**: paso a paso
    - **Impacto**: quién pierde qué y cuánto
    - **Confianza**: % y por qué
+   - **Riesgo de rechazo**: % y razón (ej: "centralización", "by design", "impacto insuficiente")
+   - **Riesgo de duplicado**: % y razón (ej: "patrón conocido", "competición previa con N submissions")
    - **Reportable**: sí/no y a qué plataforma
 2. **Espera confirmación** del usuario antes de continuar
 3. **Ejecuta el finding pipeline completo** (sección 6) — `pipeline_gate.py` lo enforce
@@ -40,7 +42,8 @@ Cada vez que se identifica un finding (cualquier severidad):
 1. Lee `~/.claude/MEMORY/STATE/current_hunt.json`. Si hay findings con `radar_id`, ejecuta `sync_state.py`.
 2. Si hay `current_component`, empieza a huntar inmediatamente sin esperar instrucción.
 3. Si no existe, lee `memory/project_revert_lend_hunt.md` como fallback.
-4. **Hunts nuevos**: `python3 audit-agents/scope_intake.py --repo <path> --platform <platform> --scope-text "..."`
+4. **Hunts nuevos**: `python3 audit-agents/scope_intake.py --repo <path> --platform <platform> --scope-text "..."` (auto-ejecuta graphify recon)
+5. **Vault de conocimiento**: `~/obsidian-vault/web3-audit/` — consultar con `/wiki-query` al inicio, findings se auto-ingestan via `apply_feedback.py`
 
 ### Decisiones autónomas (sin pedir permiso)
 - Leer contratos, escribir invariantes, correr tests, actualizar trackers, lanzar hunters/skills
@@ -50,21 +53,62 @@ Cada vez que se identifica un finding (cualquier severidad):
 - Git push
 - Contexto masivo (>50 contratos)
 
+### Monitoreo de procesos largos (benchmarks, fuzzing, builds)
+- **NUNCA** usar `sleep` > 180s. Monitorear SIEMPRE cada 3 minutos máximo.
+- Patrón: `sleep 180 && tail -20 <logfile>` — repetir hasta completar.
+- Si el proceso lleva >30 min sin progreso nuevo en el log, avisar al usuario.
+- Entre checks, reportar al usuario el último milestone visible (ej: "Hunters completados, DeepDive en progreso").
+
 ### Transición de componente
 Marcar como completo en `current_hunt.json`, actualizar HUNT_TRACKER.md, ejecutar `apply_feedback.py`. Informar resumen al usuario y **esperar confirmación explícita** antes del siguiente componente.
+
+### Resumen de componente (obligatorio al completar)
+Al informar al usuario que un componente está completo, el resumen DEBE incluir:
+- **Contratos verificados**: lista de CADA contrato leído con nombre de archivo y LOC
+- **Hipótesis analizadas**: total, desglosado por hunter
+- **Findings**: nuevos + referencia a existentes si aplica
+- **Falsos positivos descartados**: cuántos y razón principal
+- **Cross-component**: si se hizo, resultado. Si no, por qué
+- **Gates**: estado final (X/Y passed)
 
 ### Scripts del pipeline (invocar internamente)
 
 | Script | Cuándo |
 |---|---|
-| `run_hunt.py --component X` | Inicio de cada componente |
-| Agent tool (9 hunters paralelos) | Fase de análisis |
+| `run_benchmark.py --components X --protocol <name> --repo <path>` | Inicio de cada componente (flujo canónico) |
+| `run_benchmark.py --auto-components --protocol <name> --repo <path>` | Alternativa: auto-descubrir componentes (Fase 2C) |
+| `run_benchmark.py --complete <COMPONENT> [--force]` | Cierre atómico: gate+state+feedback+cross-marker (Fase 2D) |
+| `detection_engine.py --prepass --source <src> --name X --output hunt_session/results/` | Después de scope, antes de hunters |
+| Agent tool (12 hunters paralelos + 2 secuenciales) | Fase de análisis (reciben prepass signals) |
 | `halmos_property_generator.py` | Antes de Phase 5 Halmos |
 | `merge_invariants.py` | Después de hunters + DeepDive |
 | `pipeline_gate.py -c X --gate <gate>` | Entre cada fase (ver sección 5) |
 | `apply_feedback.py` | Al finalizar componente |
 | `report_finding.py --finding <ID>` | Después de ReportWriter, nunca antes |
 | `sync_state.py` | Inicio de sesión si hay radar_ids |
+
+### Flags de `run_benchmark.py` (referencia rápida)
+
+| Flag | Qué hace | Fase |
+|---|---|---|
+| `--components X,Y` | Componentes explícitos (mutex con --auto-components, --complete) | 2A |
+| `--auto-components` | Auto-descubre vía component_discovery.generate_component_map | 2C |
+| `--complete X [--force]` | Single-shot closer (mutex con --components, --auto-components) | 2D |
+| `--state-file PATH` | Override path para current_hunt.json (testing) | 2D |
+| `--hunters H1,H2` | Subset de hunters a lanzar | 2A |
+| `--domain DOM` | Fuerza dominio (lending/dex/staking/bridges/zk) | 2A |
+| `--force-regen-map` | Regenera component_map.json | 2A |
+| `--force-gate G` | Re-ejecuta un gate cached | 2A |
+| `--apply-feedback` | Invoca apply_feedback.py al final | 2B |
+
+### Módulos del pipeline moderno (audit-agents/)
+
+| Módulo | Rol |
+|---|---|
+| `context_enrichment.py` | Orchestrator de briefings + wiki + asset flow map + symmetric/flatten analysis (Fase 2A). |
+| `component_discovery.py` | 3 helpers puros: generate_component_map, find_cross_component_pairs, detect_transitive_chains (Fase 2C). |
+| `component_closer.py` | close_component: atomic gate+state+feedback+cross trigger (Fase 2D). |
+| `solodit_to_wiki.py` | Converter solodit_cards → ~/obsidian-vault/web3-audit/solodit/*.md (Fase 2B). |
 
 ### Skills (invocar internamente)
 
@@ -74,6 +118,10 @@ Marcar como completo en `current_hunt.json`, actualizar HUNT_TRACKER.md, ejecuta
 | `/escalation-hunter` | Todo finding Medium+ (obligatorio). Info/QA: skip |
 | `/variant-hunt` | Después de cada finding confirmado. NUNCA omitir |
 | `/report-writer` | Después de RedTeam si veredicto = REPORT. Genera markdown |
+| `/council FINDING` | Antes de RedTeam si hay duda. Cross-review anónimo (Karpathy pattern) |
+| `/wiki-query` | Al inicio de hunt para consultar conocimiento previo del vault |
+| `/wiki-ingest` | Al completar componente o confirmar finding (auto via apply_feedback) |
+| `/graphify <repo>` | Recon estructural. Auto via scope_intake o manual para ad-hoc |
 
 Si cualquier script falla (exit code != 0), detenerse y notificar al usuario.
 
@@ -88,7 +136,8 @@ COMPONENT COMPLETION CHECKLIST:
 [ ] 1.  FULL CODE READ — cada línea leída y entendida
 [ ] 2.  PROTOCOL MODEL — qué hace, flujos de dinero, trust boundaries
 [ ] 2.3 STATE MACHINE MODEL — FlowHunter genera FSM, DeepDive lo consume
-[ ] 2.5 DEEPDIVE HUNTER — secuencial tras los 9 hunters, max 5 hipótesis
+[ ] 2.4 CROSSCHAIN HUNTER — secuencial tras los 12 hunters, solo si multi-chain
+[ ] 2.5 DEEPDIVE HUNTER — secuencial tras los 12 hunters, sin límite artificial
 [ ] 3.  AI INVARIANTS — mínimo 10 específicos en formato Chimera
 [ ] 4.  Properties.sol — compilable, invariantes en Solidity
 [ ] 5.  TargetFunctions.sol — handlers para cada función pública
@@ -116,7 +165,9 @@ python3 audit-agents/pipeline_gate.py -c <Component> --mark <gate>   # evidencia
 | Gate | Qué verifica | Cuándo |
 |---|---|---|
 | `scope` | current_hunt.json, context, prompts, ficha | Antes de lanzar hunters |
-| `hunters` | 9 hyp_*.yaml con campos solidity | Después de 9 hunters |
+| `prepass` | detection_engine.py --prepass generó YAML (Slither + Aderyn + exploit patterns) | Después de scope, antes de hunters |
+| `hunters` | 12 hyp_*.yaml con campos solidity | Después de 12 hunters |
+| `crosschain` | CrossChainHunter YAML o .skip existe | Después de 12 hunters (solo multi-chain) |
 | `deepdive` | hyp_*_DeepDiveHunter.yaml existe | Después de DeepDiveHunter |
 | `merge` | Properties.sol + TargetFunctions.sol + boundary values | Después de merge_invariants.py |
 | `compile` | Artifacts en out/ | Después de forge build |
@@ -126,9 +177,13 @@ python3 audit-agents/pipeline_gate.py -c <Component> --mark <gate>   # evidencia
 | `phase4` | Echidna (obligatorio si optimize_* existen) | Después de Phase 4 |
 | `phase5` | Halmos (recomendado si math pura existe) | Después de Phase 5 |
 
-**9 hunters paralelos**: AccessHunter, DomainHunter, FlowHunter, MathHunter, OracleHunter, TrustBoundaryHunter, WildcardHunter, SignatureHunter, DoSHunter.
+**12 hunters paralelos**: AccessHunter, DomainHunter, FlowHunter, MathHunter, OracleHunter, TrustBoundaryHunter, WildcardHunter, SignatureHunter, DoSHunter, LogicHunter, AdversarialHunter, LibraryHunter.
 
-Después: **DeepDiveHunter** (secuencial) — lee convergencias, genera **mínimo 5** hipótesis profundas (**sin límite máximo**). Puede lanzarse múltiples rondas con ángulos distintos. Calidad > cantidad pero nunca cortar artificialmente.
+Después (secuenciales):
+1. **CrossChainHunter** — solo si componente tiene deployments en 2+ chains. Analiza signature replay, config divergence, bytecode mismatch, proxy upgrade desync, cross-chain state dependencies. Skip automático si single-chain.
+2. **DeepDiveHunter** — lee convergencias, genera hipótesis profundas (**sin límite mínimo ni máximo**). Puede lanzarse múltiples rondas con ángulos distintos. Calidad > cantidad pero nunca cortar artificialmente. Confidence >= 60% para validated: true.
+
+Total: **14 hunters** (12 paralelos + 2 secuenciales).
 
 Si el repo no tiene `test/chimera/`, lanzar sub-agente **ChimeraBuilder** para auto-generar el setup. Compile-fix loop: max 9 intentos.
 
@@ -231,7 +286,7 @@ Generar: handlers para funciones públicas, ghost variables para tracking acumul
 ### Layer 2: Merge
 1. Registry match: `python audit-agents/matcher.py <source_dir>` → top 20 genéricos
 2. AI-generated: 10+ específicos de Layer 1
-3. Merge en Properties.sol (Chimera, deduplicado, **max 25 total**)
+3. Merge en Properties.sol (Chimera, deduplicado, **sin límite artificial**)
 4. Tag tiers: Tier 1 (hard fail = bug confirmado) vs Tier 2 (necesita review, tolerancia dust)
 
 ### Layer 3: Fuzz
@@ -243,13 +298,14 @@ Ver sección 7 (Fuzzing Pipeline).
 
 ## 9. RULE #0.5: Cross-Component Hunt
 
-**Después de completar 2-3 componentes relacionados**, ejecutar hunt cross-component ANTES de pasar a componentes no relacionados.
+**Después de completar 2-3 componentes relacionados**, ejecutar hunt cross-component ANTES de pasar a componentes no relacionados. **Sin límite artificial de hipótesis ni edges** — analizar TODOS los pares, TODAS las interacciones. Igual que DeepDiveHunter: calidad > cantidad pero nunca cortar artificialmente.
 
-1. **Map interaction surface** (15 min): para cada par (A, B) completado — listar funciones cruzadas, estado compartido, assumptions mutuas.
-2. **EdgeHunters** (paralelos): un agente por edge de alto valor. Pregunta: "Qué rompe si B se comporta inesperadamente en este call site?"
+1. **Map interaction surface**: para cada par (A, B) completado — listar funciones cruzadas, estado compartido, assumptions mutuas. Sin límite de tiempo — completar el mapa entero.
+2. **EdgeHunters** (paralelos): un agente por edge de alto valor. Pregunta: "Qué rompe si B se comporta inesperadamente en este call site?" **Analizar CADA edge, no solo los "de alto valor".**
 3. **Multi-component fuzzing**: si EdgeHunter encuentra hipótesis Tier 1, o si la interacción implica transferencia de fondos. Deploy AMBOS contratos reales (no mocks).
 4. **Interaction invariants**: custody (NFT en vault XOR gauge), debt conservation, health consistency, reward conservation.
 5. **Si se encuentra finding**: entra en el finding pipeline completo (sección 6).
+6. **Ejecutar AUTOMÁTICAMENTE** — no esperar a que el usuario lo pida. Está en el pipeline, se hace siempre.
 
 ---
 
@@ -308,3 +364,59 @@ En plataformas con leaderboard: un duplicado válido da puntos, builds reputaci�
 - Log TODOS los findings (incluso Low/QA) con severidad.
 - `current_hunt.json`: estado activo del hunt, component_map, findings, finding_queue.
 - `gate_status.json`: estado de gates exportado por pipeline_gate.py.
+
+---
+
+## 15. Rejection Rules — Aprendidas de Rechazos Reales
+
+Estas reglas se extraen de findings rechazados en plataformas reales. El RedTeam DEBE verificar cada finding contra estas reglas antes de recomendar REPORT.
+
+### Reglas de Rechazo Automático
+
+| # | Patrón | Acción | Fuente |
+|---|--------|--------|--------|
+| R1 | Attack path requiere trusted/admin/manager/owner role | REJECT — centralización, no es vuln | Coinbase rechazó 3/3 findings de este tipo (Flywheel, AdConversion ×2) |
+| R2 | Función view-only vacía (no-op) por diseño | REJECT — design issue, no security impact | Coinbase AdConversion `_onUpdateMetadata` |
+| R3 | Config disabled/paused es señal off-chain, no security gate on-chain | REJECT — el contrato no lo enforce intencionalmente | Coinbase AdConversion disabled config |
+| R4 | Address del contrato NO está en la lista explícita de scope | REJECT — verificar scope ANTES de pipeline completo | DD-WT-01 gastó pipeline completo en address OOS |
+| R5 | Impacto es cosmético/UX sin fondos ni access control afectados | REJECT — las plataformas solo pagan por security impact | Coinbase "no funds at risk, no access control bypassed" |
+
+### Checklist Pre-Report (obligatorio)
+
+Antes de ejecutar `/report-writer`, verificar:
+1. [ ] ¿El attack path requiere SOLO acciones de actores no privilegiados? (Si requiere admin → R1)
+2. [ ] ¿El contrato afectado está EXPLÍCITAMENTE en scope? (Verificar address list → R4)
+3. [ ] ¿Hay pérdida de fondos O bypass de access control? (Si solo UX → R5)
+4. [ ] ¿La "vulnerabilidad" es realmente un comportamiento documentado/intencional? (→ R3)
+5. [ ] ¿Cuántos duplicados probables? (Si patrón muy conocido en contest con 200+ submissions → considerar ROI)
+
+### Actualización
+
+Estas reglas se actualizan con cada rechazo. Script: `audit-agents/ingest_rejections.py`.
+Archivo de reglas: `hunt_session/feedback/rejection_rules.yaml`.
+
+---
+
+## 16. Configuración por Defecto — Benchmark
+
+```bash
+python3 audit-agents/run_benchmark.py \
+  --repo <repo_path> \
+  --components <components> \
+  --protocol <protocol> \
+  --ground-truth benchmarks/<protocol>/benchmark.yaml \
+  --parallel-components 2 \
+  --parallel-fuzz 3 \
+  --parallel-poc 2 \
+  --fast
+```
+
+**Parámetros fijos (validados en PC con 8 cores / 10 GB RAM):**
+- `--parallel-components 2` — 2 componentes en paralelo vía git worktrees
+- `--parallel-fuzz 3` — 3 batches de fuzzing en paralelo (Phase 1 Foundry)
+- `--parallel-poc 2` — 2 PoC generators en paralelo por componente
+- `--fast` — skip Phase 2 (Medusa) y Phase 3 (Fork PoC); usar sólo para benchmarks rápidos
+
+**Consumo peak estimado:** ~5 GB RAM, ~6-7 cores. Seguro con recursos actuales.
+
+**Para benchmark completo (sin `--fast`):** quitar el flag. Añade ~30 min por batch (Medusa 15 min + PoC).
