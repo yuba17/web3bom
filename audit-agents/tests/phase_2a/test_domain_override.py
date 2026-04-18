@@ -23,6 +23,7 @@ def test_plan_generator_respects_domain_arg(tmp_path, monkeypatch):
     import sys as _sys
     _sys.path.insert(0, str(REPO_ROOT / "audit-agents"))
     import plan_generator
+    from plan import prompts_solidity
 
     session = tmp_path / "session"
     session.mkdir()
@@ -34,8 +35,9 @@ def test_plan_generator_respects_domain_arg(tmp_path, monkeypatch):
         pytest.skip(f"benchmark repo missing: {repo}")
 
     # Monkey-patch _detect_primary_domain to force auto-detect to return ""
-    # so that the override from the call path is exercised.
-    monkeypatch.setattr(plan_generator, "_detect_primary_domain", lambda src: "")
+    # so that the override from the call path is exercised. Patch the
+    # namespace where phase_hunter_prompt resolves the symbol.
+    monkeypatch.setattr(prompts_solidity, "_detect_primary_domain", lambda src: "")
 
     # With no override, domain falls back to protocol name (not a real briefing).
     plan_generator.phase_hunter_prompt(
