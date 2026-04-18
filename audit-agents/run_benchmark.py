@@ -3667,7 +3667,7 @@ def _maybe_run_apply_feedback(*, apply_feedback: bool) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Pipeline orchestrator for hunt benchmarks")
     parser.add_argument("--repo", required=True, help="Path to the repo root")
-    parser.add_argument("--components", required=True, help="Comma-separated component names")
+    parser.add_argument("--components", help="Comma-separated component names (mutually exclusive with --auto-components)")
     parser.add_argument("--protocol", required=True, help="Protocol name for namespacing")
     parser.add_argument("--ground-truth", help="Path to benchmark YAML (for scoring at end)")
     parser.add_argument("--max-retries", type=int, default=5, help="Max fix-and-retry attempts")
@@ -3740,8 +3740,17 @@ def main():
                              "to ingest pending_briefing_updates into knowledge/ and the "
                              "Obsidian vault. Off by default — benchmarks must not "
                              "pollute the corpus.")
+    parser.add_argument("--auto-components", action="store_true",
+                        help="Auto-discover components via component_discovery.generate_component_map "
+                             "(scans repo, filters interfaces/mocks/tests, orders by LOC). "
+                             "Mutually exclusive with --components — exactly one must be set.")
 
     args = parser.parse_args()
+    if bool(args.components) == bool(args.auto_components):
+        parser.error(
+            "Exactly one of --components or --auto-components must be set "
+            "(got both or neither)."
+        )
     hunters_subset = _validate_hunters_subset(args.hunters)
 
     # ── Isolate benchmark outputs ──────────────────────────────────────────
