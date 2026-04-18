@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Optional  # noqa: F401 — re-exported for consumers
 
 from plan_schema import ExecutionPlan
 
