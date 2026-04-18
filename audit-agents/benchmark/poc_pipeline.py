@@ -26,6 +26,7 @@ def fix_and_retry(step_name: str, cmd: list[str], context_files: list[str],
     Run a command. If it fails, ask Claude to fix it, then retry.
     Returns True if eventually succeeds.
     """
+    # lazy import — avoids circular import at load time (moves to benchmark.cli in Task 14)
     from run_benchmark import component_log_dir
     log_dir = component_log_dir("_fix_retry")
 
@@ -82,6 +83,7 @@ def fix_and_retry(step_name: str, cmd: list[str], context_files: list[str],
 def _generate_foundry_tester_wrappers(chimera_dir: Path):
     """Scan PropertiesX.sol files for property_* functions and generate
     invariant_* wrappers in FoundryTester.sol so Foundry actually executes them."""
+    # lazy import — avoids circular import at load time (moves to benchmark.cli in Task 14)
     from run_benchmark import detect_pragma
 
     foundry_tester = chimera_dir / "FoundryTester.sol"
@@ -203,6 +205,8 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
                           poc_confidence_threshold: int = 65):
     """Generate and test a fork PoC for a single finding.
     Top-level so both run_component_pipeline and run_cross_component can call it."""
+    # lazy module-ref — reads mutable globals (IS_PRE_PRODUCTION, POC_GEN_TIMEOUT)
+    # that main() mutates after argparse; top-level import would freeze defaults
     import run_benchmark as _rb
     from finding_pipeline import extract_relevant_code as _extract_relevant_code
 
