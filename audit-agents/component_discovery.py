@@ -112,3 +112,42 @@ def generate_component_map(
     for i, comp in enumerate(component_map):
         comp["priority"] = i + 1
     return component_map
+
+
+def find_cross_component_pairs(
+    *,
+    components_done: list[str],
+    component_map: list[dict],
+) -> list[tuple[str, str, list[str]]]:
+    if len(components_done) < 2:
+        return []
+    cmap = {c["name"]: c for c in component_map}
+    pairs: list[tuple[str, str, list[str]]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for comp_a in components_done:
+        info_a = cmap.get(comp_a, {})
+        deps_a = set(info_a.get("depends_on", []))
+        for comp_b in components_done:
+            if comp_a == comp_b:
+                continue
+            key = (comp_a, comp_b) if comp_a < comp_b else (comp_b, comp_a)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            info_b = cmap.get(comp_b, {})
+            deps_b = set(info_b.get("depends_on", []))
+
+            interactions: list[str] = []
+            if comp_b in deps_a:
+                interactions.append(f"{comp_a} imports {comp_b}")
+            if comp_a in deps_b:
+                interactions.append(f"{comp_b} imports {comp_a}")
+            shared = deps_a & deps_b
+            if shared:
+                interactions.append(f"shared deps: {', '.join(sorted(shared))}")
+
+            if interactions:
+                pairs.append((comp_a, comp_b, interactions))
+    return pairs
