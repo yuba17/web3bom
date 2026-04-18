@@ -907,6 +907,8 @@ def _last_step_id(plan: ExecutionPlan, components: list[str]) -> str:
 def phase_hunter_prompt(
     component: str, protocol: str, repo: str, session_dir: str,
     lang: str = "solidity",
+    *,
+    domain_override: str = "",
 ) -> list[dict]:
     """Build hunter brief + dispatch prompt; return one step dict with real prompt."""
 
@@ -960,7 +962,7 @@ def phase_hunter_prompt(
     # F019 + F022 + F024 + F015 + F016 — context enrichment pipeline.
     # Each sub-signal degrades to empty string on failure; the brief
     # still assembles. Domain auto-detection: cheap keyword scan on src.
-    detected_domain = _detect_primary_domain(source_code) or protocol
+    detected_domain = domain_override or _detect_primary_domain(source_code) or protocol
     context_block = build_hunter_context(
         contract_path=src_file,
         domain=detected_domain,

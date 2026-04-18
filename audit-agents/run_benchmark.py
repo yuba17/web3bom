@@ -3693,6 +3693,10 @@ def main():
                         help="Comma-separated subset of hunter names to run "
                              "(e.g., 'MathHunter,AccessHunter'). Default: all. "
                              "Unknown names exit non-zero with the valid list.")
+    parser.add_argument("--domain", default="",
+                        help="Override auto-detected domain for hunter briefings. "
+                             "Valid values: any key of context_enrichment.DOMAIN_BRIEFING "
+                             "(e.g., lending, vault, oracle, staking). Empty = auto-detect.")
 
     args = parser.parse_args()
     hunters_subset = _validate_hunters_subset(args.hunters)
