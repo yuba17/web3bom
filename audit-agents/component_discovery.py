@@ -77,7 +77,7 @@ def generate_component_map(
         seen_names.add(name)
 
         loc = _count_locs(f)
-        if loc == 0:
+        if loc < 10:
             continue
 
         if name in done:

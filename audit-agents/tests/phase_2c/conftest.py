@@ -20,17 +20,36 @@ def tmp_repo(tmp_path: Path) -> Path:
     (tmp_path / "test").mkdir()
     (tmp_path / "lib" / "openzeppelin").mkdir(parents=True)
 
+    # Each contract body has >10 real LOC (non-comment, non-blank) so they
+    # survive component_discovery's `loc < 10` filter.
+    def _body(n_vars: int) -> list[str]:
+        return [f'    uint256 internal var{i};' for i in range(n_vars)]
+
     vault_code = "\n".join(
-        ['pragma solidity ^0.8.0;', 'import "./interfaces/IStrategy.sol";']
-        + [f'// line {i}' for i in range(28)]
+        [
+            'pragma solidity ^0.8.0;',
+            'import "./interfaces/IStrategy.sol";',
+            'contract Vault {',
+        ]
+        + _body(28)
+        + ['}']
     )
     strategy_code = "\n".join(
-        ['pragma solidity ^0.8.0;', 'import "./interfaces/IVault.sol";']
-        + [f'// line {i}' for i in range(23)]
+        [
+            'pragma solidity ^0.8.0;',
+            'import "./interfaces/IVault.sol";',
+            'contract Strategy {',
+        ]
+        + _body(23)
+        + ['}']
     )
     oracle_code = "\n".join(
-        ['pragma solidity ^0.8.0;']
-        + [f'// line {i}' for i in range(19)]
+        [
+            'pragma solidity ^0.8.0;',
+            'contract Oracle {',
+        ]
+        + _body(19)
+        + ['}']
     )
 
     (src / "Vault.sol").write_text(vault_code)
