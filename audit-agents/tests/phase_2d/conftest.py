@@ -60,6 +60,8 @@ def patched_subprocess(monkeypatch):
     _fake_run.stderr = ""
 
     import subprocess
+    # Patches subprocess.run in the module namespace — safe only if callers
+    # use `import subprocess; subprocess.run(...)`, NOT `from subprocess import run`.
     monkeypatch.setattr(subprocess, "run", _fake_run)
     _fake_run.calls = calls
     return _fake_run
