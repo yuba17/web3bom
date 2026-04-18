@@ -1332,7 +1332,8 @@ def generate_and_test_poc(finding: dict, source_code: str, interfaces_code: str,
 
 def run_component_pipeline(component: str, repo: str, protocol: str,
                            args: argparse.Namespace,
-                           accumulated_context: str = "") -> dict:
+                           accumulated_context: str = "",
+                           hunters_subset: set | None = None) -> dict:
     """Run the full pipeline for one component. Returns summary dict."""
     comp_start = time.time()
     logger.info(f"\n{'='*60}")
@@ -1739,9 +1740,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         "SignatureHunter", "DoSHunter", "LogicHunter",
                         "AdversarialHunter", "LibraryHunter"]
             # Filter to subset if --hunters was provided (non-empty = user-specified subset).
-            # When args.hunters is "" (default), skip filtering — run all hunters.
-            if getattr(args, "hunters", ""):
-                hunters_subset = _validate_hunters_subset(args.hunters)
+            # hunters_subset is pre-validated by main() at startup (fail-fast); reuse it here.
+            # When args.hunters is "" (default), hunters_subset is None — run all hunters.
+            if hunters_subset is not None:
                 hunters = [h for h in hunters if h in hunters_subset]
             logger.info(f"  Sub mode: {len(hunters)} hunters, {PARALLEL_HUNTERS} parallel")
             failed_hunters = []
@@ -3605,18 +3606,22 @@ def _remove_worktree(repo: str, wt_path: str):
     logger.info(f"  Worktree removed: {wt_root}")
 
 
-def _validate_hunters_subset(raw: str) -> set[str]:
+def _validate_hunters_subset(raw: str) -> set[str] | None:
     """Parse --hunters value. Exits with list of valid names if any unknown.
 
+    Returns None when raw is empty (meaning: run all hunters, no filtering).
+    Returns a set of requested hunter names when a subset is specified.
+
     Examples:
-        "MathHunter" → {"MathHunter"}
+        ""            → None  (run all)
+        "MathHunter"  → {"MathHunter"}
         "Math,Access" → exits with error (use full names like "MathHunter")
     """
     from run_hunt import HUNTER_DOMAINS
     valid = set(HUNTER_DOMAINS.keys())
     raw = (raw or "").strip()
     if not raw:
-        return valid
+        return None
     requested = {tok.strip() for tok in raw.split(",") if tok.strip()}
     unknown = requested - valid
     if unknown:
@@ -3841,7 +3846,8 @@ def main():
                 futures = {
                     executor.submit(
                         run_component_pipeline, comp, worktrees[comp],
-                        args.protocol, args, accumulated_context=accumulated_context
+                        args.protocol, args, accumulated_context=accumulated_context,
+                        hunters_subset=hunters_subset
                     ): comp
                     for comp in worktrees
                 }
@@ -3891,7 +3897,8 @@ def main():
         # ─── Sequential mode (original) ─────────────────────────────────
         for i, component in enumerate(components):
             result = run_component_pipeline(component, repo, args.protocol, args,
-                                            accumulated_context=accumulated_context)
+                                            accumulated_context=accumulated_context,
+                                            hunters_subset=hunters_subset)
             results.append(result)
             if result.get("status") == "OK":
                 components_done.append(component)
