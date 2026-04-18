@@ -1677,7 +1677,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         hunter_brief_path = context_dir / f"{component}_hunter_brief.md"
         # Load v10 context for hunter brief (benefits both api and sub modes)
         try:
-            from run_hunt import load_rejection_context as _load_rej
+            from hunter_context import load_rejection_context as _load_rej
             _rejection_ctx = _load_rej()
         except Exception:
             _rejection_ctx = ""
@@ -1706,7 +1706,7 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         if USE_SUB_MODE:
             # Sub mode: dispatch individual hunters in parallel from Python
             # Each hunter gets agentic tools to explore code autonomously
-            from run_hunt import HUNTER_DOMAINS, load_rejection_context, load_few_shot_examples
+            from hunter_context import HUNTER_DOMAINS, load_rejection_context, load_few_shot_examples
             methodology_dir = SCRIPT_DIR / "prompts" / "hunters"
 
             def _run_single_hunter(hunter_name: str) -> str:
@@ -3693,7 +3693,7 @@ def _validate_hunters_subset(raw: str) -> set[str] | None:
         "MathHunter"  → {"MathHunter"}
         "Math,Access" → exits with error (use full names like "MathHunter")
     """
-    from run_hunt import HUNTER_DOMAINS
+    from hunter_context import HUNTER_DOMAINS
     valid = set(HUNTER_DOMAINS.keys())
     raw = (raw or "").strip()
     if not raw:
