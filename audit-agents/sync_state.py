@@ -12,8 +12,6 @@ y actualiza el estado local si ha cambiado en la UI.
 """
 
 import sys
-import json
-import shutil
 import argparse
 import requests
 from pathlib import Path
@@ -22,6 +20,7 @@ from datetime import datetime
 from constants import derive_session_token, RADAR_TO_LOCAL, REMOTE_SEVERITY
 
 from paths import STATE_FILE
+from state_manager import load_state as _sm_load_state, save_state as _sm_save_state
 
 BASE_URL   = "https://bugbounty.0mnia.dev"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
@@ -39,23 +38,17 @@ def load_env() -> dict:
 
 
 def load_state() -> dict:
+    """Wrapper around state_manager.load_state that exits if file missing."""
     if not STATE_FILE.exists():
         print("✗ current_hunt.json no encontrado")
         sys.exit(1)
-    return json.loads(STATE_FILE.read_text())
+    return _sm_load_state()
 
 
 def save_state(state: dict):
+    """Inject last_sync sidecar, then delegate to state_manager with backup."""
     state["last_sync"] = datetime.utcnow().isoformat() + "Z"
-    if STATE_FILE.exists():
-        shutil.copy2(STATE_FILE, STATE_FILE.with_suffix(".backup.json"))
-    tmp = STATE_FILE.with_suffix(".tmp.json")
-    try:
-        tmp.write_text(json.dumps(state, indent=2))
-        tmp.replace(STATE_FILE)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    _sm_save_state(state, backup=True)
 
 
 def get_session(password: str) -> requests.Session:

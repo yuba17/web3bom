@@ -11,7 +11,6 @@ Uso:
 import sys
 import re
 import json
-import shutil
 import argparse
 import requests
 import yaml
@@ -21,6 +20,7 @@ from datetime import datetime
 from constants import derive_session_token, SEVERITY_MAP, CATEGORY_MAP
 
 from paths import STATE_FILE
+from state_manager import load_state as _sm_load_state, save_state as _sm_save_state
 
 BASE_URL   = "https://bugbounty.0mnia.dev"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
@@ -186,19 +186,11 @@ def load_env() -> dict:
 
 
 def load_state() -> dict:
-    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    return _sm_load_state()
 
 
 def save_state(state: dict):
-    if STATE_FILE.exists():
-        shutil.copy2(STATE_FILE, STATE_FILE.with_suffix(".backup.json"))
-    tmp = STATE_FILE.with_suffix(".tmp.json")
-    try:
-        tmp.write_text(json.dumps(state, indent=2))
-        tmp.replace(STATE_FILE)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    _sm_save_state(state, backup=True)
 
 
 # ── Program: dedup + create ───────────────────────────────────────────────────
