@@ -3633,6 +3633,17 @@ def _validate_hunters_subset(raw: str) -> set[str] | None:
     return requested
 
 
+def _apply_force_regen_map(*, session_dir: Path, protocol: str) -> None:
+    """Delete cached component_map_<protocol>.json under session_dir. No-op if missing."""
+    for candidate in [
+        session_dir / f"component_map_{protocol}.json",
+        session_dir / "context" / f"component_map_{protocol}.json",
+    ]:
+        if candidate.exists():
+            candidate.unlink()
+            print(f"[force] removed cached component map: {candidate}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pipeline orchestrator for hunt benchmarks")
     parser.add_argument("--repo", required=True, help="Path to the repo root")
@@ -3697,6 +3708,13 @@ def main():
                         help="Override auto-detected domain for hunter briefings. "
                              "Valid values: any key of context_enrichment.DOMAIN_BRIEFING "
                              "(e.g., lending, vault, oracle, staking). Empty = auto-detect.")
+    parser.add_argument("--force-regen-map", action="store_true",
+                        help="Delete cached component_map_<protocol>.json before planning. "
+                             "Forces re-detection of components from the repo.")
+    parser.add_argument("--force-gate", default="",
+                        help="Force a specific pipeline gate to re-run (e.g., 'scope', 'prepass', "
+                             "'hunters'). Bypasses the gate's cached status. See pipeline_gate.py "
+                             "for valid gate names.")
 
     args = parser.parse_args()
     hunters_subset = _validate_hunters_subset(args.hunters)
@@ -3712,6 +3730,17 @@ def main():
         HUNT_SESSION_DIR = Path(args.ground_truth).resolve().parent / "bench_session"
     # else: keep default WEB3_DIR / "hunt_session" (non-benchmark invocation)
     HUNT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.force_regen_map:
+        _apply_force_regen_map(session_dir=HUNT_SESSION_DIR, protocol=args.protocol)
+    if args.force_gate:
+        force_cmd = [
+            sys.executable, str(Path(__file__).resolve().parent / "pipeline_gate.py"),
+            "-c", "__all__",
+            "--force", args.force_gate,
+            "--session-dir", str(HUNT_SESSION_DIR),
+        ]
+        subprocess.run(force_cmd, check=False)
 
     # Auto-detect pre-production: flag set OR ground-truth has no on-chain addresses
     IS_PRE_PRODUCTION = getattr(args, "pre_production", False)

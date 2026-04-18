@@ -64,6 +64,7 @@ WEB3_DIR = Path(__file__).resolve().parent.parent
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
 STATE_FILE = Path.home() / ".claude" / "MEMORY" / "STATE" / "current_hunt.json"
 SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
+_PROTOCOL_OVERRIDE = ""  # Set by --protocol CLI arg; overrides load_state() protocol
 
 
 def get_hyp_dir(protocol: str) -> Path:
@@ -71,6 +72,11 @@ def get_hyp_dir(protocol: str) -> Path:
     d = HUNT_SESSION_DIR / "hypotheses" / protocol
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _get_protocol() -> str:
+    """Get protocol from override (--protocol CLI) or current_hunt.json state."""
+    return _PROTOCOL_OVERRIDE or load_state().get("protocol", "")
 
 
 def get_context_dir(protocol: str) -> Path:
@@ -195,7 +201,7 @@ def check_scope(component: str, repo: str = "") -> tuple[bool, list[str], list[s
         failed.append("NO_MAP: component_map empty. Run: python3 audit-agents/run_hunt.py --map-components")
 
     # 4. Context file exists (run_hunt.py --component was executed)
-    protocol = state.get("protocol", "")
+    protocol = _get_protocol() or state.get("protocol", "")
     ctx_file = get_context_dir(protocol) / f"{component}_context.md"
     if ctx_file.exists():
         size = ctx_file.stat().st_size
@@ -238,8 +244,7 @@ def check_hunters(component: str) -> tuple[bool, list[str], list[str]]:
     passed = []
     failed = []
 
-    state = load_state()
-    protocol = state.get("protocol", "")
+    protocol = _get_protocol()
     hyp_dir = get_hyp_dir(protocol)
 
     for hunter in HUNTER_NAMES:
@@ -292,8 +297,7 @@ def check_hunters(component: str) -> tuple[bool, list[str], list[str]]:
 
 def check_deepdive(component: str) -> tuple[bool, list[str], list[str]]:
     """Check that DeepDiveHunter produced output."""
-    state = load_state()
-    protocol = state.get("protocol", "")
+    protocol = _get_protocol()
     hyp_file = get_hyp_dir(protocol) / f"hyp_{component}_DeepDiveHunter.yaml"
     if not hyp_file.exists():
         return False, [], [f"MISSING: {hyp_file.name}"]
@@ -312,8 +316,7 @@ def check_deepdive(component: str) -> tuple[bool, list[str], list[str]]:
 
 def check_crosschain(component: str) -> tuple[bool, list[str], list[str]]:
     """Check that CrossChainHunter produced output (or justified skip for single-chain)."""
-    state = load_state()
-    protocol = state.get("protocol", "")
+    protocol = _get_protocol()
     hyp_dir = get_hyp_dir(protocol)
     hyp_file = hyp_dir / f"hyp_{component}_CrossChainHunter.yaml"
 
@@ -418,7 +421,7 @@ def check_merge(component: str, repo_path: str = "") -> tuple[bool, list[str], l
         failed.append("MISSING: TargetFunctions.sol not found — handlers not generated (checklist item 5)")
 
     # Count how many hypothesis invariants have solidity vs how many are in Properties.sol
-    protocol = state.get("protocol", "")
+    protocol = _get_protocol() or state.get("protocol", "")
     hyp_dir = get_hyp_dir(protocol)
     total_solidity_invariants = 0
     for hunter in HUNTER_NAMES + ["DeepDiveHunter"]:
@@ -1855,6 +1858,10 @@ def main():
     parser.add_argument("--session-dir", help=(
         "Override HUNT_SESSION_DIR (used by run_benchmark.py to isolate benchmark outputs)"
     ))
+    parser.add_argument("--force", default="",
+                        help="Reset the named gate's status so it re-runs. "
+                             "Accepts gate names like 'scope', 'prepass', 'hunters', 'merge'. "
+                             "Can be used once per invocation.")
     args = parser.parse_args()
 
     # ── Session dir override (benchmark isolation) ──
@@ -1862,6 +1869,26 @@ def main():
         global HUNT_SESSION_DIR, SCOPE_MASTER_DIR
         HUNT_SESSION_DIR = Path(args.session_dir).resolve()
         SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
+
+    # ── Protocol override (benchmark mode — current_hunt.json may have wrong protocol) ──
+    if args.protocol:
+        global _PROTOCOL_OVERRIDE
+        _PROTOCOL_OVERRIDE = args.protocol
+
+    if args.force:
+        gate = args.force
+        protocol = args.protocol or _PROTOCOL_OVERRIDE
+        status_path = get_gate_status_file(protocol) if protocol else None
+        if status_path and status_path.exists():
+            data = json.loads(status_path.read_text())
+            comp_gates = data.get("component_gates", {})
+            for comp in list(comp_gates.keys()):
+                comp_gates[comp].pop(gate, None)
+            status_path.write_text(json.dumps(data, indent=2))
+            print(f"[force] reset gate '{gate}' for all components", file=sys.stderr)
+        else:
+            print(f"[force] no gate_status file to reset (session fresh)", file=sys.stderr)
+        sys.exit(0)
 
     # ── Scope master operations ──
     if args.scope_status:
