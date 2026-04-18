@@ -3715,6 +3715,11 @@ def main():
                         help="Force a specific pipeline gate to re-run (e.g., 'scope', 'prepass', "
                              "'hunters'). Bypasses the gate's cached status. See pipeline_gate.py "
                              "for valid gate names.")
+    parser.add_argument("--apply-feedback", action="store_true",
+                        help="After all components finish, invoke apply_feedback.py once "
+                             "to ingest pending_briefing_updates into knowledge/ and the "
+                             "Obsidian vault. Off by default — benchmarks must not "
+                             "pollute the corpus.")
 
     args = parser.parse_args()
     hunters_subset = _validate_hunters_subset(args.hunters)
