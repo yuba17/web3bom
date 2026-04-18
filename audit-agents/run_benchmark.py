@@ -3664,6 +3664,16 @@ def _maybe_run_apply_feedback(*, apply_feedback: bool) -> None:
         )
 
 
+def _resolve_components(args) -> list[str]:
+    if args.components:
+        return [c.strip() for c in args.components.split(",") if c.strip()]
+    if args.auto_components:
+        from component_discovery import generate_component_map
+        cmap = generate_component_map(repo_path=args.repo)
+        return [c["name"] for c in cmap if c["status"] in ("pending", "unmapped")]
+    return []
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pipeline orchestrator for hunt benchmarks")
     parser.add_argument("--repo", required=True, help="Path to the repo root")
@@ -3824,7 +3834,9 @@ def main():
     if DISABLE_FEW_SHOT:
         logger.info("  Few-shot examples DISABLED (--no-few-shot)")
 
-    components = [c.strip() for c in args.components.split(",")]
+    components = _resolve_components(args)
+    if not components:
+        parser.error("No components resolved from --components / --auto-components.")
     repo = str(Path(args.repo).resolve())
 
     logger.info(f"Pipeline Orchestrator starting")
