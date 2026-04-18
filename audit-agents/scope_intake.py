@@ -25,6 +25,69 @@ HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
 STATE_FILE = Path.home() / ".claude" / "MEMORY" / "STATE" / "current_hunt.json"
 
 
+# ─── Graphify Structural Recon ────────────────────────────────────────────
+
+def run_graphify_recon(repo_path: Path, protocol: str) -> Path:
+    """Run graphify on target repo to generate structural graph."""
+    graph_dir = HUNT_SESSION_DIR / "graph" / protocol
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["graphify", str(repo_path), "--no-viz"],
+            capture_output=True, text=True, timeout=300,
+            cwd=str(graph_dir)
+        )
+        if result.returncode == 0:
+            print(f"[graphify] Graph generated at {graph_dir}")
+            report = graph_dir / "GRAPH_REPORT.md"
+            if report.exists():
+                print(f"[graphify] God nodes and connections in {report}")
+        else:
+            print(f"[graphify] Warning: {result.stderr[:200]}")
+    except FileNotFoundError:
+        print("[graphify] Not installed, skipping recon (pip install graphifyy)")
+    except subprocess.TimeoutExpired:
+        print("[graphify] Timeout after 5min, skipping")
+    return graph_dir
+
+
+# ─── Obsidian Wiki Prior-Knowledge Query ──────────────────────────────────
+
+def run_wiki_query(protocol: str, components: list[str]) -> Path | None:
+    """Invoke /wiki-query to fetch prior knowledge for this protocol + components.
+
+    Writes result to hunt_session/context/{protocol}/wiki_prior_knowledge.md so
+    run_benchmark.py and hunters can pick it up. Failure-tolerant: missing skill,
+    timeout, or empty vault do not abort scope_intake.
+    """
+    ctx_dir = HUNT_SESSION_DIR / "context" / protocol
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+    out_path = ctx_dir / "wiki_prior_knowledge.md"
+
+    query = (
+        f"/wiki-query Previous findings, attack patterns, and known-vulnerable "
+        f"primitives related to the {protocol} protocol. Components: "
+        f"{', '.join(components)}. Focus on DeFi attack vectors that have been "
+        f"paid bounties on similar code. Return a concise markdown brief."
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", query, "--output-format", "text"],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            out_path.write_text(result.stdout, encoding="utf-8")
+            print(f"[wiki-query] Prior knowledge → {out_path}")
+            return out_path
+        else:
+            print(f"[wiki-query] No content returned (rc={result.returncode})")
+    except FileNotFoundError:
+        print("[wiki-query] claude CLI not found, skipping")
+    except subprocess.TimeoutExpired:
+        print("[wiki-query] Timeout after 10min, skipping")
+    return None
+
+
 # ─── Bounty Text Parser ───────────────────────────────────────────────────
 
 def parse_bounty_text(text: str) -> dict:
@@ -328,18 +391,19 @@ def main():
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
     print(f"\n  Written: {STATE_FILE}")
 
+    # Run graphify structural recon
+    if not args.dry_run:
+        run_graphify_recon(Path(args.repo), state["protocol"])
+        # Pull prior knowledge from the Obsidian vault into hunt_session/context/
+        comp_names = [c.get("name") if isinstance(c, dict) else str(c)
+                      for c in state.get("component_map", [])] or [first]
+        run_wiki_query(state["protocol"], comp_names)
+
     # Generate fichas
     generate_fichas(state)
 
-    # Auto-run run_hunt.py and pipeline_gate scope check for first component
-    print(f"\n  Running run_hunt.py --component {first} ...")
-    ret = subprocess.run(
-        ["python3", str(WEB3_DIR / "audit-agents" / "run_hunt.py"), "--component", first],
-        cwd=str(WEB3_DIR),
-    )
-    if ret.returncode != 0:
-        print(f"  WARNING: run_hunt.py exited with code {ret.returncode}")
-
+    # Scope gate check (run_hunt.py auto-dispatch removed in Phase 4 —
+    # users now invoke run_benchmark.py manually when they are ready to hunt)
     print(f"\n  Running pipeline_gate.py --gate scope ...")
     ret2 = subprocess.run(
         ["python3", str(WEB3_DIR / "audit-agents" / "pipeline_gate.py"),
