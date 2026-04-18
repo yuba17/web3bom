@@ -17,7 +17,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-WEB3_DIR = Path.home() / "Documents/Web3"
+from paths import WEB3_DIR
 DB_PATH = WEB3_DIR / "knowledge/solodit.db"
 
 CATEGORIES = [

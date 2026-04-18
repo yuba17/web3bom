@@ -25,11 +25,10 @@ import sqlite3
 import sys
 import time
 import argparse
-from pathlib import Path
 from typing import Optional
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-WEB3_DIR = Path.home() / "Documents/Web3"
+from paths import WEB3_DIR
 DB_PATH = WEB3_DIR / "knowledge/solodit.db"
 ENV_PATH = WEB3_DIR / ".env"
 

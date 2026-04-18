@@ -10,13 +10,9 @@ Migrated from run_hunt.py during Phase 4 of the optimization roadmap
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import yaml
 
-WEB3_DIR = Path.home() / "Documents/Web3"
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-AUDIT_AGENTS_DIR = WEB3_DIR / "audit-agents"
+from paths import WEB3_DIR, HUNT_SESSION_DIR, AUDIT_AGENTS_DIR
 
 
 HUNTER_DOMAINS = {

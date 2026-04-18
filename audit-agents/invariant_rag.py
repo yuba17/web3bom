@@ -23,8 +23,9 @@ try:
 except ImportError:
     yaml = None
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-WEB3_DIR = SCRIPT_DIR.parent
+from paths import WEB3_DIR, AUDIT_AGENTS_DIR
+
+SCRIPT_DIR = AUDIT_AGENTS_DIR
 INDEX_PATH = SCRIPT_DIR / "invariant_rag.json"
 
 

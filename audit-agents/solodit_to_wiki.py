@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 
 
-WEB3_DIR = Path(__file__).resolve().parents[1]
+from paths import WEB3_DIR
 DEFAULT_CARDS_DIR = WEB3_DIR / "knowledge" / "solodit_cards"
 DEFAULT_OUTPUT_DIR = Path.home() / "obsidian-vault" / "web3-audit" / "solodit"
 

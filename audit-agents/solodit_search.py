@@ -18,9 +18,8 @@ import re
 import sqlite3
 import time
 import argparse
-from pathlib import Path
 
-WEB3_DIR = Path.home() / "Documents/Web3"
+from paths import WEB3_DIR
 DB_PATH = WEB3_DIR / "knowledge/solodit.db"
 SOLODIT_JSONL = WEB3_DIR / "knowledge/solodit_all_findings.jsonl"
 SOLODIT_BULK = WEB3_DIR / "knowledge/solodit_bulk_findings.json"

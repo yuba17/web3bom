@@ -48,8 +48,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 
-WEB3_DIR = Path.home() / "Documents/Web3"
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
+from paths import WEB3_DIR, HUNT_SESSION_DIR
 def get_hyp_dir(protocol: str) -> Path:
     """Return protocol-namespaced hypotheses directory."""
     d = HUNT_SESSION_DIR / "hypotheses" / protocol

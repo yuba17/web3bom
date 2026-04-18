@@ -18,11 +18,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from paths import WEB3_DIR, AUDIT_AGENTS_DIR
+
 # Skip deep_flatten when the contract is small — the signal isn't worth
 # the subprocess cost. Threshold chosen empirically; tune if needed.
 DEEP_FLATTEN_MIN_LINES = 200
-
-AUDIT_AGENTS_DIR = Path(__file__).resolve().parent  # /home/kali/Documents/Web3/audit-agents
 
 _symmetric_mem_cache: dict[str, str] = {}
 _flatten_mem_cache: dict[str, str] = {}
@@ -132,8 +132,6 @@ def query_wiki_context(domain: str, component: str) -> str:
         return ""
     return "\n---\n## Prior Knowledge (Obsidian Vault)\n" + "\n".join(results[:8])
 
-
-WEB3_DIR = Path(__file__).resolve().parents[1]  # /home/kali/Documents/Web3
 
 DOMAIN_BRIEFING: dict[str, str] = {
     "staking":    "knowledge/staking.md",

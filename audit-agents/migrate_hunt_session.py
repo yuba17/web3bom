@@ -8,9 +8,8 @@ Also splits gate_status.json into per-protocol files.
 
 import json
 import shutil
-from pathlib import Path
 
-WEB3_DIR = Path.home() / "Documents" / "Web3"
+from paths import WEB3_DIR
 HUNT_SESSION = WEB3_DIR / "hunt_session"
 HYP_DIR = HUNT_SESSION / "hypotheses"
 CTX_DIR = HUNT_SESSION / "context"

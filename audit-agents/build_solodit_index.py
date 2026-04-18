@@ -13,9 +13,8 @@ import sqlite3
 import sys
 import time
 import argparse
-from pathlib import Path
 
-WEB3_DIR = Path.home() / "Documents/Web3"
+from paths import WEB3_DIR
 JSONL_PATH = WEB3_DIR / "knowledge/solodit_all_findings.jsonl"
 CAT_DIR = WEB3_DIR / "knowledge/solodit_by_category"
 DB_PATH = WEB3_DIR / "knowledge/solodit.db"
