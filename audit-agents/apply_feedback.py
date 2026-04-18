@@ -20,14 +20,30 @@ import json
 import yaml
 import glob
 import argparse
+import subprocess
 from datetime import datetime
 from pathlib import Path
+import shutil
 
 # Paths
 WEB3_DIR = Path.home() / "Documents/Web3"
 KNOWLEDGE_DIR = WEB3_DIR / "knowledge"
 HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
 STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
+VAULT_RAW = Path.home() / "obsidian-vault" / "web3-audit" / "_raw"
+
+
+def _apply_path_overrides(*, knowledge_dir: str | None, vault_dir: str | None) -> None:
+    """Override KNOWLEDGE_DIR and VAULT_RAW for testability and benchmark sandboxing.
+
+    No-op when both args are None. vault_dir is treated as the vault root;
+    VAULT_RAW becomes <vault_dir>/_raw.
+    """
+    global KNOWLEDGE_DIR, VAULT_RAW
+    if knowledge_dir is not None:
+        KNOWLEDGE_DIR = Path(knowledge_dir).resolve()
+    if vault_dir is not None:
+        VAULT_RAW = (Path(vault_dir) / "_raw").resolve()
 
 def _load_protocol() -> str:
     """Load current protocol from hunt state."""
@@ -222,6 +238,51 @@ def process_update(update: dict, source: str, dry_run: bool) -> bool:
         return False
 
 
+_WIKI_STAGED_FILES: list[Path] = []
+
+
+def wiki_ingest_finding(finding_id: str, hyp_path: Path, protocol: str):
+    """Copy confirmed finding to Obsidian vault for persistent knowledge."""
+    if not VAULT_RAW.exists():
+        return
+    dest = VAULT_RAW / f"finding_{protocol}_{finding_id}.yaml"
+    if not dest.exists():
+        shutil.copy2(hyp_path, dest)
+        print(f"  [wiki] Staged {finding_id} for vault ingest")
+        _WIKI_STAGED_FILES.append(dest)
+
+
+def wiki_ingest_flush(dry_run: bool = False):
+    """Promote everything in VAULT_RAW/ into the vault via /wiki-ingest skill.
+
+    Runs after all findings for the session have been staged. Failure-tolerant:
+    missing skill, timeout, or claude CLI absence do not abort apply_feedback.
+    """
+    if dry_run or not _WIKI_STAGED_FILES:
+        return
+    staged_names = ", ".join(p.name for p in _WIKI_STAGED_FILES[:8])
+    if len(_WIKI_STAGED_FILES) > 8:
+        staged_names += f" (+{len(_WIKI_STAGED_FILES) - 8} more)"
+    prompt = (
+        f"/wiki-ingest Promote all pending files under {VAULT_RAW} into the vault. "
+        f"Newly staged findings this run: {staged_names}. "
+        f"Deduplicate against existing pages and add cross-links where appropriate."
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "text"],
+            capture_output=True, text=True, timeout=900
+        )
+        if result.returncode == 0:
+            print(f"  [wiki-ingest] Flushed {len(_WIKI_STAGED_FILES)} staged finding(s) into vault")
+        else:
+            print(f"  [wiki-ingest] skill exited rc={result.returncode}: {result.stderr[:200]}")
+    except FileNotFoundError:
+        print("  [wiki-ingest] claude CLI not found, skipping flush")
+    except subprocess.TimeoutExpired:
+        print("  [wiki-ingest] Timeout after 15min, staged files remain in _raw/")
+
+
 def process_ficha(ficha_path: Path, dry_run: bool) -> int:
     """Procesa una ficha YAML y aplica sus pending_briefing_updates."""
     try:
@@ -291,6 +352,12 @@ def process_hypothesis(hyp_path: Path, dry_run: bool) -> int:
             if not dry_run:
                 update["briefing_update_applied"] = True
                 dirty = True
+
+    # Stage validated findings for Obsidian vault
+    protocol = _load_protocol()
+    for inv in hyp.get("hypotheses", hyp.get("invariants", [])):
+        if inv.get("validated") and inv.get("confidence", 0) >= 60:
+            wiki_ingest_finding(inv.get("id", "unknown"), hyp_path, protocol)
 
     # Write back modified structure only when something changed
     if dirty and not dry_run:
@@ -386,7 +453,15 @@ def main():
     parser.add_argument("--ficha", type=str, help="Procesa una ficha específica")
     parser.add_argument("--fichas-dir", type=str, help="Directorio de fichas (default: hunt_session/fichas)")
     parser.add_argument("--hyp-dir", type=str, help="Directorio de hipótesis (default: hunt_session/hypotheses)")
+    parser.add_argument("--knowledge-dir", default=None,
+                        help="Override KNOWLEDGE_DIR (default: $WEB3_DIR/knowledge). "
+                             "Used by tests and benchmark sandboxing.")
+    parser.add_argument("--vault-dir", default=None,
+                        help="Override Obsidian vault root "
+                             "(default: ~/obsidian-vault/web3-audit). "
+                             "VAULT_RAW becomes <vault-dir>/_raw.")
     args = parser.parse_args()
+    _apply_path_overrides(knowledge_dir=args.knowledge_dir, vault_dir=args.vault_dir)
 
     if args.dry_run:
         print("=== DRY RUN — no se modificará nada ===\n")
@@ -455,6 +530,9 @@ def main():
 
         # NOTA: hipótesis no se procesan en modo default.
         # Los false_positives de hunters solo se aplican con confirmación externa.
+
+    # Promote any staged findings into the Obsidian vault via /wiki-ingest
+    wiki_ingest_flush(dry_run=args.dry_run)
 
     # Resumen
     print(f"\n{'='*50}")
