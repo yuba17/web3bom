@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
+
+# Make audit_agents_path importable from within this package
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
 
 
 @pytest.fixture
