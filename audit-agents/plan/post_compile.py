@@ -16,9 +16,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 # Ensure audit-agents is on the path for sibling imports
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from plan.detectors import (  # noqa: F401
-    _fork_sol_snippet, _rpc_var, _worktree_path, _step_id,
-    _find_cargo_workspace, _hyp_dir,
+from plan.detectors import (
+    _fork_sol_snippet, _step_id, _find_cargo_workspace, _hyp_dir,
 )
 
 
