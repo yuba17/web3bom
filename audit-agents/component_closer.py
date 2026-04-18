@@ -10,18 +10,26 @@ from pathlib import Path
 from typing import Any
 
 from paths import STATE_FILE as _DEFAULT_STATE_FILE
+from state_manager import load_state as _sm_load_state, save_state as _sm_save_state
 _AUDIT_AGENTS_DIR = Path(__file__).resolve().parent
 _PIPELINE_GATE = _AUDIT_AGENTS_DIR / "pipeline_gate.py"
 _APPLY_FEEDBACK = _AUDIT_AGENTS_DIR / "apply_feedback.py"
 
 
 def _load_state(state_file: Path) -> dict:
+    """Route through state_manager when state_file == default; else read directly."""
+    if state_file == _DEFAULT_STATE_FILE:
+        return _sm_load_state()
     if not state_file.exists():
         return {}
     return json.loads(state_file.read_text())
 
 
 def _save_state_atomic(state_file: Path, data: dict) -> None:
+    """Route through state_manager when state_file == default; else write directly."""
+    if state_file == _DEFAULT_STATE_FILE:
+        _sm_save_state(data)
+        return
     state_file.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w", delete=False, dir=state_file.parent, suffix=".tmp", encoding="utf-8"
