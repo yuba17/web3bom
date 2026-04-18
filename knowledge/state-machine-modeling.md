@@ -554,7 +554,7 @@ Retrieval-Augmented Property Generation" (NDSS 2025)
 PropertyGPT valida que un LLM PUEDE generar invariantes útiles si tiene:
 - Base de datos de ejemplos verificados (nuestra knowledge base)
 - Feedback loop de compilación (nuestro pipeline Chimera)
-- Contexto del protocolo específico (nuestro run_hunt.py)
+- Contexto del protocolo específico (nuestro run_benchmark.py)
 
 **Gap a cerrar**: No hace FSM modeling explícito. Genera properties "flat" sin
 modelo de estados. Combinar FSM + RAG sería el siguiente paso.

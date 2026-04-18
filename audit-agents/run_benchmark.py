@@ -1435,10 +1435,8 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         logger.info("  Steps 0-4 SKIPPED (--skip-hunters, reusing existing hypotheses)")
 
     # Step 0: Scope (init ficha) — skipped in benchmark mode.
-    # run_hunt.py --init-ficha uses run_hunt.HUNT_SESSION_DIR (hardcoded to real hunt_session)
-    # and cannot easily accept --session-dir without a larger refactor.
     # Benchmark pipelines never read the ficha back (scope gate is not checked here),
-    # so skipping init-ficha is safe and avoids contaminating the real hunt_session/fichas/.
+    # so skipping is safe and avoids contaminating the real hunt_session/fichas/.
     if not _skip_to_merge:
         logger.info("  Step 0: Ficha init skipped (benchmark mode — not needed)")
 
@@ -1845,11 +1843,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             if len(hunters) >= 2:
                 convergence_text += f"- **{area}**: flagged by {', '.join(set(hunters))} — INVESTIGATE DEEPER\n"
 
-        # Build deepdive prompt directly from bench_session hyp_dir.
-        # Do NOT import generate_deepdive_prompt from run_hunt — that function uses
-        # run_hunt.HUNT_SESSION_DIR (real hunt_session, not bench_session) to read
-        # hypotheses, which is wrong in benchmark mode and would be a thread-safety
-        # issue in parallel component execution (two threads patching the same module global).
+        # Build deepdive prompt inline from bench_session hyp_dir.
+        # Keep this local — a helper reading from a module-global hunt dir would
+        # race across parallel components (two threads would patch the same global).
         deepdive_prompt = build_deepdive_prompt(
             component=component, protocol=protocol, source_code=source_code,
             library_code=library_code, setup_sol_text=setup_sol_text,

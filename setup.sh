@@ -165,7 +165,7 @@ else
 fi
 
 # Check audit-agents scripts
-for script in run_benchmark.py run_hunt.py detection_engine.py pipeline_gate.py benchmark_score.py; do
+for script in run_benchmark.py detection_engine.py pipeline_gate.py benchmark_score.py; do
     if [ -f "audit-agents/$script" ]; then
         ok "$script exists"
     else
@@ -188,7 +188,7 @@ if [ $ERRORS -eq 0 ]; then
     echo "      --protocol yieldoor --components Strategy --fast"
     echo ""
     echo "    # Run a hunt on a new protocol:"
-    echo "    python3 audit-agents/run_hunt.py --component <Name>"
+    echo "    python3 audit-agents/run_benchmark.py --components <Name> --protocol <name> --repo <path>"
 else
     echo -e "  ${RED}Setup finished with $ERRORS error(s)${NC}"
     echo "  Fix the errors above and re-run ./setup.sh"

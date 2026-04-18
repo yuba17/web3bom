@@ -165,7 +165,7 @@ class DetectionReport:
 
 
 def generate_prepass_yaml(findings: list, output_path: Path):
-    """Generate YAML consumable by run_hunt.py hunter prompts."""
+    """Generate YAML consumable by hunter prompts (run_benchmark.py flow)."""
     signals = []
     for f in findings:
         if f.severity_score() < 2:  # Skip low/info
