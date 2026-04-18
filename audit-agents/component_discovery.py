@@ -151,3 +151,32 @@ def find_cross_component_pairs(
             if interactions:
                 pairs.append((comp_a, comp_b, interactions))
     return pairs
+
+
+def detect_transitive_chains(
+    *,
+    all_pairs: list[tuple[str, str, list[str]]],
+) -> list[tuple[str, str, str]]:
+    adj: dict[str, set[str]] = {}
+    for a, b, _ in all_pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    chains: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for mid in sorted(adj):
+        neighbors = sorted(adj[mid])
+        if len(neighbors) < 2:
+            continue
+        for a in neighbors:
+            for c in neighbors:
+                if a >= c:
+                    continue
+                if c in adj.get(a, set()):
+                    continue
+                key = (a, mid, c)
+                if key in seen:
+                    continue
+                seen.add(key)
+                chains.append((a, mid, c))
+    return chains
