@@ -61,6 +61,7 @@ import yaml
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
 from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
+from state_manager import load_state, save_state as _sm_save_state
 SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
 _PROTOCOL_OVERRIDE = ""  # Set by --protocol CLI arg; overrides load_state() protocol
 
@@ -100,12 +101,6 @@ GATE_ORDER = ["scope", "prepass", "hunters", "crosschain", "deepdive", "merge", 
 
 
 # ─── State helpers ───────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
-
 
 def load_ficha(component: str, protocol: str = "") -> dict | None:
     """Try to load the ficha YAML for a component."""
@@ -1666,15 +1661,8 @@ def mark_finding_gate(finding_id: str, gate: str):
 # ─── Finding Queue ───────────────────────────────────────────────────────────
 
 def _save_state(state: dict):
-    """Write current_hunt.json atomically."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
-        tmp.rename(STATE_FILE)
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    """Write current_hunt.json atomically (delegates to state_manager)."""
+    _sm_save_state(state)
 
 
 def generate_queue_id(source: str, parent_id: str = None,

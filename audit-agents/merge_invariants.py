@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 
 from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
+from state_manager import load_state
 
 def get_hyp_dir(protocol: str) -> Path:
     """Return protocol-namespaced hypotheses directory."""
@@ -161,13 +162,11 @@ def detect_pragma(chimera_dir: Path) -> str:
 
 
 def load_current_hunt() -> dict:
-    """Carga el estado del hunt activo."""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {}
+    """Carga el estado del hunt activo. Corrupted JSON swallowed to {}."""
+    try:
+        return load_state()
+    except json.JSONDecodeError:
+        return {}
 
 
 def find_chimera_dir(hunt: dict) -> Path | None:
