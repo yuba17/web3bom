@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from benchmark.llm_runners import run_cmd  # noqa: F401
+from benchmark.llm_runners import run_cmd
 
 logger = logging.getLogger("orchestrator")
 
