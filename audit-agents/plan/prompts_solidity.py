@@ -14,6 +14,10 @@ from pathlib import Path
 from plan.detectors import (
     _detect_primary_domain, _read_file_safe, _detect_lang, _src_dir,
     _hyp_dir, _results_dir, _step_id, _fork_sol_snippet,
+    _find_rust_crate_src, _rust_crate_sources,
+)
+from plan.prompts_rust import (
+    _phase_hunter_prompt_rust, _phase_findings_rust, _phase_cross_prompt_rust,
 )
 from benchmark.prompt_builders import (
     build_hunter_brief, build_hunter_dispatch_prompt, build_deepdive_prompt,
@@ -41,8 +45,6 @@ def phase_hunter_prompt(
     hyp_dir = _hyp_dir(session_dir, protocol)
 
     if is_rust:
-        # lazy — breaks in Task 9 when _phase_hunter_prompt_rust moves to plan.prompts_rust
-        from plan_generator import _phase_hunter_prompt_rust
         return _phase_hunter_prompt_rust(component, protocol, repo, session_dir, hyp_dir, results_dir)
 
     # ── Solidity path — top-level imports above replace the lazy import ──
@@ -147,8 +149,6 @@ def phase_deepdive_prompt(
     hyp_dir = _hyp_dir(session_dir, protocol)
 
     if is_rust:
-        # lazy — breaks in Task 9
-        from plan_generator import _rust_crate_sources, _find_rust_crate_src
         source_code = _rust_crate_sources(repo, component)
         library_code = ""  # Rust deps are read from other crates
         setup_sol_text = ""
@@ -325,8 +325,6 @@ def phase_findings(
     is_rust = (lang == "rust")
     if is_rust:
         # Rust path: collect findings inline, delegate to _phase_findings_rust
-        # lazy — breaks in Task 9
-        from plan_generator import _phase_findings_rust
         hyp_dir = _hyp_dir(session_dir, protocol)
         findings: list[dict] = []
         try:
@@ -597,8 +595,6 @@ def phase_cross_prompt(
     pair_file = hyp_dir / f"cross_{comp_a}_{comp_b}.yaml"
 
     if lang == "rust":
-        # lazy — breaks in Task 9
-        from plan_generator import _phase_cross_prompt_rust
         return _phase_cross_prompt_rust(
             comp_a, comp_b, protocol, repo, session_dir, hyp_dir, pair_file,
         )
