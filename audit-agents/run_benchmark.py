@@ -3294,6 +3294,82 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str,
         )
         logger.info(f"  Cross-A merged: {len(merged_findings)} findings → {canonical_file.name}")
 
+    # ─── Phase A.2: Transitive chain detection & hunt ────────────────
+    from component_discovery import detect_transitive_chains as _detect_chains
+    # Filter to pairs with real cross-calls: detect_transitive_chains requires
+    # true adjacency (A↔C absent). itertools.combinations yields a complete
+    # graph, which would suppress every chain. Only keep pairs where at least
+    # one component actually references the other in source.
+    _adj_pairs: list[tuple[str, str, list[str]]] = []
+    for _a, _b in pairs:
+        _calls = _find_cross_calls(_a, _b)
+        if _calls and "No direct cross-calls detected" not in _calls:
+            _adj_pairs.append((_a, _b, []))
+    pair_tuples = _adj_pairs
+    chain_triples = _detect_chains(all_pairs=pair_tuples)
+    if chain_triples:
+        logger.info(f"  Cross-A.2: {len(chain_triples)} transitive chain(s) detected")
+
+        def _run_chain_hunt(triple: tuple) -> None:
+            comp_a, comp_mid, comp_c = triple
+            iface_a = _read_interface(comp_a)
+            iface_mid = _read_interface(comp_mid)
+            iface_c = _read_interface(comp_c)
+            chain_file = hyp_dir / f"hyp_Chain_{comp_a}_{comp_mid}_{comp_c}.yaml"
+            chain_prompt = (
+                f"# EdgeHunter — Transitive Chain {comp_a}→{comp_mid}→{comp_c}\n\n"
+                f"You are investigating a TRANSITIVE CHAIN attack surface in "
+                f"{protocol}. {comp_a}↔{comp_mid} and {comp_mid}↔{comp_c} are "
+                f"direct edges; {comp_a}↔{comp_c} is NOT. Find bugs that require "
+                f"all three components.\n\n"
+                f"## {comp_a} interface\n```solidity\n{iface_a}\n```\n\n"
+                f"## {comp_mid} interface\n```solidity\n{iface_mid}\n```\n\n"
+                f"## {comp_c} interface\n```solidity\n{iface_c}\n```\n\n"
+                f"## Checklist\n"
+                f"1. Transitive state manipulation: can {comp_a} influence state "
+                f"in {comp_mid} that {comp_c} trusts?\n"
+                f"2. Trust chain breaks: {comp_c} trusts {comp_mid}, which trusts "
+                f"{comp_a} — does this transitive trust collapse?\n"
+                f"3. Multi-tx sequences: is there a 3+ tx attack spanning all "
+                f"three? Flash-loan amplification?\n\n"
+                f"## Output\nWrite invariants (YAML) to `{chain_file}` with "
+                f"hunter='EdgeHunter', component='{comp_a}_{comp_mid}_{comp_c}'.\n"
+            )
+            _llm(
+                chain_prompt,
+                allowed_tools=["Read", "Write", "Grep", "Glob"],
+                timeout=900,
+                stall_timeout=600,
+                log_file=clog / f"chain_{comp_a}_{comp_mid}_{comp_c}.log",
+                cwd=repo,
+            )
+            logger.info(f"    Chain {comp_a}→{comp_mid}→{comp_c}: done")
+
+        with ThreadPoolExecutor(max_workers=min(3, len(chain_triples))) as executor:
+            list(executor.map(_run_chain_hunt, chain_triples))
+
+        chain_merged: list[dict] = []
+        for cf in sorted(hyp_dir.glob("hyp_Chain_*.yaml")):
+            try:
+                data = _yaml.safe_load(cf.read_text())
+                if not data:
+                    continue
+                for key in ("findings", "hypotheses", "invariants"):
+                    for entry in (data.get(key) or []):
+                        if isinstance(entry, dict):
+                            chain_merged.append(entry)
+            except Exception:
+                pass
+        if chain_merged:
+            merged_findings.extend(chain_merged)
+            canonical_file.write_text(
+                _yaml.dump({"hunter": "CrossComponentHunter",
+                            "component": "CrossComponent",
+                            "findings": merged_findings},
+                           allow_unicode=True, sort_keys=False)
+            )
+            logger.info(f"  Cross-A.2 merged: {len(chain_merged)} chain findings into canonical")
+
     # ─── Phase A.5: PoC + RedTeam for cross-component findings ────────
     # Cross-component findings are never PoC'd in the component pipelines.
     # We: (1) generate+test PoC, (2) only send PoC-confirmed to RedTeam.
