@@ -22,7 +22,7 @@ def test_phase_hunter_prompt_invokes_context_builder(language, benchmark, tmp_pa
     if not repo.exists():
         pytest.skip(f"benchmark repo missing: {repo}")
 
-    with patch("plan_generator.build_hunter_context", return_value="STUBBED CTX") as m:
+    with patch("plan.prompts_solidity.build_hunter_context", return_value="STUBBED CTX") as m:
         steps = plan_generator.phase_hunter_prompt(
             component="Vault",
             protocol=benchmark,
