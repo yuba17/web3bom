@@ -21,8 +21,9 @@ from datetime import datetime
 
 from constants import derive_session_token, RADAR_TO_LOCAL, REMOTE_SEVERITY
 
+from paths import STATE_FILE
+
 BASE_URL   = "https://bugbounty.0mnia.dev"
-STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
 
 

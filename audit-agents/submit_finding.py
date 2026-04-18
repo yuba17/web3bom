@@ -29,9 +29,10 @@ from constants import (
     REQUIRES_RESET,
 )
 
+from paths import STATE_FILE
+
 # Config
 BASE_URL   = "https://bugbounty.0mnia.dev"
-STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
 REPO_DIR_FALLBACK = Path.home() / "Documents/Web3/revert-lend"
 

@@ -20,8 +20,9 @@ from datetime import datetime
 
 from constants import derive_session_token, SEVERITY_MAP, CATEGORY_MAP
 
+from paths import STATE_FILE
+
 BASE_URL   = "https://bugbounty.0mnia.dev"
-STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 ENV_FILE   = Path.home() / "Documents/Web3/.env"
 HYP_DIR    = Path.home() / "Documents/Web3/hunt_session/hypotheses"
 REPO_DIR_FALLBACK = Path.home() / "Documents/Web3/revert-lend"

@@ -20,9 +20,7 @@ try:
 except ImportError:
     yaml = None
 
-WEB3_DIR = Path(__file__).resolve().parent.parent
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-STATE_FILE = Path.home() / ".claude" / "MEMORY" / "STATE" / "current_hunt.json"
+from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
 
 
 # ─── Graphify Structural Recon ────────────────────────────────────────────

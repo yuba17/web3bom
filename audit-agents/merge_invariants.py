@@ -48,13 +48,13 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 
-from paths import WEB3_DIR, HUNT_SESSION_DIR
+from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
+
 def get_hyp_dir(protocol: str) -> Path:
     """Return protocol-namespaced hypotheses directory."""
     d = HUNT_SESSION_DIR / "hypotheses" / protocol
     d.mkdir(parents=True, exist_ok=True)
     return d
-STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 
 # Mapeo hunter → sufijo del archivo
 HUNTER_FILE_MAP = {

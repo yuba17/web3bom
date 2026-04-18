@@ -63,10 +63,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-WEB3_DIR = SCRIPT_DIR.parent
+from paths import WEB3_DIR, HUNT_SESSION_DIR, AUDIT_AGENTS_DIR
+
+SCRIPT_DIR = AUDIT_AGENTS_DIR
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
 # POC_CONFIDENCE_THRESHOLD imported from finding_pipeline
 IS_PRE_PRODUCTION = False      # set in main() — changes PoC strategy to deploy-on-fork
 

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_DEFAULT_STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
+from paths import STATE_FILE as _DEFAULT_STATE_FILE
 _AUDIT_AGENTS_DIR = Path(__file__).resolve().parent
 _PIPELINE_GATE = _AUDIT_AGENTS_DIR / "pipeline_gate.py"
 _APPLY_FEEDBACK = _AUDIT_AGENTS_DIR / "apply_feedback.py"

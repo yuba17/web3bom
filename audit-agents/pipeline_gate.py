@@ -60,9 +60,7 @@ import yaml
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-WEB3_DIR = Path(__file__).resolve().parent.parent
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-STATE_FILE = Path.home() / ".claude" / "MEMORY" / "STATE" / "current_hunt.json"
+from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
 SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
 _PROTOCOL_OVERRIDE = ""  # Set by --protocol CLI arg; overrides load_state() protocol
 

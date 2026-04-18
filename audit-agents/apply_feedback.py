@@ -26,10 +26,9 @@ from pathlib import Path
 import shutil
 
 # Paths
-WEB3_DIR = Path.home() / "Documents/Web3"
+from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
+
 KNOWLEDGE_DIR = WEB3_DIR / "knowledge"
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
-STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 VAULT_RAW = Path.home() / "obsidian-vault" / "web3-audit" / "_raw"
 
 

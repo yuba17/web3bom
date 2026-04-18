@@ -24,12 +24,10 @@ from pathlib import Path
 
 import yaml
 
-WEB3_DIR = Path(__file__).resolve().parent.parent
+from paths import WEB3_DIR, AUDIT_AGENTS_DIR, HUNT_SESSION_DIR, STATE_FILE
+
 BENCHMARKS_DIR = WEB3_DIR / "benchmarks"
-AUDIT_AGENTS_DIR = WEB3_DIR / "audit-agents"
-HUNT_SESSION_DIR = WEB3_DIR / "hunt_session"
 REPORTS_DIR = WEB3_DIR / "reports"
-STATE_FILE = Path.home() / ".claude/MEMORY/STATE/current_hunt.json"
 
 # Hunter → typical bug categories they should catch (for diagnosis)
 HUNTER_CATEGORY_MAP = {
