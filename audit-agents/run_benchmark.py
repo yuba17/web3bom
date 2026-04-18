@@ -3754,7 +3754,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pipeline orchestrator for hunt benchmarks")
     parser.add_argument("--repo", required=True, help="Path to the repo root")
     parser.add_argument("--components", help="Comma-separated component names (mutually exclusive with --auto-components)")
-    parser.add_argument("--protocol", required=True, help="Protocol name for namespacing")
+    parser.add_argument("--protocol", default="", help="Protocol name for namespacing (required unless --complete is set)")
     parser.add_argument("--ground-truth", help="Path to benchmark YAML (for scoring at end)")
     parser.add_argument("--max-retries", type=int, default=5, help="Max fix-and-retry attempts")
     parser.add_argument("--skip-phase3", action="store_true", help="Skip fork PoC (explicit)")
@@ -3830,13 +3830,33 @@ def main():
                         help="Auto-discover components via component_discovery.generate_component_map "
                              "(scans repo, filters interfaces/mocks/tests, orders by LOC). "
                              "Mutually exclusive with --components — exactly one must be set.")
+    parser.add_argument(
+        "--complete",
+        type=str,
+        metavar="COMPONENT",
+        default="",
+        help="Single-shot: close the given component (gate check + state transition + apply_feedback + cross-component). Mutually exclusive with --components / --auto-components.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass pipeline_gate failures when --complete is set. Ignored otherwise.",
+    )
 
     args = parser.parse_args()
-    if bool(args.components) == bool(args.auto_components):
-        parser.error(
-            "Exactly one of --components or --auto-components must be set "
-            "(got both or neither)."
-        )
+    if args.complete:
+        if args.components or args.auto_components:
+            parser.error(
+                "--complete is mutually exclusive with --components / --auto-components"
+            )
+    else:
+        if not args.protocol:
+            parser.error("--protocol is required (unless --complete is set)")
+        if bool(args.components) == bool(args.auto_components):
+            parser.error(
+                "Exactly one of --components or --auto-components must be set "
+                "(got both or neither)."
+            )
     hunters_subset = _validate_hunters_subset(args.hunters)
 
     # ── Isolate benchmark outputs ──────────────────────────────────────────
