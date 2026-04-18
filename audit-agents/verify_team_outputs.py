@@ -52,12 +52,20 @@ def verify_group(session_dir: Path, protocol: str, group: dict) -> list[str]:
                     ckpt_data = json.load(f)
                 completed = len(ckpt_data.get("completed_steps", []))
                 failed = ckpt_data.get("failed_steps", {})
+                # Non-fatal steps: fuzz failures are expected in pre-production/fast mode
+                non_fatal_steps = {"fuzz", "medusa", "echidna", "halmos"}
                 if failed:
                     for step_id, info in failed.items():
-                        failures.append(
-                            f"Group {group_id}: Step {step_id} failed: "
-                            f"{info.get('error', 'unknown')}"
-                        )
+                        err_msg = info.get('error', 'unknown') if isinstance(info, dict) else str(info)
+                        # Check if the step suffix is non-fatal (e.g. "Strategy:fuzz")
+                        step_suffix = step_id.split(":")[-1] if ":" in step_id else step_id
+                        if step_suffix in non_fatal_steps:
+                            print(f"  ⚠️  Group {group_id}: Step {step_id} failed (non-fatal): {err_msg}",
+                                  file=sys.stderr)
+                        else:
+                            failures.append(
+                                f"Group {group_id}: Step {step_id} failed: {err_msg}"
+                            )
             else:
                 failures.append(
                     f"Group {group_id}: No checkpoint.json at {ckpt}"

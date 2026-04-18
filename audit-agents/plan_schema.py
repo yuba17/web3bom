@@ -98,8 +98,12 @@ class ExecutionPlan:
     hypotheses_dir: str
     components: list[str]
     is_pre_production: bool
+    lang: str = "solidity"  # "solidity" or "rust"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     steps: list[Step] = field(default_factory=list)
+    # Team-parallel metadata: when set, the skill uses Agent Teams
+    # for real parallel execution across component groups.
+    teams: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Mutation helpers
@@ -118,7 +122,7 @@ class ExecutionPlan:
     # ------------------------------------------------------------------
 
     def _to_dict(self) -> dict:
-        return {
+        d = {
             "version": self.version,
             "protocol": self.protocol,
             "repo": self.repo,
@@ -126,9 +130,13 @@ class ExecutionPlan:
             "hypotheses_dir": self.hypotheses_dir,
             "components": self.components,
             "is_pre_production": self.is_pre_production,
+            "lang": self.lang,
             "created_at": self.created_at,
             "steps": [s.to_dict() for s in self.steps],
         }
+        if self.teams:
+            d["teams"] = self.teams
+        return d
 
     def to_json(self, path: str) -> None:
         """Write the plan to *path* as pretty-printed JSON."""
@@ -149,8 +157,10 @@ class ExecutionPlan:
             hypotheses_dir=d["hypotheses_dir"],
             components=d.get("components", []),
             is_pre_production=d.get("is_pre_production", False),
+            lang=d.get("lang", "solidity"),
             created_at=d.get("created_at", ""),
             steps=steps,
+            teams=d.get("teams", {}),
         )
 
 

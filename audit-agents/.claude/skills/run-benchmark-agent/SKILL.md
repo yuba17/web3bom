@@ -1,6 +1,6 @@
 ---
 name: run-benchmark-agent
-description: Execute a benchmark plan via Agent tool (subscription mode). Reads execution_plan.json and runs each step sequentially/in-parallel using Agent and Bash tools.
+description: Execute a benchmark plan via Agent tool (subscription mode). Reads execution_plan.json and runs each step sequentially/in-parallel using Agent and Bash tools. Supports Agent Teams for multi-group parallel execution.
 ---
 
 # Run Benchmark Agent
@@ -23,6 +23,14 @@ Read the `execution_plan.json` file provided as argument. Parse it as JSON.
 Check for `checkpoint.json` in the same directory:
 - If exists: load `completed_steps` set, announce resume, skip completed steps
 - If not: fresh run
+
+**Check for `teams` field** — this determines the execution strategy:
+- If `teams` exists: use **Team-Parallel Mode** (section 8)
+- If no `teams`: use **Sequential Mode** (sections 2-7 below)
+
+---
+
+## Sequential Mode (no teams)
 
 ### 2. Resolve Execution Order
 
@@ -52,9 +60,11 @@ For each batch of runnable steps:
 
 **Generate steps** (`type: "generate"`):
 - Execute using the Bash tool with `command` from the step
-- Parse stdout as JSON array of new step objects
-- Insert these steps into the in-memory execution queue AFTER the current step (do NOT modify the original plan JSON on disk)
-- Steps with `prompt: "__DYNAMIC__"` that depend on this generate step get their prompt replaced with the prompt from the generated output
+- Parse stdout as JSON — it can contain two types of output:
+  1. **Dynamic prompts**: objects with `step_id` + `prompt` → update matching `__DYNAMIC__` agent steps
+  2. **Dynamic steps**: objects with `id` + `type` + `command`/`prompt` → **INSERT as new executable steps** into the in-memory queue AFTER the current generate step
+- **CRITICAL**: Dynamic steps (e.g., enhance_targets, fuzz, post_fuzz sentinel) MUST be executed before proceeding to steps that depend on them. The `depends_on` chains in subsequent static steps reference dynamic step IDs (e.g., `cleanup_worktree` depends on `post_fuzz`).
+- Do NOT modify the original plan JSON on disk
 
 **Python steps** (`type: "python"`):
 - Execute using the Bash tool with `command` from the step
@@ -95,6 +105,140 @@ After all steps complete:
 - If ground-truth scoring was included, print the scoring output
 - Print path to `findings_all.json`
 
+---
+
+## Team-Parallel Mode (with teams)
+
+When the plan has a `teams` field, execute component groups in parallel using Agent Teams.
+
+### 8. Team Orchestration
+
+#### 8.1 Read team configuration
+
+```json
+{
+  "teams": {
+    "parallel_components": 2,
+    "groups": [
+      {"group_id": 0, "components": ["Strategy", "Vault"], "plan_file": "/path/to/execution_plan_group_0.json", "agent_name": "group-0"},
+      {"group_id": 1, "components": ["Leverager", "LendingPool"], "plan_file": "/path/to/execution_plan_group_1.json", "agent_name": "group-1"}
+    ]
+  }
+}
+```
+
+#### 8.2 Create team
+
+Use the TeamCreate tool:
+```
+team_name: "benchmark-{protocol}"
+description: "Benchmark {protocol}: {N} component groups in parallel"
+```
+
+#### 8.3 Create tasks for each group
+
+For each group in `teams.groups`, use TaskCreate:
+```
+subject: "Execute group-{group_id}: {components}"
+description: "Run benchmark sub-plan for components {components}. Plan file: {plan_file}"
+```
+
+#### 8.4 Spawn team agents
+
+For each group, spawn an agent using the Agent tool with:
+- `name`: the `agent_name` from the group (e.g., "group-0")
+- `team_name`: "benchmark-{protocol}"
+- `mode`: "bypassPermissions"
+- `isolation`: "worktree" (each agent gets its own repo copy)
+- `prompt`: Fill the template from `team-executor-prompt.md` (see section 8.5)
+
+Launch ALL group agents in a SINGLE message (parallel spawn).
+
+#### 8.5 Agent prompt template
+
+Read the template at `audit-agents/.claude/skills/run-benchmark-agent/team-executor-prompt.md`.
+
+Fill ALL `{placeholders}` before dispatching:
+
+| Placeholder | Source |
+|-------------|--------|
+| `{group_id}` | `group["group_id"]` from teams config |
+| `{components}` | `group["components"]` joined with ", " |
+| `{plan_file}` | `group["plan_file"]` from teams config |
+| `{session_dir}` | `session_dir` from master plan |
+| `{protocol}` | `protocol` from master plan |
+| `{checkpoint_path}` | Same directory as `plan_file` + `/checkpoint.json` |
+| `{checkpoint_json}` | Contents of existing checkpoint.json, or `{"plan_file": "...", "completed_steps": [], "failed_steps": {}, "current_batch": 0}` |
+
+**CRITICAL: Paste the filled template as the prompt. Do NOT tell the agent to "read team-executor-prompt.md" — the agent needs the full text inline.**
+
+#### 8.6 Wait for all teams and verify
+
+After spawning all team agents, wait for their completion messages.
+Each agent will send a message when done. Do NOT poll — messages are delivered automatically.
+
+When all agents report completion:
+
+1. **Do NOT trust agent reports.** Run the verification gate:
+
+```bash
+python3 audit-agents/verify_team_outputs.py \
+  --session-dir {session_dir} \
+  --protocol {protocol} \
+  --groups '{json.dumps(teams["groups"])}'
+```
+
+2. **If verification fails** (exit code != 0):
+   - Read the error output — it lists exactly what's missing
+   - Report to user: "Team verification failed: {failures}"
+   - Do NOT proceed to cross-component analysis
+   - Ask user whether to re-run failed groups or abort
+
+3. **If verification passes** (exit code 0):
+   - Print: "All {N} groups verified. Proceeding to cross-component analysis."
+   - Continue to section 8.7
+
+**Rationalization prevention:**
+
+| Thought | Reality |
+|---------|---------|
+| "The agents said they finished" | Agents lie. Run verify_team_outputs.py. |
+| "Most groups passed, close enough" | ALL groups must pass. No exceptions. |
+| "I can check manually" | The script checks systematically. Use it. |
+| "Cross-component will catch gaps" | Cross-component DEPENDS on complete data. Garbage in, garbage out. |
+
+#### 8.7 Run cross-component + scoring
+
+**Prerequisite:** Section 8.6 verification gate MUST have passed. If you skipped it, go back.
+
+After all teams complete AND verification passes, the master plan's `steps` contain cross-component and scoring steps.
+Execute these steps using the **Sequential Mode** (sections 2-7), treating `all_groups_done` dependencies as satisfied.
+
+#### 8.8 Final evidence gate
+
+Before reporting benchmark completion to the user, verify:
+
+1. **Run scoring** (if ground-truth exists):
+   ```bash
+   cat {session_dir}/benchmark_score.json 2>/dev/null || echo "No scoring output"
+   ```
+
+2. **Count outputs**:
+   ```bash
+   echo "Hypothesis files:" && ls {session_dir}/hypotheses/{protocol}/hyp_*.yaml 2>/dev/null | wc -l
+   echo "Cross-component files:" && ls {session_dir}/cross_results/*.yaml 2>/dev/null | wc -l
+   ```
+
+3. **Only then** present the final summary to the user with actual numbers from the commands above.
+
+**Red flags — if you catch yourself doing any of these, STOP:**
+- Saying "benchmark complete" without running the commands above
+- Using words like "should have", "probably generated", "likely found"
+- Reporting a score without pasting the actual scoring output
+- Skipping cross-component verification because "the teams already checked"
+
+---
+
 ## Resume Protocol
 
 If `checkpoint.json` exists when skill starts:
@@ -104,8 +248,11 @@ If `checkpoint.json` exists when skill starts:
 4. Announce: "Resuming from checkpoint — {N} completed, {M} remaining"
 5. Continue normal execution
 
+For team mode: check each sub-plan's checkpoint.json independently. If a group was already completed, skip spawning its agent.
+
 ## Important Notes
 
 - NEVER modify the original `execution_plan.json` — it's an audit trail.
 - Write all step outputs to `bench_session/step_outputs/{step_id}.json`
 - If a generate step fails, all steps depending on its output are automatically skipped.
+- In team mode, the session_dir is SHARED between agents — each agent writes to its own component's files (no conflicts because components are disjoint).

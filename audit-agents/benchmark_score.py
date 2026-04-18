@@ -2,13 +2,24 @@
 """
 Benchmark scoring: compares hunter hypotheses against ground truth findings.
 
+Modes:
+  Hypothesis mode (default): semantic matching of all hunter YAML hypotheses vs ground truth.
+  Confirmed mode (--findings-json): only PoC-confirmed findings vs ground truth — the REAL score.
+
 Usage:
+    # All hypotheses (inflated — includes unverified)
     python3 audit-agents/benchmark_score.py \
         --ground-truth benchmarks/yieldoor/benchmark.yaml \
-        --hypotheses-dir hunt_session/hypotheses/yieldoor-bench/
+        --hypotheses-dir hunt_session/hypotheses/yieldoor
+
+    # PoC-confirmed only (realistic score)
+    python3 audit-agents/benchmark_score.py \
+        --ground-truth benchmarks/yieldoor/benchmark.yaml \
+        --findings-json benchmarks/yieldoor/bench_session/findings_all.json
 """
 
 import argparse
+import json
 import yaml
 import re
 from pathlib import Path
@@ -20,6 +31,32 @@ def load_ground_truth(path: str) -> list[dict]:
     with open(path) as f:
         data = yaml.safe_load(f)
     return data.get("findings", [])
+
+
+def load_confirmed_findings(findings_json_path: str) -> list[dict]:
+    """Load only PoC-confirmed (or fuzz-confirmed) findings from findings_all.json.
+    Returns them in hypothesis format so match_finding() can reuse them."""
+    with open(findings_json_path) as f:
+        data = json.load(f)
+    confirmed = []
+    for finding in data.get("findings", []):
+        if not (finding.get("poc_passed") or finding.get("fuzz_confirmed")):
+            continue
+        # If RedTeam verdict is available, filter out DO_NOT_REPORT findings
+        redteam_verdict = finding.get("redteam_verdict", "")
+        if redteam_verdict == "DO_NOT_REPORT":
+            continue
+        confirmed.append({
+                "id": finding.get("id", ""),
+                "title": finding.get("title", ""),
+                "description": finding.get("title", ""),  # title IS the description
+                "confidence": finding.get("confidence", 80),
+                "severity": finding.get("severity", ""),
+                "_component": finding.get("component", ""),
+                "_hunter": f"[PoC-confirmed] {finding.get('component','')}",
+                "_source_file": f"findings_all.json",
+            })
+    return confirmed
 
 
 def load_hypotheses(hyp_dir: str) -> list[dict]:
@@ -150,10 +187,15 @@ def match_finding(finding: dict, hypotheses: list[dict]) -> tuple[str, list[dict
         return "MISSED", []
 
 
-def score_benchmark(ground_truth_path: str, hypotheses_dir: str, components: list[str] = None):
+def score_benchmark(ground_truth_path: str, hypotheses_dir: str = None,
+                    components: list[str] = None, preloaded_hypotheses: list[dict] = None,
+                    mode_label: str = "hypotheses"):
     """Run full benchmark scoring. If components given, filter both findings and hypotheses."""
     findings = load_ground_truth(ground_truth_path)
-    hypotheses = load_hypotheses(hypotheses_dir)
+    if preloaded_hypotheses is not None:
+        hypotheses = preloaded_hypotheses
+    else:
+        hypotheses = load_hypotheses(hypotheses_dir)
 
     if components:
         # Filter hypotheses to only those from specified components
@@ -169,9 +211,9 @@ def score_benchmark(ground_truth_path: str, hypotheses_dir: str, components: lis
         print(f"  Findings in scope: {len(findings)}, Hypotheses in scope: {len(hypotheses)}")
 
     print(f"\n{'='*70}")
-    print(f"  BENCHMARK SCORING")
+    print(f"  BENCHMARK SCORING ({mode_label})")
     print(f"  Ground truth: {len(findings)} findings")
-    print(f"  Hypotheses loaded: {len(hypotheses)}")
+    print(f"  {'Confirmed findings' if preloaded_hypotheses is not None else 'Hypotheses'} loaded: {len(hypotheses)}")
     print(f"{'='*70}\n")
 
     results = []
@@ -240,7 +282,8 @@ def score_benchmark(ground_truth_path: str, hypotheses_dir: str, components: lis
     print(f"  Recall HIGH:        {recall_high:.1%} ({detected_high}/{total_high})")
     print(f"  Recall MEDIUM:      {recall_medium:.1%} ({detected_medium}/{total_medium})")
     print(f"")
-    print(f"  Total hypotheses:   {len(hypotheses)}")
+    label = "Confirmed findings" if preloaded_hypotheses is not None else "Total hypotheses"
+    print(f"  {label}:   {len(hypotheses)}")
     print(f"{'='*70}")
 
     return results
@@ -249,9 +292,30 @@ def score_benchmark(ground_truth_path: str, hypotheses_dir: str, components: lis
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark scoring for hunting system")
     parser.add_argument("--ground-truth", "-g", required=True, help="Path to benchmark.yaml")
-    parser.add_argument("--hypotheses-dir", "-d", required=True, help="Directory with hyp_*.yaml files")
+    parser.add_argument("--hypotheses-dir", "-d", help="Directory with hyp_*.yaml files (hypothesis mode)")
+    parser.add_argument("--findings-json", "-f", help="Path to findings_all.json (confirmed-only mode — realistic score)")
     parser.add_argument("--components", "-c", help="Comma-separated components to filter (e.g. Strategy,Vault)")
     args = parser.parse_args()
 
+    if not args.hypotheses_dir and not args.findings_json:
+        parser.error("One of --hypotheses-dir or --findings-json is required")
+
     comps = [c.strip() for c in args.components.split(",")] if args.components else None
-    score_benchmark(args.ground_truth, args.hypotheses_dir, components=comps)
+
+    if args.findings_json:
+        # Confirmed-only mode: realistic score
+        confirmed = load_confirmed_findings(args.findings_json)
+        print(f"\n{'='*70}")
+        print(f"  BENCHMARK SCORING — PoC-CONFIRMED FINDINGS ONLY (realistic)")
+        print(f"  Source: {args.findings_json}")
+        print(f"  Confirmed findings: {len(confirmed)}")
+        print(f"{'='*70}\n")
+        if not confirmed:
+            print("  ⚠ No PoC-confirmed findings found. Run the benchmark first.")
+            print("  Fields needed: poc_passed=true OR fuzz_confirmed=true in findings_all.json")
+        else:
+            score_benchmark(args.ground_truth, hypotheses_dir=None,
+                            components=comps, preloaded_hypotheses=confirmed,
+                            mode_label="PoC-confirmed")
+    else:
+        score_benchmark(args.ground_truth, args.hypotheses_dir, components=comps)

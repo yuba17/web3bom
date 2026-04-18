@@ -302,12 +302,12 @@ def check_finding_duplicate(finding_id: str, program_id: str, state: dict, sess:
 # ── Hypothesis + PoC ──────────────────────────────────────────────────────────
 
 def find_hypothesis(finding_id: str) -> tuple[dict, Path]:
-    for hyp_path in sorted(HYP_DIR.glob("hyp_*.yaml")):
+    for hyp_path in sorted(HYP_DIR.rglob("hyp_*.yaml")):
         try:
             data = yaml.safe_load(hyp_path.read_text())
         except Exception:
             continue
-        if not data:
+        if not data or not isinstance(data, dict):
             continue
         for key in ("invariants", "findings", "hypotheses"):
             for entry in (data.get(key) or []):

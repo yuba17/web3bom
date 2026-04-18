@@ -568,6 +568,266 @@ def generate_protocol_model(contracts: list[ContractInfo], name: str, protocol_t
 
 
 # =============================================================================
+# LAYER 2: RICH ASSET FLOW MAP (VALUE EXIT ANALYSIS)
+# =============================================================================
+
+# Patterns that indicate value operations in SOURCE CODE (line scanning)
+VALUE_EXIT_SOURCE_PATTERNS = {
+    "transfer": [".transfer(", ".safeTransfer(", "safeTransferETH("],
+    "transferFrom": [".transferFrom(", ".safeTransferFrom("],
+    "call_value": [".call{value:", "call{value:"],
+    "approve": [".approve(", ".safeApprove(", ".forceApprove(", ".safeIncreaseAllowance("],
+    "mint": ["_mint(", ".mint("],
+    "burn": ["_burn(", ".burn("],
+}
+
+# Keywords in Slither external_calls that indicate value movement
+VALUE_EXIT_CALL_KEYWORDS = [
+    "transfer", "safeTransfer", "safeTransferETH", "safeTransferFrom",
+    "transferFrom", "approve", "safeApprove", "forceApprove",
+    "mint", "burn", "call{value", "sendValue",
+]
+
+VALUE_READ_PATTERNS = ["balanceOf(", "address(this).balance"]
+
+
+def generate_rich_asset_flow(contracts: list[ContractInfo], source_dir: str) -> str:
+    """
+    Generate a rich asset flow map from Slither-extracted contract data.
+    For each value exit (transfer, approve, mint, burn, ETH send), documents:
+    - WHO can call this (caller control: access modifiers, msg.sender checks)
+    - WHAT amount (parameter, state var, computed)
+    - WHERE it goes (destination: parameter, hardcoded, state var)
+    - WHAT guards exist (modifiers, require checks, reentrancy guard)
+    - WHAT state is read/written around the transfer
+    - External calls BEFORE the transfer (reentrancy surface)
+    """
+    main_contracts = [c for c in contracts if not c.is_interface and not c.is_library]
+    if not main_contracts:
+        return ""
+
+    # Also read source files to find exact transfer lines
+    source_path = Path(source_dir).resolve()
+    file_sources: dict[str, list[str]] = {}
+    for sol_file in sorted(source_path.rglob("*.sol")):
+        rel = str(sol_file.relative_to(source_path.parent))
+        try:
+            file_sources[rel] = sol_file.read_text(encoding="utf-8", errors="ignore").split("\n")
+        except Exception:
+            pass
+        # Also index by just filename for matching
+        file_sources[sol_file.name] = file_sources[rel]
+
+    sections = []
+    sections.append("## Rich Asset Flow Map (Slither-based)")
+    sections.append("")
+
+    for contract in sorted(main_contracts, key=lambda x: x.loc, reverse=True):
+        contract_exits = []
+
+        # First pass: identify internal functions with value exits
+        internal_value_fns = set()
+        for func in contract.functions:
+            if func.visibility in ("internal", "private") and func.line_start > 0:
+                src = file_sources.get(contract.file_path, [])
+                if not src:
+                    for key, lines in file_sources.items():
+                        if contract.name in key:
+                            src = lines
+                            break
+                for ln in range(func.line_start - 1, min(func.line_end, len(src))):
+                    line = src[ln] if ln < len(src) else ""
+                    for patterns in VALUE_EXIT_SOURCE_PATTERNS.values():
+                        if any(pat in line for pat in patterns):
+                            internal_value_fns.add(func.name)
+                            break
+
+        for func in contract.functions:
+            # Skip Slither internal artifacts
+            if func.name.startswith("slither"):
+                continue
+
+            # Check if this function has external calls that look like value exits
+            has_value_exit = False
+            exit_types = []
+
+            # Method 1: Check Slither external_calls for value keywords
+            for call in func.external_calls:
+                call_lower = call.lower()
+                for keyword in VALUE_EXIT_CALL_KEYWORDS:
+                    if keyword.lower() in call_lower:
+                        has_value_exit = True
+                        # Classify the exit type
+                        if "transferfrom" in call_lower or "safetransferfrom" in call_lower:
+                            exit_types.append("transferFrom")
+                        elif "transfer" in call_lower:
+                            exit_types.append("transfer")
+                        elif "approve" in call_lower:
+                            exit_types.append("approve")
+                        elif "mint" in call_lower:
+                            exit_types.append("mint")
+                        elif "burn" in call_lower:
+                            exit_types.append("burn")
+                        elif "value" in call_lower or "sendvalue" in call_lower:
+                            exit_types.append("call_value")
+                        break
+
+            # Method 1.5: Check if this function calls internal functions with value exits
+            source_lines = file_sources.get(contract.file_path, [])
+            if not source_lines:
+                for key, lines in file_sources.items():
+                    if contract.name in key:
+                        source_lines = lines
+                        break
+
+            if internal_value_fns and source_lines and func.line_start > 0:
+                for ln in range(func.line_start - 1, min(func.line_end, len(source_lines))):
+                    line = source_lines[ln] if ln < len(source_lines) else ""
+                    for ifn in internal_value_fns:
+                        if f"{ifn}(" in line:
+                            has_value_exit = True
+                            if "indirect_value" not in exit_types:
+                                exit_types.append("indirect_value")
+
+            # Method 2: Scan source lines for direct value patterns
+            value_lines = []
+            if source_lines and func.line_start > 0:
+                for ln in range(func.line_start - 1, min(func.line_end, len(source_lines))):
+                    line = source_lines[ln]
+                    for exit_type, patterns in VALUE_EXIT_SOURCE_PATTERNS.items():
+                        for pat in patterns:
+                            if pat in line:
+                                has_value_exit = True
+                                if exit_type not in exit_types:
+                                    exit_types.append(exit_type)
+                                display = line.strip()
+                                if len(display) > 100:
+                                    display = display[:97] + "..."
+                                value_lines.append(f"L{ln + 1}: `{display}`")
+                                break  # one match per line per category
+                    for pat in VALUE_READ_PATTERNS:
+                        if pat in line:
+                            display = line.strip()
+                            if len(display) > 100:
+                                display = display[:97] + "..."
+                            value_lines.append(f"L{ln + 1}: `{display}` (balance read)")
+
+            # Also flag receive/fallback as money-in
+            if func.name in ("receive", "fallback"):
+                has_value_exit = True
+                exit_types.append("ETH_receive")
+
+            # Also flag payable functions
+            if "payable" in str(func.state_mutability).lower():
+                if "ETH_receive" not in exit_types:
+                    exit_types.append("payable")
+
+            if not has_value_exit and not value_lines:
+                continue
+
+            # Build the rich entry
+            entry = []
+            entry.append(f"### `{func.name}()` — L{func.line_start}")
+            entry.append(f"**Type**: {', '.join(sorted(set(exit_types))) if exit_types else 'balance_read'}")
+            entry.append(f"**Visibility**: {func.visibility}")
+
+            # Caller control
+            if func.modifiers:
+                entry.append(f"**Access control**: {', '.join(func.modifiers)}")
+            elif func.visibility in ("internal", "private"):
+                entry.append(f"**Access control**: {func.visibility} (called by other functions)")
+            else:
+                entry.append(f"**Access control**: NONE — any address can call")
+
+            entry.append(f"**Reentrancy guard**: {'YES' if func.has_reentrancy_guard else 'NO'}")
+
+            # State reads (what influences the amount/destination)
+            if func.reads_state:
+                entry.append(f"**State reads**: {', '.join(func.reads_state[:8])}")
+                if len(func.reads_state) > 8:
+                    entry.append(f"  (+{len(func.reads_state) - 8} more)")
+
+            # State writes (what changes during this operation)
+            if func.writes_state:
+                entry.append(f"**State writes**: {', '.join(func.writes_state[:8])}")
+                if len(func.writes_state) > 8:
+                    entry.append(f"  (+{len(func.writes_state) - 8} more)")
+
+            # External calls before transfer (reentrancy surface)
+            non_library_calls = [c for c in func.external_calls
+                                 if not any(lib in c for lib in ("SafeERC20", "SafeCast", "Math", "Address"))]
+            if non_library_calls:
+                entry.append(f"**External calls**: {', '.join(non_library_calls[:5])}")
+
+            # Parameters (amount source, destination)
+            if func.parameters:
+                entry.append(f"**Parameters**: `{func.parameters}`")
+
+            # Exact value lines from source
+            if value_lines:
+                entry.append("**Value operations**:")
+                for vl in value_lines[:10]:
+                    entry.append(f"  - {vl}")
+
+            contract_exits.append("\n".join(entry))
+
+        if contract_exits:
+            sections.append(f"## {contract.name}")
+            sections.append("")
+            sections.append("\n\n".join(contract_exits))
+            sections.append("")
+
+    if len(sections) <= 2:
+        return ""
+
+    return "\n".join(sections) + "\n"
+
+
+def generate_asset_flow_for_file(contract_file: str) -> str:
+    """
+    Convenience wrapper: generate rich asset flow for a single .sol file.
+    Finds project root, runs Slither, filters to the target contract, returns markdown.
+    Falls back to regex-based output if Slither fails.
+    """
+    contract_path = Path(contract_file).resolve()
+    if not contract_path.exists():
+        return ""
+
+    source_dir = str(contract_path.parent)
+    project_root = _find_project_root(source_dir)
+
+    print(f"[*] Asset flow analysis: {contract_path.name}", file=sys.stderr)
+    print(f"[*] Project root: {project_root}", file=sys.stderr)
+
+    try:
+        contracts = run_layer1_slither(source_dir)
+    except Exception as e:
+        print(f"[!] Slither failed for asset flow: {e}", file=sys.stderr)
+        return ""
+
+    if not contracts:
+        print("[!] No contracts found for asset flow", file=sys.stderr)
+        return ""
+
+    # Filter to contracts in the target file
+    target_name = contract_path.stem
+    filtered = [c for c in contracts if target_name.lower() in c.name.lower()
+                or target_name.lower() in c.file_path.lower()]
+
+    # If no match, use all contracts in scope
+    if not filtered:
+        filtered = contracts
+
+    result = generate_rich_asset_flow(filtered, source_dir)
+
+    if result:
+        lines = result.count("\n")
+        print(f"[+] Asset flow: {lines} lines for {len(filtered)} contracts", file=sys.stderr)
+
+    return result
+
+
+# =============================================================================
 # HELPERS
 # =============================================================================
 
@@ -596,9 +856,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Protocol Analyzer — Generate PROTOCOL_MODEL.md"
     )
-    parser.add_argument("--source", required=True,
+    parser.add_argument("--source", default=None,
                         help="Path to source directory (e.g., ./revert-lend/src)")
-    parser.add_argument("--name", required=True,
+    parser.add_argument("--name", default=None,
                         help="Protocol name (e.g., revert-lend)")
     parser.add_argument("--type", default="unknown",
                         help="Protocol type: lending, dex, staking, bridge, vault, oracle")
@@ -606,8 +866,22 @@ def main():
                         help="Output path (default: source/../PROTOCOL_MODEL.md)")
     parser.add_argument("--no-slither", action="store_true",
                         help="Skip Slither, use regex fallback only")
+    parser.add_argument("--asset-flow", default=None,
+                        help="Generate rich asset flow map for a single .sol file (prints to stdout)")
 
     args = parser.parse_args()
+
+    # Asset flow mode: single file analysis, output to stdout
+    if args.asset_flow:
+        result = generate_asset_flow_for_file(args.asset_flow)
+        if result:
+            print(result)
+        else:
+            print("## Asset Flow Map\nNo value exits detected.", file=sys.stderr)
+        return
+
+    if not args.source or not args.name:
+        parser.error("--source and --name are required (unless using --asset-flow)")
 
     source_dir = os.path.abspath(args.source)
     if not os.path.isdir(source_dir):
