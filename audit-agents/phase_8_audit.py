@@ -5,6 +5,7 @@ debt backlog for Phases 9+. See docs/superpowers/specs/2026-04-19-phase-8-audit-
 """
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import yaml
@@ -208,3 +209,65 @@ def check_docs_sync(*, root: Path, removed_modules: list[str] | None = None, doc
     else:
         status = "PASS" if not hits else "FAIL"
     return CheckResult(name="check_docs_sync", status=status, evidence=evidence, debt_items=debts)
+
+
+def _iter_py_files(pkg_root: Path) -> list[Path]:
+    """Walk pkg_root for .py files, excluding any tests/ subdirectory."""
+    return sorted(p for p in pkg_root.rglob("*.py") if "tests" not in p.relative_to(pkg_root).parts)
+
+
+def _file_loc(path: Path) -> int:
+    return sum(1 for _ in path.read_text(errors="replace").splitlines())
+
+
+def _function_lengths(path: Path) -> list[tuple[str, int]]:
+    try:
+        tree = ast.parse(path.read_text(errors="replace"))
+    except SyntaxError:
+        return []
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.end_lineno is not None:
+                out.append((node.name, node.end_lineno - node.lineno + 1))
+    return out
+
+
+def check_size_inventory(*, root: Path) -> CheckResult:
+    """Report files >800 LOC and functions >100 LOC."""
+    pkg = root / "audit-agents"
+    if not pkg.exists():
+        return CheckResult(name="check_size_inventory", status="ERROR", evidence={"reason": "audit-agents/ missing"})
+    files = _iter_py_files(pkg)
+    file_entries = []
+    debts: list[DebtItem] = []
+    for p in files:
+        loc = _file_loc(p)
+        rel = str(p.relative_to(root))
+        file_entries.append({"path": rel, "loc": loc})
+        if loc >= 2000:
+            sev = "CRITICAL"
+        elif loc >= 1500:
+            sev = "HIGH"
+        elif loc >= 800:
+            sev = "MEDIUM"
+        else:
+            sev = None
+        if sev:
+            debts.append(DebtItem(
+                severity=sev,
+                category="file_size",
+                description=f"{rel} is {loc} LOC ({sev.lower()} threshold)",
+                evidence={"path": rel, "loc": loc},
+            ))
+        for name, flen in _function_lengths(p):
+            if flen >= 200:
+                debts.append(DebtItem(severity="HIGH", category="function_size",
+                    description=f"{rel}::{name} is {flen} LOC", evidence={"path": rel, "function": name, "loc": flen}))
+            elif flen >= 100:
+                debts.append(DebtItem(severity="MEDIUM", category="function_size",
+                    description=f"{rel}::{name} is {flen} LOC", evidence={"path": rel, "function": name, "loc": flen}))
+    evidence = {"file_count": len(files), "files": sorted(file_entries, key=lambda e: -e["loc"])[:20]}
+    has_high = any(d.severity in ("CRITICAL", "HIGH") for d in debts)
+    status = "WARN" if has_high else "PASS"
+    return CheckResult(name="check_size_inventory", status=status, evidence=evidence, debt_items=debts)

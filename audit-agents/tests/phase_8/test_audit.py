@@ -218,3 +218,44 @@ def test_check_docs_sync_missing_doc_is_warn(tmp_path):
     r = check_docs_sync(root=tmp_path, removed_modules=["run_hunt"], docs=["DOES_NOT_EXIST.md"])
     assert r.status == "WARN"
     assert "DOES_NOT_EXIST.md" in str(r.evidence)
+
+
+from phase_8_audit import check_size_inventory
+
+
+def test_check_size_inventory_under_thresholds(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "small.py").write_text("def a():\n    return 1\n")
+    r = check_size_inventory(root=tmp_path)
+    assert r.status == "PASS"
+    assert r.evidence["file_count"] == 1
+    assert r.debt_items == []
+
+
+def test_check_size_inventory_flags_critical_file(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    lines = "\n".join([f"x{i} = {i}" for i in range(2100)])
+    (pkg / "huge.py").write_text(lines + "\n")
+    r = check_size_inventory(root=tmp_path)
+    assert r.status == "WARN"
+    assert any(d.severity == "CRITICAL" and "huge.py" in d.description for d in r.debt_items)
+
+
+def test_check_size_inventory_flags_large_function(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    body = "\n".join([f"    y{i} = {i}" for i in range(150)])
+    (pkg / "fn.py").write_text(f"def huge_fn():\n{body}\n    return 1\n")
+    r = check_size_inventory(root=tmp_path)
+    assert any(d.category == "function_size" and "huge_fn" in d.description for d in r.debt_items)
+
+
+def test_check_size_inventory_excludes_tests(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    (pkg / "tests").mkdir(parents=True)
+    lines = "\n".join([f"x{i} = {i}" for i in range(2100)])
+    (pkg / "tests" / "test_huge.py").write_text(lines + "\n")
+    r = check_size_inventory(root=tmp_path)
+    assert r.debt_items == []
