@@ -596,20 +596,23 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         )
 
         # Rescue DeepDive YAML: Claude may write to cwd (worktree root) instead of hyp_dir.
-        # Use find to locate the file wherever it landed in the worktree, then copy to hyp_dir.
-        dd_yaml_target = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
-        if not dd_yaml_target.exists():
-            import shutil as _shutil_dd
-            import subprocess as _sp_dd
-            _find = _sp_dd.run(
+        def _rescue_deepdive_yaml(context_label: str) -> bool:
+            target = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
+            if target.exists():
+                return True
+            _find_out = subprocess.run(
                 ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
                 capture_output=True, text=True
             )
-            for _found in _find.stdout.strip().splitlines():
-                if _found and Path(_found) != dd_yaml_target:
-                    _shutil_dd.copy2(_found, dd_yaml_target)
-                    logger.info(f"  Rescued DeepDive YAML from worktree: {Path(_found).name} → {hyp_dir.name}/")
-                    break
+            for _found in _find_out.stdout.strip().splitlines():
+                if _found and Path(_found) != target:
+                    import shutil as _sh_rescue
+                    _sh_rescue.copy2(_found, target)
+                    logger.info(f"  {context_label}: rescued {Path(_found).name} → {hyp_dir.name}/")
+                    return True
+            return False
+
+        _rescue_deepdive_yaml("DeepDive rescue")
 
         deepdive_ok = _rb.check_gate(component, "deepdive", protocol, repo)
         summary["gates"]["deepdive"] = deepdive_ok
@@ -723,21 +726,6 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             logger.info(f"  Step 5b: Cached chimera setup → {_persist_dir}")
         except Exception as _e_cache:
             logger.warning(f"  Step 5b: Could not persist chimera cache: {_e_cache}")
-
-        # ─── Step 5c: Second-chance rescue of DeepDive YAML before merge ──────
-        # (Primary rescue is right after run_claude; this catches any edge cases)
-        dd_yaml_pre = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
-        if not dd_yaml_pre.exists():
-            import shutil as _shutil_pre, subprocess as _sp_pre
-            _find2 = _sp_pre.run(
-                ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
-                capture_output=True, text=True
-            )
-            for _f2 in _find2.stdout.strip().splitlines():
-                if _f2 and Path(_f2) != dd_yaml_pre:
-                    _shutil_pre.copy2(_f2, dd_yaml_pre)
-                    logger.info(f"  Pre-merge rescue: {Path(_f2).name} → {hyp_dir.name}/")
-                    break
 
         # ─── Step 6: Merge Invariants (setup-aware) ──────────────────────────
         logger.info("  Step 6: Merge Invariants")
