@@ -2,21 +2,21 @@
 
 ## Executive Summary
 
-- Gates: 1 PASS / 2 FAIL / 4 WARN / 0 ERROR
-- Debt: 1 CRITICAL / 16 HIGH / 46 MEDIUM / 195 LOW
-- Roadmap verdict: **FAILED**
+- Gates: 4 PASS / 0 FAIL / 3 WARN / 0 ERROR
+- Debt: 1 CRITICAL / 14 HIGH / 46 MEDIUM / 195 LOW
+- Roadmap verdict: **PARTIAL**
 
 ## Per-check results
 
-### ❌ check_test_suite — FAIL
+### ✅ check_test_suite — PASS
 
 Evidence:
 
 ```json
 {
-  "passed": 220,
-  "expected": 138,
-  "returncode": 1
+  "passed": 224,
+  "expected": 224,
+  "returncode": 0
 }
 ```
 
@@ -56,7 +56,7 @@ Evidence:
 }
 ```
 
-### ❌ check_parity_matrix — FAIL
+### ✅ check_parity_matrix — PASS
 
 Evidence:
 
@@ -74,7 +74,7 @@ Evidence:
 }
 ```
 
-### ⚠️ check_docs_sync — WARN
+### ✅ check_docs_sync — PASS
 
 Evidence:
 
@@ -84,9 +84,7 @@ Evidence:
   "docs_checked": [
     "CLAUDE.md",
     "WIKI.md",
-    "HUNT_TRACKER.md"
-  ],
-  "missing_docs": [
+    "HUNT_TRACKER.md",
     "README.md"
   ]
 }
@@ -310,22 +308,20 @@ Evidence:
 
 ### HIGH
 
-- **HIGH-01** [test_regression] pytest: expected 138 passed, got 220 (returncode=1)
-- **HIGH-02** [stale_claim] F036 (added_phase_6): modern_location 'audit-agents/benchmark/component_pipeline.py' missing
-- **HIGH-03** [file_size] audit-agents/agents/v2/zk_circuit_agent.py is 1520 LOC (high threshold)
-- **HIGH-04** [function_size] audit-agents/benchmark/cli.py::main is 538 LOC
-- **HIGH-05** [file_size] audit-agents/benchmark/component_pipeline/runner.py is 1608 LOC (high threshold)
-- **HIGH-06** [function_size] audit-agents/benchmark/component_pipeline/runner.py::run_component_pipeline is 1573 LOC
-- **HIGH-07** [function_size] audit-agents/benchmark/cross_component.py::run_cross_component is 441 LOC
-- **HIGH-08** [function_size] audit-agents/benchmark.py::cmd_score_hypotheses is 225 LOC
-- **HIGH-09** [function_size] audit-agents/hybrid_pipeline.py::main is 269 LOC
-- **HIGH-10** [function_size] audit-agents/merge_invariants.py::run_split_mode is 219 LOC
-- **HIGH-11** [file_size] audit-agents/pipeline_gate.py is 1982 LOC (high threshold)
-- **HIGH-12** [function_size] audit-agents/plan/cli.py::main is 222 LOC
-- **HIGH-13** [function_size] audit-agents/plan/generator.py::_add_component_steps is 382 LOC
-- **HIGH-14** [function_size] audit-agents/plan/post_compile.py::phase_post_compile is 235 LOC
-- **HIGH-15** [function_size] audit-agents/plan/prompts_rust.py::_phase_findings_rust is 225 LOC
-- **HIGH-16** [function_size] audit-agents/report_finding.py::main is 286 LOC
+- **HIGH-01** [file_size] audit-agents/agents/v2/zk_circuit_agent.py is 1520 LOC (high threshold)
+- **HIGH-02** [function_size] audit-agents/benchmark/cli.py::main is 538 LOC
+- **HIGH-03** [file_size] audit-agents/benchmark/component_pipeline/runner.py is 1608 LOC (high threshold)
+- **HIGH-04** [function_size] audit-agents/benchmark/component_pipeline/runner.py::run_component_pipeline is 1573 LOC
+- **HIGH-05** [function_size] audit-agents/benchmark/cross_component.py::run_cross_component is 441 LOC
+- **HIGH-06** [function_size] audit-agents/benchmark.py::cmd_score_hypotheses is 225 LOC
+- **HIGH-07** [function_size] audit-agents/hybrid_pipeline.py::main is 269 LOC
+- **HIGH-08** [function_size] audit-agents/merge_invariants.py::run_split_mode is 219 LOC
+- **HIGH-09** [file_size] audit-agents/pipeline_gate.py is 1982 LOC (high threshold)
+- **HIGH-10** [function_size] audit-agents/plan/cli.py::main is 222 LOC
+- **HIGH-11** [function_size] audit-agents/plan/generator.py::_add_component_steps is 382 LOC
+- **HIGH-12** [function_size] audit-agents/plan/post_compile.py::phase_post_compile is 235 LOC
+- **HIGH-13** [function_size] audit-agents/plan/prompts_rust.py::_phase_findings_rust is 225 LOC
+- **HIGH-14** [function_size] audit-agents/report_finding.py::main is 286 LOC
 
 ### MEDIUM
 
@@ -576,6 +572,6 @@ Evidence:
 
 ## Roadmap closure
 
-Phase 8 status: **COMPLETE**. Verdict: **FAILED**.
+Phase 8 status: **COMPLETE**. Verdict: **PARTIAL**.
 
 Next: Phase 9+ addresses the backlog above, prioritized by severity.
