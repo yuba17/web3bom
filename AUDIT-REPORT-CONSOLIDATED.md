@@ -20,7 +20,7 @@
 ### 3. HERRAMIENTAS DESCONECTADAS
 - 57 pasos en el workflow, solo 33% automatizado
 - No hay LLM orchestrator (cada prompt es copy-paste manual)
-- hybrid_pipeline.py y agents/v2/pipeline.py son generadores de prompts, NO pipelines
+- ~~hybrid_pipeline.py~~ y agents/v2/pipeline.py eran generadores de prompts, NO pipelines (hybrid_pipeline.py removido Phase 10)
 - No hay orquestador end-to-end conectando las herramientas
 
 ### 4. COBERTURA DESIGUAL

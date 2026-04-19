@@ -677,7 +677,6 @@ false_positives:
 | `registry.py` | 293 invariants, 13 categorías | ✅ cargado |
 | `scaffold.py` | Genera proyecto Foundry | ✅ funcional |
 | `detection_engine.py` | Multi-layer detection | ✅ funcional |
-| `hybrid_pipeline.py` | Pipeline semi-manual | ⚠️ manual |
 | `poc_generator.py` | Template de PoC | ⚠️ parcial |
 | `report_generator.py` | Formato C4/Immunefi/Cantina | ⚠️ parcial |
 

@@ -20,7 +20,7 @@ and convert those into accepted reports at >60% acceptance rate.
 
 What we HAVE (v2):
 - 129 invariants in registry, 13 categories
-- hybrid_pipeline.py (prompt-based, semi-manual)
+- ~~hybrid_pipeline.py~~ (prompt-based, semi-manual — removed Phase 10, superseded by run_benchmark.py)
 - matcher.py (pattern matching against invariant registry)
 - scaffold.py (contest quickstart)
 - bounty_monitor_v2.py (target discovery)
@@ -441,9 +441,10 @@ Confirmed Finding
 | Invariant registry feedback updater | 1 day | SQLite tracker | **Not started** |
 | Dashboard (CLI-based) | 2 days | SQLite | **Not started** |
 
-**Key enabler:** Replace the current prompt-template approach in hybrid_pipeline.py
-with actual Claude API calls. The current system generates .md files for manual
-copy-paste. The v3 system calls the API directly and pipes outputs between steps.
+**Key enabler:** Replace the prompt-template approach that hybrid_pipeline.py
+once used (removed Phase 10) with actual Claude API calls. That system generated
+.md files for manual copy-paste. The v3 system calls the API directly and pipes
+outputs between steps — now implemented via run_benchmark.py + Agent Teams.
 
 ### Tier 2: Buildable in 1-3 Months
 
