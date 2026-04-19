@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -82,3 +83,64 @@ def check_clis(*, root: Path, scripts: list[str] | None = None) -> CheckResult:
             ))
     status = "PASS" if not debts else "FAIL"
     return CheckResult(name="check_clis", status=status, evidence={"clis": cli_results}, debt_items=debts)
+
+
+def load_parity_matrix(path: Path) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def _strip_location_qualifier(loc: str) -> str:
+    """'run_benchmark.py (section X)' -> 'run_benchmark.py'; keep 'foo.py' as-is."""
+    return loc.split(" ")[0].split(":")[0] if loc else ""
+
+
+def check_parity_matrix(*, root: Path, matrix_path: Path) -> CheckResult:
+    """Validate every entry in the parity matrix and arithmetic of summary."""
+    try:
+        data = load_parity_matrix(matrix_path)
+    except Exception as e:
+        return CheckResult(
+            name="check_parity_matrix",
+            status="ERROR",
+            evidence={"error": str(e)},
+            debt_items=[DebtItem(severity="CRITICAL", category="parse", description=f"YAML parse failed: {e}", evidence={})],
+        )
+    debts: list[DebtItem] = []
+    features = data.get("features", [])
+    for feat in features:
+        fid = feat.get("id", "?")
+        decision = feat.get("migration_decision", "")
+        if decision in ("migrated", "added_phase_5", "added_phase_6"):
+            modern = _strip_location_qualifier(feat.get("modern_location", ""))
+            if modern and not (root / modern).exists():
+                debts.append(DebtItem(
+                    severity="HIGH",
+                    category="stale_claim",
+                    description=f"{fid} ({decision}): modern_location '{modern}' missing",
+                    evidence={"entry": fid, "path": modern},
+                ))
+        elif decision == "deprecated":
+            legacy = _strip_location_qualifier(feat.get("legacy_location", ""))
+            if legacy and (root / legacy).exists():
+                debts.append(DebtItem(
+                    severity="HIGH",
+                    category="stale_claim",
+                    description=f"{fid} (deprecated): legacy_location '{legacy}' still exists",
+                    evidence={"entry": fid, "path": legacy},
+                ))
+    summary = data.get("summary", {})
+    total = summary.get("total_features", 0)
+    by_decision = summary.get("by_decision", {}) or {}
+    declared_sum = sum(by_decision.values()) if by_decision else 0
+    actual_count = len(features)
+    if total != declared_sum or total != actual_count:
+        debts.append(DebtItem(
+            severity="MEDIUM",
+            category="arithmetic",
+            description=f"summary arithmetic: total={total}, by_decision_sum={declared_sum}, features_count={actual_count}",
+            evidence={"total": total, "by_decision_sum": declared_sum, "features_count": actual_count},
+        ))
+    evidence = {"total": actual_count, "by_decision": by_decision, "summary_total": total}
+    status = "PASS" if not debts else "FAIL"
+    return CheckResult(name="check_parity_matrix", status=status, evidence=evidence, debt_items=debts)

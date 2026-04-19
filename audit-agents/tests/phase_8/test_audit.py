@@ -1,5 +1,6 @@
 """Phase 8 audit tests — scaffold."""
 import sys
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -93,3 +94,92 @@ def test_check_clis_one_fails():
     assert any(c["exit_code"] == 2 for c in r.evidence["clis"])
     assert len(r.debt_items) == 1
     assert "pipeline_gate" in r.debt_items[0].description
+
+
+from phase_8_audit import check_parity_matrix, load_parity_matrix
+
+
+def _write_matrix(tmp_path: Path, content: str) -> Path:
+    p = tmp_path / "parity.yaml"
+    p.write_text(textwrap.dedent(content))
+    return p
+
+
+def test_load_parity_matrix_parses_entries(tmp_path):
+    p = _write_matrix(tmp_path, """
+    features:
+      - id: F001
+        modern_location: "audit-agents/foo.py"
+        migration_decision: migrated
+    summary:
+      total_features: 1
+      by_decision:
+        migrated: 1
+    """)
+    d = load_parity_matrix(p)
+    assert d["features"][0]["id"] == "F001"
+
+
+def test_check_parity_matrix_all_valid(tmp_path):
+    (tmp_path / "audit-agents").mkdir()
+    (tmp_path / "audit-agents" / "foo.py").write_text("# ok")
+    p = _write_matrix(tmp_path, """
+    features:
+      - id: F001
+        modern_location: "audit-agents/foo.py"
+        migration_decision: migrated
+    summary:
+      total_features: 1
+      by_decision:
+        migrated: 1
+        deprecated: 0
+        keep_standalone: 0
+        added_phase_5: 0
+        added_phase_6: 0
+    """)
+    r = check_parity_matrix(root=tmp_path, matrix_path=p)
+    assert r.status == "PASS"
+    assert r.evidence["total"] == 1
+    assert r.debt_items == []
+
+
+def test_check_parity_matrix_migrated_file_missing(tmp_path):
+    p = _write_matrix(tmp_path, """
+    features:
+      - id: F001
+        modern_location: "audit-agents/missing.py"
+        migration_decision: migrated
+    summary:
+      total_features: 1
+      by_decision:
+        migrated: 1
+        deprecated: 0
+        keep_standalone: 0
+        added_phase_5: 0
+        added_phase_6: 0
+    """)
+    r = check_parity_matrix(root=tmp_path, matrix_path=p)
+    assert r.status == "FAIL"
+    assert any("F001" in d.description for d in r.debt_items)
+
+
+def test_check_parity_matrix_summary_arithmetic_mismatch(tmp_path):
+    (tmp_path / "audit-agents").mkdir()
+    (tmp_path / "audit-agents" / "foo.py").write_text("# ok")
+    p = _write_matrix(tmp_path, """
+    features:
+      - id: F001
+        modern_location: "audit-agents/foo.py"
+        migration_decision: migrated
+    summary:
+      total_features: 2
+      by_decision:
+        migrated: 1
+        deprecated: 0
+        keep_standalone: 0
+        added_phase_5: 0
+        added_phase_6: 0
+    """)
+    r = check_parity_matrix(root=tmp_path, matrix_path=p)
+    assert r.status == "FAIL"
+    assert any(d.category == "arithmetic" for d in r.debt_items)
