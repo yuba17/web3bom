@@ -5,10 +5,12 @@ debt backlog for Phases 9+. See docs/superpowers/specs/2026-04-19-phase-8-audit-
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import re
 import subprocess
+import sys
 import yaml
 from collections import Counter
 from dataclasses import dataclass, field
@@ -520,3 +522,67 @@ def check_shim_status(*, root: Path, shims: list[str] | None = None) -> CheckRes
     has_issue = bool(debts)
     status = "WARN" if has_issue else "PASS"
     return CheckResult(name="check_shim_status", status=status, evidence=evidence, debt_items=debts)
+
+
+# ---------------------------------------------------------------------------
+# Task 10: CLI entrypoint — argparse + exit codes + single-check mode
+# ---------------------------------------------------------------------------
+
+_ALL_CHECKS = {
+    "check_test_suite": lambda root: check_test_suite(root=root),
+    "check_clis": lambda root: check_clis(root=root),
+    "check_parity_matrix": lambda root: check_parity_matrix(
+        root=root, matrix_path=root / "docs/superpowers/specs/2026-04-17-phase-0-parity-matrix.yaml"),
+    "check_docs_sync": lambda root: check_docs_sync(root=root),
+    "check_size_inventory": lambda root: check_size_inventory(root=root),
+    "check_dead_code_residual": lambda root: check_dead_code_residual(root=root),
+    "check_shim_status": lambda root: check_shim_status(root=root),
+}
+
+_DEFAULT_JSON = "audit-agents/audit_report.json"
+_DEFAULT_MD = "docs/superpowers/specs/2026-04-19-phase-8-audit-report.md"
+
+
+def _exit_code(results: list[CheckResult], fail_on: str | None) -> int:
+    statuses = {r.status for r in results}
+    if "ERROR" in statuses:
+        return 3
+    if "FAIL" in statuses:
+        return 1
+    if fail_on == "WARN" and "WARN" in statuses:
+        return 2
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Phase 8 audit — roadmap closure")
+    parser.add_argument("--root", default=".", help="Repo root (default: cwd)")
+    parser.add_argument("--check", help="Run a single check and print to stdout")
+    parser.add_argument("--json-only", action="store_true")
+    parser.add_argument("--md-only", action="store_true")
+    parser.add_argument("--json-path", default=None)
+    parser.add_argument("--md-path", default=None)
+    parser.add_argument("--fail-on", choices=["WARN"], default=None)
+    args = parser.parse_args(argv)
+    root = Path(args.root).resolve()
+
+    if args.check:
+        if args.check not in _ALL_CHECKS:
+            print(f"unknown check: {args.check}", file=sys.stderr)
+            print(f"available: {', '.join(_ALL_CHECKS)}", file=sys.stderr)
+            return 4
+        r = _ALL_CHECKS[args.check](root)
+        print(f"{r.name}: {r.status}")
+        print(json.dumps({"evidence": r.evidence, "debts": [d.__dict__ for d in r.debt_items]}, indent=2, default=str))
+        return _exit_code([r], args.fail_on)
+
+    results = [fn(root) for fn in _ALL_CHECKS.values()]
+    if not args.md_only:
+        render_json(results, Path(args.json_path) if args.json_path else root / _DEFAULT_JSON)
+    if not args.json_only:
+        render_markdown(results, Path(args.md_path) if args.md_path else root / _DEFAULT_MD)
+    return _exit_code(results, args.fail_on)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -388,3 +388,51 @@ def test_render_markdown_verdict_failed_on_fail():
     r = [CheckResult(name="a", status="FAIL", evidence={})]
     from phase_8_audit import _roadmap_verdict
     assert _roadmap_verdict(r) == "FAILED"
+
+
+from phase_8_audit import main
+
+
+def _stub_all_checks(monkeypatch, results):
+    for r in results:
+        monkeypatch.setattr(f"phase_8_audit.{r.name}", lambda *, root, _r=r, **kw: _r)
+
+
+def test_cli_all_checks_pass_exit_0(tmp_path, monkeypatch):
+    results = [CheckResult(name=n, status="PASS", evidence={}) for n in [
+        "check_test_suite", "check_clis", "check_parity_matrix", "check_docs_sync",
+        "check_size_inventory", "check_dead_code_residual", "check_shim_status"
+    ]]
+    _stub_all_checks(monkeypatch, results)
+    exit_code = main(["--root", str(tmp_path), "--json-only", "--json-path", str(tmp_path / "r.json")])
+    assert exit_code == 0
+    assert (tmp_path / "r.json").exists()
+
+
+def test_cli_fail_on_warn_exits_2(tmp_path, monkeypatch):
+    results = [CheckResult(name="check_test_suite", status="PASS", evidence={}),
+               CheckResult(name="check_size_inventory", status="WARN", evidence={})]
+    def stub(name, res):
+        return lambda *, root, **kw: res
+    monkeypatch.setattr("phase_8_audit.check_test_suite", stub("check_test_suite", results[0]))
+    monkeypatch.setattr("phase_8_audit.check_size_inventory", stub("check_size_inventory", results[1]))
+    for n in ["check_clis", "check_parity_matrix", "check_docs_sync", "check_dead_code_residual", "check_shim_status"]:
+        monkeypatch.setattr(f"phase_8_audit.{n}", lambda *, root, _n=n, **kw: CheckResult(name=_n, status="PASS", evidence={}))
+    exit_code = main(["--root", str(tmp_path), "--json-only",
+                      "--json-path", str(tmp_path / "r.json"), "--fail-on", "WARN"])
+    assert exit_code == 2
+
+
+def test_cli_single_check_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("phase_8_audit.check_test_suite",
+                        lambda *, root, **kw: CheckResult(name="check_test_suite", status="PASS", evidence={"passed": 138}))
+    exit_code = main(["--root", str(tmp_path), "--check", "check_test_suite"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "check_test_suite" in captured.out
+    assert "PASS" in captured.out
+
+
+def test_cli_unknown_check_errors(tmp_path):
+    exit_code = main(["--root", str(tmp_path), "--check", "bogus"])
+    assert exit_code != 0
