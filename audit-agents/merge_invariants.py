@@ -50,40 +50,19 @@ from collections import defaultdict
 
 from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
 from state_manager import load_state
+from merge.constants import (
+    HUNTER_FILE_MAP,
+    CROSS_COMPONENT_HUNTERS,
+    _PRAGMA,
+    REQUIRED_HYP_FIELDS,
+    HUNTER_REQUIRED_TABLES,
+)
 
 def get_hyp_dir(protocol: str) -> Path:
     """Return protocol-namespaced hypotheses directory."""
     d = HUNT_SESSION_DIR / "hypotheses" / protocol
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-# Mapeo hunter → sufijo del archivo
-HUNTER_FILE_MAP = {
-    "MathHunter":           "Math",
-    "AccessHunter":         "Access",
-    "FlowHunter":           "Flow",
-    "DomainHunter":         "Domain",
-    "OracleHunter":         "Oracle",
-    "DoSHunter":            "DoS",
-    "WildcardHunter":       "Wildcard",
-    "TrustBoundaryHunter":  "Trust",
-    "SignatureHunter":       "Signature",
-    "LogicHunter":          "Logic",
-    "AdversarialHunter":    "Adversarial",
-    "LibraryHunter":        "Library",
-    "DeepDiveHunter":       "DeepDive",
-    "CrossChainHunter":     "CrossChain",
-    "EdgeHunter":           "Cross",
-}
-
-# EdgeHunter hypotheses need special handling: they reference TWO contracts
-CROSS_COMPONENT_HUNTERS = {"EdgeHunter"}
-
-# Default pragma — overridden by detect_pragma()
-_PRAGMA = "pragma solidity ^0.8.0;"
-
-# ── Hypothesis YAML validation (Task 12) ──────────────────────────────
-REQUIRED_HYP_FIELDS = {"id", "description", "solidity"}
 
 def validate_hypothesis(hyp: dict, source_file: str) -> list[str]:
     """Validate a single hypothesis. Returns list of warnings."""
@@ -211,17 +190,6 @@ def load_hypothesis_file(path: Path) -> dict | None:
     except Exception as e:
         print(f"  ✗ Error leyendo {path.name}: {e}")
         return None
-
-
-# Required structured evidence tables per hunter (added 2026-04)
-HUNTER_REQUIRED_TABLES = {
-    "MathHunter": ["decimal_analysis", "boundary_analysis"],
-    "FlowHunter": ["derived_state_map"],
-    "AccessHunter": ["state_var_lifecycle"],
-    "DoSHunter": ["loop_termination"],
-    "DomainHunter": ["parameter_consistency"],
-    "TrustBoundaryHunter": ["integration_assumptions"],
-}
 
 
 def validate_evidence_tables(hyp_data: dict) -> list[str]:
