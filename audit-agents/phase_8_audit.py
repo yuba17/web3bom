@@ -38,7 +38,7 @@ class CheckResult:
     debt_items: list[DebtItem] = field(default_factory=list)
 
 
-def check_test_suite(*, root: Path, expected_count: int = 138) -> CheckResult:
+def check_test_suite(*, root: Path, expected_count: int = 224) -> CheckResult:
     """Run pytest over audit-agents/tests and verify expected_count passed."""
     proc = subprocess.run(
         ["python3", "-m", "pytest", "audit-agents/tests/", "-q"],
