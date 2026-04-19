@@ -913,9 +913,11 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                 summary["status"] = "BLOCKED_COMPILE"
                 return summary
 
-        # ─── Step 7.5: Enhance TargetFunctions with attack sequences ────────
+        # ─── Step 7.5: Enhance TargetFunctions with attack sequences (opt-in) ────
         if _skip_to_extract:
             logger.info("  Skipping Step 7.5 (compile failed, fast mode)")
+        elif not getattr(args, 'enhance_targets', False):
+            logger.info("  Step 7.5 skipped (activate with --enhance-targets)")
         else:
             logger.info("  Step 7.5: Enhance TargetFunctions with attack sequences")
             target_funcs_path = chimera_dir / "TargetFunctions.sol"

@@ -180,6 +180,10 @@ def main():
                         help="If prepass produces 0 findings, skip hunters+merge+fuzz+PoC for this "
                              "component and return early. Use for protocols already audited exhaustively "
                              "(ToB/OZ/Cyfrin) — saves ~40min on components with no detectable signals.")
+    parser.add_argument("--enhance-targets", action="store_true",
+                        help="Run Step 7.5 (LLM enhances TargetFunctions.sol with multi-step attack "
+                             "sequences). Disabled by default — empirically adds 10-15min, often breaks "
+                             "compile and reverts. Hunters already produce TargetFunctions handlers via merge.")
     parser.add_argument("--hunters", default="",
                         help="Comma-separated subset of hunter names to run "
                              "(e.g., 'MathHunter,AccessHunter'). Default: all. "
