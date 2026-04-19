@@ -30,7 +30,7 @@ Editar cualquiera requiere cargar las otras siete en contexto. El archivo cabe a
 Patrón validado en Fase 6: **paquete + shim de compat**.
 
 - `audit-agents/pipeline_gate.py` → shim `<50 LOC` con re-exports marcados `# noqa: F401`. Preserva `from pipeline_gate import X`, `pipeline_gate.STATE_FILE`, el entry-point CLI (`python3 audit-agents/pipeline_gate.py --help`), y los tests existentes sin tocar sus imports.
-- `audit-agents/pipeline_gate/` paquete nuevo con 8 módulos + `__init__.py`.
+- `audit-agents/gate/` paquete nuevo con 8 módulos + `__init__.py`.
 
 Todo el código se preserva verbatim en la primera fase del split — misma lógica, mismo comportamiento observable. Ninguna feature nueva, ningún bugfix encubierto.
 
@@ -55,7 +55,7 @@ El shim `pipeline_gate.py` debe re-exportar (en este orden mínimo, vía `# noqa
 
 ```python
 # constants
-from pipeline_gate.constants import (
+from gate.constants import (
     HUNTER_NAMES, GATE_ORDER, DISPLAY_GATES,
     get_hyp_dir, get_context_dir, get_gate_status_file, _get_protocol,
 )
@@ -63,26 +63,26 @@ from pipeline_gate.constants import (
 from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
 from state_manager import load_state, save_state as _sm_save_state
 # ficha
-from pipeline_gate.ficha import load_ficha, update_ficha
+from gate.ficha import load_ficha, update_ficha
 # gates_component
-from pipeline_gate.gates_component import (
+from gate.gates_component import (
     check_scope, check_hunters, check_deepdive, check_crosschain,
     check_merge, check_compile, check_phase1, check_phase2, check_phase3,
     check_phase4, check_phase5, check_prepass, GATE_CHECKS,
 )
 # scope_master
-from pipeline_gate.scope_master import (
+from gate.scope_master import (
     _find_scope_master, _scope_master_update_component,
     _scope_master_update_coverage, scope_master_on_complete,
     scope_master_on_review, scope_master_on_finding, show_scope_status,
 )
 # gate_status
-from pipeline_gate.gate_status import (
+from gate.gate_status import (
     _map_gate_state, _load_gate_status, _save_gate_status,
     export_gate_status, run_gate, show_status, mark_gate,
 )
 # gates_finding
-from pipeline_gate.gates_finding import (
+from gate.gates_finding import (
     _check_poc_uses_fork, _find_hyp_with_finding,
     check_finding_poc, check_finding_escalation, check_finding_variant,
     check_finding_redteam, check_finding_verify, check_finding_report,
@@ -91,12 +91,12 @@ from pipeline_gate.gates_finding import (
     mark_finding_gate,
 )
 # finding_queue
-from pipeline_gate.finding_queue import (
+from gate.finding_queue import (
     _save_state, generate_queue_id, queue_finding,
     list_queue, queue_update, queue_promote,
 )
 # cli
-from pipeline_gate.cli import main
+from gate.cli import main
 
 if __name__ == "__main__":
     main()
@@ -183,7 +183,7 @@ Baseline a mantener en cada tarea: **224/224 passed** tras cada commit.
 Añadir `audit-agents/tests/phase_9/test_shim_reexports.py` (~30 LOC):
 
 ```python
-"""Shim contract: all documented symbols are re-exported from pipeline_gate."""
+"""Shim contract: all documented symbols are re-exported from gate."""
 import pipeline_gate
 
 EXPECTED_PUBLIC = {
@@ -239,7 +239,7 @@ Este test protege el contrato y atrapa regresiones si alguien accidentalmente bo
 Tras extraer cada módulo, ejecutar:
 
 ```bash
-python3 -c "from pipeline_gate.<module> import <sym1>, <sym2>"
+python3 -c "from gate.<module> import <sym1>, <sym2>"
 python3 -m pytest audit-agents/tests/ -q  # 224 passed
 python3 audit-agents/pipeline_gate.py --help > /dev/null  # CLI exit 0
 ```
@@ -250,14 +250,14 @@ Añadir una entrada por cada módulo nuevo (8 entries F047-F054) con `migration_
 
 | ID | Módulo | legacy_location | modern_location |
 |---|---|---|---|
-| F047 | constants | `pipeline_gate.py (Paths + constants section)` | `audit-agents/pipeline_gate/constants.py` |
-| F048 | ficha | `pipeline_gate.py (State helpers section)` | `audit-agents/pipeline_gate/ficha.py` |
-| F049 | gates_component | `pipeline_gate.py (Gate checks section)` | `audit-agents/pipeline_gate/gates_component.py` |
-| F050 | scope_master | `pipeline_gate.py (SCOPE_MASTER section)` | `audit-agents/pipeline_gate/scope_master.py` |
-| F051 | gate_status | `pipeline_gate.py (Gate Status JSON Export section)` | `audit-agents/pipeline_gate/gate_status.py` |
-| F052 | gates_finding | `pipeline_gate.py (Finding Pipeline Gates section)` | `audit-agents/pipeline_gate/gates_finding.py` |
-| F053 | finding_queue | `pipeline_gate.py (Finding Queue section)` | `audit-agents/pipeline_gate/finding_queue.py` |
-| F054 | cli | `pipeline_gate.py (Main section)` | `audit-agents/pipeline_gate/cli.py` |
+| F047 | constants | `pipeline_gate.py (Paths + constants section)` | `audit-agents/gate/constants.py` |
+| F048 | ficha | `pipeline_gate.py (State helpers section)` | `audit-agents/gate/ficha.py` |
+| F049 | gates_component | `pipeline_gate.py (Gate checks section)` | `audit-agents/gate/gates_component.py` |
+| F050 | scope_master | `pipeline_gate.py (SCOPE_MASTER section)` | `audit-agents/gate/scope_master.py` |
+| F051 | gate_status | `pipeline_gate.py (Gate Status JSON Export section)` | `audit-agents/gate/gate_status.py` |
+| F052 | gates_finding | `pipeline_gate.py (Finding Pipeline Gates section)` | `audit-agents/gate/gates_finding.py` |
+| F053 | finding_queue | `pipeline_gate.py (Finding Queue section)` | `audit-agents/gate/finding_queue.py` |
+| F054 | cli | `pipeline_gate.py (Main section)` | `audit-agents/gate/cli.py` |
 
 Summary block:
 - `total_features: 46 → 54`
