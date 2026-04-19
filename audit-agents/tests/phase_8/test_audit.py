@@ -329,3 +329,62 @@ def test_check_shim_status_orphan_reexport(tmp_path):
     (pkg / "plan_generator.py").write_text("# empty\n")
     r = check_shim_status(root=tmp_path)
     assert any(d.category == "orphan_reexport" and "orphan_fn" in d.description for d in r.debt_items)
+
+
+import json as _json
+
+from phase_8_audit import render_json, render_markdown
+
+
+def test_render_json_schema(tmp_path):
+    results = [
+        CheckResult(name="check_test_suite", status="PASS", evidence={"passed": 138}),
+        CheckResult(name="check_size_inventory", status="WARN", evidence={"file_count": 60},
+                    debt_items=[DebtItem(severity="HIGH", category="file_size", description="x.py 1500 LOC", evidence={"loc": 1500})]),
+    ]
+    out = tmp_path / "report.json"
+    render_json(results, out)
+    data = _json.loads(out.read_text())
+    assert "generated_at" in data
+    assert "summary" in data
+    assert data["summary"]["gates"]["PASS"] == 1
+    assert data["summary"]["gates"]["WARN"] == 1
+    assert data["summary"]["debt_items"]["HIGH"] == 1
+    assert len(data["checks"]) == 2
+
+
+def test_render_markdown_has_required_sections(tmp_path):
+    results = [
+        CheckResult(name="check_test_suite", status="PASS", evidence={"passed": 138}),
+        CheckResult(name="check_size_inventory", status="WARN", evidence={"file_count": 60},
+                    debt_items=[DebtItem(severity="HIGH", category="file_size", description="x.py 1500 LOC", evidence={"loc": 1500})]),
+    ]
+    out = tmp_path / "report.md"
+    render_markdown(results, out)
+    text = out.read_text()
+    assert "# Phase 8 Audit Report" in text
+    assert "## Executive Summary" in text
+    assert "## Per-check results" in text
+    assert "## Debt Backlog" in text
+    assert "## Roadmap closure" in text
+    assert "check_test_suite" in text
+    assert "x.py 1500 LOC" in text
+
+
+def test_render_markdown_verdict_successful_when_no_fail():
+    r = [CheckResult(name="a", status="PASS", evidence={})]
+    from phase_8_audit import _roadmap_verdict
+    assert _roadmap_verdict(r) == "SUCCESSFUL"
+
+
+def test_render_markdown_verdict_partial_on_warn():
+    r = [CheckResult(name="a", status="PASS", evidence={}),
+         CheckResult(name="b", status="WARN", evidence={})]
+    from phase_8_audit import _roadmap_verdict
+    assert _roadmap_verdict(r) == "PARTIAL"
+
+
+def test_render_markdown_verdict_failed_on_fail():
+    r = [CheckResult(name="a", status="FAIL", evidence={})]
+    from phase_8_audit import _roadmap_verdict
+    assert _roadmap_verdict(r) == "FAILED"

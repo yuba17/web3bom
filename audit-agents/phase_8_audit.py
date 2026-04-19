@@ -6,10 +6,13 @@ debt backlog for Phases 9+. See docs/superpowers/specs/2026-04-19-phase-8-audit-
 from __future__ import annotations
 
 import ast
+import json
 import re
 import subprocess
 import yaml
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -387,6 +390,103 @@ def _consumer_count(pkg: Path, shim_mod: str, reexport: str) -> int:
         if pattern.search(text):
             count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Task 9: render_json + render_markdown — artifact emitters
+# ---------------------------------------------------------------------------
+
+def _summarize(results: list[CheckResult]) -> dict:
+    gates = Counter(r.status for r in results)
+    debts = Counter(d.severity for r in results for d in r.debt_items)
+    return {
+        "gates": {"PASS": gates.get("PASS", 0), "FAIL": gates.get("FAIL", 0),
+                  "WARN": gates.get("WARN", 0), "ERROR": gates.get("ERROR", 0)},
+        "debt_items": {"CRITICAL": debts.get("CRITICAL", 0), "HIGH": debts.get("HIGH", 0),
+                       "MEDIUM": debts.get("MEDIUM", 0), "LOW": debts.get("LOW", 0)},
+    }
+
+
+def _roadmap_verdict(results: list[CheckResult]) -> str:
+    statuses = {r.status for r in results}
+    if "FAIL" in statuses or "ERROR" in statuses:
+        return "FAILED"
+    if "WARN" in statuses:
+        return "PARTIAL"
+    return "SUCCESSFUL"
+
+
+def render_json(results: list[CheckResult], output_path: Path) -> None:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": _summarize(results),
+        "verdict": _roadmap_verdict(results),
+        "checks": [
+            {
+                "name": r.name,
+                "status": r.status,
+                "evidence": r.evidence,
+                "debt_items": [
+                    {"severity": d.severity, "category": d.category,
+                     "description": d.description, "evidence": d.evidence}
+                    for d in r.debt_items
+                ],
+            }
+            for r in results
+        ],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, default=str))
+
+
+_STATUS_GLYPH = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️", "ERROR": "💥"}
+
+
+def render_markdown(results: list[CheckResult], output_path: Path) -> None:
+    summary = _summarize(results)
+    verdict = _roadmap_verdict(results)
+    lines = [
+        "# Phase 8 Audit Report — " + datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "",
+        "## Executive Summary",
+        "",
+        f"- Gates: {summary['gates']['PASS']} PASS / {summary['gates']['FAIL']} FAIL / {summary['gates']['WARN']} WARN / {summary['gates']['ERROR']} ERROR",
+        f"- Debt: {summary['debt_items']['CRITICAL']} CRITICAL / {summary['debt_items']['HIGH']} HIGH / {summary['debt_items']['MEDIUM']} MEDIUM / {summary['debt_items']['LOW']} LOW",
+        f"- Roadmap verdict: **{verdict}**",
+        "",
+        "## Per-check results",
+        "",
+    ]
+    for r in results:
+        glyph = _STATUS_GLYPH.get(r.status, "")
+        lines.append(f"### {glyph} {r.name} — {r.status}")
+        lines.append("")
+        lines.append("Evidence:")
+        lines.append("")
+        lines.append("```json")
+        lines.append(json.dumps(r.evidence, indent=2, default=str))
+        lines.append("```")
+        lines.append("")
+    lines += ["## Debt Backlog", ""]
+    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+        items = [d for r in results for d in r.debt_items if d.severity == sev]
+        if not items:
+            continue
+        lines.append(f"### {sev}")
+        lines.append("")
+        for i, d in enumerate(items, start=1):
+            lines.append(f"- **{sev}-{i:02d}** [{d.category}] {d.description}")
+        lines.append("")
+    lines += [
+        "## Roadmap closure",
+        "",
+        f"Phase 8 status: **COMPLETE**. Verdict: **{verdict}**.",
+        "",
+        "Next: Phase 9+ addresses the backlog above, prioritized by severity.",
+        "",
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines))
 
 
 def check_shim_status(*, root: Path, shims: list[str] | None = None) -> CheckResult:
