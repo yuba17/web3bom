@@ -53,3 +53,32 @@ def check_test_suite(*, root: Path, expected_count: int = 138) -> CheckResult:
         evidence=evidence,
     )
     return CheckResult(name="check_test_suite", status="FAIL", evidence=evidence, debt_items=[debt])
+
+
+CLI_SCRIPTS = ["run_benchmark.py", "plan_generator.py", "pipeline_gate.py", "scope_intake.py", "sync_state.py"]
+
+
+def check_clis(*, root: Path, scripts: list[str] | None = None) -> CheckResult:
+    """Run `python3 <cli> --help` for each CLI and check exit 0."""
+    scripts = scripts or CLI_SCRIPTS
+    cli_results = []
+    debts = []
+    for cli in scripts:
+        proc = subprocess.run(
+            ["python3", f"audit-agents/{cli}", "--help"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        first_line = (proc.stdout or "").splitlines()[0] if proc.stdout else ""
+        cli_results.append({"cli": cli, "exit_code": proc.returncode, "first_line": first_line})
+        if proc.returncode != 0:
+            debts.append(DebtItem(
+                severity="HIGH",
+                category="cli_broken",
+                description=f"{cli} --help exited {proc.returncode}",
+                evidence={"stderr": (proc.stderr or "")[:200]},
+            ))
+    status = "PASS" if not debts else "FAIL"
+    return CheckResult(name="check_clis", status=status, evidence={"clis": cli_results}, debt_items=debts)

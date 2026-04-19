@@ -66,3 +66,30 @@ def test_check_test_suite_fail_pytest_nonzero_exit():
         r = check_test_suite(root=Path("/tmp"), expected_count=138)
     assert r.status == "FAIL"
     assert len(r.debt_items) == 1
+
+
+from phase_8_audit import check_clis
+
+
+def test_check_clis_all_pass():
+    def fake_run(*args, **kwargs):
+        return MagicMock(returncode=0, stdout="usage: ...\n", stderr="")
+    with patch("phase_8_audit.subprocess.run", side_effect=fake_run):
+        r = check_clis(root=Path("/tmp"))
+    assert r.name == "check_clis"
+    assert r.status == "PASS"
+    assert len(r.evidence["clis"]) == 5
+    assert all(c["exit_code"] == 0 for c in r.evidence["clis"])
+
+
+def test_check_clis_one_fails():
+    def fake_run(cmd, *args, **kwargs):
+        if "pipeline_gate" in " ".join(str(x) for x in cmd):
+            return MagicMock(returncode=2, stdout="", stderr="Traceback...\n")
+        return MagicMock(returncode=0, stdout="usage: ...\n", stderr="")
+    with patch("phase_8_audit.subprocess.run", side_effect=fake_run):
+        r = check_clis(root=Path("/tmp"))
+    assert r.status == "FAIL"
+    assert any(c["exit_code"] == 2 for c in r.evidence["clis"])
+    assert len(r.debt_items) == 1
+    assert "pipeline_gate" in r.debt_items[0].description
