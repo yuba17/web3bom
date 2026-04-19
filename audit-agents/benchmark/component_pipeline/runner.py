@@ -133,11 +133,11 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                     gen_file.unlink()
                     logger.info(f"    Removed generated {gen_file.name}")
 
-    # Clean forge cache
-    out_dir = Path(repo) / "out"
-    if out_dir.exists():
-        shutil.rmtree(out_dir, ignore_errors=True)
-        logger.info("    Cleaned forge out/ cache")
+    # Clean forge cache — only chimera artifacts (forge detects src staleness via hash)
+    chimera_out = Path(repo) / "out" / "test" / "chimera"
+    if chimera_out.exists():
+        shutil.rmtree(chimera_out, ignore_errors=True)
+        logger.info("    Cleaned out/test/chimera/ artifacts (forge cache retained)")
 
     # Clean PoC directory from previous runs
     poc_clean_dir = Path(repo) / "test" / "poc"
