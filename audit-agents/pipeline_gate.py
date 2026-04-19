@@ -62,7 +62,7 @@ import yaml
 
 from paths import WEB3_DIR, HUNT_SESSION_DIR, STATE_FILE
 from state_manager import load_state, save_state as _sm_save_state
-SCOPE_MASTER_DIR = HUNT_SESSION_DIR / "context"
+from gate.constants import *  # noqa: F401,F403
 _PROTOCOL_OVERRIDE = ""  # Set by --protocol CLI arg; overrides load_state() protocol
 
 
@@ -90,15 +90,6 @@ def get_gate_status_file(protocol: str) -> Path:
     d = HUNT_SESSION_DIR / "gate_status"
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{protocol}.json"
-
-HUNTER_NAMES = [
-    "AccessHunter", "DomainHunter", "FlowHunter", "MathHunter",
-    "OracleHunter", "TrustBoundaryHunter", "WildcardHunter",
-    "SignatureHunter", "DoSHunter",
-]
-
-GATE_ORDER = ["scope", "prepass", "hunters", "crosschain", "deepdive", "merge", "compile", "phase1", "phase2", "phase3", "phase4", "phase5", "complete"]
-
 
 # ─── State helpers ───────────────────────────────────────────────────────────
 
