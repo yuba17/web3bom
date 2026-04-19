@@ -297,3 +297,35 @@ def test_check_dead_code_residual_respects_noqa(tmp_path):
     (pkg / "x.py").write_text("import shim  # noqa: F401\n")
     r = check_dead_code_residual(root=tmp_path)
     assert r.evidence["unused_import_count"] == 0
+
+
+from phase_8_audit import check_shim_status
+
+
+def test_check_shim_status_thin_and_consumed(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "run_benchmark.py").write_text("from mod import build_x  # noqa: F401\n")
+    (pkg / "plan_generator.py").write_text("from mod import phase_x  # noqa: F401\n")
+    (pkg / "consumer.py").write_text("from run_benchmark import build_x\nfrom plan_generator import phase_x\n")
+    r = check_shim_status(root=tmp_path)
+    assert r.status == "PASS"
+
+
+def test_check_shim_status_fat_shim(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    body = "\n".join([f"x{i} = {i}" for i in range(80)])
+    (pkg / "run_benchmark.py").write_text(body + "\n")
+    (pkg / "plan_generator.py").write_text("# thin\n")
+    r = check_shim_status(root=tmp_path)
+    assert any(d.category == "shim_size" and "run_benchmark" in d.description for d in r.debt_items)
+
+
+def test_check_shim_status_orphan_reexport(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "run_benchmark.py").write_text("from mod import orphan_fn  # noqa: F401\n")
+    (pkg / "plan_generator.py").write_text("# empty\n")
+    r = check_shim_status(root=tmp_path)
+    assert any(d.category == "orphan_reexport" and "orphan_fn" in d.description for d in r.debt_items)

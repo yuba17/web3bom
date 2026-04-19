@@ -349,3 +349,74 @@ def check_dead_code_residual(*, root: Path) -> CheckResult:
     evidence = {"todo_count": len(todos), "unused_import_count": len(unused)}
     status = "PASS" if not debts else "WARN"
     return CheckResult(name="check_dead_code_residual", status=status, evidence=evidence, debt_items=debts)
+
+
+# ---------------------------------------------------------------------------
+# Task 8: check_shim_status — LOC + orphan re-export detection
+# ---------------------------------------------------------------------------
+
+SHIMS = ["run_benchmark.py", "plan_generator.py"]
+
+
+def _reexports_in_shim(path: Path) -> list[str]:
+    try:
+        tree = ast.parse(path.read_text(errors="replace"))
+    except (SyntaxError, FileNotFoundError):
+        return []
+    names = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                name = a.asname or a.name
+                if name != "*":
+                    names.append(name)
+    return names
+
+
+def _consumer_count(pkg: Path, shim_mod: str, reexport: str) -> int:
+    """Count `from <shim_mod> import <reexport>` across pkg (excluding the shim itself)."""
+    pattern = re.compile(rf"from\s+{re.escape(shim_mod)}\s+import[^\n]*\b{re.escape(reexport)}\b")
+    count = 0
+    for p in pkg.rglob("*.py"):
+        if p.name == f"{shim_mod}.py":
+            continue
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        if pattern.search(text):
+            count += 1
+    return count
+
+
+def check_shim_status(*, root: Path, shims: list[str] | None = None) -> CheckResult:
+    """Analyze shim size + re-export consumer counts."""
+    shims = shims or SHIMS
+    pkg = root / "audit-agents"
+    if not pkg.exists():
+        return CheckResult(name="check_shim_status", status="ERROR", evidence={"reason": "audit-agents/ missing"})
+    debts: list[DebtItem] = []
+    shim_info = []
+    for shim in shims:
+        path = pkg / shim
+        if not path.exists():
+            debts.append(DebtItem(severity="MEDIUM", category="missing_shim",
+                description=f"shim {shim} missing", evidence={"shim": shim}))
+            continue
+        loc = _file_loc(path)
+        reexports = _reexports_in_shim(path)
+        shim_mod = shim[:-3]
+        consumer_counts = {rx: _consumer_count(pkg, shim_mod, rx) for rx in reexports}
+        orphan = [rx for rx, n in consumer_counts.items() if n == 0]
+        shim_info.append({"shim": shim, "loc": loc, "reexports": len(reexports), "orphans": orphan})
+        if loc > 50:
+            debts.append(DebtItem(severity="LOW", category="shim_size",
+                description=f"{shim} is {loc} LOC (expected <50)", evidence={"shim": shim, "loc": loc}))
+        for o in orphan:
+            debts.append(DebtItem(severity="LOW", category="orphan_reexport",
+                description=f"{shim} re-exports '{o}' with 0 consumers — sunset candidate",
+                evidence={"shim": shim, "reexport": o}))
+    evidence = {"shims": shim_info}
+    has_issue = bool(debts)
+    status = "WARN" if has_issue else "PASS"
+    return CheckResult(name="check_shim_status", status=status, evidence=evidence, debt_items=debts)
