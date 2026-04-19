@@ -1,0 +1,35 @@
+"""Phase 8 audit tests — scaffold."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from phase_8_audit import CheckResult, DebtItem
+
+
+def test_check_result_dataclass_has_required_fields():
+    r = CheckResult(name="x", status="PASS", evidence={}, debt_items=[])
+    assert r.name == "x"
+    assert r.status == "PASS"
+    assert r.evidence == {}
+    assert r.debt_items == []
+
+
+def test_debt_item_dataclass_has_required_fields():
+    d = DebtItem(severity="HIGH", category="size", description="foo", evidence={"loc": 1500})
+    assert d.severity == "HIGH"
+    assert d.category == "size"
+    assert d.description == "foo"
+    assert d.evidence == {"loc": 1500}
+
+
+def test_check_result_status_values_allowed():
+    for s in ["PASS", "FAIL", "WARN", "ERROR"]:
+        r = CheckResult(name="x", status=s, evidence={}, debt_items=[])
+        assert r.status == s
+
+
+def test_debt_item_severity_values_allowed():
+    for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+        d = DebtItem(severity=s, category="x", description="x", evidence={})
+        assert d.severity == s
