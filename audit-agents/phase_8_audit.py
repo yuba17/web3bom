@@ -271,3 +271,81 @@ def check_size_inventory(*, root: Path) -> CheckResult:
     has_high = any(d.severity in ("CRITICAL", "HIGH") for d in debts)
     status = "WARN" if has_high else "PASS"
     return CheckResult(name="check_size_inventory", status=status, evidence=evidence, debt_items=debts)
+
+
+_TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
+
+
+def _line_has_noqa(text: str, lineno: int) -> bool:
+    lines = text.splitlines()
+    if 0 < lineno <= len(lines):
+        return "# noqa" in lines[lineno - 1]
+    return False
+
+
+def _unused_imports(path: Path) -> list[dict]:
+    text = path.read_text(errors="replace")
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    imported: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                name = a.asname or a.name.split(".")[0]
+                imported[name] = node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                name = a.asname or a.name
+                if name == "*":
+                    continue
+                imported[name] = node.lineno
+    if not imported:
+        return []
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            n = node
+            while isinstance(n, ast.Attribute):
+                n = n.value
+            if isinstance(n, ast.Name):
+                used.add(n.id)
+    out = []
+    for name, lineno in imported.items():
+        if name in used:
+            continue
+        if _line_has_noqa(text, lineno):
+            continue
+        out.append({"name": name, "line": lineno})
+    return out
+
+
+def check_dead_code_residual(*, root: Path) -> CheckResult:
+    """Find TODO markers and unused imports in audit-agents/."""
+    pkg = root / "audit-agents"
+    if not pkg.exists():
+        return CheckResult(name="check_dead_code_residual", status="ERROR", evidence={"reason": "audit-agents/ missing"})
+    files = _iter_py_files(pkg)
+    todos = []
+    unused = []
+    debts: list[DebtItem] = []
+    for p in files:
+        rel = str(p.relative_to(root))
+        text = p.read_text(errors="replace")
+        for i, line in enumerate(text.splitlines(), start=1):
+            if _TODO_RE.search(line):
+                todos.append({"path": rel, "line": i, "content": line.strip()[:120]})
+        for u in _unused_imports(p):
+            unused.append({"path": rel, **u})
+    for t in todos:
+        debts.append(DebtItem(severity="LOW", category="todo",
+            description=f"{t['path']}:{t['line']} — {t['content']}", evidence=t))
+    for u in unused:
+        debts.append(DebtItem(severity="LOW", category="unused_import",
+            description=f"{u['path']}:{u['line']} imports '{u['name']}' but never uses it", evidence=u))
+    evidence = {"todo_count": len(todos), "unused_import_count": len(unused)}
+    status = "PASS" if not debts else "WARN"
+    return CheckResult(name="check_dead_code_residual", status=status, evidence=evidence, debt_items=debts)

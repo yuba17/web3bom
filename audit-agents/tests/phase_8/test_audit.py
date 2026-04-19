@@ -259,3 +259,41 @@ def test_check_size_inventory_excludes_tests(tmp_path):
     (pkg / "tests" / "test_huge.py").write_text(lines + "\n")
     r = check_size_inventory(root=tmp_path)
     assert r.debt_items == []
+
+
+from phase_8_audit import check_dead_code_residual
+
+
+def test_check_dead_code_residual_clean(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "ok.py").write_text("import os\nprint(os.getcwd())\n")
+    r = check_dead_code_residual(root=tmp_path)
+    assert r.status == "PASS"
+    assert r.evidence["todo_count"] == 0
+    assert r.evidence["unused_import_count"] == 0
+
+
+def test_check_dead_code_residual_flags_todo(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "x.py").write_text("# TODO: fix this\nimport os\nprint(os.getcwd())\n")
+    r = check_dead_code_residual(root=tmp_path)
+    assert r.evidence["todo_count"] == 1
+    assert any(d.category == "todo" for d in r.debt_items)
+
+
+def test_check_dead_code_residual_flags_unused_import(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "x.py").write_text("import unused_pkg\ndef f():\n    return 1\n")
+    r = check_dead_code_residual(root=tmp_path)
+    assert r.evidence["unused_import_count"] == 1
+
+
+def test_check_dead_code_residual_respects_noqa(tmp_path):
+    pkg = tmp_path / "audit-agents"
+    pkg.mkdir()
+    (pkg / "x.py").write_text("import shim  # noqa: F401\n")
+    r = check_dead_code_residual(root=tmp_path)
+    assert r.evidence["unused_import_count"] == 0
