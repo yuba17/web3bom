@@ -144,3 +144,67 @@ def check_parity_matrix(*, root: Path, matrix_path: Path) -> CheckResult:
     evidence = {"total": actual_count, "by_decision": by_decision, "summary_total": total}
     status = "PASS" if not debts else "FAIL"
     return CheckResult(name="check_parity_matrix", status=status, evidence=evidence, debt_items=debts)
+
+
+REMOVED_MODULES_DEFAULT = [
+    "run_hunt",
+    "bounty_monitor_config", "results_tracker", "test_stream_claude2",
+    "invariant_test_runner", "quickstart", "bounty_scanner", "claude_classify",
+    "invariant-hunt", "parameter_boundary_scanner", "target_score", "test_stream_claude",
+    "ai_invariant_generator", "migrate_hunt_session", "protocol_analyzer",
+    "compile_fixer", "invariant_rag",
+]
+
+DOCS_DEFAULT = ["CLAUDE.md", "WIKI.md", "HUNT_TRACKER.md", "README.md"]
+
+_ARCHIVED_OPEN = "<!-- Archived"
+_ARCHIVED_CLOSE = "<!-- /Archived"
+
+
+def _strip_archived_blocks(text: str) -> list[tuple[int, str]]:
+    """Return list of (1-based_line_number, line) excluding lines inside archived blocks."""
+    result = []
+    in_archived = False
+    for i, line in enumerate(text.splitlines(), start=1):
+        if _ARCHIVED_OPEN in line:
+            in_archived = True
+            continue
+        if _ARCHIVED_CLOSE in line:
+            in_archived = False
+            continue
+        if not in_archived:
+            result.append((i, line))
+    return result
+
+
+def check_docs_sync(*, root: Path, removed_modules: list[str] | None = None, docs: list[str] | None = None) -> CheckResult:
+    """Grep docs for stale refs to removed modules, skipping archived blocks."""
+    removed_modules = removed_modules or REMOVED_MODULES_DEFAULT
+    docs = docs or DOCS_DEFAULT
+    hits = []
+    missing = []
+    for doc in docs:
+        path = root / doc
+        if not path.exists():
+            missing.append(doc)
+            continue
+        text = path.read_text()
+        for lineno, line in _strip_archived_blocks(text):
+            for mod in removed_modules:
+                if mod in line:
+                    hits.append({"doc": doc, "line": lineno, "module": mod, "content": line.strip()[:120]})
+    evidence: dict[str, Any] = {"hits": hits, "docs_checked": [d for d in docs if d not in missing]}
+    debts = []
+    if hits:
+        debts.append(DebtItem(
+            severity="MEDIUM",
+            category="stale_ref",
+            description=f"{len(hits)} stale module reference(s) in docs",
+            evidence={"sample": hits[:5]},
+        ))
+    if missing:
+        evidence["missing_docs"] = missing
+        status = "WARN"
+    else:
+        status = "PASS" if not hits else "FAIL"
+    return CheckResult(name="check_docs_sync", status=status, evidence=evidence, debt_items=debts)

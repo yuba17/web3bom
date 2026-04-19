@@ -183,3 +183,38 @@ def test_check_parity_matrix_summary_arithmetic_mismatch(tmp_path):
     r = check_parity_matrix(root=tmp_path, matrix_path=p)
     assert r.status == "FAIL"
     assert any(d.category == "arithmetic" for d in r.debt_items)
+
+
+from phase_8_audit import check_docs_sync
+
+
+def test_check_docs_sync_clean(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("Nothing to flag here.\n")
+    (tmp_path / "WIKI.md").write_text("Modern pipeline description.\n")
+    r = check_docs_sync(root=tmp_path, removed_modules=["run_hunt", "target_score"], docs=["CLAUDE.md", "WIKI.md"])
+    assert r.status == "PASS"
+    assert r.evidence["hits"] == []
+
+
+def test_check_docs_sync_flags_stale_ref(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("Use run_hunt.py --component X\n")
+    (tmp_path / "WIKI.md").write_text("clean\n")
+    r = check_docs_sync(root=tmp_path, removed_modules=["run_hunt"], docs=["CLAUDE.md", "WIKI.md"])
+    assert r.status == "FAIL"
+    assert len(r.evidence["hits"]) == 1
+    assert r.evidence["hits"][0]["doc"] == "CLAUDE.md"
+    assert r.evidence["hits"][0]["line"] == 1
+
+
+def test_check_docs_sync_skips_archived_block(tmp_path):
+    content = "Active section.\n<!-- Archived/Phase 7 cleanup -->\nold: run_hunt.py mention\n<!-- /Archived -->\nActive again.\n"
+    (tmp_path / "CLAUDE.md").write_text(content)
+    r = check_docs_sync(root=tmp_path, removed_modules=["run_hunt"], docs=["CLAUDE.md"])
+    assert r.status == "PASS"
+    assert r.evidence["hits"] == []
+
+
+def test_check_docs_sync_missing_doc_is_warn(tmp_path):
+    r = check_docs_sync(root=tmp_path, removed_modules=["run_hunt"], docs=["DOES_NOT_EXIST.md"])
+    assert r.status == "WARN"
+    assert "DOES_NOT_EXIST.md" in str(r.evidence)
