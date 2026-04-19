@@ -673,7 +673,6 @@ false_positives:
 |-------------|---------|--------|
 | `bounty_monitor_v2.py` | Escanea 6 plataformas bounty | ✅ 90% |
 | `target_monitor.py` | Detecta cambios de código | ✅ 80% |
-| `protocol_analyzer.py` | Structure Map (Layer 1) | ✅ funcional |
 | `matcher.py` | Cruza código con registry | ✅ funcional, poco usado |
 | `registry.py` | 293 invariants, 13 categorías | ✅ cargado |
 | `scaffold.py` | Genera proyecto Foundry | ✅ funcional |
@@ -832,7 +831,7 @@ false_positives:
 |------|--------|
 | L0 INTAKE + TRIAGE | Parcial — bounty_monitor existe, falta priority score |
 | L0.5 CLASSIFIER | ❌ No existe — construir |
-| L1 ANALYST | Parcial — protocol_analyzer.py existe, falta 2-pass |
+| L1 ANALYST | No existe — eliminado en Phase 7 cleanup |
 | L2 HUNTERS | ❌ No existe — V2 agents son la base |
 | L3 PRIORITIZER | ❌ No existe — construir |
 | L4 VALIDATOR | ❌ No existe — construir |
