@@ -816,7 +816,6 @@ false_positives:
 | Protocol Model puede tener omisiones | Validación estructural: funciones públicas en código vs modelo |
 | Feedback a briefings se salta | L8 es tarea BLOQUEANTE en Shared Task List |
 | Sin diff automático (código nuevo) | L0 busca audit tags en git, marca `[NEW]` en Protocol Model |
-| Sin target triage formal | `target_score.py` antes de cada hunt |
 
 **Media gravedad:**
 
