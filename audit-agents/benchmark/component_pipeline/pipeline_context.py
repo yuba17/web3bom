@@ -62,3 +62,13 @@ class PipelineContext:
 
     # Skip flags
     _skip_to_merge: bool = False
+
+    # Fuzz accumulators (set by fuzz phase, consumed by extract phase)
+    phase1_fuzz_failures: Dict[str, Any] = field(default_factory=dict)
+    phase2_log: Path = field(default_factory=lambda: Path(".") / "phase2_medusa.log")
+
+    # Extract-phase outputs (set by extract, consumed by verify/poc phases)
+    finding_groups: List[Any] = field(default_factory=list)
+    poc_findings: List[Any] = field(default_factory=list)
+    escaped_siblings: List[Any] = field(default_factory=list)
+    fallback_findings: List[Any] = field(default_factory=list)

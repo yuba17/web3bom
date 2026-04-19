@@ -1248,55 +1248,26 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
             else:
                 logger.info("  ⚡ Skipping Steps 9-9.5 (Medusa + tolerance tuning)")
 
-    # ─── Step 10: Extract Findings ──────────────────────────────────────
-    logger.info("  Step 10: Extract findings from hypotheses + fuzz results")
-
-    # Rescue misplaced YAML files — hunters may write inside repo instead of global dir
-    import shutil as _shutil
-    for rescue_dir in [
-        Path(repo) / "hunt_session" / "hypotheses",
-        Path(repo) / "hunt_session" / "hypotheses" / protocol,
-        Path(repo) / "results",
-    ]:
-        if rescue_dir.exists():
-            for misplaced in rescue_dir.glob(f"hyp_{component}_*.yaml"):
-                target = hyp_dir / misplaced.name
-                if not target.exists():
-                    _shutil.copy2(misplaced, target)
-                    logger.info(f"    Rescued {misplaced.name} → {hyp_dir.name}/")
-
-    # Parse fuzz results — combine iterative loop results + Medusa
-    # phase1_fuzz_failures already accumulated from all fuzz rounds above
-    fuzz_failures = dict(phase1_fuzz_failures)  # copy accumulated Phase 1 results
-    medusa_failures = parse_fuzz_failures(phase2_log) if phase2_log.exists() else {}
-    fuzz_failures.update(medusa_failures)
-    if fuzz_failures:
-        logger.info(f"  Fuzz failures detected: {list(fuzz_failures.keys())}")
-
-    findings = _rb.extract_findings(component, protocol, fuzz_failures)
-    summary["findings"] = findings
-    logger.info(f"  Found {len(findings)} findings ({sum(1 for f in findings if f.get('fuzz_confirmed'))} fuzz-confirmed)")
-
-    # ─── Early exit for hypothesis mode ──────────────────────────────────
-    # In hypothesis mode, scoring happens at the main() level against the YAML files.
-    # No PoC generation, no verification, no RedTeam. Fastest possible iteration.
-    benchmark_mode_flag = getattr(args, "benchmark_mode", "redteam")
-    if benchmark_mode_flag == "hypothesis":
-        comp_elapsed = (time.time() - comp_start) / 60
-        logger.info(f"  🏁 Component {component} COMPLETE (hypothesis mode) — "
-                    f"{len(findings)} findings ({comp_elapsed:.1f}min)")
+    # ─── Step 10: Extract Findings + dedup ──────────────────────────────
+    from benchmark.component_pipeline.pipeline_context import PipelineContext
+    from benchmark.component_pipeline.extract import extract_findings
+    _ctx_extract = PipelineContext(
+        component=component, repo=repo, protocol=protocol,
+        args=args, logger=logger,
+        src_dir=src_dir, hyp_dir=hyp_dir, clog=clog, src_file=src_file,
+        comp_start=comp_start,
+        phase1_fuzz_failures=phase1_fuzz_failures,
+        phase2_log=phase2_log,
+    )
+    _ctx_extract.summary = summary  # share by reference
+    _extract_result = extract_findings(_ctx_extract)
+    if _extract_result == "EARLY_EXIT_hypothesis":
         return summary
-
-    # ─── Step 10.1: Deduplicate findings by root cause ─────────────────
-    finding_groups = _dedup_findings_pure(findings)
-    logger.info(f"  Step 10.1: Dedup — {len(findings)} findings → {len(finding_groups)} unique groups")
-    for i, g in enumerate(finding_groups):
-        leader = g[0]
-        logger.info(f"    Group {i}: {leader['id']} (conv={len(g)}, conf={leader.get('confidence',0)}%) "
-                    f"+ {len(g)-1} dupes — {leader['title'][:60]}")
-    poc_findings: list = []        # populated in Step 10.3/10.5 — initialized here for funnel
-    escaped_siblings: list = []    # Capa 3: siblings that are different bugs (Step 10.6)
-    fallback_findings: list = []   # Capa 2: fallbacks when group leader fails PoC (Step 10.5b)
+    findings = summary["findings"]
+    finding_groups = _ctx_extract.finding_groups
+    poc_findings = _ctx_extract.poc_findings
+    escaped_siblings = _ctx_extract.escaped_siblings
+    fallback_findings = _ctx_extract.fallback_findings
 
     # ─── Step 10.2: Verification — lightweight code-read before Foundry PoC ─────
     # For every distinct (function, line) location, run a quick Claude call:
