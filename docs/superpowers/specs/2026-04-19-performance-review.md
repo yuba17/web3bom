@@ -16,7 +16,7 @@
    - Eliminar la ronda 2 del fuzz-refine loop (`runner.py:1059-1193`): ahorra ~25 min/componente.
    - Early-exit cuando `prepass` no detecta nada (`runner.py:161-177`): ahorra ~40 min/componente "limpio" (protocolos ya auditados por ToB/OZ).
 
-4. **El win estructural grande es migrar de `claude -p` subprocess al SDK Anthropic** con `cache_control: ephemeral`. Los 12 hunters comparten ~15K chars de brief común que se reenvía 12 veces sin caching; migrar a SDK da savings estimado 60-80% tokens + mayor control de watchdog. Effort: L. Ya existe skill `claude-api` con el patrón.
+4. **Constraint: el sistema usa suscripción `claude -p` CLI, no API Anthropic SDK.** Eso descarta `cache_control: ephemeral` (sólo disponible en SDK). Las optimizaciones de tokens deben hacerse dentro del CLI: **reducir input enviado** (trim prompts, dedup de contexto en filesystem) y **consolidar calls** (batching). Savings realistas vía CLI: 20-40% input tokens vs 60-80% que daría el SDK, pero sin cambio de billing model.
 
 5. **Mediana por componente: 100 min** (rango 69.6–316.3 min, N=12 runs con instrumentación completa). **Mediana PoC-confirm: ~75%** (findings que superan Phase 3 fork PoC).
 
@@ -62,8 +62,8 @@ Los 6 `time.time()` en `runner.py` solo producen 3 líneas útiles de log (`Hunt
 | 6 | TargetFunctions enhance (Step 7.5) rompe y revierte | MED | S | 10-15 min | `runner.py:900-959` |
 | 7 | Compile-fix de 9 intentos sin feedback diferencial | HIGH | M | 20-40 min worst-case | `runner.py:797-883` |
 | 8 | PoC fix loop — worst case 67 min/finding | MED | M | 5+ h de long tail | `poc_pipeline.py:282-326` |
-| 9 | Sin prompt caching en LLM calls | HIGH | L | 60-80% coste tokens | `llm_runners.py:52-217` |
-| 10 | 12 hunters reciben 90% del mismo prompt no cacheado | HIGH | L | ligado a #9 | `runner.py:428-452` |
+| 9 | 12 hunters reciben 90% del mismo prompt (brief ~15K chars × 12) | HIGH | M | 20-40% input tokens vía trim/batching CLI | `runner.py:428-452` |
+| 10 | Input tokens no optimizados (source+libs enviados completos repetidos) | MED | M | 15-25% input tokens | `prompt_builders.py:31-111`, `llm_runners.py` |
 
 ---
 
@@ -119,17 +119,26 @@ Respuesta directa a la pregunta del usuario. Lista accionable, ordenada por valo
     - Medusa 900s corre después del refine loop de Phase 1. Podrían correr en paralelo.
     - Acción: lanzar Medusa en background al inicio del refine loop; join antes de extract findings.
 
-### Estructural (Effort L, migración)
+### Token reduction dentro de `claude -p` (Effort M, sin migrar a SDK)
 
-11. **Todo `claude -p` subprocess renuncia a prompt caching** (`llm_runners.py:52-217`)
-    - El CLI `-p` no soporta `cache_control: ephemeral`. Cada call paga tokens completos.
-    - Peak ~144K tok/min. Un componente envía 200-500K tokens input; con caching, 80% sería hits a 10% del precio.
-    - Acción: migrar a `anthropic.Anthropic().messages.create` con wrapper manual para stream + watchdog (ya existen en `llm_runners`). Aplicar `cache_control` sobre blocks grandes (source_code, library_code, setup_sol, brief).
-    - Referencia: skill `claude-api`.
+**Constraint:** el sistema usa suscripción Claude (CLI subprocess), no API SDK. `cache_control: ephemeral` no está disponible. Alternativas realistas:
 
-12. **12 hunters × brief común no cacheado** (`runner.py:428-452` + `prompt_builders.py:31-111`)
-    - ~15K chars de brief + methodology × 12 hunters = ~180K tokens repetidos.
-    - Fix: ligado a #11.
+11. **Brief común de hunters sobredimensionado** (`prompt_builders.py:31-111`)
+    - `build_hunter_brief` genera ~15K chars que se envían 12 veces idénticos. Cada hunter solo lee las secciones relevantes a su especialización.
+    - Acción: generar briefs específicos por hunter (`build_hunter_brief(hunter_name)`) que incluyan sólo la methodology + hypothesis types relevantes. Savings: 40-60% chars en el brief.
+
+12. **Source code enviado completo a cada call** (`runner.py:74, 181-189`)
+    - El source se envía a setup early-gen, a los 12 hunters, a DeepDive, a merge, a compile-fix, a verify, a PoC gen. Con `source_code` de 10-20K chars, son ~150-300K tokens redundantes por componente.
+    - Acción: enviar sólo las funciones relevantes al scope del call (slice por AST). Para verify/PoC, enviar sólo la función atacada + dependencias directas. Savings: 30-50% input tokens en calls downstream.
+
+13. **Batching de verify** (`runner.py:1320-1354`)
+    - Hoy: 1 LLM call por finding × N findings (10 paralelos).
+    - Acción: 1 LLM call analiza 3-5 findings a la vez (prompt estructurado con separadores). Savings: 60-70% calls = 60-70% overhead de proceso + input repetido.
+
+14. **Session reuse con `claude --session-id`** (exploración)
+    - Investigar si `claude -p --session-id <uuid>` permite reusar contexto entre calls consecutivos (setup → hunters → merge). Si aplica, el source_code se envía una sola vez por sesión y los hunters referencian el contexto.
+    - Acción: prototipar en `llm_runners.run_claude` con flag opcional `session_id`. Validar empíricamente si reduce tiempo de warmup.
+    - **No confirmado que funcione** — requiere experimentación antes de invertir.
 
 ### No sobra (validado)
 
@@ -163,9 +172,14 @@ Total esfuerzo estimado: ~3-5 días. Savings: long-tail eliminado (5h → 1.5h p
 10. Dedup consolidado: una pasada estructural; LLM sólo para high-delta pairs
 11. Medusa en paralelo con fuzz-refine round 1
 
-### Estructural (cuando el sistema sea estable)
+### Token reduction (Effort M, cuando quick wins estén estables)
 
-12. Migración a SDK Anthropic con prompt caching. Ver skill `claude-api` para patrón. Savings: 60-80% tokens en hunters + verify.
+12. Briefs específicos por hunter (savings ~40-60% en el brief × 12)
+13. Source code sliced por AST en calls downstream (savings ~30-50% en verify/PoC)
+14. Batching de verify en grupos de 3-5 (savings ~60-70% calls)
+15. Investigar `claude --session-id` para reuso de contexto entre calls relacionados (unvalidated)
+
+**Nota:** migrar a SDK Anthropic con `cache_control` daría savings mayores (60-80%) pero queda fuera de alcance — constraint del usuario: seguir usando suscripción `claude -p`.
 
 ---
 
@@ -200,7 +214,7 @@ component_pipeline/
 - Benchmarks sintéticos nuevos (Pasada 3 opcional con instrumentación).
 - Optimización de `pipeline_gate.py` (ya está split en Phase 9).
 - Optimización de `merge_invariants.py` / `target_monitor.py` (ya split en Phases 11/12).
-- Rewrite del sistema de subprocess CLI si se migra a SDK (cambio estructural, nuevo spec).
+- **Migración a SDK Anthropic** — descartada por constraint del usuario (suscripción `claude -p` CLI, no API billing).
 
 ---
 
