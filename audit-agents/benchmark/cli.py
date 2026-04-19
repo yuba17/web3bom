@@ -172,6 +172,10 @@ def main():
                         help="Disable few-shot example injection into hunter prompts (prevents benchmark contamination)")
     parser.add_argument("--skip-hunters", action="store_true",
                         help="Skip prepass+hunters+deepdive if hypothesis files already exist. Resume from merge step.")
+    parser.add_argument("--fuzz-refine", action="store_true",
+                        help="Enable round 2 of fuzz-refine loop (LLM refines invariants and re-fuzzes). "
+                             "Disabled by default — empirically adds 20-25min with low marginal value "
+                             "since Medusa (Phase 2) already explores multi-step sequences.")
     parser.add_argument("--hunters", default="",
                         help="Comma-separated subset of hunter names to run "
                              "(e.g., 'MathHunter,AccessHunter'). Default: all. "

@@ -1056,51 +1056,35 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                 summary["status"] = "BLOCKED_PHASE1_INFRA"
                 return summary
 
-            # ─── ITERATIVE FUZZ-REFINE LOOP (max 3 rounds) ─────────────────────
-            # This replicates what I did manually: fuzz → analyze → refine → re-fuzz
-            # Round 0 = Phase 1 already ran above
-            # Round 1+ = targeted refinement based on what we learned
-            all_fuzz_failures = {}  # accumulate across rounds
+            # ─── Parse Phase 1 failures + optional deep trace ──────────────────
+            # Round 2 refinement (LLM-driven re-write + re-fuzz) is gated behind
+            # --fuzz-refine flag. Medusa (Phase 2) already explores multi-step
+            # sequences, so the refinement round duplicates effort at 20-25 min cost.
+            all_fuzz_failures = {}
+            current_log = clog / "phase1_foundry.log"
+            round_failures = parse_fuzz_failures(current_log)
+            all_fuzz_failures.update(round_failures)
 
-            for fuzz_round in range(2):  # max 2 rounds: initial + 1 refinement
-                round_label = f"Round {fuzz_round}"
+            if round_failures and not _SKIP_HEAVY_FUZZ:
+                logger.info(f"  Round 0: Deep trace analysis for {len(round_failures)} failures")
+                for fail_name in list(round_failures.keys())[:5]:
+                    logger.info(f"    Re-running {fail_name} with -vvv...")
+                    _, deep_stdout, _ = _rb.run_cmd(
+                        ["forge", "test", "--match-test", fail_name, "--fuzz-runs", "100", "-vvv"],
+                        timeout=300, cwd=repo,
+                        log_file=clog / f"deep_trace_{fail_name}.log",
+                        env=forge_env
+                    )
+                    if deep_stdout and "FAIL" in deep_stdout:
+                        all_fuzz_failures[fail_name] = deep_stdout[-5000:]
+                        logger.info(f"    {fail_name}: deep trace captured")
+            elif round_failures and _SKIP_HEAVY_FUZZ:
+                logger.info(f"  Round 0: Skipping deep trace in fast mode ({len(round_failures)} failures — using -vv traces)")
 
-                # ─── Analyze current fuzz results ─────────────────────────────
-                if fuzz_round == 0:
-                    current_log = clog / "phase1_foundry.log"
-                else:
-                    current_log = clog / f"phase1_round{fuzz_round}.log"
-
-                round_failures = parse_fuzz_failures(current_log)
-                all_fuzz_failures.update(round_failures)
-
-                # ─── Deep trace analysis for failures (-vvvv) ─────────────────
-                # Skip in fast mode: normal -vv already has call sequences for PoC gen.
-                # Deep trace adds opcodes/SLOAD/SSTORE detail but costs 10-15 min with
-                # frequent timeouts, and content gets truncated before use anyway.
-                if round_failures and not _SKIP_HEAVY_FUZZ:
-                    logger.info(f"  {round_label}: Deep trace analysis for {len(round_failures)} failures")
-                    for fail_name in list(round_failures.keys())[:5]:
-                        logger.info(f"    Re-running {fail_name} with -vvvv...")
-                        _, deep_stdout, _ = _rb.run_cmd(
-                            ["forge", "test", "--match-test", fail_name, "--fuzz-runs", "100", "-vvvv"],
-                            timeout=300, cwd=repo,
-                            log_file=clog / f"deep_trace_{fail_name}.log",
-                            env=forge_env
-                        )
-                        if deep_stdout and "FAIL" in deep_stdout:
-                            all_fuzz_failures[fail_name] = deep_stdout[-5000:]
-                            logger.info(f"    {fail_name}: deep trace captured")
-                elif round_failures and _SKIP_HEAVY_FUZZ:
-                    logger.info(f"  {round_label}: Skipping deep trace in fast mode ({len(round_failures)} failures — using -vv traces)")
-
-                # ─── Decide: refine or stop? ──────────────────────────────────
-                if fuzz_round >= 1:
-                    logger.info(f"  {round_label}: Max refinement reached — proceeding to Medusa")
-                    break
-
-                if round_failures and fuzz_round < 1:
-                    # FOUND BUGS → write MORE invariants targeting the SAME area
+            # ─── Optional: Round 2 refinement (gated by --fuzz-refine) ─────────
+            if getattr(args, 'fuzz_refine', False):
+                round_label = "Round 1"
+                if round_failures:
                     logger.info(f"  {round_label}: {len(round_failures)} failures → writing targeted invariants for same area")
                     failure_traces = "\n".join(
                         f"### {name}\n```\n{trace[:1500]}\n```"
@@ -1131,12 +1115,10 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         deepen_prompt,
                         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
                         timeout=600,
-                        log_file=clog / f"deepen_round{fuzz_round + 1}.log",
+                        log_file=clog / "deepen_round1.log",
                         cwd=repo
                     )
-
-                elif not round_failures:
-                    # ALL PASS → invariants too weak, write more aggressive ones
+                else:
                     logger.info(f"  {round_label}: All invariants held — writing more aggressive properties")
                     existing_props = ""
                     for pf in chimera_dir.glob("Properties*.sol"):
@@ -1162,35 +1144,35 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                         refocus_prompt,
                         allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
                         timeout=600,
-                        log_file=clog / f"refocus_round{fuzz_round + 1}.log",
+                        log_file=clog / "refocus_round1.log",
                         cwd=repo
                     )
 
-                # ─── Re-compile and re-fuzz ───────────────────────────────────
                 recompile_ok = _rb.fix_and_retry(
-                    f"round{fuzz_round + 1}_compile", ["forge", "build"],
+                    "round1_compile", ["forge", "build"],
                     [str(f) for f in chimera_dir.glob("*.sol")],
                     max_retries=3, cwd=repo
                 )
-                if not recompile_ok:
-                    logger.warning(f"  {round_label}: New invariants don't compile — stopping refinement loop")
-                    break
+                if recompile_ok:
+                    logger.info("  Round 1: Re-fuzzing with refined invariants (3K runs)")
+                    _rb.run_cmd(
+                        ["forge", "test", "--match-contract", "FoundryTester", "--fuzz-runs", "3000", "-vv"],
+                        timeout=600, cwd=repo,
+                        log_file=clog / "phase1_round1.log",
+                        env=forge_env
+                    )
+                    round1_failures = parse_fuzz_failures(clog / "phase1_round1.log")
+                    all_fuzz_failures.update(round1_failures)
+                else:
+                    logger.warning("  Round 1: New invariants don't compile — skipping re-fuzz")
+            else:
+                logger.info("  Fuzz-refine round 1 skipped (activate with --fuzz-refine)")
 
-                # Re-fuzz with new invariants
-                logger.info(f"  Round {fuzz_round + 1}: Re-fuzzing with refined invariants (3K runs)")
-                _rb.run_cmd(
-                    ["forge", "test", "--match-contract", "FoundryTester", "--fuzz-runs", "3000", "-vv"],
-                    timeout=600, cwd=repo,
-                    log_file=clog / f"phase1_round{fuzz_round + 1}.log",
-                    env=forge_env
-                )
-
-            # Update fuzz_failures for downstream use (includes all rounds)
             phase1_fuzz_failures = all_fuzz_failures
             if phase1_fuzz_failures:
-                logger.info(f"  Total fuzz failures across all rounds: {list(phase1_fuzz_failures.keys())}")
+                logger.info(f"  Total fuzz failures: {list(phase1_fuzz_failures.keys())}")
             else:
-                logger.info(f"  No fuzz failures after {fuzz_round + 1} rounds of refinement")
+                logger.info("  No fuzz failures in Phase 1")
 
             # ─── Step 9: Phase 2 — Medusa 15 min (skipped in fast mode) ─────────
             if not _SKIP_HEAVY_FUZZ:
