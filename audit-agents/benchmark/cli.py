@@ -176,6 +176,10 @@ def main():
                         help="Enable round 2 of fuzz-refine loop (LLM refines invariants and re-fuzzes). "
                              "Disabled by default — empirically adds 20-25min with low marginal value "
                              "since Medusa (Phase 2) already explores multi-step sequences.")
+    parser.add_argument("--skip-empty-prepass", action="store_true",
+                        help="If prepass produces 0 findings, skip hunters+merge+fuzz+PoC for this "
+                             "component and return early. Use for protocols already audited exhaustively "
+                             "(ToB/OZ/Cyfrin) — saves ~40min on components with no detectable signals.")
     parser.add_argument("--hunters", default="",
                         help="Comma-separated subset of hunter names to run "
                              "(e.g., 'MathHunter,AccessHunter'). Default: all. "
