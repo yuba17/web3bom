@@ -33,3 +33,36 @@ def test_debt_item_severity_values_allowed():
     for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
         d = DebtItem(severity=s, category="x", description="x", evidence={})
         assert d.severity == s
+
+
+from unittest.mock import patch, MagicMock
+
+from phase_8_audit import check_test_suite
+
+
+def test_check_test_suite_pass():
+    mock_result = MagicMock(returncode=0, stdout="138 passed in 23.52s\n", stderr="")
+    with patch("phase_8_audit.subprocess.run", return_value=mock_result):
+        r = check_test_suite(root=Path("/tmp"), expected_count=138)
+    assert r.name == "check_test_suite"
+    assert r.status == "PASS"
+    assert r.evidence["passed"] == 138
+    assert r.debt_items == []
+
+
+def test_check_test_suite_fail_count_mismatch():
+    mock_result = MagicMock(returncode=0, stdout="120 passed in 20s\n", stderr="")
+    with patch("phase_8_audit.subprocess.run", return_value=mock_result):
+        r = check_test_suite(root=Path("/tmp"), expected_count=138)
+    assert r.status == "FAIL"
+    assert r.evidence["passed"] == 120
+    assert len(r.debt_items) == 1
+    assert r.debt_items[0].severity == "HIGH"
+
+
+def test_check_test_suite_fail_pytest_nonzero_exit():
+    mock_result = MagicMock(returncode=1, stdout="5 failed, 133 passed\n", stderr="")
+    with patch("phase_8_audit.subprocess.run", return_value=mock_result):
+        r = check_test_suite(root=Path("/tmp"), expected_count=138)
+    assert r.status == "FAIL"
+    assert len(r.debt_items) == 1
