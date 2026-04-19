@@ -3,7 +3,7 @@
 ## Executive Summary
 
 - Gates: 4 PASS / 0 FAIL / 3 WARN / 0 ERROR
-- Debt: 1 CRITICAL / 12 HIGH / 45 MEDIUM / 197 LOW
+- Debt: 1 CRITICAL / 12 HIGH / 44 MEDIUM / 196 LOW
 - Roadmap verdict: **PARTIAL**
 
 ## Per-check results
@@ -14,8 +14,8 @@ Evidence:
 
 ```json
 {
-  "passed": 227,
-  "expected": 227,
+  "passed": 230,
+  "expected": 230,
   "returncode": 0
 }
 ```
@@ -62,16 +62,17 @@ Evidence:
 
 ```json
 {
-  "total": 55,
+  "total": 56,
   "by_decision": {
     "migrated": 16,
     "deprecated": 15,
     "keep_standalone": 0,
     "added_phase_5": 2,
     "added_phase_6": 14,
-    "added_phase_9": 8
+    "added_phase_9": 8,
+    "added_phase_11": 1
   },
-  "summary_total": 55
+  "summary_total": 56
 }
 ```
 
@@ -97,7 +98,7 @@ Evidence:
 
 ```json
 {
-  "file_count": 97,
+  "file_count": 105,
   "files": [
     {
       "path": "audit-agents/scanners/vulnerability_patterns.py",
@@ -110,10 +111,6 @@ Evidence:
     {
       "path": "audit-agents/agents/v2/zk_circuit_agent.py",
       "loc": 1520
-    },
-    {
-      "path": "audit-agents/merge_invariants.py",
-      "loc": 1280
     },
     {
       "path": "audit-agents/target_monitor.py",
@@ -178,6 +175,10 @@ Evidence:
     {
       "path": "audit-agents/submit_finding.py",
       "loc": 559
+    },
+    {
+      "path": "audit-agents/ingest_rejections.py",
+      "loc": 553
     }
   ]
 }
@@ -190,7 +191,7 @@ Evidence:
 ```json
 {
   "todo_count": 21,
-  "unused_import_count": 93
+  "unused_import_count": 92
 }
 ```
 
@@ -315,7 +316,7 @@ Evidence:
 - **HIGH-04** [function_size] audit-agents/benchmark/component_pipeline/runner.py::run_component_pipeline is 1573 LOC
 - **HIGH-05** [function_size] audit-agents/benchmark/cross_component.py::run_cross_component is 441 LOC
 - **HIGH-06** [function_size] audit-agents/benchmark.py::cmd_score_hypotheses is 225 LOC
-- **HIGH-07** [function_size] audit-agents/merge_invariants.py::run_split_mode is 219 LOC
+- **HIGH-07** [function_size] audit-agents/merge/modes.py::run_split_mode is 219 LOC
 - **HIGH-08** [function_size] audit-agents/plan/cli.py::main is 222 LOC
 - **HIGH-09** [function_size] audit-agents/plan/generator.py::_add_component_steps is 382 LOC
 - **HIGH-10** [function_size] audit-agents/plan/post_compile.py::phase_post_compile is 235 LOC
@@ -350,31 +351,30 @@ Evidence:
 - **MEDIUM-24** [function_size] audit-agents/gate/cli.py::main is 171 LOC
 - **MEDIUM-25** [function_size] audit-agents/halmos_property_generator.py::parse_functions is 133 LOC
 - **MEDIUM-26** [function_size] audit-agents/halmos_property_generator.py::generate_check_functions is 167 LOC
-- **MEDIUM-27** [file_size] audit-agents/merge_invariants.py is 1280 LOC (medium threshold)
-- **MEDIUM-28** [function_size] audit-agents/merge_invariants.py::main is 120 LOC
-- **MEDIUM-29** [function_size] audit-agents/plan/generator.py::generate_plan is 174 LOC
-- **MEDIUM-30** [file_size] audit-agents/plan/prompts_rust.py is 807 LOC (medium threshold)
-- **MEDIUM-31** [function_size] audit-agents/plan/prompts_rust.py::phase_rust_fuzz_harness_prompt is 121 LOC
-- **MEDIUM-32** [function_size] audit-agents/plan/prompts_rust.py::_phase_hunter_prompt_rust is 126 LOC
-- **MEDIUM-33** [file_size] audit-agents/plan/prompts_solidity.py is 988 LOC (medium threshold)
-- **MEDIUM-34** [function_size] audit-agents/plan/prompts_solidity.py::phase_hunter_prompt is 103 LOC
-- **MEDIUM-35** [function_size] audit-agents/plan/prompts_solidity.py::phase_deepdive_prompt is 157 LOC
-- **MEDIUM-36** [function_size] audit-agents/plan/prompts_solidity.py::phase_findings is 121 LOC
-- **MEDIUM-37** [function_size] audit-agents/plan/prompts_solidity.py::phase_fork_poc_prompt is 149 LOC
-- **MEDIUM-38** [function_size] audit-agents/plan/prompts_solidity.py::phase_chimera_early_prompt is 119 LOC
-- **MEDIUM-39** [function_size] audit-agents/scaffold.py::scaffold_project is 111 LOC
-- **MEDIUM-40** [function_size] audit-agents/scope_intake.py::main is 107 LOC
-- **MEDIUM-41** [function_size] audit-agents/solodit_search.py::search_sqlite is 124 LOC
-- **MEDIUM-42** [function_size] audit-agents/sync_state.py::main is 102 LOC
-- **MEDIUM-43** [file_size] audit-agents/target_monitor.py is 1261 LOC (medium threshold)
-- **MEDIUM-44** [function_size] audit-agents/target_monitor.py::main is 107 LOC
-- **MEDIUM-45** [function_size] audit-agents/target_monitor.py::_check_deployer is 125 LOC
+- **MEDIUM-27** [function_size] audit-agents/merge/cli.py::main is 120 LOC
+- **MEDIUM-28** [function_size] audit-agents/plan/generator.py::generate_plan is 174 LOC
+- **MEDIUM-29** [file_size] audit-agents/plan/prompts_rust.py is 807 LOC (medium threshold)
+- **MEDIUM-30** [function_size] audit-agents/plan/prompts_rust.py::phase_rust_fuzz_harness_prompt is 121 LOC
+- **MEDIUM-31** [function_size] audit-agents/plan/prompts_rust.py::_phase_hunter_prompt_rust is 126 LOC
+- **MEDIUM-32** [file_size] audit-agents/plan/prompts_solidity.py is 988 LOC (medium threshold)
+- **MEDIUM-33** [function_size] audit-agents/plan/prompts_solidity.py::phase_hunter_prompt is 103 LOC
+- **MEDIUM-34** [function_size] audit-agents/plan/prompts_solidity.py::phase_deepdive_prompt is 157 LOC
+- **MEDIUM-35** [function_size] audit-agents/plan/prompts_solidity.py::phase_findings is 121 LOC
+- **MEDIUM-36** [function_size] audit-agents/plan/prompts_solidity.py::phase_fork_poc_prompt is 149 LOC
+- **MEDIUM-37** [function_size] audit-agents/plan/prompts_solidity.py::phase_chimera_early_prompt is 119 LOC
+- **MEDIUM-38** [function_size] audit-agents/scaffold.py::scaffold_project is 111 LOC
+- **MEDIUM-39** [function_size] audit-agents/scope_intake.py::main is 107 LOC
+- **MEDIUM-40** [function_size] audit-agents/solodit_search.py::search_sqlite is 124 LOC
+- **MEDIUM-41** [function_size] audit-agents/sync_state.py::main is 102 LOC
+- **MEDIUM-42** [file_size] audit-agents/target_monitor.py is 1261 LOC (medium threshold)
+- **MEDIUM-43** [function_size] audit-agents/target_monitor.py::main is 107 LOC
+- **MEDIUM-44** [function_size] audit-agents/target_monitor.py::_check_deployer is 125 LOC
 
 ### LOW
 
 - **LOW-01** [todo] audit-agents/halmos_property_generator.py:380 — // TODO: Import the target contract
 - **LOW-02** [todo] audit-agents/halmos_property_generator.py:384 — // TODO: Initialize target contract
-- **LOW-03** [todo] audit-agents/merge_invariants.py:349 — body = inv.get("solidity_property", inv.get("solidity", "    // TODO: implement")).rstrip()
+- **LOW-03** [todo] audit-agents/merge/solidity.py:70 — body = inv.get("solidity_property", inv.get("solidity", "    // TODO: implement")).rstrip()
 - **LOW-04** [todo] audit-agents/phase_8_audit.py:281 — _TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
 - **LOW-05** [todo] audit-agents/phase_8_audit.py:332 — """Find TODO markers and unused imports in audit-agents/."""
 - **LOW-06** [todo] audit-agents/poc_generator.py:40 — // TODO: Add target contract interface functions
@@ -450,125 +450,124 @@ Evidence:
 - **LOW-76** [unused_import] audit-agents/matcher.py:11 imports 're' but never uses it
 - **LOW-77** [unused_import] audit-agents/matcher.py:12 imports 'subprocess' but never uses it
 - **LOW-78** [unused_import] audit-agents/matcher.py:13 imports 'tempfile' but never uses it
-- **LOW-79** [unused_import] audit-agents/merge_invariants.py:51 imports 'STATE_FILE' but never uses it
-- **LOW-80** [unused_import] audit-agents/paths.py:11 imports 'annotations' but never uses it
-- **LOW-81** [unused_import] audit-agents/phase_8_audit.py:6 imports 'annotations' but never uses it
-- **LOW-82** [unused_import] audit-agents/pipeline_gate.py:54 imports 'WEB3_DIR' but never uses it
-- **LOW-83** [unused_import] audit-agents/pipeline_gate.py:54 imports 'HUNT_SESSION_DIR' but never uses it
-- **LOW-84** [unused_import] audit-agents/pipeline_gate.py:54 imports 'STATE_FILE' but never uses it
-- **LOW-85** [unused_import] audit-agents/pipeline_gate.py:55 imports 'load_state' but never uses it
-- **LOW-86** [unused_import] audit-agents/pipeline_gate.py:55 imports '_sm_save_state' but never uses it
-- **LOW-87** [unused_import] audit-agents/plan/cli.py:2 imports 'annotations' but never uses it
-- **LOW-88** [unused_import] audit-agents/plan/detectors.py:7 imports 'annotations' but never uses it
-- **LOW-89** [unused_import] audit-agents/plan/generator.py:10 imports 'annotations' but never uses it
-- **LOW-90** [unused_import] audit-agents/plan/post_compile.py:6 imports 'annotations' but never uses it
-- **LOW-91** [unused_import] audit-agents/plan/prompts_rust.py:14 imports 'annotations' but never uses it
-- **LOW-92** [unused_import] audit-agents/plan/prompts_solidity.py:9 imports 'annotations' but never uses it
-- **LOW-93** [unused_import] audit-agents/plan_schema.py:8 imports 'annotations' but never uses it
-- **LOW-94** [unused_import] audit-agents/plan_schema.py:11 imports 'asdict' but never uses it
-- **LOW-95** [unused_import] audit-agents/registry.py:10 imports 'os' but never uses it
-- **LOW-96** [unused_import] audit-agents/scaffold.py:20 imports 'os' but never uses it
-- **LOW-97** [unused_import] audit-agents/scaffold.py:27 imports 'get_registry' but never uses it
-- **LOW-98** [unused_import] audit-agents/solodit_to_wiki.py:7 imports 'annotations' but never uses it
-- **LOW-99** [unused_import] audit-agents/state_manager.py:14 imports 'annotations' but never uses it
-- **LOW-100** [unused_import] audit-agents/symmetric_analyzer.py:17 imports 'sys' but never uses it
-- **LOW-101** [unused_import] audit-agents/target_monitor.py:34 imports 're' but never uses it
-- **LOW-102** [unused_import] audit-agents/target_monitor.py:35 imports 'sys' but never uses it
-- **LOW-103** [unused_import] audit-agents/target_monitor.py:38 imports 'timedelta' but never uses it
-- **LOW-104** [unused_import] audit-agents/utils/__init__.py:1 imports 'console' but never uses it
-- **LOW-105** [unused_import] audit-agents/utils/__init__.py:1 imports 'banner' but never uses it
-- **LOW-106** [unused_import] audit-agents/utils/__init__.py:1 imports 'agent_start' but never uses it
-- **LOW-107** [unused_import] audit-agents/utils/__init__.py:1 imports 'agent_done' but never uses it
-- **LOW-108** [unused_import] audit-agents/utils/__init__.py:1 imports 'finding' but never uses it
-- **LOW-109** [unused_import] audit-agents/utils/__init__.py:1 imports 'info' but never uses it
-- **LOW-110** [unused_import] audit-agents/utils/__init__.py:1 imports 'error' but never uses it
-- **LOW-111** [unused_import] audit-agents/utils/__init__.py:1 imports 'results_table' but never uses it
-- **LOW-112** [unused_import] audit-agents/utils/__init__.py:2 imports 'parse_solidity' but never uses it
-- **LOW-113** [unused_import] audit-agents/utils/__init__.py:2 imports 'SolidityContract' but never uses it
-- **LOW-114** [unused_import] audit-agents/utils/__init__.py:2 imports 'SolidityFunction' but never uses it
-- **LOW-115** [shim_size] run_benchmark.py is 52 LOC (expected <50)
-- **LOW-116** [orphan_reexport] run_benchmark.py re-exports 'HUNT_SESSION_DIR' with 0 consumers — sunset candidate
-- **LOW-117** [orphan_reexport] run_benchmark.py re-exports 'AUDIT_AGENTS_DIR' with 0 consumers — sunset candidate
-- **LOW-118** [orphan_reexport] run_benchmark.py re-exports 'run_claude' with 0 consumers — sunset candidate
-- **LOW-119** [orphan_reexport] run_benchmark.py re-exports '_run_claude_inner' with 0 consumers — sunset candidate
-- **LOW-120** [orphan_reexport] run_benchmark.py re-exports 'run_claude_sub' with 0 consumers — sunset candidate
-- **LOW-121** [orphan_reexport] run_benchmark.py re-exports '_llm' with 0 consumers — sunset candidate
-- **LOW-122** [orphan_reexport] run_benchmark.py re-exports 'run_cmd' with 0 consumers — sunset candidate
-- **LOW-123** [orphan_reexport] run_benchmark.py re-exports '_extract_first_errors' with 0 consumers — sunset candidate
-- **LOW-124** [orphan_reexport] run_benchmark.py re-exports '_CLAUDE_SEMAPHORE' with 0 consumers — sunset candidate
-- **LOW-125** [orphan_reexport] run_benchmark.py re-exports '_AGENTIC_TOOLS' with 0 consumers — sunset candidate
-- **LOW-126** [orphan_reexport] run_benchmark.py re-exports 'load_prompt' with 0 consumers — sunset candidate
-- **LOW-127** [orphan_reexport] run_benchmark.py re-exports 'read_source' with 0 consumers — sunset candidate
-- **LOW-128** [orphan_reexport] run_benchmark.py re-exports 'build_hunter_brief' with 0 consumers — sunset candidate
-- **LOW-129** [orphan_reexport] run_benchmark.py re-exports 'build_hunter_dispatch_prompt' with 0 consumers — sunset candidate
-- **LOW-130** [orphan_reexport] run_benchmark.py re-exports 'build_deepdive_prompt' with 0 consumers — sunset candidate
-- **LOW-131** [orphan_reexport] run_benchmark.py re-exports 'build_poc_prompt' with 0 consumers — sunset candidate
-- **LOW-132** [orphan_reexport] run_benchmark.py re-exports 'build_escalation_prompt' with 0 consumers — sunset candidate
-- **LOW-133** [orphan_reexport] run_benchmark.py re-exports 'build_redteam_prompt' with 0 consumers — sunset candidate
-- **LOW-134** [orphan_reexport] run_benchmark.py re-exports 'build_variant_prompt' with 0 consumers — sunset candidate
-- **LOW-135** [orphan_reexport] run_benchmark.py re-exports 'build_report_prompt' with 0 consumers — sunset candidate
-- **LOW-136** [orphan_reexport] run_benchmark.py re-exports 'build_cross_pair_prompt' with 0 consumers — sunset candidate
-- **LOW-137** [orphan_reexport] run_benchmark.py re-exports 'fix_and_retry' with 0 consumers — sunset candidate
-- **LOW-138** [orphan_reexport] run_benchmark.py re-exports '_generate_foundry_tester_wrappers' with 0 consumers — sunset candidate
-- **LOW-139** [orphan_reexport] run_benchmark.py re-exports '_log_funnel' with 0 consumers — sunset candidate
-- **LOW-140** [orphan_reexport] run_benchmark.py re-exports '_sanitize_sol_unicode' with 0 consumers — sunset candidate
-- **LOW-141** [orphan_reexport] run_benchmark.py re-exports '_filter_errors_for_file' with 0 consumers — sunset candidate
-- **LOW-142** [orphan_reexport] run_benchmark.py re-exports 'generate_and_test_poc' with 0 consumers — sunset candidate
-- **LOW-143** [orphan_reexport] run_benchmark.py re-exports 'run_component_pipeline' with 0 consumers — sunset candidate
-- **LOW-144** [orphan_reexport] run_benchmark.py re-exports 'parse_fuzz_failures' with 0 consumers — sunset candidate
-- **LOW-145** [orphan_reexport] run_benchmark.py re-exports 'extract_findings' with 0 consumers — sunset candidate
-- **LOW-146** [orphan_reexport] run_benchmark.py re-exports 'run_finding_pipeline' with 0 consumers — sunset candidate
-- **LOW-147** [orphan_reexport] run_benchmark.py re-exports 'run_cross_component' with 0 consumers — sunset candidate
-- **LOW-148** [orphan_reexport] run_benchmark.py re-exports '_create_worktree' with 0 consumers — sunset candidate
-- **LOW-149** [orphan_reexport] run_benchmark.py re-exports '_remove_worktree' with 0 consumers — sunset candidate
-- **LOW-150** [orphan_reexport] run_benchmark.py re-exports '_maybe_run_apply_feedback' with 0 consumers — sunset candidate
-- **LOW-151** [orphan_reexport] run_benchmark.py re-exports '_resolve_components' with 0 consumers — sunset candidate
-- **LOW-152** [orphan_reexport] run_benchmark.py re-exports '_extract_relevant_code' with 0 consumers — sunset candidate
-- **LOW-153** [orphan_reexport] run_benchmark.py re-exports 'build_verify_prompt' with 0 consumers — sunset candidate
-- **LOW-154** [orphan_reexport] run_benchmark.py re-exports 'build_is_same_bug_prompt' with 0 consumers — sunset candidate
-- **LOW-155** [orphan_reexport] run_benchmark.py re-exports 'POC_CONFIDENCE_THRESHOLD' with 0 consumers — sunset candidate
-- **LOW-156** [orphan_reexport] run_benchmark.py re-exports 'setup_logging' with 0 consumers — sunset candidate
-- **LOW-157** [orphan_reexport] run_benchmark.py re-exports 'check_gate' with 0 consumers — sunset candidate
-- **LOW-158** [orphan_reexport] run_benchmark.py re-exports 'main' with 0 consumers — sunset candidate
-- **LOW-159** [orphan_reexport] run_benchmark.py re-exports 'logger' with 0 consumers — sunset candidate
-- **LOW-160** [orphan_reexport] run_benchmark.py re-exports 'SCRIPT_DIR' with 0 consumers — sunset candidate
-- **LOW-161** [orphan_reexport] plan_generator.py re-exports '_detect_primary_domain' with 0 consumers — sunset candidate
-- **LOW-162** [orphan_reexport] plan_generator.py re-exports '_read_file_safe' with 0 consumers — sunset candidate
-- **LOW-163** [orphan_reexport] plan_generator.py re-exports '_detect_lang' with 0 consumers — sunset candidate
-- **LOW-164** [orphan_reexport] plan_generator.py re-exports '_src_dir' with 0 consumers — sunset candidate
-- **LOW-165** [orphan_reexport] plan_generator.py re-exports '_find_cargo_workspace' with 0 consumers — sunset candidate
-- **LOW-166** [orphan_reexport] plan_generator.py re-exports '_find_rust_crate_src' with 0 consumers — sunset candidate
-- **LOW-167** [orphan_reexport] plan_generator.py re-exports '_rust_crate_sources' with 0 consumers — sunset candidate
-- **LOW-168** [orphan_reexport] plan_generator.py re-exports '_results_dir' with 0 consumers — sunset candidate
-- **LOW-169** [orphan_reexport] plan_generator.py re-exports '_hyp_dir' with 0 consumers — sunset candidate
-- **LOW-170** [orphan_reexport] plan_generator.py re-exports '_step_id' with 0 consumers — sunset candidate
-- **LOW-171** [orphan_reexport] plan_generator.py re-exports '_rpc_var' with 0 consumers — sunset candidate
-- **LOW-172** [orphan_reexport] plan_generator.py re-exports '_fork_sol_snippet' with 0 consumers — sunset candidate
-- **LOW-173** [orphan_reexport] plan_generator.py re-exports '_worktree_path' with 0 consumers — sunset candidate
-- **LOW-174** [orphan_reexport] plan_generator.py re-exports '_last_step_id' with 0 consumers — sunset candidate
-- **LOW-175** [orphan_reexport] plan_generator.py re-exports 'generate_plan' with 0 consumers — sunset candidate
-- **LOW-176** [orphan_reexport] plan_generator.py re-exports '_add_component_steps' with 0 consumers — sunset candidate
-- **LOW-177** [orphan_reexport] plan_generator.py re-exports '_add_cross_component_steps' with 0 consumers — sunset candidate
-- **LOW-178** [orphan_reexport] plan_generator.py re-exports 'phase_hunter_prompt' with 0 consumers — sunset candidate
-- **LOW-179** [orphan_reexport] plan_generator.py re-exports 'phase_deepdive_prompt' with 0 consumers — sunset candidate
-- **LOW-180** [orphan_reexport] plan_generator.py re-exports 'phase_findings' with 0 consumers — sunset candidate
-- **LOW-181** [orphan_reexport] plan_generator.py re-exports 'phase_fork_poc_prompt' with 0 consumers — sunset candidate
-- **LOW-182** [orphan_reexport] plan_generator.py re-exports 'phase_cross_prompt' with 0 consumers — sunset candidate
-- **LOW-183** [orphan_reexport] plan_generator.py re-exports 'phase_transitive_chain_prompt' with 0 consumers — sunset candidate
-- **LOW-184** [orphan_reexport] plan_generator.py re-exports 'phase_chimera_early_prompt' with 0 consumers — sunset candidate
-- **LOW-185** [orphan_reexport] plan_generator.py re-exports 'phase_chimera_builder_prompt' with 0 consumers — sunset candidate
-- **LOW-186** [orphan_reexport] plan_generator.py re-exports 'phase_enhance_targets_prompt' with 0 consumers — sunset candidate
-- **LOW-187** [orphan_reexport] plan_generator.py re-exports 'phase_rust_fuzz_scaffold_prompt' with 0 consumers — sunset candidate
-- **LOW-188** [orphan_reexport] plan_generator.py re-exports 'phase_rust_fuzz_harness_prompt' with 0 consumers — sunset candidate
-- **LOW-189** [orphan_reexport] plan_generator.py re-exports 'phase_rust_merge_harness' with 0 consumers — sunset candidate
-- **LOW-190** [orphan_reexport] plan_generator.py re-exports '_rust_enhance_fuzz_prompt' with 0 consumers — sunset candidate
-- **LOW-191** [orphan_reexport] plan_generator.py re-exports '_phase_hunter_prompt_rust' with 0 consumers — sunset candidate
-- **LOW-192** [orphan_reexport] plan_generator.py re-exports '_phase_findings_rust' with 0 consumers — sunset candidate
-- **LOW-193** [orphan_reexport] plan_generator.py re-exports '_phase_cross_prompt_rust' with 0 consumers — sunset candidate
-- **LOW-194** [orphan_reexport] plan_generator.py re-exports 'phase_write_fork_setup' with 0 consumers — sunset candidate
-- **LOW-195** [orphan_reexport] plan_generator.py re-exports 'phase_post_compile' with 0 consumers — sunset candidate
-- **LOW-196** [orphan_reexport] plan_generator.py re-exports 'phase_checkpoint' with 0 consumers — sunset candidate
-- **LOW-197** [orphan_reexport] plan_generator.py re-exports 'main' with 0 consumers — sunset candidate
+- **LOW-79** [unused_import] audit-agents/paths.py:11 imports 'annotations' but never uses it
+- **LOW-80** [unused_import] audit-agents/phase_8_audit.py:6 imports 'annotations' but never uses it
+- **LOW-81** [unused_import] audit-agents/pipeline_gate.py:54 imports 'WEB3_DIR' but never uses it
+- **LOW-82** [unused_import] audit-agents/pipeline_gate.py:54 imports 'HUNT_SESSION_DIR' but never uses it
+- **LOW-83** [unused_import] audit-agents/pipeline_gate.py:54 imports 'STATE_FILE' but never uses it
+- **LOW-84** [unused_import] audit-agents/pipeline_gate.py:55 imports 'load_state' but never uses it
+- **LOW-85** [unused_import] audit-agents/pipeline_gate.py:55 imports '_sm_save_state' but never uses it
+- **LOW-86** [unused_import] audit-agents/plan/cli.py:2 imports 'annotations' but never uses it
+- **LOW-87** [unused_import] audit-agents/plan/detectors.py:7 imports 'annotations' but never uses it
+- **LOW-88** [unused_import] audit-agents/plan/generator.py:10 imports 'annotations' but never uses it
+- **LOW-89** [unused_import] audit-agents/plan/post_compile.py:6 imports 'annotations' but never uses it
+- **LOW-90** [unused_import] audit-agents/plan/prompts_rust.py:14 imports 'annotations' but never uses it
+- **LOW-91** [unused_import] audit-agents/plan/prompts_solidity.py:9 imports 'annotations' but never uses it
+- **LOW-92** [unused_import] audit-agents/plan_schema.py:8 imports 'annotations' but never uses it
+- **LOW-93** [unused_import] audit-agents/plan_schema.py:11 imports 'asdict' but never uses it
+- **LOW-94** [unused_import] audit-agents/registry.py:10 imports 'os' but never uses it
+- **LOW-95** [unused_import] audit-agents/scaffold.py:20 imports 'os' but never uses it
+- **LOW-96** [unused_import] audit-agents/scaffold.py:27 imports 'get_registry' but never uses it
+- **LOW-97** [unused_import] audit-agents/solodit_to_wiki.py:7 imports 'annotations' but never uses it
+- **LOW-98** [unused_import] audit-agents/state_manager.py:14 imports 'annotations' but never uses it
+- **LOW-99** [unused_import] audit-agents/symmetric_analyzer.py:17 imports 'sys' but never uses it
+- **LOW-100** [unused_import] audit-agents/target_monitor.py:34 imports 're' but never uses it
+- **LOW-101** [unused_import] audit-agents/target_monitor.py:35 imports 'sys' but never uses it
+- **LOW-102** [unused_import] audit-agents/target_monitor.py:38 imports 'timedelta' but never uses it
+- **LOW-103** [unused_import] audit-agents/utils/__init__.py:1 imports 'console' but never uses it
+- **LOW-104** [unused_import] audit-agents/utils/__init__.py:1 imports 'banner' but never uses it
+- **LOW-105** [unused_import] audit-agents/utils/__init__.py:1 imports 'agent_start' but never uses it
+- **LOW-106** [unused_import] audit-agents/utils/__init__.py:1 imports 'agent_done' but never uses it
+- **LOW-107** [unused_import] audit-agents/utils/__init__.py:1 imports 'finding' but never uses it
+- **LOW-108** [unused_import] audit-agents/utils/__init__.py:1 imports 'info' but never uses it
+- **LOW-109** [unused_import] audit-agents/utils/__init__.py:1 imports 'error' but never uses it
+- **LOW-110** [unused_import] audit-agents/utils/__init__.py:1 imports 'results_table' but never uses it
+- **LOW-111** [unused_import] audit-agents/utils/__init__.py:2 imports 'parse_solidity' but never uses it
+- **LOW-112** [unused_import] audit-agents/utils/__init__.py:2 imports 'SolidityContract' but never uses it
+- **LOW-113** [unused_import] audit-agents/utils/__init__.py:2 imports 'SolidityFunction' but never uses it
+- **LOW-114** [shim_size] run_benchmark.py is 52 LOC (expected <50)
+- **LOW-115** [orphan_reexport] run_benchmark.py re-exports 'HUNT_SESSION_DIR' with 0 consumers — sunset candidate
+- **LOW-116** [orphan_reexport] run_benchmark.py re-exports 'AUDIT_AGENTS_DIR' with 0 consumers — sunset candidate
+- **LOW-117** [orphan_reexport] run_benchmark.py re-exports 'run_claude' with 0 consumers — sunset candidate
+- **LOW-118** [orphan_reexport] run_benchmark.py re-exports '_run_claude_inner' with 0 consumers — sunset candidate
+- **LOW-119** [orphan_reexport] run_benchmark.py re-exports 'run_claude_sub' with 0 consumers — sunset candidate
+- **LOW-120** [orphan_reexport] run_benchmark.py re-exports '_llm' with 0 consumers — sunset candidate
+- **LOW-121** [orphan_reexport] run_benchmark.py re-exports 'run_cmd' with 0 consumers — sunset candidate
+- **LOW-122** [orphan_reexport] run_benchmark.py re-exports '_extract_first_errors' with 0 consumers — sunset candidate
+- **LOW-123** [orphan_reexport] run_benchmark.py re-exports '_CLAUDE_SEMAPHORE' with 0 consumers — sunset candidate
+- **LOW-124** [orphan_reexport] run_benchmark.py re-exports '_AGENTIC_TOOLS' with 0 consumers — sunset candidate
+- **LOW-125** [orphan_reexport] run_benchmark.py re-exports 'load_prompt' with 0 consumers — sunset candidate
+- **LOW-126** [orphan_reexport] run_benchmark.py re-exports 'read_source' with 0 consumers — sunset candidate
+- **LOW-127** [orphan_reexport] run_benchmark.py re-exports 'build_hunter_brief' with 0 consumers — sunset candidate
+- **LOW-128** [orphan_reexport] run_benchmark.py re-exports 'build_hunter_dispatch_prompt' with 0 consumers — sunset candidate
+- **LOW-129** [orphan_reexport] run_benchmark.py re-exports 'build_deepdive_prompt' with 0 consumers — sunset candidate
+- **LOW-130** [orphan_reexport] run_benchmark.py re-exports 'build_poc_prompt' with 0 consumers — sunset candidate
+- **LOW-131** [orphan_reexport] run_benchmark.py re-exports 'build_escalation_prompt' with 0 consumers — sunset candidate
+- **LOW-132** [orphan_reexport] run_benchmark.py re-exports 'build_redteam_prompt' with 0 consumers — sunset candidate
+- **LOW-133** [orphan_reexport] run_benchmark.py re-exports 'build_variant_prompt' with 0 consumers — sunset candidate
+- **LOW-134** [orphan_reexport] run_benchmark.py re-exports 'build_report_prompt' with 0 consumers — sunset candidate
+- **LOW-135** [orphan_reexport] run_benchmark.py re-exports 'build_cross_pair_prompt' with 0 consumers — sunset candidate
+- **LOW-136** [orphan_reexport] run_benchmark.py re-exports 'fix_and_retry' with 0 consumers — sunset candidate
+- **LOW-137** [orphan_reexport] run_benchmark.py re-exports '_generate_foundry_tester_wrappers' with 0 consumers — sunset candidate
+- **LOW-138** [orphan_reexport] run_benchmark.py re-exports '_log_funnel' with 0 consumers — sunset candidate
+- **LOW-139** [orphan_reexport] run_benchmark.py re-exports '_sanitize_sol_unicode' with 0 consumers — sunset candidate
+- **LOW-140** [orphan_reexport] run_benchmark.py re-exports '_filter_errors_for_file' with 0 consumers — sunset candidate
+- **LOW-141** [orphan_reexport] run_benchmark.py re-exports 'generate_and_test_poc' with 0 consumers — sunset candidate
+- **LOW-142** [orphan_reexport] run_benchmark.py re-exports 'run_component_pipeline' with 0 consumers — sunset candidate
+- **LOW-143** [orphan_reexport] run_benchmark.py re-exports 'parse_fuzz_failures' with 0 consumers — sunset candidate
+- **LOW-144** [orphan_reexport] run_benchmark.py re-exports 'extract_findings' with 0 consumers — sunset candidate
+- **LOW-145** [orphan_reexport] run_benchmark.py re-exports 'run_finding_pipeline' with 0 consumers — sunset candidate
+- **LOW-146** [orphan_reexport] run_benchmark.py re-exports 'run_cross_component' with 0 consumers — sunset candidate
+- **LOW-147** [orphan_reexport] run_benchmark.py re-exports '_create_worktree' with 0 consumers — sunset candidate
+- **LOW-148** [orphan_reexport] run_benchmark.py re-exports '_remove_worktree' with 0 consumers — sunset candidate
+- **LOW-149** [orphan_reexport] run_benchmark.py re-exports '_maybe_run_apply_feedback' with 0 consumers — sunset candidate
+- **LOW-150** [orphan_reexport] run_benchmark.py re-exports '_resolve_components' with 0 consumers — sunset candidate
+- **LOW-151** [orphan_reexport] run_benchmark.py re-exports '_extract_relevant_code' with 0 consumers — sunset candidate
+- **LOW-152** [orphan_reexport] run_benchmark.py re-exports 'build_verify_prompt' with 0 consumers — sunset candidate
+- **LOW-153** [orphan_reexport] run_benchmark.py re-exports 'build_is_same_bug_prompt' with 0 consumers — sunset candidate
+- **LOW-154** [orphan_reexport] run_benchmark.py re-exports 'POC_CONFIDENCE_THRESHOLD' with 0 consumers — sunset candidate
+- **LOW-155** [orphan_reexport] run_benchmark.py re-exports 'setup_logging' with 0 consumers — sunset candidate
+- **LOW-156** [orphan_reexport] run_benchmark.py re-exports 'check_gate' with 0 consumers — sunset candidate
+- **LOW-157** [orphan_reexport] run_benchmark.py re-exports 'main' with 0 consumers — sunset candidate
+- **LOW-158** [orphan_reexport] run_benchmark.py re-exports 'logger' with 0 consumers — sunset candidate
+- **LOW-159** [orphan_reexport] run_benchmark.py re-exports 'SCRIPT_DIR' with 0 consumers — sunset candidate
+- **LOW-160** [orphan_reexport] plan_generator.py re-exports '_detect_primary_domain' with 0 consumers — sunset candidate
+- **LOW-161** [orphan_reexport] plan_generator.py re-exports '_read_file_safe' with 0 consumers — sunset candidate
+- **LOW-162** [orphan_reexport] plan_generator.py re-exports '_detect_lang' with 0 consumers — sunset candidate
+- **LOW-163** [orphan_reexport] plan_generator.py re-exports '_src_dir' with 0 consumers — sunset candidate
+- **LOW-164** [orphan_reexport] plan_generator.py re-exports '_find_cargo_workspace' with 0 consumers — sunset candidate
+- **LOW-165** [orphan_reexport] plan_generator.py re-exports '_find_rust_crate_src' with 0 consumers — sunset candidate
+- **LOW-166** [orphan_reexport] plan_generator.py re-exports '_rust_crate_sources' with 0 consumers — sunset candidate
+- **LOW-167** [orphan_reexport] plan_generator.py re-exports '_results_dir' with 0 consumers — sunset candidate
+- **LOW-168** [orphan_reexport] plan_generator.py re-exports '_hyp_dir' with 0 consumers — sunset candidate
+- **LOW-169** [orphan_reexport] plan_generator.py re-exports '_step_id' with 0 consumers — sunset candidate
+- **LOW-170** [orphan_reexport] plan_generator.py re-exports '_rpc_var' with 0 consumers — sunset candidate
+- **LOW-171** [orphan_reexport] plan_generator.py re-exports '_fork_sol_snippet' with 0 consumers — sunset candidate
+- **LOW-172** [orphan_reexport] plan_generator.py re-exports '_worktree_path' with 0 consumers — sunset candidate
+- **LOW-173** [orphan_reexport] plan_generator.py re-exports '_last_step_id' with 0 consumers — sunset candidate
+- **LOW-174** [orphan_reexport] plan_generator.py re-exports 'generate_plan' with 0 consumers — sunset candidate
+- **LOW-175** [orphan_reexport] plan_generator.py re-exports '_add_component_steps' with 0 consumers — sunset candidate
+- **LOW-176** [orphan_reexport] plan_generator.py re-exports '_add_cross_component_steps' with 0 consumers — sunset candidate
+- **LOW-177** [orphan_reexport] plan_generator.py re-exports 'phase_hunter_prompt' with 0 consumers — sunset candidate
+- **LOW-178** [orphan_reexport] plan_generator.py re-exports 'phase_deepdive_prompt' with 0 consumers — sunset candidate
+- **LOW-179** [orphan_reexport] plan_generator.py re-exports 'phase_findings' with 0 consumers — sunset candidate
+- **LOW-180** [orphan_reexport] plan_generator.py re-exports 'phase_fork_poc_prompt' with 0 consumers — sunset candidate
+- **LOW-181** [orphan_reexport] plan_generator.py re-exports 'phase_cross_prompt' with 0 consumers — sunset candidate
+- **LOW-182** [orphan_reexport] plan_generator.py re-exports 'phase_transitive_chain_prompt' with 0 consumers — sunset candidate
+- **LOW-183** [orphan_reexport] plan_generator.py re-exports 'phase_chimera_early_prompt' with 0 consumers — sunset candidate
+- **LOW-184** [orphan_reexport] plan_generator.py re-exports 'phase_chimera_builder_prompt' with 0 consumers — sunset candidate
+- **LOW-185** [orphan_reexport] plan_generator.py re-exports 'phase_enhance_targets_prompt' with 0 consumers — sunset candidate
+- **LOW-186** [orphan_reexport] plan_generator.py re-exports 'phase_rust_fuzz_scaffold_prompt' with 0 consumers — sunset candidate
+- **LOW-187** [orphan_reexport] plan_generator.py re-exports 'phase_rust_fuzz_harness_prompt' with 0 consumers — sunset candidate
+- **LOW-188** [orphan_reexport] plan_generator.py re-exports 'phase_rust_merge_harness' with 0 consumers — sunset candidate
+- **LOW-189** [orphan_reexport] plan_generator.py re-exports '_rust_enhance_fuzz_prompt' with 0 consumers — sunset candidate
+- **LOW-190** [orphan_reexport] plan_generator.py re-exports '_phase_hunter_prompt_rust' with 0 consumers — sunset candidate
+- **LOW-191** [orphan_reexport] plan_generator.py re-exports '_phase_findings_rust' with 0 consumers — sunset candidate
+- **LOW-192** [orphan_reexport] plan_generator.py re-exports '_phase_cross_prompt_rust' with 0 consumers — sunset candidate
+- **LOW-193** [orphan_reexport] plan_generator.py re-exports 'phase_write_fork_setup' with 0 consumers — sunset candidate
+- **LOW-194** [orphan_reexport] plan_generator.py re-exports 'phase_post_compile' with 0 consumers — sunset candidate
+- **LOW-195** [orphan_reexport] plan_generator.py re-exports 'phase_checkpoint' with 0 consumers — sunset candidate
+- **LOW-196** [orphan_reexport] plan_generator.py re-exports 'main' with 0 consumers — sunset candidate
 
 ## Roadmap closure
 
