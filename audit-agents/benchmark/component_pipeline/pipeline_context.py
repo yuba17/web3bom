@@ -72,3 +72,6 @@ class PipelineContext:
     poc_findings: List[Any] = field(default_factory=list)
     escaped_siblings: List[Any] = field(default_factory=list)
     fallback_findings: List[Any] = field(default_factory=list)
+
+    # Verify-phase outputs (set by verify, consumed by poc phase)
+    verified_findings: List[Any] = field(default_factory=list)
