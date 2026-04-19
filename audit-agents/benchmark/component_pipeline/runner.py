@@ -193,13 +193,16 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     protocol_model = ""
 
     # ─── Step 1.6: Read project's existing tests (inline, no Claude call) ──
-    # Include raw test content in hunter brief — hunters interpret it themselves
+    # Include raw test content in hunter brief — hunters interpret it themselves.
+    # QW6: Load once into _test_files_cache, derive slices at consumption points.
     existing_tests_summary = ""
+    _test_files_cache: List[Tuple[str, str]] = []  # (filename, full_content) — used by Setup.sol prompt later
     test_dir = Path(repo) / "test"
     if test_dir.exists():
         test_files = [f for f in test_dir.glob("*.sol") if "chimera" not in str(f)]
         for tf in sorted(test_files)[:3]:  # max 3 test files, raw content
             content = tf.read_text(encoding="utf-8")
+            _test_files_cache.append((tf.name, content))
             existing_tests_summary += f"\n// === {tf.name} ===\n{content[:3000]}\n"
         if existing_tests_summary:
             logger.info(f"  Loaded {len(test_files)} existing test files (raw, {len(existing_tests_summary)} chars)")
@@ -258,13 +261,10 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         chimera_dir_early = Path(repo) / "test" / "chimera"
         chimera_dir_early.mkdir(parents=True, exist_ok=True)
 
-        # Read project's own tests to understand deployment pattern
+        # QW6: Reuse _test_files_cache loaded in Step 1.6 (no re-read from disk)
         existing_test_code = ""
-        test_dir = Path(repo) / "test"
-        if test_dir.exists():
-            for tf in sorted(test_dir.glob("*.sol"))[:3]:
-                content = tf.read_text(encoding="utf-8")
-                existing_test_code += f"\n// === {tf.name} ===\n{content[:5000]}\n"
+        for _tf_name, _tf_content in _test_files_cache:
+            existing_test_code += f"\n// === {_tf_name} ===\n{_tf_content[:5000]}\n"
 
         # Read foundry.toml for remappings and compiler settings
         foundry_toml = ""
