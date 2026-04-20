@@ -50,6 +50,72 @@ def load_findings(protocol: str) -> list[dict[str, Any]]:
     return []
 
 
+GATE_ORDER = ("scope", "prepass", "hunters", "crosschain", "deepdive",
+              "merge", "compile", "phase1", "phase2", "phase3", "verify")
+
+
+@dataclass
+class HuntSnapshot:
+    protocol: str = ""
+    components: list[str] = field(default_factory=list)
+    gates: dict[str, dict[str, str]] = field(default_factory=dict)
+    active_component: str | None = None
+    active_gate: str | None = None
+    active_step: str | None = None
+    findings_total: int = 0
+    findings_by_severity: dict[str, int] = field(default_factory=dict)
+    recent_events: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+def aggregate_findings_by_severity(findings: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for f in findings:
+        sev = str(f.get("severity", "unknown")).lower()
+        counts[sev] = counts.get(sev, 0) + 1
+    return counts
+
+
+def build_snapshot(protocol_override: str | None) -> HuntSnapshot:
+    hunt = load_current_hunt()
+    protocol = protocol_override or hunt.get("protocol", "")
+    if not protocol:
+        return HuntSnapshot()
+
+    gs = load_gate_status(protocol).get("component_gates", {})
+    components = hunt.get("components") or list(gs.keys())
+
+    gates: dict[str, dict[str, str]] = {}
+    active_component = None
+    active_gate = None
+    for comp in components:
+        comp_gates = {}
+        comp_data = gs.get(comp, {})
+        for gate in GATE_ORDER:
+            state = comp_data.get(gate, {}).get("state", "pending")
+            comp_gates[gate] = state
+            if state == "pending" and active_component is None:
+                prior_ok = all(comp_gates[g] == "pass" for g in GATE_ORDER[:GATE_ORDER.index(gate)])
+                if prior_ok:
+                    active_component = comp
+                    active_gate = gate
+        gates[comp] = comp_gates
+
+    findings = load_findings(protocol)
+    severity_counts = aggregate_findings_by_severity(findings)
+
+    return HuntSnapshot(
+        protocol=protocol,
+        components=components,
+        gates=gates,
+        active_component=active_component,
+        active_gate=active_gate,
+        active_step=None,
+        findings_total=len(findings),
+        findings_by_severity=severity_counts,
+        recent_events=[],
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TUI dashboard for audit pipeline")
     p.add_argument("--protocol", help="Protocol name (overrides current_hunt.json)")
