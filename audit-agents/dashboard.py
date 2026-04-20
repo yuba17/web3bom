@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.spinner import Spinner
@@ -282,6 +284,36 @@ def render_activity(snap: HuntSnapshot) -> Panel:
     return Panel(body, title="▸▸▸ Activity", border_style="blue", padding=(0, 1))
 
 
+def _find_orchestrator_log(protocol: str) -> Path | None:
+    bench_logs = WEB3_DIR / "benchmarks" / protocol.removesuffix("-bench") / "bench_session" / "logs"
+    hunt_logs = HUNT_SESSION / "logs"
+    candidates: list[Path] = []
+    for root in (bench_logs, hunt_logs):
+        if root.exists():
+            for p in root.rglob("orchestrator.log"):
+                candidates.append(p)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def render_layout(snap: HuntSnapshot, prev_total: int, flash_until: float,
+                  phase1_runs: int | None) -> Layout:
+    layout = Layout()
+    panels = [
+        Layout(render_header(snap), name="header", size=3),
+        Layout(render_gates(snap), name="gates"),
+    ]
+    if phase1_runs is not None and snap.active_gate == "phase1":
+        panels.append(Layout(render_phase1_progress(phase1_runs), name="phase1", size=3))
+    panels.extend([
+        Layout(render_findings(snap, prev_total, flash_until), name="findings", size=3),
+        Layout(render_activity(snap), name="activity", size=7),
+    ])
+    layout.split_column(*panels)
+    return layout
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TUI dashboard for audit pipeline")
     p.add_argument("--protocol", help="Protocol name (overrides current_hunt.json)")
@@ -290,8 +322,62 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    print(f"dashboard started (protocol={args.protocol or 'auto'})")
-    return 0
+    from rich.console import Console
+    console = Console()
+
+    activity: deque[tuple[str, str, str]] = deque(maxlen=3)
+    log_offsets: dict[str, int] = {}
+    prev_total = 0
+    flash_until = 0.0
+    snap_cache: tuple[float, HuntSnapshot] | None = None
+    SNAPSHOT_TTL = 1.0
+
+    def _refresh_snapshot() -> HuntSnapshot:
+        nonlocal snap_cache
+        now = time.time()
+        if snap_cache and now - snap_cache[0] < SNAPSHOT_TTL:
+            return snap_cache[1]
+        s = build_snapshot(args.protocol)
+        snap_cache = (now, s)
+        return s
+
+    try:
+        with Live(console=console, refresh_per_second=4, screen=False) as live:
+            while True:
+                snap = _refresh_snapshot()
+
+                if not snap.protocol:
+                    live.update(Panel(
+                        Text("No active hunt — polling…", style="dim", justify="center"),
+                        border_style="grey50",
+                    ))
+                    time.sleep(2.0)
+                    snap_cache = None
+                    continue
+
+                log = _find_orchestrator_log(snap.protocol)
+                if log is not None:
+                    key = str(log)
+                    offset = log_offsets.get(key, log.stat().st_size)
+                    events, new_offset = parse_recent_events(log, offset, max_events=10)
+                    log_offsets[key] = new_offset
+                    for ev in events:
+                        activity.append(ev)
+
+                if snap.findings_total > prev_total:
+                    flash_until = time.time() + 1.0
+                prev_total = snap.findings_total
+
+                phase1_runs: int | None = None
+                if snap.active_gate == "phase1" and log is not None:
+                    phase1_runs = parse_phase1_progress(log)
+
+                snap.recent_events = list(activity)
+                live.update(render_layout(snap, prev_total, flash_until, phase1_runs))
+                time.sleep(0.25)
+    except KeyboardInterrupt:
+        console.print("\n[dim]dashboard stopped[/]")
+        return 0
 
 
 if __name__ == "__main__":
