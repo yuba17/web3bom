@@ -26,6 +26,7 @@ from benchmark.component_pipeline.extract import extract_findings
 from benchmark.component_pipeline.verify import verify_findings_lightweight
 from benchmark.component_pipeline.poc import generate_fork_pocs
 from benchmark.component_pipeline.finding import dispatch_finding_pipeline
+from benchmark.component_pipeline.gate_status_writer import flush_gate_status
 from benchmark.prompt_builders import read_source
 
 logger = logging.getLogger("orchestrator")
@@ -74,23 +75,27 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     ctx.library_code = library_code
     ctx.accumulated_context = accumulated_context
 
-    # Context phase
+    # Benchmark mode bypasses pipeline_gate.py — flush after each phase so the
+    # on-disk gate_status JSON reflects live progress for dashboard.py.
+    summary["gates"]["scope"] = True; flush_gate_status(ctx)
+
     clean_slate(ctx)
-    run_prepass(ctx)
+    run_prepass(ctx); flush_gate_status(ctx)
     if check_early_exit(ctx) == "EMPTY_PREPASS_SKIP":
         return summary
     load_tests(ctx); load_knowledge(ctx); load_interfaces(ctx); ensure_chimera_setup(ctx)
 
     if run_hunters(ctx, hunters_subset=hunters_subset) == BLOCKED_HUNTERS:
-        return summary
+        flush_gate_status(ctx); return summary
     if not ctx._skip_to_merge:
         run_deepdive(ctx)
+    flush_gate_status(ctx)
 
     if args.fast:
         logger.info("  FAST MODE: Steps 5-8 (compile+Phase1 5K), skip 9-9.5 (Medusa+tuning)")
         summary["gates"]["phase2"] = True
 
-    merge_result = run_merge(ctx)
+    merge_result = run_merge(ctx); flush_gate_status(ctx)
     if summary.get("status") in ("BLOCKED_CHIMERA", "BLOCKED_MERGE", "BLOCKED_COMPILE"):
         return summary
     skip_to_extract = (merge_result == SKIP_TO_EXTRACT)
@@ -98,8 +103,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     if not skip_to_extract:
         enhance_target_functions(ctx)
         if run_phase1_foundry(ctx) == BLOCKED_PHASE1_INFRA:
-            return summary
-        run_phase2_medusa(ctx)
+            flush_gate_status(ctx); return summary
+        flush_gate_status(ctx)
+        run_phase2_medusa(ctx); flush_gate_status(ctx)
 
     if extract_findings(ctx) == "EARLY_EXIT_hypothesis":
         return summary
