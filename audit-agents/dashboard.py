@@ -156,7 +156,8 @@ def parse_recent_events(log_path: Path, offset: int, max_events: int = 3
         parts = line.split("|", 1)
         if len(parts) == 2:
             header, msg = parts[0].strip(), parts[1].strip()
-            ts = header.split()[1] if len(header.split()) >= 2 else header
+            tokens = header.split()
+            ts = tokens[1] if len(tokens) >= 2 else header
         else:
             ts, msg = "", line.strip()
         matched.append((ts, "", msg))

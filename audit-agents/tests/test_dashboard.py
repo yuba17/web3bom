@@ -77,6 +77,8 @@ def test_build_snapshot_merges_sources(tmp_path, monkeypatch):
     assert snap.findings_total == 2
     assert snap.findings_by_severity["high"] == 1
     assert snap.findings_by_severity["medium"] == 1
+    assert snap.active_component == "Alpha"
+    assert snap.active_gate == "hunters"
 
 
 def test_parse_recent_events_extracts_step_markers(tmp_path):
