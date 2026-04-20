@@ -102,11 +102,13 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         narrate(ctx, "⛔", f"Bloqueado en {summary.get('status')}"); return summary
     if merge_result != SKIP_TO_EXTRACT:
         enhance_target_functions(ctx)
-        narrate(ctx, "🔥", "Phase 1: Foundry fuzzing 5K runs")
+        _runs = "3K" if args.fast else "5K"
+        narrate(ctx, "🔥", f"Phase 1: Foundry fuzzing {_runs} runs")
         if run_phase1_foundry(ctx) == BLOCKED_PHASE1_INFRA:
             narrate(ctx, "⛔", "Phase 1 bloqueada"); flush_gate_status(ctx); return summary
         flush_gate_status(ctx)
-        narrate(ctx, "🌊", "Phase 2: Medusa 15 min")
+        if not args.fast:
+            narrate(ctx, "🌊", "Phase 2: Medusa 15 min")
         run_phase2_medusa(ctx); flush_gate_status(ctx)
 
     if extract_findings(ctx) == "EARLY_EXIT_hypothesis": return summary
