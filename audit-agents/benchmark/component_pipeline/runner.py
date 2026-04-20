@@ -901,68 +901,21 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
                 summary["status"] = "BLOCKED_COMPILE"
                 return summary
 
-        # ─── Step 7.5: Enhance TargetFunctions with attack sequences (opt-in) ────
+        # ─── Step 7.5: Enhance TargetFunctions (opt-in) ────────────────
         if _skip_to_extract:
             logger.info("  Skipping Step 7.5 (compile failed, fast mode)")
-        elif not getattr(args, 'enhance_targets', False):
-            logger.info("  Step 7.5 skipped (activate with --enhance-targets)")
         else:
-            logger.info("  Step 7.5: Enhance TargetFunctions with attack sequences")
-            target_funcs_path = chimera_dir / "TargetFunctions.sol"
-            if target_funcs_path.exists():
-                top_hyps = ""
-                for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml"))[:5]:
-                    try:
-                        import yaml as _y
-                        data = _y.safe_load(hyp_file.read_text())
-                        if data:
-                            hyps = data.get("hypotheses", data.get("invariants", []))
-                            for h in hyps[:3]:
-                                if h.get("tier", 3) <= 2 and h.get("confidence", 0) >= 60:
-                                    top_hyps += f"\n- {h.get('id','?')}: {h.get('description','')}\n  Attack: {h.get('attack_scenario','')}\n"
-                    except Exception:
-                        pass
-
-                if top_hyps:
-                    target_funcs_code = target_funcs_path.read_text(encoding="utf-8")
-                    enhance_prompt = (
-                        f"Enhance the TargetFunctions.sol for {component} with multi-step attack sequences.\n\n"
-                        f"## Current TargetFunctions\n```solidity\n{target_funcs_code[:15000]}\n```\n\n"
-                        f"## Setup\n```solidity\n{setup_sol_text}\n```\n\n"
-                        f"## High-Priority Attack Scenarios from Hunters\n{top_hyps}\n\n"
-                        f"## Task\n"
-                        f"Add 3-5 NEW handler functions that encode MULTI-STEP attack sequences:\n"
-                        f"1. Flash loan → deposit → manipulate → withdraw sequences\n"
-                        f"2. Sandwich patterns: frontrun → victim action → backrun\n"
-                        f"3. State manipulation: set up bad state → trigger vulnerable path\n"
-                        f"4. Cross-function: call A to set state, call B to exploit it\n\n"
-                        f"Each handler should:\n"
-                        f"- Use clamped inputs (bound by `_clampBetween`)\n"
-                        f"- Prank as attacker where needed\n"
-                        f"- Be a realistic attack, not random calls\n\n"
-                        f"ONLY ADD new functions. Do NOT modify or remove existing handlers.\n"
-                        f"Write changes to: {target_funcs_path}"
-                    )
-                    _rb._llm(
-                        enhance_prompt,
-                        allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
-                        timeout=600,
-                        log_file=clog / "target_functions_enhance.log",
-                        cwd=repo
-                    )
-                    # Quick recompile to make sure enhancement didn't break anything
-                    recomp_ok = _rb.fix_and_retry(
-                        "targetfunc_compile", ["forge", "build"],
-                        [str(target_funcs_path)], max_retries=2, cwd=repo
-                    )
-                    if recomp_ok:
-                        logger.info("  TargetFunctions enhanced and compiles")
-                    else:
-                        logger.warning("  TargetFunctions enhancement broke compile — reverting")
-                        _rb.run_cmd(["git", "checkout", "--", str(target_funcs_path.relative_to(Path(repo)))], cwd=repo)
-                        _rb.run_cmd(["forge", "build"], cwd=repo)  # restore working state
-                else:
-                    logger.info("  No high-priority hypotheses — skipping TargetFunctions enhancement")
+            from benchmark.component_pipeline.pipeline_context import PipelineContext
+            from benchmark.component_pipeline.enhance import enhance_target_functions
+            _ctx_enhance = PipelineContext(
+                component=component, repo=repo, protocol=protocol,
+                args=args, logger=logger,
+                src_dir=src_dir, hyp_dir=hyp_dir, clog=clog,
+                src_file=src_file if 'src_file' in dir() else Path("."),
+            )
+            _ctx_enhance.summary = summary
+            _ctx_enhance.setup_sol_text = setup_sol_text
+            enhance_target_functions(_ctx_enhance)
 
         # forge_env already defined above (shared by fuzz + PoC steps)
 
