@@ -9,12 +9,14 @@ import argparse
 import json
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.spinner import Spinner
 from rich.style import Style
 from rich.table import Table
@@ -170,6 +172,44 @@ def parse_recent_events(log_path: Path, offset: int, max_events: int = 3
         matched.append((ts, "", msg))
 
     return matched[-max_events:], new_offset
+
+
+_PHASE1_RE = re.compile(r"runs:\s*(\d+)\s*/\s*5000")
+
+
+def parse_phase1_progress(log_path: Path) -> int | None:
+    """Return the highest fuzz run counter seen in the last 50 log lines.
+
+    Scanning only the tail avoids reading large logs on every tick; the
+    highest value is the most recent counter because Foundry emits them in
+    ascending order.
+    """
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            tail = deque(fh, maxlen=50)
+    except FileNotFoundError:
+        return None
+
+    best: int | None = None
+    for line in tail:
+        m = _PHASE1_RE.search(line)
+        if m:
+            val = int(m.group(1))
+            if best is None or val > best:
+                best = val
+    return best
+
+
+def render_phase1_progress(runs: int, total: int = 5000) -> Progress:
+    """Build a rich Progress bar showing Phase 1 fuzz completion."""
+    bar = Progress(
+        TextColumn("[bold cyan]Phase 1 fuzz[/]"),
+        BarColumn(),
+        TaskProgressColumn(),
+    )
+    task = bar.add_task("fuzz", total=total)
+    bar.update(task, completed=runs)
+    return bar
 
 
 GATE_COLS = [

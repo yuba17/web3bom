@@ -12,6 +12,7 @@ from dashboard import (
     load_findings,
     build_snapshot,
     parse_recent_events,
+    parse_phase1_progress,
     aggregate_findings_by_severity,
     HuntSnapshot,
 )
@@ -95,6 +96,24 @@ def test_parse_recent_events_extracts_step_markers(tmp_path):
     assert len(events) == 3
     assert any("Step 4: DeepDive Hunter" in msg for _, _, msg in events)
     assert any("12 Hunters completed" in msg for _, _, msg in events)
+
+
+def test_parse_phase1_progress_reads_latest_runs(tmp_path):
+    from dashboard import parse_phase1_progress
+    log = tmp_path / "orch.log"
+    log.write_text("\n".join([
+        "foo",
+        "runs: 500 / 5000",
+        "bar",
+        "runs: 2300 / 5000",
+        "runs: 4100 / 5000",
+    ]) + "\n")
+    assert parse_phase1_progress(log) == 4100
+
+
+def test_parse_phase1_progress_missing(tmp_path):
+    from dashboard import parse_phase1_progress
+    assert parse_phase1_progress(tmp_path / "does_not_exist.log") is None
 
 
 def test_findings_severity_aggregation():
