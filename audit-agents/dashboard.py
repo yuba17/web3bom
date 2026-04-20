@@ -218,6 +218,30 @@ def render_gates(snap: HuntSnapshot) -> Table:
     return tbl
 
 
+def render_findings(snap: HuntSnapshot, prev_total: int, flash_until: float) -> Panel:
+    sev = snap.findings_by_severity
+    body = Text.from_markup(
+        f"🐛  [bold]{snap.findings_total}[/] findings   "
+        f"[red]H:{sev.get('high', 0)}[/]  "
+        f"[yellow]M:{sev.get('medium', 0)}[/]  "
+        f"[white]L:{sev.get('low', 0)}[/]"
+    )
+    border = "bright_green" if time.time() < flash_until else "grey50"
+    return Panel(body, border_style=border, padding=(0, 2))
+
+
+def render_activity(snap: HuntSnapshot) -> Panel:
+    body = Text()
+    if not snap.recent_events:
+        body.append("waiting for events…", style="dim")
+    for ts, comp, msg in snap.recent_events[-3:]:
+        body.append(f"{ts}  ", style="cyan")
+        if comp:
+            body.append(f"{comp}  ", style="magenta")
+        body.append(msg + "\n", style="white")
+    return Panel(body, title="▸▸▸ Activity", border_style="blue", padding=(0, 1))
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TUI dashboard for audit pipeline")
     p.add_argument("--protocol", help="Protocol name (overrides current_hunt.json)")
