@@ -77,3 +77,19 @@ def test_build_snapshot_merges_sources(tmp_path, monkeypatch):
     assert snap.findings_total == 2
     assert snap.findings_by_severity["high"] == 1
     assert snap.findings_by_severity["medium"] == 1
+
+
+def test_parse_recent_events_extracts_step_markers(tmp_path):
+    log = tmp_path / "orchestrator.log"
+    log.write_text(
+        "2026-04-20 16:58:40 INFO | some noise line\n"
+        "2026-04-20 16:58:41 INFO |   Step 4: DeepDive Hunter\n"
+        "2026-04-20 16:58:42 INFO |   Running claude -p sub (3175 chars)...\n"
+        "2026-04-20 16:58:43 INFO |   12 Hunters completed (5.2min)\n"
+    )
+    import dashboard as d
+    events, new_offset = d.parse_recent_events(log, offset=0, max_events=3)
+    assert new_offset == log.stat().st_size
+    assert len(events) == 3
+    assert any("Step 4: DeepDive Hunter" in msg for _, _, msg in events)
+    assert any("12 Hunters completed" in msg for _, _, msg in events)

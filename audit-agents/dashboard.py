@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,6 +115,53 @@ def build_snapshot(protocol_override: str | None) -> HuntSnapshot:
         findings_by_severity=severity_counts,
         recent_events=[],
     )
+
+
+_EVENT_PATTERNS = (
+    re.compile(r"Step\s+[-\d.]+:\s*.+"),
+    re.compile(r"\d+\s+Hunters\s+completed.*"),
+    re.compile(r"DeepDive.*"),
+    re.compile(r"Gate\s+\w+:\s*(PASS|FAIL)"),
+    re.compile(r"Running\s+claude\s+-p.*"),
+    re.compile(r"🏁.*"),
+    re.compile(r"Found\s+\d+\s+findings.*"),
+    re.compile(r"Phase\s+\d+.*"),
+)
+
+
+def _matches_event(line: str) -> bool:
+    return any(p.search(line) for p in _EVENT_PATTERNS)
+
+
+def parse_recent_events(log_path: Path, offset: int, max_events: int = 3
+                        ) -> tuple[list[tuple[str, str, str]], int]:
+    """Read log from `offset`, return (events, new_offset).
+
+    Each event is (timestamp_str, component, message). Component is "" if not
+    inferrable. Keeps only the last `max_events` matching lines.
+    """
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(offset)
+            new_lines = fh.readlines()
+            new_offset = fh.tell()
+    except FileNotFoundError:
+        return [], offset
+
+    matched: list[tuple[str, str, str]] = []
+    for raw in new_lines:
+        line = raw.rstrip("\n")
+        if not _matches_event(line):
+            continue
+        parts = line.split("|", 1)
+        if len(parts) == 2:
+            header, msg = parts[0].strip(), parts[1].strip()
+            ts = header.split()[1] if len(header.split()) >= 2 else header
+        else:
+            ts, msg = "", line.strip()
+        matched.append((ts, "", msg))
+
+    return matched[-max_events:], new_offset
 
 
 def parse_args() -> argparse.Namespace:
