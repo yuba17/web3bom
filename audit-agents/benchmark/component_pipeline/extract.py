@@ -68,7 +68,7 @@ def extract_findings(ctx: PipelineContext):
     if fuzz_failures:
         logger.info(f"  Fuzz failures detected: {list(fuzz_failures.keys())}")
 
-    findings = _rb.extract_findings(component, protocol, fuzz_failures)
+    findings = _rb.extract_findings(component, protocol, fuzz_failures, hyp_dir=hyp_dir)
     summary["findings"] = findings
     logger.info(f"  Found {len(findings)} findings ({sum(1 for f in findings if f.get('fuzz_confirmed'))} fuzz-confirmed)")
 

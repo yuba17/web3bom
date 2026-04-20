@@ -252,6 +252,36 @@ def extract_findings_from_yaml(hyp_dir: Path, component: str,
         except Exception:
             continue
 
+    # Orphan fuzz failures: a broken invariant with no owning hypothesis.
+    # Happens when the invariant comes from the generic registry (matcher.py)
+    # or from merge/DeepDive injection — not from a per-hunter hyp_*.yaml.
+    # Without this block, a real fuzzer-proven bug would be silently dropped.
+    matched_props = {f["property_name"] for f in confirmed if f.get("property_name")}
+    for prop_name, trace in fuzz_failures.items():
+        if prop_name in matched_props:
+            continue
+        synth_id = f"FUZZ-{component}-{prop_name}"
+        if synth_id in seen_ids:
+            continue
+        confirmed.append({
+            "id": synth_id,
+            "title": f"Fuzzer broke invariant {prop_name}",
+            "severity": "Medium",
+            "confidence": 90,
+            "root_cause": (
+                f"Invariant `{prop_name}` violated by fuzz sequence. "
+                f"No hunter hypothesis owned this property — likely from the "
+                f"generic invariant registry or merge-time injection."
+            ),
+            "source_file": "",
+            "hunter": "FuzzOrphan",
+            "fuzz_confirmed": True,
+            "property_name": prop_name,
+            "counterexample_trace": trace,
+            "vulnerable_location": None,
+        })
+        seen_ids.add(synth_id)
+
     unconfirmed.sort(key=lambda f: f.get("confidence", 0), reverse=True)
 
     # No artificial cap — dedup + verify filter by quality, not count

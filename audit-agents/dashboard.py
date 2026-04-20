@@ -46,6 +46,23 @@ def load_gate_status(protocol: str) -> dict[str, Any]:
         return {}
 
 
+def load_narration(protocol: str, n: int = 6) -> list[dict[str, Any]]:
+    """Read tail of hunt_session/narration/<protocol>.jsonl. Last n entries."""
+    path = HUNT_SESSION / "narration" / f"{protocol}.jsonl"
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            tail = deque(fh, maxlen=n)
+    except FileNotFoundError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in tail:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
 def load_findings(protocol: str) -> list[dict[str, Any]]:
     """Try hunt_session/findings.json first, then benchmarks/<protocol>/bench_session/findings_all.json."""
     real = HUNT_SESSION / "findings.json"
@@ -77,6 +94,7 @@ class HuntSnapshot:
     findings_total: int = 0
     findings_by_severity: dict[str, int] = field(default_factory=dict)
     recent_events: list[tuple[str, str, str]] = field(default_factory=list)
+    narration: list[dict[str, Any]] = field(default_factory=list)
 
 
 def aggregate_findings_by_severity(findings: list[dict[str, Any]]) -> dict[str, int]:
@@ -125,6 +143,7 @@ def build_snapshot(protocol_override: str | None) -> HuntSnapshot:
         findings_total=len(findings),
         findings_by_severity=severity_counts,
         recent_events=[],
+        narration=load_narration(protocol, n=6),
     )
 
 
@@ -272,6 +291,25 @@ def render_findings(snap: HuntSnapshot, prev_total: int, flash_until: float) -> 
     return Panel(body, border_style=border, padding=(0, 2))
 
 
+def render_narrator(snap: HuntSnapshot) -> Panel:
+    """Panel showing Claude's natural-language narration of pipeline progress."""
+    body = Text()
+    if not snap.narration:
+        body.append("esperando a que el pipeline empiece a contarnos algo…", style="dim")
+    for entry in snap.narration[-6:]:
+        ts_raw = str(entry.get("ts", ""))
+        ts_short = ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw
+        comp = str(entry.get("component", ""))
+        emoji = str(entry.get("emoji", "•"))
+        msg = str(entry.get("message", ""))
+        body.append(f"{ts_short}  ", style="cyan")
+        body.append(f"{emoji}  ", style="white")
+        if comp:
+            body.append(f"{comp}  ", style="magenta")
+        body.append(msg + "\n", style="white")
+    return Panel(body, title="🗣️  Claude narra", border_style="green", padding=(0, 1))
+
+
 def render_activity(snap: HuntSnapshot) -> Panel:
     body = Text()
     if not snap.recent_events:
@@ -308,7 +346,8 @@ def render_layout(snap: HuntSnapshot, prev_total: int, flash_until: float,
         panels.append(Layout(render_phase1_progress(phase1_runs), name="phase1", size=3))
     panels.extend([
         Layout(render_findings(snap, prev_total, flash_until), name="findings", size=3),
-        Layout(render_activity(snap), name="activity", size=7),
+        Layout(render_narrator(snap), name="narrator", size=9),
+        Layout(render_activity(snap), name="activity", size=5),
     ])
     layout.split_column(*panels)
     return layout

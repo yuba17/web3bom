@@ -22,19 +22,26 @@ from finding_pipeline import (
     extract_findings_from_yaml,
     extract_relevant_code as _extract_relevant_code,
 )
-from paths import HUNT_SESSION_DIR
-
 logger = logging.getLogger("orchestrator")
 
 
 def extract_findings(component: str, protocol: str,
-                     fuzz_failures: dict[str, str] = None) -> list[dict]:
+                     fuzz_failures: dict[str, str] = None,
+                     hyp_dir: Path = None) -> list[dict]:
     """Extract findings from hypothesis files, prioritizing fuzz-confirmed ones.
 
     Thin wrapper around finding_pipeline.extract_findings_from_yaml that adds
-    logging and constructs hyp_dir from HUNT_SESSION_DIR.
+    logging and constructs hyp_dir.
+
+    hyp_dir: explicit directory to read hypothesis YAMLs from. When None, falls
+        back to run_benchmark.HUNT_SESSION_DIR (which is reassigned by
+        benchmark.cli.main() in benchmark mode). Module-level `from paths import
+        HUNT_SESSION_DIR` would bind to the original value and miss the
+        reassignment — that's the historical bug this defaulting dodges.
     """
-    hyp_dir = HUNT_SESSION_DIR / "hypotheses" / protocol
+    if hyp_dir is None:
+        import run_benchmark as _rb
+        hyp_dir = _rb.HUNT_SESSION_DIR / "hypotheses" / protocol
     findings = extract_findings_from_yaml(hyp_dir, component, fuzz_failures)
 
     # Log fuzz-confirmed findings

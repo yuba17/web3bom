@@ -460,6 +460,9 @@ def run_cross_component(components_done: list[str], protocol: str, repo: str,
     )
     if cross_fuzz_failures:
         logger.info(f"  Cross-component fuzz failures: {cross_fuzz_failures}")
-    findings = _rb.extract_findings("CrossComponent", protocol, cross_fuzz_failures)
+    findings = _rb.extract_findings(
+        "CrossComponent", protocol, cross_fuzz_failures,
+        hyp_dir=_rb.HUNT_SESSION_DIR / "hypotheses" / protocol,
+    )
     logger.info(f"  Cross-component hunt complete: {len(findings)} findings")
     return poc_candidates
