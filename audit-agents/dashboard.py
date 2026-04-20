@@ -165,6 +165,62 @@ def parse_recent_events(log_path: Path, offset: int, max_events: int = 3
     return matched[-max_events:], new_offset
 
 
+from datetime import datetime
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.table import Table
+from rich.text import Text
+from rich.style import Style
+
+GATE_COLS = [
+    ("scope", "scope"), ("prepass", "prep"), ("hunters", "hunt"),
+    ("crosschain", "xch"), ("deepdive", "dd"), ("merge", "mrg"),
+    ("compile", "cmp"), ("phase1", "p1"), ("phase2", "p2"),
+    ("phase3", "p3"), ("verify", "vfy"),
+]
+
+_SPINNER = Spinner("dots", style="yellow")
+
+
+def _gate_cell(state: str, is_active: bool):
+    if is_active:
+        return _SPINNER
+    if state == "pass":
+        return Text("✅", style="green")
+    if state == "fail":
+        return Text("❌", style="red")
+    return Text("⋯", style="grey50")
+
+
+def render_header(snap: HuntSnapshot) -> Panel:
+    now = datetime.now().strftime("%H:%M:%S")
+    title = f"[bold cyan]{snap.protocol or 'no active hunt'}[/]  •  [white]{now}[/]"
+    return Panel(Text.from_markup(title, justify="center"), border_style="cyan")
+
+
+def render_gates(snap: HuntSnapshot) -> Table:
+    tbl = Table(show_lines=False, padding=(0, 1), expand=True)
+    tbl.add_column("Component", style="bold white", min_width=12)
+    for _key, label in GATE_COLS:
+        tbl.add_column(label, justify="center", min_width=4)
+
+    pulse_bold = int(time.time()) % 2 == 0
+    for comp in snap.components:
+        gates = snap.gates.get(comp, {})
+        is_active_row = (comp == snap.active_component)
+        row_style = (Style(bold=True) if pulse_bold else Style(dim=True)) if is_active_row else Style()
+        cells: list[Any] = [Text(comp + (" ←" if is_active_row else ""), style=row_style)]
+        for key, _label in GATE_COLS:
+            state = gates.get(key, "pending")
+            is_active_cell = is_active_row and key == snap.active_gate
+            cells.append(_gate_cell(state, is_active_cell))
+        tbl.add_row(*cells)
+    return tbl
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TUI dashboard for audit pipeline")
     p.add_argument("--protocol", help="Protocol name (overrides current_hunt.json)")
