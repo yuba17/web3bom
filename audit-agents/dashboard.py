@@ -25,6 +25,31 @@ def load_current_hunt() -> dict[str, Any]:
         return {}
 
 
+def load_gate_status(protocol: str) -> dict[str, Any]:
+    """Read hunt_session/gate_status/<protocol>.json. Return {} if missing."""
+    path = HUNT_SESSION / "gate_status" / f"{protocol}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def load_findings(protocol: str) -> list[dict[str, Any]]:
+    """Try hunt_session/findings.json first, then benchmarks/<protocol>/bench_session/findings_all.json."""
+    real = HUNT_SESSION / "findings.json"
+    bench = WEB3_DIR / "benchmarks" / protocol.removesuffix("-bench") / "bench_session" / "findings_all.json"
+    for path in (real, bench):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "findings" in data:
+                return data["findings"]
+            if isinstance(data, list):
+                return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return []
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TUI dashboard for audit pipeline")
     p.add_argument("--protocol", help="Protocol name (overrides current_hunt.json)")
