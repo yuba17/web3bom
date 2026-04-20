@@ -17,6 +17,14 @@ HUNT_SESSION = WEB3_DIR / "hunt_session"
 CURRENT_HUNT = HUNT_SESSION / "MEMORY" / "STATE" / "current_hunt.json"
 
 
+def load_current_hunt() -> dict[str, Any]:
+    """Read current_hunt.json. Return {} if missing or malformed."""
+    try:
+        return json.loads(CURRENT_HUNT.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TUI dashboard for audit pipeline")
     p.add_argument("--protocol", help="Protocol name (overrides current_hunt.json)")
