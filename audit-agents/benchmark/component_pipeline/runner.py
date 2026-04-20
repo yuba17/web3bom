@@ -24,7 +24,6 @@ from benchmark.prompt_builders import (
     read_source,
     build_hunter_brief,
     build_hunter_dispatch_prompt,
-    build_deepdive_prompt,
 )
 from benchmark.component_pipeline.reporting import parse_fuzz_failures
 
@@ -547,80 +546,23 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
 
         # Step 3 (Library Analyzer) — now runs as LibraryHunter (#11) in parallel with other hunters above
 
-        # ─── Step 4: DeepDive Hunter ────────────────────────────────────────
-        logger.info("  Step 4: DeepDive Hunter")
-
-        # Pre-digest hunter hypotheses: summarize convergences for DeepDive (Gap #5)
-        import yaml as _yaml_dd
-        hunter_digest = ""
-        convergence_map = {}  # track which areas multiple hunters flagged
-        for hyp_file in sorted(hyp_dir.glob(f"hyp_{component}_*.yaml")):
-            if "DeepDive" in hyp_file.name or "CrossChain" in hyp_file.name:
-                continue
-            try:
-                data = _yaml_dd.safe_load(hyp_file.read_text())
-                if not data:
-                    continue
-                hunter_name = hyp_file.stem.replace(f"hyp_{component}_", "")
-                hyps = data.get("hypotheses", data.get("invariants", []))
-                for h in hyps:
-                    if h.get("confidence", 0) >= 50 and h.get("tier", 3) <= 2:
-                        desc = h.get("description", h.get("title", ""))
-                        area = h.get("type", "unknown")
-                        hunter_digest += f"- [{hunter_name}] (tier={h.get('tier')}, conf={h.get('confidence')}%) {desc}\n"
-                        convergence_map.setdefault(area, []).append(hunter_name)
-            except Exception:
-                pass
-
-        convergence_text = ""
-        for area, hunters in convergence_map.items():
-            if len(hunters) >= 2:
-                convergence_text += f"- **{area}**: flagged by {', '.join(set(hunters))} — INVESTIGATE DEEPER\n"
-
-        # Build deepdive prompt inline from bench_session hyp_dir.
-        # Keep this local — a helper reading from a module-global hunt dir would
-        # race across parallel components (two threads would patch the same global).
-        deepdive_prompt = build_deepdive_prompt(
-            component=component, protocol=protocol, source_code=source_code,
-            library_code=library_code, setup_sol_text=setup_sol_text,
-            protocol_model=protocol_model, hyp_dir=hyp_dir,
-            convergence_text=convergence_text, hunter_digest=hunter_digest
+        # ─── Step 4: DeepDive hunter ───────────────────────────────────────
+        from benchmark.component_pipeline.pipeline_context import PipelineContext
+        from benchmark.component_pipeline.deepdive import run_deepdive
+        _ctx_dd = PipelineContext(
+            component=component, repo=repo, protocol=protocol,
+            args=args, logger=logger,
+            src_dir=src_dir, hyp_dir=hyp_dir, clog=clog,
+            src_file=src_file if 'src_file' in dir() else Path("."),
         )
-
-        _rb._llm(
-            deepdive_prompt,
-            allowed_tools=["Read", "Write", "Edit", "Grep", "Glob"],
-            timeout=1800,
-            log_file=clog / "deepdive.log",
-            cwd=repo
-        )
-
-        # Rescue DeepDive YAML: Claude may write to cwd (worktree root) instead of hyp_dir.
-        def _rescue_deepdive_yaml(context_label: str) -> bool:
-            target = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
-            if target.exists():
-                return True
-            _find_out = subprocess.run(
-                ["find", str(repo), "-name", f"hyp_{component}_DeepDiveHunter.yaml", "-type", "f"],
-                capture_output=True, text=True
-            )
-            for _found in _find_out.stdout.strip().splitlines():
-                if _found and Path(_found) != target:
-                    import shutil as _sh_rescue
-                    _sh_rescue.copy2(_found, target)
-                    logger.info(f"  {context_label}: rescued {Path(_found).name} → {hyp_dir.name}/")
-                    return True
-            return False
-
-        _rescue_deepdive_yaml("DeepDive rescue")
-
-        deepdive_ok = _rb.check_gate(component, "deepdive", protocol, repo)
-        summary["gates"]["deepdive"] = deepdive_ok
-        if not deepdive_ok:
-            dd_file = hyp_dir / f"hyp_{component}_DeepDiveHunter.yaml"
-            if not dd_file.exists():
-                logger.warning("  DeepDive gate failed and no YAML — continuing without DeepDive")
-            # Not blocking — DeepDive is additive, hunters provide the base
+        _ctx_dd.summary = summary
+        if 'source_code' in dir(): _ctx_dd.source_code = source_code
+        if 'library_code' in dir(): _ctx_dd.library_code = library_code
+        if 'accumulated_context' in dir(): _ctx_dd.accumulated_context = accumulated_context
+        if 'prepass_signals_text' in dir(): _ctx_dd.prepass_signals_text = prepass_signals_text
+        if 'setup_sol_text' in dir(): _ctx_dd.setup_sol_text = setup_sol_text
+        if 'protocol_model' in dir(): _ctx_dd.protocol_model = protocol_model
+        run_deepdive(_ctx_dd)
 
     # ─── Forge env (shared by fuzz + PoC steps) ─────────────────────────
     forge_env = os.environ.copy()
