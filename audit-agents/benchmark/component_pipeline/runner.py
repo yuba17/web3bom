@@ -81,7 +81,9 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     if check_early_exit(ctx) == "EMPTY_PREPASS_SKIP": return summary
     load_tests(ctx); load_knowledge(ctx); load_interfaces(ctx); ensure_chimera_setup(ctx)
 
-    narrate(ctx, "🎯", "Lanzando 12 hunters en paralelo")
+    import run_benchmark as _rb
+    _n_hunters = len(hunters_subset) if hunters_subset else 12
+    narrate(ctx, "🎯", f"Lanzando {_n_hunters} hunters ({_rb.PARALLEL_HUNTERS} en paralelo por componente)")
     if run_hunters(ctx, hunters_subset=hunters_subset) == BLOCKED_HUNTERS:
         narrate(ctx, "⛔", "Hunters bloqueados"); flush_gate_status(ctx); return summary
     n_hyps = len(list(ctx.hyp_dir.glob(f"hyp_{component}_*.yaml"))) if ctx.hyp_dir.exists() else 0
