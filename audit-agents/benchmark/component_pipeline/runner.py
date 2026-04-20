@@ -1179,179 +1179,30 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
     # Rebind locals that downstream Steps consume:
     verified_findings = _ctx_verify.verified_findings
 
-    # ─── Step 10.5: Fork PoC per confirmed finding (Phase 3) ─────────
-    if finding_groups:
-        logger.info("  Step 10.5: Generating Fork PoCs for confirmed findings")
-        poc_dir = Path(repo) / "test" / "poc"
-        poc_dir.mkdir(parents=True, exist_ok=True)
-
-        def _run_poc(finding):
-            """Delegate to top-level generate_and_test_poc with component context."""
-            _rb.generate_and_test_poc(
-                finding, source_code, interfaces_code,
-                component, protocol, repo, clog, forge_env,
-                poc_confidence_threshold=POC_CONFIDENCE_THRESHOLD
-            )
-
-        # Run PoC for every verified finding (Step 10.2 output).
-        # Fallback to group leaders if verification produced nothing.
-        POC_PHASE_TIMEOUT = 12 * 3600 if not args.fast else 3 * 3600
-        POC_PARALLEL = args.parallel_poc
-
-        # ── Dedup verified findings before PoC phase ──────────────────────
-        # Multiple hunters often find the same bug — verification confirms all of
-        # them because they describe the same issue. Without dedup, we'd generate
-        # N PoCs for the same bug (N = convergence count, typically 3-5×).
-        # Strategy: keep only the best representative per dedup group (lowest rank
-        # = highest confidence). If the leader's PoC fails, the group's fallbacks
-        # are still attempted in _process_finding's retry logic.
-        if verified_findings:
-            pre_dedup = len(verified_findings)
-            poc_findings = _dedup_for_poc_pure(verified_findings)
-            post_dedup = len(poc_findings)
-            if pre_dedup != post_dedup:
-                logger.info(f"  Step 10.3: Dedup before PoC — {pre_dedup} verified → "
-                            f"{post_dedup} unique ({pre_dedup - post_dedup} duplicates removed)")
-        else:
-            poc_findings = [
-                g[0] for g in finding_groups
-                if g and (g[0].get("fuzz_confirmed") or g[0].get("confidence", 0) >= POC_CONFIDENCE_THRESHOLD)
-            ]
-
-        logger.info(f"  Step 10.5: PoC phase — {len(poc_findings)} verified findings "
-                    f"({POC_PHASE_TIMEOUT/3600:.0f}h timer, {POC_PARALLEL} parallel)")
-        poc_phase_start = time.time()
-        pocs_confirmed = 0
-
-        def _process_finding(idx_and_finding):
-            """Generate and test PoC for one verified finding."""
-            idx, finding, total = idx_and_finding
-            elapsed = time.time() - poc_phase_start
-            if elapsed > POC_PHASE_TIMEOUT:
-                return idx, False, None
-            remaining = POC_PHASE_TIMEOUT - elapsed
-            logger.info(f"    [Finding {idx+1}/{total}] {finding['id']} "
-                        f"— {remaining/60:.0f}min remaining")
-            _run_poc(finding)
-            return idx, finding.get("has_poc", False), finding["id"]
-
-        n_poc = len(poc_findings)
-        with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
-            futures = {
-                executor.submit(_process_finding, (i, f, n_poc)): i
-                for i, f in enumerate(poc_findings)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    _, confirmed, fid = future.result()
-                    if confirmed:
-                        pocs_confirmed += 1
-                except Exception as e:
-                    logger.error(f"    Finding {idx+1}: PoC error: {e}")
-
-        logger.info(f"  PoC phase complete: {pocs_confirmed}/{len(poc_findings)} findings confirmed")
-
-        # ── Step 10.5b+10.6+10.7: Unified Capa 2 (fallback) + Capa 3 (escaped) ──
-        # Phase A: Identify fallback candidates (groups where leader failed PoC)
-        fallback_findings: list[dict] = []
-        for g in finding_groups:
-            if len(g) > 1 and not g[0].get("has_poc"):
-                for sib in g[1:]:
-                    if sib.get("_verified") or sib.get("fuzz_confirmed"):
-                        sib["_capa2_fallback"] = True
-                        fallback_findings.append(sib)
-                        break
-
-        # ── Step 10.6: is_same_bug safety check (Capa 3) ─────────────────
-        # For every group whose leader passed PoC, check each sibling:
-        # "Is B really the same bug as A, or a different vulnerability?"
-        # If DIFFERENT → the sibling escaped dedup by mistake and needs its own PoC.
-        # This prevents silent loss of real bugs due to over-aggressive deduplication.
-        def _check_is_same_bug(leader: dict, sibling: dict) -> bool:
-            """180s Claude call: does sibling describe the same bug as leader?
-            Conservative: returns True (SAME) on timeout/error — avoid duplicate PoC work."""
-            prompt = _rb.build_is_same_bug_prompt(leader=leader, sibling=sibling)
-            fid_s = sibling["id"]
-            _, out = _rb._llm(
-                prompt, allowed_tools=[], timeout=180, stall_timeout=120,
-                log_file=clog / f"{fid_s}_same_bug_check.log", cwd=repo
-            )
-            # Conservative fallback: empty/timeout → treat as SAME (avoid duplicate PoC work)
-            result = (out or "").strip().upper()
-            if not result:
-                # Timeout/empty → treat as SAME (conservative: avoid duplicate PoC work)
-                is_same = True
-                verdict = "SAME (timeout fallback)"
-                logger.info(f"    is_same_bug({leader['id']}, {fid_s}): {verdict}")
-                return is_same
-            is_same = result.startswith("SAME") and not result.startswith("DIFFERENT")
-            verdict = "SAME" if is_same else "DIFFERENT"
-            logger.info(f"    is_same_bug({leader['id']}, {fid_s}): {verdict}")
-            return is_same
-
-        # Phase B: is_same_bug check for groups where leader PASSED
-        groups_with_passed_leader = [
-            g for g in finding_groups
-            if len(g) > 1 and g[0].get("has_poc")
-        ]
-        if groups_with_passed_leader:
-            sibling_checks = [
-                (g[0], sib)
-                for g in groups_with_passed_leader
-                for sib in g[1:]
-                if sib.get("_verified") or sib.get("fuzz_confirmed")
-            ]
-            if sibling_checks:
-                logger.info(f"  Step 10.6: is_same_bug check — {len(sibling_checks)} siblings "
-                            f"across {len(groups_with_passed_leader)} confirmed groups")
-                with ThreadPoolExecutor(max_workers=min(8, len(sibling_checks))) as ex:
-                    future_map = {
-                        ex.submit(_check_is_same_bug, leader, sib): (leader, sib)
-                        for leader, sib in sibling_checks
-                    }
-                    for fut in as_completed(future_map):
-                        leader, sib = future_map[fut]
-                        try:
-                            same = fut.result()
-                        except Exception:
-                            same = True
-                        if not same:
-                            sib["_escaped_dedup"] = True
-                            escaped_siblings.append(sib)
-
-        # Phase C: Single unified PoC batch for all fallbacks + escaped siblings
-        unified_extra = fallback_findings + escaped_siblings
-        if unified_extra:
-            logger.info(f"  Step 10.7: Unified PoC batch — {len(fallback_findings)} fallbacks + "
-                        f"{len(escaped_siblings)} escaped siblings = {len(unified_extra)} total")
-            n_extra = len(unified_extra)
-            with ThreadPoolExecutor(max_workers=POC_PARALLEL) as executor:
-                futures = {
-                    executor.submit(_process_finding, (i, f, n_extra)): (i, f)
-                    for i, f in enumerate(unified_extra)
-                }
-                for future in as_completed(futures):
-                    i, f = futures[future]
-                    try:
-                        _, confirmed, fid = future.result()
-                        if confirmed:
-                            pocs_confirmed += 1
-                            source = "Capa 2 fallback" if f.get("_capa2_fallback") else "Escaped sibling"
-                            logger.info(f"    {source} {fid}: PoC PASSED — real distinct bug!")
-                    except Exception as e:
-                        logger.error(f"    Unified batch PoC error: {e}")
-            fb_confirmed = sum(1 for f in fallback_findings if f.get("has_poc"))
-            esc_confirmed = sum(1 for f in escaped_siblings if f.get("has_poc"))
-            logger.info(f"  Unified batch complete: {fb_confirmed} fallbacks + {esc_confirmed} escaped = "
-                        f"{fb_confirmed + esc_confirmed} new confirmed")
-
-        # Mark all findings without PoC (default)
-        for group in finding_groups:
-            for f in group:
-                f.setdefault("has_poc", False)
-        for f in escaped_siblings:
-            f.setdefault("has_poc", False)
+    # ─── Step 11: Fork PoC per finding (Phase 3) ───────────────────────
+    from benchmark.component_pipeline.pipeline_context import PipelineContext
+    from benchmark.component_pipeline.poc import generate_fork_pocs
+    _ctx_poc = PipelineContext(
+        component=component, repo=repo, protocol=protocol,
+        args=args, logger=logger,
+        src_dir=src_dir, hyp_dir=hyp_dir, clog=clog,
+        src_file=src_file if 'src_file' in dir() else Path("."),
+    )
+    _ctx_poc.summary = summary
+    if 'source_code' in dir(): _ctx_poc.source_code = source_code
+    if 'library_code' in dir(): _ctx_poc.library_code = library_code
+    if 'interfaces_code' in dir(): _ctx_poc.interfaces_code = interfaces_code
+    if 'verified_findings' in dir(): _ctx_poc.verified_findings = verified_findings
+    _ctx_poc.finding_groups = finding_groups
+    _ctx_poc.poc_findings = poc_findings
+    _ctx_poc.escaped_siblings = escaped_siblings
+    _ctx_poc.fallback_findings = fallback_findings
+    generate_fork_pocs(_ctx_poc)
+    # Rebind locals downstream steps consume:
+    finding_groups = _ctx_poc.finding_groups
+    poc_findings = _ctx_poc.poc_findings
+    fallback_findings = _ctx_poc.fallback_findings
+    escaped_siblings = _ctx_poc.escaped_siblings
 
     # ─── Step 12: Finding pipeline dispatch ────────────────────────────
     from benchmark.component_pipeline.pipeline_context import PipelineContext
