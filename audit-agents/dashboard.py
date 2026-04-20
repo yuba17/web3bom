@@ -10,8 +10,15 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.style import Style
+from rich.table import Table
+from rich.text import Text
 
 WEB3_DIR = Path(__file__).resolve().parent.parent
 HUNT_SESSION = WEB3_DIR / "hunt_session"
@@ -164,16 +171,6 @@ def parse_recent_events(log_path: Path, offset: int, max_events: int = 3
 
     return matched[-max_events:], new_offset
 
-
-from datetime import datetime
-
-from rich.console import Console
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.table import Table
-from rich.text import Text
-from rich.style import Style
 
 GATE_COLS = [
     ("scope", "scope"), ("prepass", "prep"), ("hunters", "hunt"),
