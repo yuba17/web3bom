@@ -93,3 +93,17 @@ def test_parse_recent_events_extracts_step_markers(tmp_path):
     assert len(events) == 3
     assert any("Step 4: DeepDive Hunter" in msg for _, _, msg in events)
     assert any("12 Hunters completed" in msg for _, _, msg in events)
+
+
+def test_findings_severity_aggregation():
+    import dashboard as d
+    findings = [
+        {"severity": "High"}, {"severity": "high"}, {"severity": "MEDIUM"},
+        {"severity": "low"}, {"severity": "low"}, {"severity": "low"},
+        {},  # no severity → "unknown"
+    ]
+    counts = d.aggregate_findings_by_severity(findings)
+    assert counts["high"] == 2
+    assert counts["medium"] == 1
+    assert counts["low"] == 3
+    assert counts["unknown"] == 1
