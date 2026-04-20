@@ -1458,57 +1458,24 @@ def run_component_pipeline(component: str, repo: str, protocol: str,
         for f in escaped_siblings:
             f.setdefault("has_poc", False)
 
-    # Flatten groups back to findings list for downstream
-    findings = [f for group in finding_groups for f in group]
-    summary["findings"] = findings
-
-    # ─── Step 11: Finding Pipeline (parallel — 4 findings at a time) ────
-    # Only findings with PoC OR fuzz-confirmed go through the full pipeline
-    pipeline_findings = [f for f in findings if f.get("has_poc") or f.get("fuzz_confirmed")]
-    skipped = len(findings) - len(pipeline_findings)
-    if skipped:
-        logger.info(f"  Skipping {skipped} unverified findings (no PoC, no fuzz confirmation)")
-
-    # In 'poc' mode: stop here — we have PoC-confirmed findings but don't need RedTeam.
-    # In 'redteam' mode (default): run the full finding pipeline.
-    if benchmark_mode_flag == "poc":
-        _rb._log_funnel(component, findings, verified_findings,
-                    poc_findings + escaped_siblings + fallback_findings,
-                    pipeline_findings, [])
-        comp_elapsed = (time.time() - comp_start) / 60
-        logger.info(f"  🏁 Component {component} COMPLETE (poc mode) — "
-                    f"{len(pipeline_findings)} PoC-confirmed ({comp_elapsed:.1f}min)")
+    # ─── Step 12: Finding pipeline dispatch ────────────────────────────
+    from benchmark.component_pipeline.pipeline_context import PipelineContext
+    from benchmark.component_pipeline.finding import dispatch_finding_pipeline
+    _ctx_finding = PipelineContext(
+        component=component, repo=repo, protocol=protocol,
+        args=args, logger=logger,
+        src_dir=src_dir, hyp_dir=hyp_dir, clog=clog, src_file=src_file,
+    )
+    _ctx_finding.summary = summary  # share by reference
+    _ctx_finding.source_code = source_code
+    _ctx_finding.comp_start = comp_start
+    _ctx_finding.finding_groups = finding_groups
+    if 'verified_findings' in dir():
+        _ctx_finding.verified_findings = verified_findings
+    _ctx_finding.poc_findings = poc_findings
+    _ctx_finding.escaped_siblings = escaped_siblings
+    _ctx_finding.fallback_findings = fallback_findings
+    _finding_result = dispatch_finding_pipeline(_ctx_finding)
+    if _finding_result == "EARLY_EXIT_poc_mode":
         return summary
-
-    report_findings = []
-    if pipeline_findings:
-        logger.info(f"  Processing {len(pipeline_findings)} verified findings (3 parallel)")
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                executor.submit(
-                    _rb.run_finding_pipeline, f, component, protocol, source_code, repo, clog,
-                    benchmark_mode=True  # always True in benchmark: skip Variant+Report, stop at RedTeam
-                ): f["id"]
-                for f in pipeline_findings
-            }
-            for future in as_completed(futures):
-                fid = futures[future]
-                try:
-                    future.result()
-                    logger.info(f"    {fid}: pipeline complete")
-                except Exception as e:
-                    logger.error(f"    {fid}: pipeline error: {e}")
-
-        report_findings = [f for f in pipeline_findings
-                           if f.get("redteam_verdict") in ("REPORT", "REPORT_DOWNGRADED")]
-
-    # ─── Funnel Dashboard ────────────────────────────────────────────────
-    # Total PoC attempts = initial dedup batch + escaped siblings (Capa 3) + fallback (Capa 2)
-    _rb._log_funnel(component, findings, verified_findings,
-                poc_findings + escaped_siblings + fallback_findings,
-                pipeline_findings, report_findings)
-
-    # ─── Done ────────────────────────────────────────────────────────────
-    comp_elapsed = (time.time() - comp_start) / 60
-    logger.info(f"  🏁 Component {component} COMPLETE — {len(findings)} findings ({comp_elapsed:.1f}min)")
     return summary
