@@ -29,20 +29,24 @@ def parse_fuzz_failures(phase1_log: Path, phase2_log: Path = None) -> dict[str, 
             if "=== STDERR ===" in content:
                 content = content.split("=== STDERR ===")[0]
 
-        # Foundry format: [FAIL. Reason: ...] invariant_xxx() or property_xxx() (runs: ...)
-        for m in re.finditer(r'\[FAIL[^\]]*\]\s+(invariant_\w+|check_\w+|property_\w+)\(\)', content):
-            name = m.group(1)
-            # Extract counterexample trace — everything from this FAIL line to next test or end
-            fail_pos = m.start()
-            # Look for the trace section after this failure
-            trace_end = content.find("[PASS]", fail_pos + 1)
-            trace_end2 = content.find("[FAIL", fail_pos + 1)
-            if trace_end == -1:
-                trace_end = len(content)
-            if trace_end2 != -1 and trace_end2 < trace_end:
-                trace_end = trace_end2
-            trace = content[fail_pos:trace_end].strip()[:3000]
-            failed[name] = trace
+        # Foundry format: [FAIL...] starts a failure block. The invariant name
+        # appears at the END of the block (after [Sequence] + sender=... lines)
+        # on a line like: " invariant_xxx() (runs: N, calls: M, reverts: K)".
+        # Walk each [FAIL...] marker and search up to the next [FAIL/[PASS boundary.
+        fail_markers = list(re.finditer(r'\[FAIL[^\]]*\]', content))
+        name_re = re.compile(
+            r'(invariant_\w+|check_\w+|property_\w+|echidna_\w+)\(\)\s*\(runs:'
+        )
+        for idx, m in enumerate(fail_markers):
+            block_start = m.start()
+            block_end = fail_markers[idx + 1].start() if idx + 1 < len(fail_markers) else len(content)
+            next_pass = content.find("[PASS]", m.end(), block_end)
+            if next_pass != -1:
+                block_end = next_pass
+            block = content[block_start:block_end]
+            name_m = name_re.search(block)
+            if name_m:
+                failed[name_m.group(1)] = block.strip()[:3000]
 
         # Medusa format: "assertion failed" or "property violated" with function name
         for m in re.finditer(r'(?:assertion failed|property violated).*?(invariant_\w+|check_\w+|property_\w+)', content):
