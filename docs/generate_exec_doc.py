@@ -435,44 +435,88 @@ body(
     "profundidad. Cada hunter es un agente de IA independiente con su propia ventana de contexto, que "
     "escribe sus hipótesis en su propio fichero para evitar conflictos."
 )
+body(
+    "Cada hunter está calibrado, cuando existe, con la metodología de un referente real del sector. "
+    "Antes de emitir una hipótesis, cada agente aplica un auto-filtro: “¿por qué estaría equivocado?”. "
+    "Esto reduce el ruido en origen. A continuación se describe qué hace cada uno y qué busca."
+)
 heading("Los 12 hunters en paralelo", 2)
 make_table(
-    ["Hunter", "Especialidad"],
+    ["Hunter", "Referente", "Cómo trabaja y qué patrones prioriza"],
     [
-        ["AccessHunter", "Control de acceso, escalada de privilegios, inicializadores desprotegidos"],
-        ["MathHunter", "Accounting, redondeo, inflación de shares, donation attacks, deriva de interés"],
-        ["OracleHunter", "Manipulación de precios, TWAP insuficiente, staleness, arbitraje cross-DEX"],
-        ["FlowHunter", "Reentrancy, callbacks de tokens, violaciones checks-effects-interactions"],
-        ["DomainHunter", "Lógica específica del dominio (staking, gauges, epochs, swaps)"],
-        ["TrustBoundaryHunter", "Fronteras de confianza entre contratos y dependencias externas"],
-        ["SignatureHunter", "Replay de firmas, validación de firmas, nonces"],
-        ["DoSHunter", "Denegación de servicio, bloqueo permanente de fondos"],
-        ["LogicHunter", "Errores de lógica de negocio y máquinas de estado"],
-        ["AdversarialHunter", "Pensamiento de atacante con capital real y motivación"],
-        ["LibraryHunter", "Vulnerabilidades en librerías y código reutilizado"],
-        ["WildcardHunter", "Lo que nadie documentó antes — hipótesis novedosas sin filtrar por probabilidad"],
+        ["MathHunter", "Trust",
+         "Identifica el invariante económico central y enumera todas las formas de alterar los activos "
+         "sin alterar las participaciones (shares). Solo valida si hay pérdida concreta mayor que el coste "
+         "del ataque. Patrones: truncación de redondeo acumulativa, donation attacks, deriva en el cálculo "
+         "de intereses, inflación de shares, descuadres de comisiones."],
+        ["AccessHunter", "Mudit Gupta",
+         "Construye el grafo completo de privilegios del contrato y rastrea todos los caminos —directos e "
+         "indirectos— que llevan a un rol privilegiado. Patrones: control de acceso ausente, escalada de "
+         "privilegios, inicializadores desprotegidos, roles mal configurados en el despliegue."],
+        ["OracleHunter", "samczsun",
+         "Localiza cada punto donde se consume un precio y traza hacia atrás hasta su fuente, preguntando: "
+         "“¿puede manipularse en un solo bloque y con cuánto beneficio?”. Patrones: manipulación de precio "
+         "spot, TWAP con ventana insuficiente, precios obsoletos (staleness), arbitraje cross-DEX."],
+        ["FlowHunter", "samczsun",
+         "Trata cada llamada externa como un punto de reentrada potencial y comprueba qué estado queda "
+         "desincronizado en ese instante. Verifica el orden checks-effects-interactions. Patrones: "
+         "reentrancy vía callback, cross-function, read-only, abuso de callbacks de tokens (ERC-777/721)."],
+        ["DomainHunter", "Variable según protocolo",
+         "Aplica la lógica específica del dominio activo (staking, gauges, DEX, bridges). En staking, por "
+         "ejemplo: proporcionalidad de recompensas, bugs en los límites de epoch, staking con flash loan, "
+         "drenaje de recompensas antes de que los usuarios las reclamen."],
+        ["TrustBoundaryHunter", "—",
+         "Examina las fronteras de confianza entre el contrato y sus dependencias externas: qué asume de "
+         "cada contrato con el que interactúa y qué ocurre si ese contrato se comporta de forma inesperada "
+         "o maliciosa."],
+        ["SignatureHunter", "—",
+         "Se centra en la criptografía aplicada: replay de firmas entre contextos o cadenas, validación "
+         "incorrecta de firmas, gestión de nonces y vencimientos (deadlines)."],
+        ["DoSHunter", "—",
+         "Busca denegación de servicio: rutas que pueden bloquearse de forma permanente, fondos que quedan "
+         "atrapados sin posibilidad de recuperación, y operaciones que un atacante puede encarecer hasta "
+         "hacerlas inviables."],
+        ["LogicHunter", "—",
+         "Caza errores de lógica de negocio y de máquina de estado: transiciones inválidas, suposiciones "
+         "incorrectas sobre el orden de las operaciones y casos límite no contemplados por el diseño."],
+        ["AdversarialHunter", "—",
+         "Adopta la mentalidad de un atacante con capital real y motivación: no busca patrones de catálogo, "
+         "sino la combinación de acciones más rentable para romper el protocolo, por exótica que sea."],
+        ["LibraryHunter", "—",
+         "Audita las librerías y el código reutilizado, donde los fallos heredados pasan desapercibidos por "
+         "darse por “probados”. Patrones: bugs conocidos en versiones de librerías, mal uso de utilidades."],
+        ["WildcardHunter", "Sin referente",
+         "Su misión es encontrar lo que nadie documentó antes. Recibe la lista de hipótesis ya generadas "
+         "para no repetir y piensa de forma libre. Sus hipótesis se etiquetan como “novedosas” y NUNCA se "
+         "descartan por baja probabilidad."],
     ],
-    col_widths=[1.7, 4.0],
+    col_widths=[1.35, 1.05, 3.3], font_size=8.8,
 )
 heading("Los 2 hunters secuenciales", 2)
+body(
+    "Tras los 12 hunters en paralelo se ejecutan dos hunters de forma secuencial, porque necesitan "
+    "consumir el trabajo de todos los anteriores.", space_after=4,
+)
 bullet("solo se activa si el componente está desplegado en dos o más cadenas. Busca "
-       "replay de firmas, divergencia de configuración, desincronización de proxies y dependencias "
-       "de estado cross-chain. Si el componente es de una sola cadena, se omite automáticamente.",
-       "CrossChainHunter: ")
+       "replay de firmas entre cadenas, divergencia de configuración, desincronización en actualizaciones "
+       "de proxy y dependencias de estado cross-chain. Si el componente es de una sola cadena, se omite "
+       "automáticamente.", "CrossChainHunter: ")
 bullet("lee las convergencias de todos los hunters anteriores y genera hipótesis "
        "profundas, sin límite mínimo ni máximo. Puede ejecutarse en varias rondas con ángulos distintos. "
-       "Es donde aparecen los hallazgos más sofisticados.", "DeepDiveHunter: ")
+       "Prioriza calidad sobre cantidad, pero nunca corta el análisis de forma artificial. Es donde "
+       "aparecen los hallazgos más sofisticados, los que los auditores anteriores pasaron por alto.",
+       "DeepDiveHunter: ")
 callout(
-    "Filosofía de cada hunter",
-    "Cada hunter está calibrado con la metodología de un referente real del sector (por ejemplo, "
-    "samczsun para oráculos y reentrancy, Mudit Gupta para control de acceso, Trust para matemáticas). "
-    "Antes de emitir una hipótesis, cada agente aplica un auto-filtro: “¿por qué estaría equivocado?”. "
-    "Esto reduce el ruido en origen.",
+    "Por qué referentes reales",
+    "Calibrar cada hunter con la metodología de un experto reconocido (samczsun para oráculos y reentrancy, "
+    "Mudit Gupta para control de acceso, Trust para matemáticas) traslada conocimiento tácito difícil de "
+    "codificar de otra forma. El sistema replica así, en paralelo, a un panel de especialistas que ningún "
+    "equipo humano podría reunir a la vez sobre un mismo objetivo.",
 )
 body(
-    "Las hipótesis se priorizan con una fórmula simple —severidad si es cierta × confianza × "
-    "(1 / esfuerzo)— y las que cruzan varios componentes reciben prioridad alta, porque ahí es donde "
-    "viven los hallazgos críticos que los auditores anteriores pasaron por alto."
+    "Las hipótesis de los 14 hunters se priorizan con una fórmula simple —severidad si es cierta × "
+    "confianza × (1 / esfuerzo)— y las que cruzan varios componentes reciben prioridad alta, porque ahí es "
+    "donde viven los hallazgos de mayor severidad."
 )
 
 # ============================================================================
